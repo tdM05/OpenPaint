@@ -22,3 +22,6 @@ pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# Native tablet/pen input (Windows Ink) behind our InputBackend trait. Windows-
+# only for now; the mouse backend covers other platforms until we add theirs.
+octotablet = "0.1"

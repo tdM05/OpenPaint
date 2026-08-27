@@ -15,6 +15,8 @@ mod canvas_renderer;
 mod gpu;
 mod input;
 mod input_mouse;
+#[cfg(target_os = "windows")]
+mod input_pen;
 
 use std::error::Error;
 use std::sync::Arc;
@@ -85,6 +87,16 @@ impl ApplicationHandler for OpenPaint {
             }
         };
 
+        // Select the input backend now that we have a window. On Windows, try
+        // the pen backend (octotablet / Windows Ink); if it can't connect, keep
+        // the mouse backend from `Default`. Other platforms use the mouse until
+        // their own backend exists. This is the one swap point — the engine is
+        // untouched regardless of which backend wins.
+        #[cfg(target_os = "windows")]
+        if let Some(pen) = input_pen::PenBackend::try_new(window.clone()) {
+            self.input = Box::new(pen);
+        }
+
         match Gpu::new(window) {
             Ok(gpu) => {
                 println!("{} — {}", openpaint_core::hello(), openpaint_core::VERSION);
@@ -115,6 +127,14 @@ impl ApplicationHandler for OpenPaint {
                 return;
             }
             WindowEvent::RedrawRequested => {
+                // Drain any polled backend (e.g. octotablet) just before
+                // rendering, so queued pen samples are applied this frame.
+                self.pen_events.clear();
+                self.input.poll(&mut self.pen_events);
+                for pe in self.pen_events.drain(..) {
+                    Self::handle_pen_event(gpu, &pe);
+                }
+
                 match gpu.render() {
                     Ok(()) => {}
                     Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -138,6 +158,18 @@ impl ApplicationHandler for OpenPaint {
             .process_window_event(&event, &mut self.pen_events);
         for pe in self.pen_events.drain(..) {
             Self::handle_pen_event(gpu, &pe);
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Polled backends (e.g. octotablet) have no window events to wake them,
+        // so drive a redraw each loop iteration to keep `poll` running. The
+        // mouse backend returns false here and stays idle until a real event,
+        // keeping the app at 0% CPU when nothing is happening.
+        if self.input.wants_continuous_poll() {
+            if let Some(gpu) = self.gpu.as_ref() {
+                gpu.window().request_redraw();
+            }
         }
     }
 }

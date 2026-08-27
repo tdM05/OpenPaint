@@ -68,15 +68,33 @@ pub enum PenEvent {
     Up,
 }
 
-/// A source of pen input. Implementors translate their native events into
+/// A source of pen input. Implementors translate their native input into
 /// [`PenEvent`]s, appending any produced events to `out`.
 ///
-/// The winit-event hook fits the mouse backend directly; richer backends
-/// (octotablet, Windows Ink) may also observe these events and/or their own
-/// native queues, but they still emit the same [`PenEvent`] type.
+/// Two delivery models are supported because real backends differ:
+/// - **Event-driven** (the mouse): input arrives as winit [`WindowEvent`]s →
+///   [`InputBackend::process_window_event`].
+/// - **Polled** (octotablet, and typically native tablet APIs): input lives in
+///   the backend's own queue, drained once per frame → [`InputBackend::poll`].
+///
+/// A backend implements whichever it needs; both have default no-op impls.
 pub trait InputBackend {
     /// Inspect a window event and append any resulting pen events to `out`.
-    fn process_window_event(&mut self, event: &WindowEvent, out: &mut Vec<PenEvent>);
+    /// Default: ignore window events (for purely polled backends).
+    fn process_window_event(&mut self, _event: &WindowEvent, _out: &mut Vec<PenEvent>) {}
+
+    /// Drain any queued native input into `out`. Called once per frame before
+    /// rendering. Default: nothing to poll (for purely event-driven backends).
+    fn poll(&mut self, _out: &mut Vec<PenEvent>) {}
+
+    /// Whether this backend needs the app to redraw continuously so [`poll`]
+    /// runs every frame. Event-driven backends (mouse) return `false` and stay
+    /// idle until a window event; polled backends (octotablet) return `true`.
+    ///
+    /// [`poll`]: InputBackend::poll
+    fn wants_continuous_poll(&self) -> bool {
+        false
+    }
 
     /// Human-readable name of the active backend, for logging.
     fn name(&self) -> &'static str;

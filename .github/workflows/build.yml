@@ -54,9 +54,16 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      # Lint the Windows-specific code (e.g. the pen backend) that the Linux
+      # job can't see because it's #[cfg(windows)].
+      - name: Clippy (Windows)
+        run: cargo clippy --bin openpaint -- -D warnings
 
       - name: Build (release)
         run: cargo build --release --bin openpaint

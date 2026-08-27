@@ -201,7 +201,18 @@ Decision: **stay cross-platform-capable by construction, ship Windows first.**
 
 - **Phase 0 — Vertical slice (prove the feel):** repo scaffold + winit/wgpu
   render loop + one pressure/tilt brush (via the input abstraction) on a tiled
-  canvas. If this doesn't feel good, nothing else matters. **We start here.**
+  canvas. If this doesn't feel good, nothing else matters. **IN PROGRESS:**
+  - [x] Step 1 — window opens (winit). Verified on Windows.
+  - [x] Step 2 — wgpu renderer clears surface. Verified (RTX 3070 Ti / D3D12).
+  - [x] Step 3 — tiled canvas + stamp-based brush + mouse drawing. Verified.
+  - [x] Step 4 — input abstraction (PenSample/PenEvent + InputBackend trait),
+        mouse as first swappable backend. Behavior-identical refactor.
+  - [x] Step 5 — octotablet backend (Windows Ink) behind the trait; extended
+        trait with a polled path (`poll` + `wants_continuous_poll`) since
+        octotablet is polled, not event-driven. Windows target cross-checked
+        from Linux. AWAITING real-tablet test on Windows.
+  - [ ] Step 6 — assess feel; if inadequate, swap to hand-rolled Windows Ink
+        (WM_POINTER) behind the same trait (prediction + coalesced samples).
 - **Phase 1 — Real engine:** full brush engine; layers + blend modes + masks;
   undo history; color management (linear-space compositing).
 - **Phase 2 — Document & pages:** the multi-page/growable model; on-disk

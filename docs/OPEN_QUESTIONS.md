@@ -43,6 +43,17 @@ build, GitHub release/artifact download)?
 
 ---
 
+### Q2d. Verifying Windows-only code from Linux → ✅ WORKFLOW FOUND
+Windows-only code (`#[cfg(windows)]`, e.g. the pen backend) is invisible to the
+Linux clippy/build, so it used to be checkable only via the slow Windows CI job.
+Now we cross-check it from Linux before pushing:
+`rustup target add x86_64-pc-windows-gnu` once, then
+`PATH="$HOME/.cargo/bin:$PATH" rustup run stable cargo clippy \
+  --target x86_64-pc-windows-gnu -p openpaint-app -- -D warnings`.
+This typechecks + lints the Windows code in seconds (already caught a real
+borrow error pre-push). CI's Windows job also now runs clippy on the real
+windows-msvc target as the authoritative check.
+
 ### Q2c. Dev-box lint tooling (rustfmt/clippy) → ✅ RESOLVED
 Installed rustup into `~/.cargo` / `~/.rustup` with `--no-modify-path` (system
 `/usr/bin/cargo` stays the default; invoke the rustup toolchain explicitly via
@@ -65,6 +76,13 @@ sRGB-only v1? ICC profiles? Wide-gamut/display-P3 support? CMYK for print later?
 Container is "zip of tiles + JSON" in spirit. Open: exact tile encoding
 (raw/compressed? per-tile format?), metadata schema, versioning strategy,
 thumbnail/preview embedding, autosave/recovery model.
+
+### Q10b. Wintab is NOT provided by octotablet (correction)
+Earlier notes implied octotablet would give Wintab "for free." That is WRONG:
+octotablet supports Windows Ink (covers Surface/Veikk/modern Wacom, pressure +
+tilt) and Wayland-tablet on Linux, but NOT Wintab. Windows Ink is sufficient for
+all three target devices. Wintab remains a Phase-4 item and, when wanted, will
+be its own backend behind the InputBackend trait (like hand-rolled Windows Ink).
 
 ### Q7. Brush engine: port libmypaint vs. build our own
 Depends on Q1 (license). If GPL-compatible, porting/wrapping libmypaint could
