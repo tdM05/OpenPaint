@@ -1,0 +1,9 @@
+[package]
+name = "openpaint-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenPaint engine core: document model, tiled canvas, brush engine, compositor. UI-agnostic."
+
+[dependencies]

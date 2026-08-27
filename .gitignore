@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local build outputs (Windows cross-compiles, etc.)
+/build
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/

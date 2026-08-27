@@ -1,0 +1,74 @@
+name: Build
+
+# Runs on every push and PR to main, plus a manual "Run workflow" button.
+# The Windows job is the one that matters for testing: it produces a real
+# native (MSVC) OpenPaint.exe you can download from the Actions run page on
+# your Windows/tablet machine — no toolchain needed on Windows.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fast correctness gate on Linux: check, test, fmt, clippy. Cheap and quick.
+  linux-check:
+    name: Check & test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # winit needs these system libs to build on Linux CI.
+      - name: Install Linux GUI deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev
+
+      # fmt/clippy are non-blocking for now: the dev box lacks rustfmt/clippy
+      # so these can't be verified locally yet. Flip continue-on-error off
+      # (make them blocking) once the loop is confirmed and tooling is set up.
+      - name: Formatting
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        continue-on-error: true
+
+      - name: Test
+        run: cargo test --workspace
+
+  # The important one: build the downloadable Windows .exe.
+  windows-build:
+    name: Build Windows .exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --bin openpaint
+
+      - name: Upload OpenPaint.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenPaint-windows-x86_64
+          path: target/release/openpaint.exe
+          if-no-files-found: error

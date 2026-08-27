@@ -1,0 +1,17 @@
+[package]
+name = "openpaint-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenPaint desktop application shell (window + UI). Thin layer over openpaint-core."
+
+[[bin]]
+name = "openpaint"
+path = "src/main.rs"
+
+[dependencies]
+openpaint-core = { path = "../openpaint-core" }
+winit = "0.30"
+
+[target.'cfg(target_os = "windows")'.dependencies]
