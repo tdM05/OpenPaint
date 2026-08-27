@@ -1,0 +1,83 @@
+//! Input abstraction — the durable foundation of pen handling.
+//!
+//! The engine and the rest of the app depend ONLY on the types in this module,
+//! never on any specific input library or OS API. A concrete input source
+//! (mouse now; octotablet / hand-rolled Windows Ink later) is just a backend
+//! implementing [`InputBackend`] that translates its native events into our
+//! [`PenEvent`]s. Swapping backends therefore touches only the backend file,
+//! never the engine.
+//!
+//! `PenSample` is intentionally designed to hold everything the *ultimate*
+//! (hand-rolled Windows Ink) path will need — pressure, tilt, timestamp — and
+//! `PenEvent::Move` carries a *batch* of samples so high-frequency coalesced
+//! input (pens report far faster than the display refreshes) has a home from
+//! day one. Simpler backends (the mouse) just fill the basic fields and emit
+//! one sample at a time; nothing above has to change when a richer backend
+//! starts filling in the rest.
+
+use winit::event::WindowEvent;
+
+/// A single pen/pointer sample in window pixel coordinates.
+#[derive(Clone, Copy, Debug)]
+pub struct PenSample {
+    /// Position in window pixels (x right, y down).
+    pub x: f64,
+    pub y: f64,
+    /// Normalized pressure in `0.0..=1.0`. Mouse reports a constant 1.0.
+    pub pressure: f32,
+    /// Pen tilt, radians from vertical, as (x, y). Zero when unavailable.
+    ///
+    /// Intentionally part of the foundation now though nothing reads it yet:
+    /// the real pen backend fills it, and tilt-driven brushes consume it later.
+    /// Kept here so adding those is "use existing data", not a reshape.
+    #[allow(dead_code)]
+    pub tilt: (f32, f32),
+    /// Milliseconds since an arbitrary start, for future prediction/
+    /// stabilization. Zero when the backend has no clock (e.g. mouse for now).
+    ///
+    /// Also forward-looking (see `tilt`): stroke smoothing and input prediction
+    /// need per-sample timing; reserving the field now avoids a later rework.
+    #[allow(dead_code)]
+    pub time_ms: f64,
+}
+
+impl PenSample {
+    /// Convenience constructor for a basic sample (no tilt, no timestamp).
+    pub fn at(x: f64, y: f64, pressure: f32) -> Self {
+        Self {
+            x,
+            y,
+            pressure,
+            tilt: (0.0, 0.0),
+            time_ms: 0.0,
+        }
+    }
+}
+
+/// A stroke-lifecycle event carrying one or more samples.
+///
+/// `Move` holds a `Vec` so a backend can deliver a whole batch of coalesced
+/// samples captured since the last frame in one event, in chronological order.
+#[derive(Clone, Debug)]
+pub enum PenEvent {
+    /// Pen/button went down — the start of a stroke.
+    Down(PenSample),
+    /// Movement while down. Contains 1..N samples in time order.
+    Move(Vec<PenSample>),
+    /// Pen/button lifted — the end of a stroke.
+    Up,
+}
+
+/// A source of pen input. Implementors translate their native events into
+/// [`PenEvent`]s, appending any produced events to `out`.
+///
+/// The winit-event hook fits the mouse backend directly; richer backends
+/// (octotablet, Windows Ink) may also observe these events and/or their own
+/// native queues, but they still emit the same [`PenEvent`] type.
+pub trait InputBackend {
+    /// Inspect a window event and append any resulting pen events to `out`.
+    fn process_window_event(&mut self, event: &WindowEvent, out: &mut Vec<PenEvent>);
+
+    /// Human-readable name of the active backend, for logging.
+    fn name(&self) -> &'static str;
+}

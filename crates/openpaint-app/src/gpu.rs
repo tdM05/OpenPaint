@@ -10,6 +10,7 @@ use openpaint_core::{Brush, Canvas, StrokeState};
 use winit::window::Window;
 
 use crate::canvas_renderer::CanvasRenderer;
+use crate::input::PenSample;
 
 /// Fixed test-bed canvas size for the Phase 0 slice. The real document/page
 /// model (and growable/webtoon canvases) arrives in Phase 2.
@@ -136,24 +137,24 @@ impl Gpu {
             .screen_to_canvas(px, py, self.config.width, self.config.height)
     }
 
-    /// Begin a stroke at a window position (if it lands on the canvas).
-    pub fn stroke_begin(&mut self, px: f64, py: f64, pressure: f32) {
-        if let Some((cx, cy)) = self.to_canvas(px, py) {
+    /// Begin a stroke at a pen sample (if it lands on the canvas).
+    pub fn stroke_begin(&mut self, s: &PenSample) {
+        if let Some((cx, cy)) = self.to_canvas(s.x, s.y) {
             self.brush
-                .stroke_begin(&mut self.canvas, &mut self.stroke, cx, cy, pressure);
+                .stroke_begin(&mut self.canvas, &mut self.stroke, cx, cy, s.pressure);
             self.drawing = true;
             self.window.request_redraw();
         }
     }
 
-    /// Continue the current stroke to a new window position.
-    pub fn stroke_to(&mut self, px: f64, py: f64, pressure: f32) {
+    /// Continue the current stroke to a new pen sample.
+    pub fn stroke_to(&mut self, s: &PenSample) {
         if !self.drawing {
             return;
         }
-        if let Some((cx, cy)) = self.to_canvas(px, py) {
+        if let Some((cx, cy)) = self.to_canvas(s.x, s.y) {
             self.brush
-                .stroke_to(&mut self.canvas, &mut self.stroke, cx, cy, pressure);
+                .stroke_to(&mut self.canvas, &mut self.stroke, cx, cy, s.pressure);
             self.window.request_redraw();
         }
     }
