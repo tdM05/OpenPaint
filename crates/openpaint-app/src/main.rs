@@ -2,13 +2,14 @@
 //!
 //! Phase 0 progress:
 //!   step 1 — open a window (done).
-//!   step 2 — stand up wgpu and clear the surface to a canvas color (this).
-//! Next: a tiled canvas + first brush strokes.
+//!   step 2 — stand up wgpu, clear surface (done).
+//!   step 3 — tiled canvas + mouse drawing (this).
+//! Next: Windows Ink pressure/tilt so strokes respond to the pen.
 //!
-//! NOTE: we intentionally keep the console attached on Windows for now so that
-//! GPU selection logs and any startup errors are visible during early testing.
-//! Before a real release we'll add `#![windows_subsystem = "windows"]`.
+//! NOTE: console stays attached on Windows for now (GPU logs + errors). We add
+//! `#![windows_subsystem = "windows"]` before a real release.
 
+mod canvas_renderer;
 mod gpu;
 
 use std::error::Error;
@@ -16,7 +17,7 @@ use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
@@ -27,6 +28,8 @@ use gpu::Gpu;
 #[derive(Default)]
 struct OpenPaint {
     gpu: Option<Gpu>,
+    /// Latest known cursor position in window pixels.
+    cursor: (f64, f64),
 }
 
 impl ApplicationHandler for OpenPaint {
@@ -74,11 +77,25 @@ impl ApplicationHandler for OpenPaint {
                 gpu.resize(new_size);
                 gpu.window().request_redraw();
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x, position.y);
+                // Mouse has no pressure; feed full pressure for now.
+                gpu.stroke_to(self.cursor.0, self.cursor.1, 1.0);
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left {
+                    match state {
+                        ElementState::Pressed => {
+                            gpu.stroke_begin(self.cursor.0, self.cursor.1, 1.0);
+                        }
+                        ElementState::Released => {
+                            gpu.stroke_end();
+                        }
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => match gpu.render() {
                 Ok(()) => {}
-                // The surface can be transiently lost/outdated (e.g. resize,
-                // minimize, GPU reset). Recover by reconfiguring; drop the frame
-                // if the GPU is out of memory.
                 Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                     gpu.reconfigure();
                 }
@@ -86,9 +103,7 @@ impl ApplicationHandler for OpenPaint {
                     eprintln!("GPU out of memory — exiting");
                     event_loop.exit();
                 }
-                Err(wgpu::SurfaceError::Timeout) => {
-                    // Skip this frame; the next redraw will try again.
-                }
+                Err(wgpu::SurfaceError::Timeout) => {}
             },
             _ => {}
         }
@@ -97,8 +112,6 @@ impl ApplicationHandler for OpenPaint {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
-    // Wait for events rather than busy-looping; correct for a paint app that
-    // stays idle until there's input or a redraw request.
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = OpenPaint::default();

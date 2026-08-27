@@ -1,23 +1,35 @@
 //! Minimal wgpu setup for OpenPaint.
 //!
-//! Phase 0, step 2: stand up the GPU (adapter/device/queue), configure a
-//! surface for the window, and clear it to a canvas color each frame. This
-//! confirms wgpu works on the target machine's GPU/drivers before we build the
-//! tiled canvas and brush rendering on top.
+//! Phase 0: stand up the GPU, configure the surface, hold the tiled canvas and
+//! its renderer, and draw the canvas fitted in the window. Painting is driven
+//! from `main.rs` via [`Gpu::stroke_begin`] / [`Gpu::stroke_to`] / [`Gpu::stroke_end`].
 
 use std::sync::Arc;
 
+use openpaint_core::{Brush, Canvas, StrokeState};
 use winit::window::Window;
+
+use crate::canvas_renderer::CanvasRenderer;
+
+/// Fixed test-bed canvas size for the Phase 0 slice. The real document/page
+/// model (and growable/webtoon canvases) arrives in Phase 2.
+const CANVAS_W: u32 = 2048;
+const CANVAS_H: u32 = 2048;
 
 /// Owns everything needed to draw to the window's surface.
 pub struct Gpu {
-    // `surface` borrows the window, so we keep the window alive via `Arc`.
-    // Field order matters for drop: surface is dropped before the window.
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
+
+    canvas: Canvas,
+    canvas_renderer: CanvasRenderer,
+    brush: Brush,
+    stroke: StrokeState,
+    drawing: bool,
+
     window: Arc<Window>,
 }
 
@@ -27,7 +39,6 @@ impl Gpu {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            // PRIMARY = Vulkan/DX12/Metal — the backends we actually want.
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         });
@@ -43,8 +54,6 @@ impl Gpu {
         }))
         .ok_or_else(|| "no suitable GPU adapter found".to_string())?;
 
-        // Log what we got — invaluable when debugging GPU issues on the
-        // Windows/tablet machine via the attached console.
         let info = adapter.get_info();
         println!(
             "GPU: {} ({:?}) via {:?}",
@@ -63,8 +72,6 @@ impl Gpu {
         .map_err(|e| format!("request_device failed: {e}"))?;
 
         let caps = surface.get_capabilities(&adapter);
-        // Prefer an sRGB surface format so the OS handles the final
-        // gamma-correct present; we'll composite in linear space upstream.
         let format = caps
             .formats
             .iter()
@@ -77,12 +84,16 @@ impl Gpu {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo, // vsync; low-latency modes later
+            present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
+
+        let canvas = Canvas::new(CANVAS_W, CANVAS_H);
+        let canvas_renderer = CanvasRenderer::new(&device, &queue, format, &canvas);
+        canvas_renderer.update_placement(&queue, config.width, config.height);
 
         Ok(Self {
             surface,
@@ -90,11 +101,17 @@ impl Gpu {
             queue,
             config,
             size,
+            canvas,
+            canvas_renderer,
+            brush: Brush::default(),
+            stroke: StrokeState::new(),
+            drawing: false,
             window,
         })
     }
 
-    /// Handle a window resize by reconfiguring the surface.
+    /// Handle a window resize by reconfiguring the surface and re-fitting the
+    /// canvas placement.
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width == 0 || new_size.height == 0 {
             return;
@@ -103,15 +120,57 @@ impl Gpu {
         self.config.width = new_size.width;
         self.config.height = new_size.height;
         self.surface.configure(&self.device, &self.config);
+        self.canvas_renderer
+            .update_placement(&self.queue, self.config.width, self.config.height);
     }
 
-    /// Re-apply the current configuration (e.g. after a surface is lost).
     pub fn reconfigure(&mut self) {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Draw one frame: clear the surface to the canvas background color.
+    // --- Painting -----------------------------------------------------------
+
+    /// Map a window position to canvas space using the renderer's placement.
+    fn to_canvas(&self, px: f64, py: f64) -> Option<(f32, f32)> {
+        self.canvas_renderer
+            .screen_to_canvas(px, py, self.config.width, self.config.height)
+    }
+
+    /// Begin a stroke at a window position (if it lands on the canvas).
+    pub fn stroke_begin(&mut self, px: f64, py: f64, pressure: f32) {
+        if let Some((cx, cy)) = self.to_canvas(px, py) {
+            self.brush
+                .stroke_begin(&mut self.canvas, &mut self.stroke, cx, cy, pressure);
+            self.drawing = true;
+            self.window.request_redraw();
+        }
+    }
+
+    /// Continue the current stroke to a new window position.
+    pub fn stroke_to(&mut self, px: f64, py: f64, pressure: f32) {
+        if !self.drawing {
+            return;
+        }
+        if let Some((cx, cy)) = self.to_canvas(px, py) {
+            self.brush
+                .stroke_to(&mut self.canvas, &mut self.stroke, cx, cy, pressure);
+            self.window.request_redraw();
+        }
+    }
+
+    /// End the current stroke.
+    pub fn stroke_end(&mut self) {
+        self.drawing = false;
+        self.stroke = StrokeState::new();
+    }
+
+    // --- Rendering ----------------------------------------------------------
+
+    /// Draw one frame: upload dirty tiles, clear the backdrop, draw the canvas.
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        self.canvas_renderer
+            .upload_dirty(&self.queue, &mut self.canvas);
+
         let frame = self.surface.get_current_texture()?;
         let view = frame
             .texture
@@ -124,15 +183,13 @@ impl Gpu {
             });
 
         {
-            // A calm neutral gray, like an empty canvas backdrop. Values are in
-            // the surface's (sRGB) space; wgpu treats these clear values as
-            // already-encoded, so this reads as mid-light gray on screen.
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear-pass"),
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("canvas-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
+                        // Neutral gray backdrop framing the canvas sheet.
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.16,
                             g: 0.16,
@@ -146,6 +203,7 @@ impl Gpu {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            self.canvas_renderer.draw(&mut pass);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

@@ -166,6 +166,25 @@ and (for webcomics) panel/frame tooling + export to CBZ/PDF/image-sequence.
 - General interaction/design language should feel like **CSP** (with Procreate
   influence), not Krita.
 
+### Cross-platform reach (Windows now; Linux/macOS cheap to add later)
+Decision: **stay cross-platform-capable by construction, ship Windows first.**
+- wgpu (rendering) and winit (windowing) already run natively on Windows,
+  Linux, and macOS with the *same code* — no extra effort.
+- The engine core (`openpaint-core`) is pure Rust, no OS calls → runs anywhere.
+- The ONLY platform-specific piece is **stylus input**, which is why it lives
+  behind an input **trait** producing a stream of samples
+  `(x, y, pressure, tilt, …)`. Windows Ink is just one implementation.
+  - Linux pen: via winit/libinput or a small evdev backend (Wacom/Veikk give
+    pressure+tilt). Modest, self-contained effort when wanted.
+  - macOS pen: `NSEvent` pressure/tilt via objc2/cocoa. Similar modest effort.
+- Cost of keeping the door open now: ~zero (just don't hardcode Windows types
+  into the app; keep input behind the trait). We simply don't *build* the
+  Linux/macOS input backends until desired — adding one is a few-hundred-line
+  module, not a rewrite.
+- Deferred, non-architectural friction (only when actually shipping to a
+  platform): macOS code-signing/notarization + `.app` packaging; Linux
+  Flatpak/AppImage; real-hardware pen testing per platform.
+
 ---
 
 ## 7. File format & interop (direction, details TBD)

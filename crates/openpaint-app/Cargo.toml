@@ -18,5 +18,7 @@ winit = "0.30"
 wgpu = "22"
 # Block on wgpu's async setup calls without pulling in a full async runtime.
 pollster = "0.3"
+# Safe casting of plain-old-data structs to bytes for GPU uploads.
+bytemuck = { version = "1", features = ["derive"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]

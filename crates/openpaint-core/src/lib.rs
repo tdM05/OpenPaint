@@ -1,16 +1,23 @@
 //! OpenPaint engine core.
 //!
-//! This crate is deliberately **UI-agnostic**: it knows nothing about windows,
-//! buttons, or any specific UI framework. It will house the document model,
-//! the tiled canvas, the brush engine, and the GPU compositor.
-//!
-//! Right now it is an empty shell — the first real subsystem lands in Phase 0.
+//! This crate is deliberately **UI-agnostic and platform-agnostic**: it knows
+//! nothing about windows, buttons, any UI framework, or any OS. It houses the
+//! document model, the tiled canvas, the brush engine, and (later) the GPU
+//! compositor. Everything here compiles and runs identically on Windows, Linux,
+//! and macOS — the only platform-specific code (stylus input) lives in the app
+//! layer behind a trait.
+
+pub mod brush;
+pub mod canvas;
+pub mod tile;
+
+pub use brush::{Brush, StrokeState};
+pub use canvas::Canvas;
 
 /// Crate version, surfaced so the app/UI can display it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Placeholder to give the pipeline something to build and test until the
-/// first real subsystem exists. Will be removed once the tiled canvas lands.
+/// Sanity signal that the core crate is linked and reachable.
 pub fn hello() -> &'static str {
     "openpaint-core online"
 }
