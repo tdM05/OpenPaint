@@ -74,6 +74,15 @@ thumbnail/preview embedding, autosave/recovery model.
 Depends on Q1 (license). If GPL-compatible, porting/wrapping libmypaint could
 save enormous time. If permissive license, likely build our own dab engine.
 
+### Q7a. Round-brush fidelity target = Photoshop/CSP soft round
+The default round brush should aim to feel/look like Photoshop's (and CSP's)
+soft round brush. That is a **Phase-1 quality goal**, not the first
+proof-of-pipeline stroke. To match it we must get right: the hardness FALLOFF
+CURVE (PS's is a specific tuned curve, not plain linear/Gaussian), the FLOW vs
+OPACITY accumulation model (how overlapping dabs build up within one stroke),
+correct SPACING (~25% diameter default in PS), anti-aliasing, and LINEAR-space
+blending (to avoid dark edge fringing). Tracked so we hold ourselves to it.
+
 ---
 
 ## Lower-priority / later

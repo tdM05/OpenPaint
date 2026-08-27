@@ -13,5 +13,10 @@ path = "src/main.rs"
 [dependencies]
 openpaint-core = { path = "../openpaint-core" }
 winit = "0.30"
+# GPU rendering. wgpu 22 is compatible with winit 0.30 and auto-selects a
+# backend at runtime (D3D12/Vulkan on Windows, Vulkan on Linux).
+wgpu = "22"
+# Block on wgpu's async setup calls without pulling in a full async runtime.
+pollster = "0.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
