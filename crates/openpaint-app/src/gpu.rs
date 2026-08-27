@@ -36,13 +36,11 @@ impl Gpu {
             .create_surface(window.clone())
             .map_err(|e| format!("create_surface failed: {e}"))?;
 
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            },
-        ))
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        }))
         .ok_or_else(|| "no suitable GPU adapter found".to_string())?;
 
         // Log what we got — invaluable when debugging GPU issues on the

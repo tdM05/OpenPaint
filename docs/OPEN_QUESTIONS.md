@@ -43,15 +43,11 @@ build, GitHub release/artifact download)?
 
 ---
 
-### Q2c. Dev-box lint tooling (rustfmt/clippy)
-This Linux dev box has Rust via the system package (`/usr/bin/cargo`), NOT
-rustup, and no `rustfmt`/`clippy`, and no sudo to apt-install them. So CI's
-fmt/clippy steps are currently **non-blocking** (`continue-on-error: true`) to
-avoid failing on lints we can't verify locally. TODO: get rustfmt+clippy
-available (rustup toolchain in a user dir, or ask admin for the apt packages
-`rustfmt` + `rust-clippy`) and then make those CI steps blocking again.
-
-**Status: workaround in place; re-harden later.**
+### Q2c. Dev-box lint tooling (rustfmt/clippy) → ✅ RESOLVED
+Installed rustup into `~/.cargo` / `~/.rustup` with `--no-modify-path` (system
+`/usr/bin/cargo` stays the default; invoke the rustup toolchain explicitly via
+`PATH="$HOME/.cargo/bin:$PATH" rustup run stable cargo …`). rustfmt + clippy now
+verifiable locally, so CI's fmt/clippy steps are **blocking again**.
 
 ---
 

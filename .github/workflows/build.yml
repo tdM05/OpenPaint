@@ -36,16 +36,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev
 
-      # fmt/clippy are non-blocking for now: the dev box lacks rustfmt/clippy
-      # so these can't be verified locally yet. Flip continue-on-error off
-      # (make them blocking) once the loop is confirmed and tooling is set up.
       - name: Formatting
         run: cargo fmt --all -- --check
-        continue-on-error: true
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-        continue-on-error: true
 
       - name: Test
         run: cargo test --workspace

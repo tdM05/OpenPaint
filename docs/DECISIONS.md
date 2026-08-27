@@ -53,6 +53,13 @@ We explicitly do NOT want Krita's bloat or its layout/interaction choices.
   great-feeling v1. (Note: webview/Chromium stacks can't use Wintab at all,
   which is one reason we're going native.)
 
+### Confirmed test hardware
+Author's Windows/tablet machine: **NVIDIA GeForce RTX 3070 Ti Laptop GPU**,
+wgpu running via **DirectX 12**. Strong discrete GPU + mature D3D12 path — ample
+headroom for the tiled compositor, large/long canvases, and brush effects. The
+pipeline (Linux code → GitHub Actions → download .exe → run on Windows) is
+verified working end to end, including wgpu init and frame rendering.
+
 ### Development vs. validation — CONFIRMED SETUP
 - **Code is written on Linux (SSH).** The **tablet lives on the author's Windows
   machine.** So the real iteration loop is:
