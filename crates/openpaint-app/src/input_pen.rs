@@ -202,6 +202,8 @@ impl InputBackend for PenBackend {
                     }
                     if self.down {
                         out.push(PenEvent::Move(vec![self.sample()]));
+                    } else {
+                        out.push(PenEvent::Hover(self.sample()));
                     }
                 }
                 Action::Down => {

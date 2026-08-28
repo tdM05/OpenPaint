@@ -15,7 +15,25 @@
 //! one sample at a time; nothing above has to change when a richer backend
 //! starts filling in the rest.
 
+use std::sync::OnceLock;
+use std::time::Instant;
+
 use winit::event::WindowEvent;
+
+/// Milliseconds on the input clock.
+///
+/// One shared epoch for every backend, so a timestamp from one is comparable with a timestamp
+/// from another and with "now" at present time. Latency is then a subtraction rather than a
+/// per-backend special case.
+///
+/// This is deliberately *our* clock, read when the sample reaches us, not the tablet's own. It
+/// therefore cannot see the time the sample spent in the driver and the OS before arriving, and
+/// any number derived from it has to be read as "our share", never as end to end. See the module
+/// note in `perf.rs` for why that is still the measurement worth having.
+pub fn now_ms() -> f64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
 
 /// A single pen/pointer sample in window pixel coordinates.
 #[derive(Clone, Copy, Debug)]
@@ -32,24 +50,24 @@ pub struct PenSample {
     /// Kept here so adding those is "use existing data", not a reshape.
     #[allow(dead_code)]
     pub tilt: (f32, f32),
-    /// Milliseconds since an arbitrary start, for future prediction/
-    /// stabilization. Zero when the backend has no clock (e.g. mouse for now).
+    /// When this sample reached us, on the [`now_ms`] clock.
     ///
-    /// Also forward-looking (see `tilt`): stroke smoothing and input prediction
-    /// need per-sample timing; reserving the field now avoids a later rework.
-    #[allow(dead_code)]
+    /// Read by the latency measurement, and the input that stroke smoothing and prediction will
+    /// need — those want to know how fast the pen was moving, which is distance over *time*, not
+    /// distance over samples. Sample rate varies with pen speed on real hardware, so treating
+    /// consecutive samples as evenly spaced would make speed-dependent behaviour subtly wrong.
     pub time_ms: f64,
 }
 
 impl PenSample {
-    /// Convenience constructor for a basic sample (no tilt, no timestamp).
+    /// Convenience constructor for a basic sample (no tilt), stamped with the arrival time.
     pub fn at(x: f64, y: f64, pressure: f32) -> Self {
         Self {
             x,
             y,
             pressure,
             tilt: (0.0, 0.0),
-            time_ms: 0.0,
+            time_ms: now_ms(),
         }
     }
 }
@@ -66,6 +84,16 @@ pub enum PenEvent {
     Move(Vec<PenSample>),
     /// Pen/button lifted — the end of a stroke.
     Up,
+    /// The pointer moved without drawing.
+    ///
+    /// Its own event rather than a flag on `Move`, because the two mean different things to
+    /// everything downstream: `Move` extends a stroke, `Hover` only says where the pointer is.
+    ///
+    /// Carried through the pen seam rather than read off winit's `CursorMoved`, because a pen
+    /// hovering over a tablet is not guaranteed to produce mouse motion at all — whether Windows
+    /// synthesises it depends on the driver and on what RealTimeStylus decides to consume. The
+    /// backend that already knows the pen's pose is the one that can answer this reliably.
+    Hover(PenSample),
 }
 
 /// A source of pen input. Implementors translate their native input into

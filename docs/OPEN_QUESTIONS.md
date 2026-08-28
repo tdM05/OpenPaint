@@ -416,11 +416,16 @@ without a GPU.
    proper fix is a single input-dispatch layer that multiplexes sources and offers
    events to the UI before the canvas — which is the same work as Q14. Doing them
    together avoids building the layer twice.
-3. **`PenSample::time_ms` is still hardcoded `0.0`.** octotablet already provides
-   `ToolEvent::Frame(Option<FrameTimestamp>)`. Until it is wired, prediction,
-   stabilization, and *any* latency measurement are impossible — so this is a
-   prerequisite for the step-6 `WM_POINTER` decision, not an optional extra.
-   Cheap; just not yet load-bearing.
+3. **`PenSample::time_ms` carries *our* arrival time, not the tablet's.**
+   Partly resolved: samples are now stamped from `input::now_ms` when they reach
+   us, which is what made the §4f latency readout possible and is enough for
+   speed-dependent smoothing (sample rate varies with pen speed, so treating
+   samples as evenly spaced would be wrong). Still unread is octotablet's
+   `ToolEvent::Frame(Option<FrameTimestamp>)`, which is the *tablet's* clock —
+   and therefore the only way to see the share of latency spent in the driver and
+   the OS before we ever hear about the sample. Wiring it turns the §4f numbers
+   from a lower bound into something closer to end to end, and remains a
+   prerequisite for judging the step-6 `WM_POINTER` question on evidence.
 4. **`tilt` is captured but unused.** Surface Pen reports real tilt (the Veikk does
    not), so there is finally hardware to develop against when tilt-driven brushes
    arrive.

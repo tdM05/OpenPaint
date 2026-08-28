@@ -391,6 +391,70 @@ engine is written:
 On-disk storage format is a **separate, later** decision (Q6) — 16-bit in memory
 does not oblige 16-bit on disk.
 
+### 4f. Latency is measured, not felt — landed 2026-08-28
+
+§4.1 has called input latency the project's top quality axis since the first day,
+and for every day since then **nothing measured it**. `PenSample::time_ms` was a
+field permanently equal to `0.0`. Every judgement about how the app felt —
+including the `POLL_INTERVAL = 4ms` in `main.rs`, whose own comment says "revisit
+with real latency numbers" — was a guess dressed as engineering.
+
+`perf.rs` now records two rolling windows, shown in the panel:
+
+- **stroke latency**, from a pen sample reaching us to the frame containing it
+  being presented;
+- **frame time**, how long producing that frame took.
+
+Two things about this are deliberate and both limit what the numbers mean:
+
+1. **The clock starts when the sample reaches us** (`input::now_ms`), not when the
+   pen touched the tablet. octotablet does expose `FrameTimestamp`; it is not read
+   yet. So the driver's and the OS's share is invisible, as is everything after
+   `present` returns. **These numbers are a lower bound**, and the panel says so
+   rather than letting a flattering figure be mistaken for the truth.
+2. **Only frames that carried a sample count** towards stroke latency. A frame
+   drawn because the UI wanted a repaint has no input in it, and counting it would
+   pull the average towards the cost of doing nothing.
+
+Mean *and* peak, because a mean hides the single long frame, and one stutter
+mid-stroke is precisely what an artist notices.
+
+The point is not that measuring makes anything faster. It is that a claim about
+speed becomes falsifiable, and that the next optimisation gets chosen by evidence
+instead of by whichever one is most fun to build. It also arrives just in time to
+be the instrument for the §2 target (a Surface, integrated graphics), which
+**this project has still never once run on**.
+
+### 4g. The brush ring is drawn by us, and hovering therefore costs a frame
+
+Brush size was invisible until you made a mark, which turns choosing a radius
+into a guess-and-undo loop. So the pointer now carries a ring showing the actual
+size, in screen pixels, tracking zoom — because the question it answers is "how
+big will this be *here*".
+
+Two consequences worth naming, because neither is free:
+
+- **The OS cursor was the cheap route and does not work.** Windows caps cursor
+  bitmaps far below the radii a paint brush reaches, so a large brush would
+  silently stop matching its own cursor. Drawing it ourselves is the only version
+  that stays correct at every size.
+- **Hovering now repaints.** There is no cached composite to draw an overlay over
+  — §4e deferred that cache on purpose — so a moved pointer costs a full canvas
+  composite. Guarded by a half-pixel threshold in `note_pointer`, because a pen
+  resting on a tablet reports poses continuously and would otherwise pin us at
+  full rate forever. The threshold is not tuned for feel; below half a physical
+  pixel the redraw provably cannot change a pixel.
+
+If the §4f frame-time readout says hover repaints hurt on integrated graphics,
+the composite cache is the fix — and now there is a number to justify it with,
+which is exactly the sequencing §4f was for.
+
+Hover reaches us as `PenEvent::Hover`, through the pen seam rather than off
+winit's `CursorMoved`, because a pen hovering over a tablet is not guaranteed to
+produce mouse motion at all — whether Windows synthesises it depends on the
+driver and on what RealTimeStylus consumes. The backend that already knows the
+pose is the one that can answer reliably.
+
 ---
 
 ## 5. Document model — the core differentiator

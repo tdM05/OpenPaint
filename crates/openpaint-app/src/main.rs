@@ -42,6 +42,7 @@ mod input;
 mod input_mouse;
 #[cfg(target_os = "windows")]
 mod input_pen;
+mod perf;
 mod renderer;
 mod stroke_exec;
 mod stroke_layer;
@@ -160,6 +161,13 @@ struct OpenPaint {
     after_save: Option<Dialog>,
     /// A native file dialog running on its own thread.
     file_dialog: Option<FileDialogTask>,
+    /// Arrival time of the newest pen sample the next presented frame will show.
+    ///
+    /// Taken by the frame that presents it, so a frame drawn for some other reason cannot claim
+    /// an input latency it had no input for.
+    pending_sample_ms: Option<f64>,
+    /// Rolling latency and frame-time measurements.
+    perf: perf::Perf,
 }
 
 /// Which file dialog is in flight, and where its answer will arrive.
@@ -267,6 +275,8 @@ impl Default for OpenPaint {
             pending_confirm: None,
             after_save: None,
             file_dialog: None,
+            pending_sample_ms: None,
+            perf: perf::Perf::default(),
         }
     }
 }
@@ -280,10 +290,13 @@ impl OpenPaint {
     fn handle_pen_event(&mut self, event: &PenEvent) {
         match event {
             PenEvent::Down(sample) => {
+                // Before the guards below: a press that lands on the UI is still the pointer
+                // telling us where it is, and the zoom anchor and the ring both want that.
+                self.note_pointer(sample.x, sample.y);
                 // Don't paint underneath the UI. This check is needed for the pen
                 // specifically, because pen input never reaches egui and so egui's
                 // own pointer capture cannot exclude it (OPEN_QUESTIONS Q14).
-                if self.ui_blocks_point(sample)
+                if self.ui_blocks_point(sample.x, sample.y)
                     || self.nav.is_active()
                     || self.pending_confirm.is_some()
                 {
@@ -296,10 +309,24 @@ impl OpenPaint {
                 }
                 if let Some((cx, cy)) = self.to_canvas(sample) {
                     self.editor.stroke_begin(cx, cy, sample.pressure);
+                    self.note_latency_input(sample);
+                    self.request_redraw();
+                }
+            }
+            PenEvent::Hover(sample) => {
+                // The brush ring follows the pointer, so a hover is a real visible change and
+                // does need a frame -- but only when the pointer actually moved. Pens report
+                // poses continuously, including while resting perfectly still, so repainting on
+                // every one would turn a pen left on the tablet into a permanent full-rate
+                // repaint and defeat the whole demand-driven design.
+                if self.note_pointer(sample.x, sample.y) {
                     self.request_redraw();
                 }
             }
             PenEvent::Move(samples) => {
+                if let Some(sample) = samples.last() {
+                    self.note_pointer(sample.x, sample.y);
+                }
                 if self.crop.is_some() {
                     if let Some(sample) = samples.last() {
                         self.crop_drag(sample);
@@ -313,6 +340,12 @@ impl OpenPaint {
                     if let Some((cx, cy)) = self.to_canvas(sample) {
                         self.editor.stroke_to(cx, cy, sample.pressure);
                     }
+                }
+                // The newest sample in the batch is the one at the tip of the stroke, which is
+                // the pixel the artist is actually watching, so it is the one whose latency
+                // matters. Older samples in the same batch are already historical.
+                if let Some(sample) = samples.last() {
+                    self.note_latency_input(sample);
                 }
                 self.request_redraw();
             }
@@ -337,10 +370,69 @@ impl OpenPaint {
             .screen_to_canvas(sample.x, sample.y, w, h, self.editor.page_rect())
     }
 
-    fn ui_blocks_point(&self, sample: &PenSample) -> bool {
-        self.ui
-            .as_ref()
-            .is_some_and(|ui| ui.blocks_point(sample.x, sample.y))
+    fn ui_blocks_point(&self, x: f64, y: f64) -> bool {
+        self.ui.as_ref().is_some_and(|ui| ui.blocks_point(x, y))
+    }
+
+    /// Remember where the pointer is. Returns whether it moved far enough to be worth a frame.
+    ///
+    /// Half a physical pixel, because that is the threshold below which redrawing cannot change
+    /// what is on screen. Nothing about it is tuned to feel right — it is the point at which the
+    /// work is provably wasted.
+    ///
+    /// **The only place `nav.cursor` is written.** It has two readers that must agree — the zoom
+    /// anchor and the brush ring — and it is reached from two directions, the pen seam's `Hover`
+    /// and winit's `CursorMoved` for mouse drags. When the navigation handler wrote it directly as
+    /// well, it always got there first for the mouse, so the threshold below saw an unchanged
+    /// position every time and the ring never moved at all.
+    fn note_pointer(&mut self, x: f64, y: f64) -> bool {
+        let next = (x, y);
+        let still = self
+            .nav
+            .cursor
+            .is_some_and(|(x, y)| (x - next.0).abs() < 0.5 && (y - next.1).abs() < 0.5);
+        if still {
+            // Below the threshold, and deliberately *without* storing the position. The
+            // comparison is against the last position we accepted, not the last we saw: storing
+            // every sample would let a slow drift of sub-threshold steps carry the pointer
+            // arbitrarily far while never once crossing the threshold, so the ring would sit
+            // somewhere the pen no longer is.
+            return false;
+        }
+        self.nav.cursor = Some(next);
+        true
+    }
+
+    /// Mark this sample as the one whose latency the next presented frame will measure.
+    fn note_latency_input(&mut self, sample: &PenSample) {
+        self.pending_sample_ms = Some(sample.time_ms);
+    }
+
+    /// The brush ring to draw at the pointer, if there should be one.
+    ///
+    /// Drawn by us rather than handed to the OS as a cursor bitmap, which is the obvious cheaper
+    /// route and does not work: Windows caps cursor size well below the radii a paint brush
+    /// reaches, so a large brush would silently stop matching its own cursor.
+    ///
+    /// The honest cost is that hovering now repaints at display rate, because there is no cached
+    /// composite to draw an overlay over — DECISIONS §4e deferred that cache deliberately. Adding
+    /// it is the fix if the frame-time readout says it matters, and now there is a readout to ask.
+    fn brush_cursor(&self) -> Option<ui::BrushCursor> {
+        // No ring while cropping: the pointer is dragging a rectangle, not painting, and a brush
+        // circle would claim otherwise.
+        if self.crop.is_some() {
+            return None;
+        }
+        let (x, y) = self.nav.cursor?;
+        if self.ui_blocks_point(x, y) {
+            return None;
+        }
+        Some(ui::BrushCursor {
+            centre: [x as f32, y as f32],
+            // Brush radius is in page pixels and the ring is in screen pixels, so it tracks zoom.
+            // That is the entire point: the ring has to say how big the mark will be *here*.
+            radius: self.editor.brush().radius * self.view.scale(),
+        })
     }
 
     fn request_redraw(&self) {
@@ -1210,8 +1302,24 @@ impl OpenPaint {
         };
 
         match event {
+            // The pointer is gone, so the brush ring must go with it -- a ring frozen at the edge
+            // of the window says the brush is somewhere it is not. Forgetting the position also
+            // returns the zoom anchor to the centre of the view, which is the right answer for a
+            // wheel event that arrives with no pointer over us.
+            WindowEvent::CursorLeft { .. } => {
+                if self.nav.cursor.take().is_some() {
+                    self.request_redraw();
+                }
+                // Not navigation, so it goes on to the rest of the handlers.
+                false
+            }
             WindowEvent::CursorMoved { position, .. } => {
-                self.nav.cursor = Some((position.x, position.y));
+                // Through `note_pointer`, not by assignment, and here as well as on the pen seam's
+                // `Hover`: a pan drag is swallowed below, so this is the only path that keeps the
+                // pointer position current while one is in progress.
+                if self.note_pointer(position.x, position.y) {
+                    self.request_redraw();
+                }
                 if let Some(from) = self.nav.panning_from {
                     let dx = (position.x - from.0) as f32;
                     let dy = (position.y - from.1) as f32;
@@ -1334,6 +1442,8 @@ impl OpenPaint {
             let r = c.rect();
             (r.x, r.y, r.w, r.h)
         });
+        let brush_cursor = self.brush_cursor();
+        let perf = self.perf.snapshot();
 
         // Disjoint field borrows, so the overlay closure can touch the editor and
         // the UI while the renderer is mutably borrowed.
@@ -1410,6 +1520,10 @@ impl OpenPaint {
         // the view silently writes to a dead value. Disjoint field borrows make
         // this fine alongside the mutable borrows of `renderer` and `editor`.
         let view = &self.view;
+        // Started here rather than at the top of `redraw`: what this measures is the cost of
+        // producing a frame, and the work above it is bookkeeping that happens whether or not a
+        // frame follows. `render` presents before it returns, so the interval ends at the present.
+        let frame_start = Instant::now();
         let result = renderer.render(xform, visible, &layers, active_index, |gpu| {
             if let Some(ui) = ui {
                 let out = ui.render(
@@ -1431,6 +1545,8 @@ impl OpenPaint {
                         pages: (page_count, active_page),
                         tool: active_tool,
                         confirm: confirm_prompt,
+                        brush_cursor,
+                        perf,
                     },
                 );
                 ui_wants_repaint = out.wants_repaint;
@@ -1444,6 +1560,17 @@ impl OpenPaint {
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
+
+        // Recorded whatever `render` returned: a frame that failed still consumed the time, and
+        // hiding those would make the readout flatter than the app.
+        self.perf
+            .frame
+            .push(frame_start.elapsed().as_secs_f32() * 1000.0);
+        if let Some(sent) = self.pending_sample_ms.take() {
+            self.perf
+                .input
+                .push((input::now_ms() - sent).max(0.0) as f32);
+        }
 
         if edited {
             self.mark_dirty();
@@ -1716,4 +1843,116 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut app = OpenPaint::default();
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hovering must not turn into an unbounded repaint loop.
+    ///
+    /// The brush ring made pointer movement a reason to redraw, which it had never been before,
+    /// and a pen reports poses continuously — including while lying perfectly still on the
+    /// tablet. Without a threshold, a pen left on the surface would drive a full canvas composite
+    /// at pen report rate forever, which is exactly the kind of idle cost the demand-driven paint
+    /// loop exists to avoid. On the integrated graphics of the §2 target that is not a rounding
+    /// error.
+    #[test]
+    fn a_resting_pointer_does_not_ask_for_frames() {
+        let mut app = OpenPaint::default();
+
+        // The first sighting is a change: there was no ring on screen before it.
+        assert!(app.note_pointer(100.0, 100.0));
+
+        for _ in 0..64 {
+            assert!(
+                !app.note_pointer(100.0, 100.0),
+                "an unchanged pose must be free"
+            );
+        }
+        assert!(
+            !app.note_pointer(100.3, 99.8),
+            "jitter too small to move a pixel is not worth a frame"
+        );
+        assert!(app.note_pointer(101.0, 100.0), "real movement is");
+    }
+
+    /// A slow drift must still reach the threshold.
+    ///
+    /// Guards the reason `note_pointer` does not store sub-threshold positions. If it did, every
+    /// step would reset the comparison and a pointer creeping along in third-of-a-pixel steps
+    /// could cross the whole window without ever asking for a frame — leaving the ring parked at
+    /// the start of the drift.
+    #[test]
+    fn a_slow_drift_is_not_invisible() {
+        let mut app = OpenPaint::default();
+        assert!(app.note_pointer(0.0, 0.0));
+
+        let mut x = 0.0;
+        let mut asked = 0;
+        for _ in 0..30 {
+            x += 0.3;
+            if app.note_pointer(x, 0.0) {
+                asked += 1;
+            }
+        }
+        // 9 px of travel in 0.3 px steps: roughly one frame per half pixel crossed, and
+        // emphatically not zero.
+        assert!(
+            asked >= 8,
+            "9 px of drift should have asked for several frames, got {asked}"
+        );
+    }
+
+    /// The pointer leaving the window takes the ring with it.
+    #[test]
+    fn losing_the_pointer_forgets_where_it_was() {
+        let mut app = OpenPaint::default();
+        app.note_pointer(10.0, 20.0);
+        assert!(app.brush_cursor().is_some());
+
+        app.nav.cursor = None;
+        assert!(
+            app.brush_cursor().is_none(),
+            "a ring frozen at the window edge claims the brush is somewhere it is not"
+        );
+    }
+
+    /// The crop tool owns the pointer while it is up, so no brush ring follows it.
+    #[test]
+    fn cropping_shows_no_brush_ring() {
+        let mut app = OpenPaint::default();
+        app.note_pointer(10.0, 20.0);
+        app.crop = Some(crop::Crop::new(app.editor.page_rect()));
+        assert!(app.brush_cursor().is_none());
+    }
+
+    /// The ring reports the size of the mark *on screen*, so it has to track zoom.
+    ///
+    /// Its whole purpose is answering "how big will this be here", and a ring fixed in page
+    /// pixels would answer a question nobody asked.
+    #[test]
+    fn the_ring_tracks_zoom() {
+        let mut app = OpenPaint::default();
+        app.note_pointer(10.0, 20.0);
+        app.editor.brush_mut().radius = 20.0;
+
+        app.view.fit(1000, 1000, app.editor.page_rect());
+        let fitted = app
+            .brush_cursor()
+            .expect("the pointer is over the canvas")
+            .radius;
+
+        app.view
+            .set_scale_about(app.view.scale() * 2.0, (500.0, 500.0), 1000, 1000);
+        let zoomed = app
+            .brush_cursor()
+            .expect("the pointer is over the canvas")
+            .radius;
+
+        assert!(
+            (zoomed - fitted * 2.0).abs() < 0.01,
+            "doubling the zoom should double the ring: {fitted} -> {zoomed}"
+        );
+    }
 }

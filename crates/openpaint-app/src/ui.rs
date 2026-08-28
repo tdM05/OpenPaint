@@ -134,6 +134,21 @@ pub struct Status<'a> {
     pub tool: Tool,
     /// Set while an unsaved-changes question is waiting, describing what is about to happen.
     pub confirm: Option<&'static str>,
+    /// The brush outline to draw at the pointer, when there is a pointer to draw it at.
+    pub brush_cursor: Option<BrushCursor>,
+    /// Latency and frame-time readout.
+    pub perf: crate::perf::PerfSnapshot,
+}
+
+/// Where to draw the brush outline, and how big.
+///
+/// The size a mark will be is otherwise invisible until you make one, which makes choosing a
+/// radius a guess-and-undo loop. Both fields are in physical pixels, ready to be divided by the
+/// scale factor — the same convention as [`CropOverlay`], so the two overlays cannot drift.
+#[derive(Clone, Copy, Debug)]
+pub struct BrushCursor {
+    pub centre: [f32; 2],
+    pub radius: f32,
 }
 
 /// What the panel wants the app to do, collected during the frame.
@@ -546,6 +561,31 @@ impl Ui {
                         .weak(),
                     );
                     ui.separator();
+                    ui.heading("Speed");
+                    // Shown in the app, not only logged, because the number has to be visible at
+                    // the moment something feels wrong -- that is when it is worth reading, and a
+                    // log read afterwards cannot tell you what you were doing at the time.
+                    match status.perf.input {
+                        Some((mean, peak)) => {
+                            ui.label(format!("Stroke {mean:.1} ms, peak {peak:.1}"));
+                        }
+                        None => {
+                            ui.label("Stroke -- draw something");
+                        }
+                    }
+                    if let Some((mean, peak)) = status.perf.frame {
+                        ui.label(format!("Frame {mean:.1} ms, peak {peak:.1}"));
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Stroke time is from the sample reaching us to the frame being \
+                             presented. It leaves out the tablet, the driver and the display, \
+                             so the real figure is higher.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.separator();
                     ui.heading("Export");
                     ui.label(
                         egui::RichText::new(
@@ -684,6 +724,35 @@ impl Ui {
                 painter.rect_filled(r, 0.0, egui::Color32::from_black_alpha(160));
                 painter.rect_filled(r.shrink(1.5), 0.0, egui::Color32::WHITE);
             }
+        }
+
+        // The brush outline, drawn after the crop overlay so that on the one frame where both
+        // could exist the crop wins the pixels. Painted, not a widget, for the same reason the
+        // crop handles are: egui never sees pen input (Q14).
+        if let Some(cursor) = status.brush_cursor {
+            let ppp = self.ctx.pixels_per_point();
+            let painter = self.ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("brush-cursor"),
+            ));
+            let centre = egui::pos2(cursor.centre[0] / ppp, cursor.centre[1] / ppp);
+            // Floored at a size that is still a visible ring. Zoomed far out, a small brush is a
+            // fraction of a pixel across, and an honest circle would simply vanish -- leaving the
+            // artist with no pointer at all, which is worse than a slightly optimistic one.
+            let radius = (cursor.radius / ppp).max(2.0);
+
+            // Two rings, dark under light, for the same reason the crop outline has two: it has
+            // to stay legible over white paper and over black ink without knowing which is there.
+            painter.circle_stroke(
+                centre,
+                radius,
+                egui::Stroke::new(2.0_f32, egui::Color32::from_black_alpha(130)),
+            );
+            painter.circle_stroke(
+                centre,
+                radius,
+                egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(235)),
+            );
         }
 
         brush.set_color_srgb8(color_srgb);
