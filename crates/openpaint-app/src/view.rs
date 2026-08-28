@@ -159,7 +159,10 @@ impl View {
         let ch = canvas.height().max(1) as f32;
         self.scale = ((area_w / cw).min(area_h / ch) * FIT_MARGIN).clamp(MIN_SCALE, MAX_SCALE);
         self.rotation = 0.0;
-        self.center = (cw * 0.5, ch * 0.5);
+        // The page's centre in page coordinates, which is not `extent / 2` once the
+        // origin is negative.
+        let (ox, oy) = canvas.origin();
+        self.center = (ox as f32 + cw * 0.5, oy as f32 + ch * 0.5);
     }
 
     /// Set zoom to an exact scale, keeping the canvas point under `anchor` fixed.
@@ -275,18 +278,21 @@ impl View {
     pub fn placement(&self, surface_w: u32, surface_h: u32, canvas: &Canvas) -> Placement {
         let sw = surface_w.max(1) as f32;
         let sh = surface_h.max(1) as f32;
-        let cw = canvas.width() as f32;
-        let ch = canvas.height() as f32;
-
         // Pixels -> NDC: x maps 0..sw to -1..1, y maps 0..sh to 1..-1.
         let to_ndc = |(x, y): (f32, f32)| [x / sw * 2.0 - 1.0, 1.0 - y / sh * 2.0];
         let corner = |cx: f32, cy: f32| to_ndc(self.canvas_to_screen(cx, cy, surface_w, surface_h));
 
+        // The page's own corners, which start at its origin rather than at zero.
+        let (ox, oy) = canvas.origin();
+        let (ex, ey) = canvas.end();
+        let (x0, y0) = (ox as f32, oy as f32);
+        let (x1, y1) = (ex as f32, ey as f32);
+
         Placement {
-            tl: corner(0.0, 0.0),
-            tr: corner(cw, 0.0),
-            bl: corner(0.0, ch),
-            br: corner(cw, ch),
+            tl: corner(x0, y0),
+            tr: corner(x1, y0),
+            bl: corner(x0, y1),
+            br: corner(x1, y1),
         }
     }
 
@@ -304,7 +310,9 @@ impl View {
         canvas: &Canvas,
     ) -> Option<(f32, f32)> {
         let (cx, cy) = self.screen_to_canvas_unclipped((px, py), surface_w, surface_h);
-        if cx < 0.0 || cy < 0.0 || cx > canvas.width() as f32 || cy > canvas.height() as f32 {
+        let (ox, oy) = canvas.origin();
+        let (ex, ey) = canvas.end();
+        if cx < ox as f32 || cy < oy as f32 || cx > ex as f32 || cy > ey as f32 {
             return None;
         }
         Some((cx, cy))
@@ -574,5 +582,60 @@ mod tests {
         v.fit(0, 0, &c);
         let _ = v.placement(0, 0, &c);
         let _ = v.screen_to_canvas(0.0, 0.0, 0, 0, &c);
+    }
+
+    /// After extending upward the page origin is negative, and the camera must treat
+    /// that area as part of the page -- otherwise the space just added would not be
+    /// drawable on.
+    #[test]
+    fn a_negative_origin_is_inside_the_page() {
+        let mut c = Canvas::new(1000, 1000);
+        c.resize(1000, 1500, openpaint_core::Anchor::BOTTOM_LEFT);
+        assert_eq!(c.origin(), (0, -500));
+
+        let mut v = View::new();
+        v.fit(SW, SH, &c);
+
+        // The centre of the visible area is the page's centre, which is now y = 250.
+        let (cx, cy) =
+            v.screen_to_canvas_unclipped((f64::from(SW) / 2.0, f64::from(SH) / 2.0), SW, SH);
+        assert!((cx - 500.0).abs() < 0.5, "x {cx}");
+        assert!((cy - 250.0).abs() < 0.5, "y {cy}");
+
+        // A point in the newly added region maps and is accepted.
+        let screen = v.canvas_to_screen(500.0, -250.0, SW, SH);
+        let hit = v
+            .screen_to_canvas(f64::from(screen.0), f64::from(screen.1), SW, SH, &c)
+            .expect("negative-y page space should be paintable");
+        assert!((hit.1 - -250.0).abs() < 0.5, "got {hit:?}");
+    }
+
+    /// The invariant that removed the camera compensation: extending the page does not
+    /// change where existing content appears on screen, because the content's
+    /// coordinates do not change and the camera is untouched.
+    #[test]
+    fn extending_does_not_move_content_on_screen() {
+        let mut c = Canvas::new(1000, 1000);
+        let mut v = View::new();
+        v.fit(SW, SH, &c);
+
+        let p = (137.0_f32, 421.0_f32);
+        let before = v.canvas_to_screen(p.0, p.1, SW, SH);
+
+        // Extend upward and leftward; neither the point nor the camera changes.
+        c.resize(
+            1400,
+            1500,
+            openpaint_core::Anchor {
+                h: openpaint_core::page::Horizontal::Right,
+                v: openpaint_core::page::Vertical::Bottom,
+            },
+        );
+        let after = v.canvas_to_screen(p.0, p.1, SW, SH);
+
+        assert_eq!(
+            before, after,
+            "content appeared to move; the camera should need no compensation"
+        );
     }
 }

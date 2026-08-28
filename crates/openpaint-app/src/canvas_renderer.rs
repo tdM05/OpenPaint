@@ -19,6 +19,8 @@ use openpaint_core::tile::{TILE_BYTES, TILE_CHANNELS, TILE_SIZE};
 use openpaint_core::Canvas;
 use wgpu::util::DeviceExt;
 
+use openpaint_core::PageResize;
+
 use crate::view::Placement;
 
 /// Uniform matching `Placement` in canvas.wgsl.
@@ -48,6 +50,10 @@ pub const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 pub struct CanvasRenderer {
     texture: wgpu::Texture,
+    /// The page origin this texture represents. A texture is always zero-based, so
+    /// this is the offset between page and texture coordinates -- the single mapping
+    /// between the two.
+    origin: (i32, i32),
     /// Kept so the stroke layer can bake into the canvas.
     view: wgpu::TextureView,
     /// Retained so the bind group can be rebuilt when the page is resized and the
@@ -188,6 +194,7 @@ impl CanvasRenderer {
 
         Self {
             texture,
+            origin: canvas.origin(),
             view,
             bind_group_layout,
             sampler,
@@ -255,15 +262,14 @@ impl CanvasRenderer {
     /// One texture copy, which is why resizing is cheap on the GPU even though the
     /// CPU reference has to move pixels tile by tile: the shift rarely lands on a
     /// tile boundary, but a texture copy does not care.
-    pub fn resize(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        new_w: u32,
-        new_h: u32,
-        dx: i32,
-        dy: i32,
-    ) {
+    pub fn resize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, resize: PageResize) {
+        let (new_w, new_h) = (resize.new_w.max(1), resize.new_h.max(1));
+        // The texture is zero-based, so old content moves *within* it even though it
+        // does not move in page coordinates.
+        let (dx, dy) = resize.content_offset();
+        let shift = resize.origin_shift();
+        self.origin = (self.origin.0 + shift.0, self.origin.1 + shift.1);
+
         let old = std::mem::replace(
             &mut self.texture,
             create_canvas_texture(device, queue, new_w, new_h),
@@ -341,6 +347,12 @@ impl CanvasRenderer {
                 },
             ],
         });
+    }
+
+    /// The page origin this texture currently represents.
+    #[must_use]
+    pub fn origin(&self) -> (i32, i32) {
+        self.origin
     }
 
     /// The canvas texture itself, for history's region copies.
@@ -486,7 +498,17 @@ mod tests {
         mark(&queue, r.texture(), 7, 9, red);
 
         // Grow downward: content must not move.
-        r.resize(&device, &queue, SIZE, SIZE * 2, 0, 0);
+        r.resize(
+            &device,
+            &queue,
+            PageResize {
+                old_w: SIZE,
+                old_h: SIZE,
+                new_w: SIZE,
+                new_h: SIZE * 2,
+                anchor: openpaint_core::Anchor::TOP_LEFT,
+            },
+        );
 
         let size = r.texture().size();
         assert_eq!((size.width, size.height), (SIZE, SIZE * 2));
@@ -508,10 +530,11 @@ mod tests {
         );
     }
 
-    /// Extending *upward* shifts content down by the growth. Getting this direction
-    /// backwards would move content off the top instead.
+    /// Extending upward leaves content at the same *page* coordinate, which lands it
+    /// lower inside the zero-based texture. Getting that direction backwards would push
+    /// content off the top instead.
     #[test]
-    fn resizing_up_shifts_content_down() {
+    fn resizing_up_moves_content_down_within_the_texture() {
         let Some((device, queue)) = try_device() else {
             eprintln!("skipping: no usable GPU adapter");
             return;
@@ -527,8 +550,25 @@ mod tests {
         let red = [1.0, 0.0, 0.0, 1.0];
         mark(&queue, r.texture(), 7, 9, red);
 
-        // Same growth, but anchored at the bottom, so dy = SIZE.
-        r.resize(&device, &queue, SIZE, SIZE * 2, 0, SIZE as i32);
+        // Same growth, anchored at the bottom, so the origin moves up by SIZE and the
+        // content lands SIZE lower in the new texture.
+        r.resize(
+            &device,
+            &queue,
+            PageResize {
+                old_w: SIZE,
+                old_h: SIZE,
+                new_w: SIZE,
+                new_h: SIZE * 2,
+                anchor: openpaint_core::Anchor::BOTTOM_LEFT,
+            },
+        );
+
+        assert_eq!(
+            r.origin(),
+            (0, -(SIZE as i32)),
+            "the origin should have moved up, not the content"
+        );
 
         let pixels = read_full(&device, &queue, r.texture(), SIZE, SIZE * 2);
         let at = |x: u32, y: u32| pixels[(y * SIZE + x) as usize];
@@ -564,7 +604,17 @@ mod tests {
         mark(&queue, r.texture(), 5, 5, [1.0, 0.0, 0.0, 1.0]);
 
         let half = SIZE / 2;
-        r.resize(&device, &queue, half, half, 0, 0);
+        r.resize(
+            &device,
+            &queue,
+            PageResize {
+                old_w: SIZE,
+                old_h: SIZE,
+                new_w: half,
+                new_h: half,
+                anchor: openpaint_core::Anchor::TOP_LEFT,
+            },
+        );
         let size = r.texture().size();
         assert_eq!((size.width, size.height), (half, half));
 

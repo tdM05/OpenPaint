@@ -27,7 +27,11 @@
 // ---------------------------------------------------------------- dab stamping
 
 struct CanvasSize {
-    // Canvas dimensions in pixels; z/w unused, present for 16-byte alignment.
+    // xy = page extent in pixels, zw = page origin in page coordinates.
+    //
+    // The origin is needed because dabs arrive in *page* coordinates, which stay stable
+    // when the page is extended, while a texture is always zero-based. Subtracting it
+    // here is the whole cost of that stability on the GPU side.
     size: vec4<f32>,
 };
 
@@ -60,7 +64,8 @@ fn dab_vs(@builtin(vertex_index) vid: u32, inst: DabInst) -> DabOut {
     // One pixel of slack so the antialiased rim is never clipped by the quad.
     let extent = inst.radius + 1.0;
     let offset = offsets[vid] * extent;
-    let p = inst.center + offset;
+    // Page coordinates -> texture coordinates.
+    let p = inst.center + offset - canvas.size.zw;
 
     var out: DabOut;
     out.pos = vec4<f32>(

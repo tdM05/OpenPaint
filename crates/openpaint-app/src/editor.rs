@@ -231,8 +231,7 @@ impl Editor {
     /// End the current stroke, committing it to the canvas.
     pub fn stroke_end(&mut self) {
         if self.drawing {
-            let (w, h) = (self.canvas().width(), self.canvas().height());
-            let bounds = self.bounds.to_rect(w, h);
+            let bounds = self.bounds.to_rect(self.canvas());
             self.ops.push(StrokeOp::End { bounds });
         }
         self.drawing = false;
@@ -382,9 +381,13 @@ mod tests {
         let (ops, _) = e.pending_stroke();
         match ops.last() {
             Some(StrokeOp::End { bounds: Some(r) }) => {
+                // Page coordinates are signed now, so widen deliberately rather than
+                // mixing i32 and u32 at the comparison.
+                let right = r.x + r.w as i32;
+                let bottom = r.y + r.h as i32;
                 assert!(r.x <= 189, "left edge {} too far right", r.x);
-                assert!(r.x + r.w >= 411, "right edge {} too far left", r.x + r.w);
-                assert!(r.y <= 289 && r.y + r.h >= 311, "vertical bounds {r:?}");
+                assert!(right >= 411, "right edge {right} too far left");
+                assert!(r.y <= 289 && bottom >= 311, "vertical bounds {r:?}");
             }
             other => panic!("expected End with bounds, got {other:?}"),
         }

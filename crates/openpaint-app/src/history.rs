@@ -34,7 +34,7 @@
 //!   undoable extends nearly free. **Shrinking does**, so a crop keeps a copy of the
 //!   whole pre-crop canvas; that is the only way to give back what it removed.
 
-use openpaint_core::{Anchor, Dab};
+use openpaint_core::{Dab, PageResize};
 
 use crate::canvas_renderer::CANVAS_FORMAT;
 
@@ -45,11 +45,12 @@ use crate::canvas_renderer::CANVAS_FORMAT;
 /// far-back edits.
 pub const BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-/// A rectangle of canvas pixels.
+/// A rectangle in **page coordinates**, whose corner may be negative once the page
+/// has been extended upward or leftward (see `openpaint_core::canvas`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CanvasRect {
-    pub x: u32,
-    pub y: u32,
+    pub x: i32,
+    pub y: i32,
     pub w: u32,
     pub h: u32,
 }
@@ -63,6 +64,20 @@ impl CanvasRect {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.w == 0 || self.h == 0
+    }
+
+    /// This rectangle's corner as a texture origin.
+    ///
+    /// A texture is always zero-based, so page coordinates are converted by subtracting
+    /// the page origin. This is *the* place that conversion happens; keeping it to one
+    /// method is what stops page and texture coordinates being mixed up silently.
+    #[must_use]
+    pub fn texture_origin(&self, page_origin: (i32, i32)) -> wgpu::Origin3d {
+        wgpu::Origin3d {
+            x: (self.x - page_origin.0).max(0) as u32,
+            y: (self.y - page_origin.1).max(0) as u32,
+            z: 0,
+        }
     }
 }
 
@@ -87,69 +102,30 @@ impl BoundsBuilder {
         });
     }
 
-    /// The accumulated bounds clipped to a canvas of `w` × `h`, or `None` if the
-    /// stroke touched nothing inside it.
+    /// The accumulated bounds clipped to the page, or `None` if the stroke touched
+    /// nothing inside it.
+    ///
+    /// Clipped against the page's actual rectangle rather than `0..w`, because the
+    /// origin can be negative.
     #[must_use]
-    pub fn to_rect(self, canvas_w: u32, canvas_h: u32) -> Option<CanvasRect> {
-        let (x0, y0, x1, y1) = self.min?;
-        let x0 = x0.floor().max(0.0) as u32;
-        let y0 = y0.floor().max(0.0) as u32;
-        let x1 = (x1.ceil().max(0.0) as u32).min(canvas_w);
-        let y1 = (y1.ceil().max(0.0) as u32).min(canvas_h);
+    pub fn to_rect(self, canvas: &openpaint_core::Canvas) -> Option<CanvasRect> {
+        let (x0f, y0f, x1f, y1f) = self.min?;
+        let (ox, oy) = canvas.origin();
+        let (ex, ey) = canvas.end();
+
+        let x0 = (x0f.floor() as i32).max(ox);
+        let y0 = (y0f.floor() as i32).max(oy);
+        let x1 = (x1f.ceil() as i32).min(ex);
+        let y1 = (y1f.ceil() as i32).min(ey);
         if x1 <= x0 || y1 <= y0 {
             return None;
         }
         Some(CanvasRect {
             x: x0,
             y: y0,
-            w: x1 - x0,
-            h: y1 - y0,
+            w: (x1 - x0) as u32,
+            h: (y1 - y0) as u32,
         })
-    }
-}
-
-/// A page resize, from which the content offset is **derived** rather than passed in.
-///
-/// Deriving it removes a class of bug: an offset carried alongside the sizes can
-/// disagree with them, and the result is content copied to the wrong place with no
-/// error raised.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PageResize {
-    pub old_w: u32,
-    pub old_h: u32,
-    pub new_w: u32,
-    pub new_h: u32,
-    pub anchor: Anchor,
-}
-
-impl PageResize {
-    /// How far existing content moves.
-    #[must_use]
-    pub fn offset(&self) -> (i32, i32) {
-        self.anchor
-            .offset(self.old_w, self.old_h, self.new_w, self.new_h)
-    }
-
-    /// The inverse resize, for undoing this one.
-    ///
-    /// Swapping the sizes and keeping the anchor is sufficient, because the offset is
-    /// computed from the size difference — so the same anchor yields exactly the
-    /// opposite movement.
-    #[must_use]
-    pub fn inverted(&self) -> Self {
-        Self {
-            old_w: self.new_w,
-            old_h: self.new_h,
-            new_w: self.old_w,
-            new_h: self.old_h,
-            anchor: self.anchor,
-        }
-    }
-
-    /// Whether this resize loses pixels, and therefore needs them saved.
-    #[must_use]
-    pub fn shrinks(&self) -> bool {
-        self.new_w < self.old_w || self.new_h < self.old_h
     }
 }
 
@@ -286,10 +262,18 @@ pub fn snapshot_region(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
     canvas: &wgpu::Texture,
+    page_origin: (i32, i32),
     rect: CanvasRect,
 ) -> wgpu::Texture {
     let snapshot = new_snapshot(device, rect.w, rect.h);
-    copy_region(encoder, canvas, rect_origin(rect), &snapshot, zero(), rect);
+    copy_region(
+        encoder,
+        canvas,
+        rect.texture_origin(page_origin),
+        &snapshot,
+        zero(),
+        rect,
+    );
     snapshot
 }
 
@@ -298,9 +282,17 @@ pub fn restore_region(
     encoder: &mut wgpu::CommandEncoder,
     snapshot: &wgpu::Texture,
     canvas: &wgpu::Texture,
+    page_origin: (i32, i32),
     rect: CanvasRect,
 ) {
-    copy_region(encoder, snapshot, zero(), canvas, rect_origin(rect), rect);
+    copy_region(
+        encoder,
+        snapshot,
+        zero(),
+        canvas,
+        rect.texture_origin(page_origin),
+        rect,
+    );
 }
 
 /// A snapshot texture of the given size.
@@ -323,14 +315,6 @@ pub fn new_snapshot(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
 
 fn zero() -> wgpu::Origin3d {
     wgpu::Origin3d::ZERO
-}
-
-fn rect_origin(rect: CanvasRect) -> wgpu::Origin3d {
-    wgpu::Origin3d {
-        x: rect.x,
-        y: rect.y,
-        z: 0,
-    }
 }
 
 /// The snapshot is always origin-based and rect-sized; the canvas side is offset by
@@ -368,6 +352,14 @@ fn copy_region(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openpaint_core::{Anchor, Canvas};
+
+    /// One past a rect's bottom-right corner. A test helper rather than API, so
+    /// callers don't mix i32 and u32 at a comparison -- which is where sign errors
+    /// creep in -- without adding a method nothing in production needs.
+    fn rect_end(r: &CanvasRect) -> (i32, i32) {
+        (r.x + r.w as i32, r.y + r.h as i32)
+    }
 
     fn dab(x: f32, y: f32, radius: f32) -> Dab {
         Dab {
@@ -397,9 +389,22 @@ mod tests {
     fn bounds_cover_a_dab_and_its_radius() {
         let mut b = BoundsBuilder::default();
         b.add_dab(&dab(100.0, 100.0, 10.0));
-        let r = b.to_rect(2048, 2048).expect("non-empty");
+        let r = b
+            .to_rect(&openpaint_core::Canvas::new(2048, 2048))
+            .expect("non-empty");
         assert!(r.x <= 89 && r.y <= 89);
-        assert!(r.x + r.w >= 111 && r.y + r.h >= 111);
+        assert_eq!(
+            rect_end(&r).0.min(111),
+            111,
+            "right edge short: {:?}",
+            rect_end(&r)
+        );
+        assert_eq!(
+            rect_end(&r).1.min(111),
+            111,
+            "bottom edge short: {:?}",
+            rect_end(&r)
+        );
     }
 
     #[test]
@@ -407,10 +412,12 @@ mod tests {
         let mut b = BoundsBuilder::default();
         b.add_dab(&dab(100.0, 100.0, 5.0));
         b.add_dab(&dab(500.0, 300.0, 5.0));
-        let r = b.to_rect(2048, 2048).expect("non-empty");
+        let r = b
+            .to_rect(&openpaint_core::Canvas::new(2048, 2048))
+            .expect("non-empty");
         assert!(r.x <= 94);
-        assert!(r.x + r.w >= 506);
-        assert!(r.y + r.h >= 306);
+        assert!(rect_end(&r).0 >= 506);
+        assert!(rect_end(&r).1 >= 306);
     }
 
     /// A stroke running off the canvas must clip, or the snapshot copy would address
@@ -419,23 +426,27 @@ mod tests {
     fn bounds_clip_to_the_canvas() {
         let mut b = BoundsBuilder::default();
         b.add_dab(&dab(5.0, 5.0, 50.0));
-        let r = b.to_rect(256, 256).expect("non-empty");
+        let r = b
+            .to_rect(&openpaint_core::Canvas::new(256, 256))
+            .expect("non-empty");
         assert_eq!(r.x, 0, "did not clip at the left edge");
         assert_eq!(r.y, 0);
-        assert!(r.x + r.w <= 256);
-        assert!(r.y + r.h <= 256);
+        assert!(rect_end(&r).0 <= 256);
+        assert!(rect_end(&r).1 <= 256);
     }
 
     #[test]
     fn bounds_entirely_off_canvas_are_empty() {
         let mut b = BoundsBuilder::default();
         b.add_dab(&dab(-500.0, -500.0, 5.0));
-        assert!(b.to_rect(256, 256).is_none());
+        assert!(b.to_rect(&Canvas::new(256, 256)).is_none());
     }
 
     #[test]
     fn no_dabs_means_no_rect() {
-        assert!(BoundsBuilder::default().to_rect(256, 256).is_none());
+        assert!(BoundsBuilder::default()
+            .to_rect(&Canvas::new(256, 256))
+            .is_none());
     }
 
     #[test]
@@ -443,7 +454,9 @@ mod tests {
         let mut b = BoundsBuilder::default();
         b.add_dab(&dab(1000.0, 1000.0, 5.0));
         b.clear();
-        assert!(b.to_rect(2048, 2048).is_none());
+        assert!(b
+            .to_rect(&openpaint_core::Canvas::new(2048, 2048))
+            .is_none());
     }
 
     /// A grow costs no snapshot memory. That is what makes undoable extends nearly
@@ -513,51 +526,5 @@ mod tests {
         let mut h = History::new(8);
         assert!(h.pop_undo().is_none());
         assert!(h.pop_redo().is_none());
-    }
-
-    /// Inverting a resize must produce exactly the opposite content movement, since
-    /// that is what undoing one relies on.
-    #[test]
-    fn inverting_a_resize_reverses_its_offset() {
-        for anchor in [
-            Anchor::TOP_LEFT,
-            Anchor::BOTTOM_LEFT,
-            Anchor::TOP_RIGHT,
-            Anchor::CENTER,
-        ] {
-            let forward = PageResize {
-                old_w: 300,
-                old_h: 300,
-                new_w: 800,
-                new_h: 700,
-                anchor,
-            };
-            let (fx, fy) = forward.offset();
-            let (bx, by) = forward.inverted().offset();
-            assert_eq!((bx, by), (-fx, -fy), "anchor {anchor:?} did not invert");
-        }
-    }
-
-    #[test]
-    fn only_a_shrink_needs_pixels_saved() {
-        let grow = PageResize {
-            old_w: 100,
-            old_h: 100,
-            new_w: 100,
-            new_h: 400,
-            anchor: Anchor::TOP_LEFT,
-        };
-        assert!(!grow.shrinks());
-        assert!(grow.inverted().shrinks(), "undoing a grow is a shrink");
-
-        // Growing in one axis while shrinking the other still loses pixels.
-        let mixed = PageResize {
-            old_w: 400,
-            old_h: 100,
-            new_w: 100,
-            new_h: 400,
-            anchor: Anchor::TOP_LEFT,
-        };
-        assert!(mixed.shrinks());
     }
 }

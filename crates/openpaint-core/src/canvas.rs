@@ -5,6 +5,26 @@
 //! touched, allocating them on demand and recording them as dirty so the
 //! renderer can re-upload only what changed.
 //!
+//! # Coordinates are stable, and the origin may be negative
+//!
+//! A canvas is a **rectangle placed in a signed coordinate space**: an origin plus an
+//! extent, not a `w × h` grid anchored at (0, 0). That gives one invariant worth
+//! stating loudly:
+//!
+//! > **A pixel you painted keeps its coordinate forever.**
+//!
+//! Extending to the left or upward moves the *origin*, never the content. The
+//! alternative — re-basing every coordinate at zero — makes extending left shift every
+//! pixel's x, and that instability then leaks outward: the camera has to compensate so
+//! the drawing doesn't appear to lurch, undo rectangles have to be rewritten, and
+//! every future consumer of coordinates needs the same correction. Those corrections
+//! are all symptoms of the coordinate choice, so the choice is what to fix.
+//!
+//! Tile coordinates are `i32` and the arithmetic uses `div_euclid`/`rem_euclid`, which
+//! are correct for negatives, so this costs nothing here. It costs exactly one
+//! subtraction at the GPU boundary, because a texture is always zero-based — and that
+//! mapping belongs to the renderer.
+//!
 //! Pixels are **linear and premultiplied** throughout — see [`crate::color`].
 //!
 //! # This is the reference implementation, not the fast path
@@ -24,9 +44,13 @@ use crate::tile::{Tile, TileCoord, TILE_SIZE};
 /// Default paper color for freshly allocated tiles, as authored (near-white sRGB).
 const PAPER_SRGB: [u8; 3] = [250, 249, 246];
 
-/// A fixed-dimension tiled canvas. Dimensions are stored for bounds/clamping,
-/// but tiles are sparse, so unpainted area costs nothing.
+/// A tiled canvas: a rectangle in a signed coordinate space. Tiles are sparse, so
+/// unpainted area costs nothing.
 pub struct Canvas {
+    /// Top-left corner in canvas coordinates. May be negative, and moves when the
+    /// canvas is extended leftward or upward.
+    origin_x: i32,
+    origin_y: i32,
     width: u32,
     height: u32,
     tiles: HashMap<TileCoord, Tile>,
@@ -39,6 +63,8 @@ impl Canvas {
     #[must_use]
     pub fn new(width: u32, height: u32) -> Self {
         Self {
+            origin_x: 0,
+            origin_y: 0,
             width,
             height,
             tiles: HashMap::new(),
@@ -56,6 +82,28 @@ impl Canvas {
         self.height
     }
 
+    /// Top-left corner in canvas coordinates.
+    #[must_use]
+    pub fn origin(&self) -> (i32, i32) {
+        (self.origin_x, self.origin_y)
+    }
+
+    /// One past the bottom-right corner, in canvas coordinates.
+    #[must_use]
+    pub fn end(&self) -> (i32, i32) {
+        (
+            self.origin_x + self.width as i32,
+            self.origin_y + self.height as i32,
+        )
+    }
+
+    /// Whether a canvas coordinate lies inside the canvas.
+    #[must_use]
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        let (ex, ey) = self.end();
+        x >= self.origin_x && y >= self.origin_y && x < ex && y < ey
+    }
+
     /// Composite a linear premultiplied `src` over one canvas pixel.
     ///
     /// `src` must already have coverage folded in (see
@@ -63,7 +111,7 @@ impl Canvas {
     /// scales all four channels, so folding it in at the call site keeps this a
     /// plain Porter-Duff "over" with no special cases.
     pub fn blend_pixel(&mut self, x: i32, y: i32, src_linear_premul: [f32; 4]) {
-        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+        if !self.contains(x, y) {
             return;
         }
         // Fully transparent source cannot change the destination.
@@ -96,7 +144,7 @@ impl Canvas {
     /// every update rather than darkening it progressively — that recomputation is
     /// what keeps a mid-stroke preview identical to the committed result.
     pub fn replace_pixel(&mut self, x: i32, y: i32, linear_premul: [f32; 4]) {
-        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+        if !self.contains(x, y) {
             return;
         }
         let tile_coord = (
@@ -114,43 +162,36 @@ impl Canvas {
         self.dirty.insert(tile_coord);
     }
 
-    /// Change the canvas size, keeping existing content at `anchor`.
+    /// Change the canvas size, keeping existing content where it is.
     ///
-    /// Returns how far content moved, in pixels. Callers need that: GPU textures
-    /// copy their old contents to the same offset, and anything storing canvas
-    /// coordinates (undo rectangles) must be shifted by it.
+    /// Returns how far the **origin** moved. Content does not move at all — that is
+    /// the point of a signed origin (see the module note). Callers need the origin
+    /// delta because a GPU texture is zero-based, so its contents must be copied to a
+    /// new position within the new texture.
     ///
-    /// Pixels genuinely move here rather than tile keys being remapped, because the
-    /// shift is rarely a multiple of the tile size — extending up by 500 with 256px
-    /// tiles offsets content by 500, so each destination tile draws from two source
-    /// tiles. Doing it per pixel is obviously correct and this is the reference
-    /// implementation (clarity over speed); the app's real pixels live on the GPU,
-    /// where the same operation is a single texture copy.
+    /// No pixel is touched and no tile is rekeyed. Extending is two integers; only a
+    /// crop does any work, dropping tiles that fall entirely outside.
     pub fn resize(&mut self, new_w: u32, new_h: u32, anchor: Anchor) -> (i32, i32) {
-        let (dx, dy) = anchor.offset(self.width, self.height, new_w, new_h);
+        let shift = anchor.origin_shift(self.width, self.height, new_w, new_h);
+        self.origin_x += shift.0;
+        self.origin_y += shift.1;
         self.width = new_w.max(1);
         self.height = new_h.max(1);
 
-        // Nothing painted, or nothing to move: just the new bounds.
-        if self.tiles.is_empty() {
-            self.dirty.clear();
-            return (dx, dy);
-        }
-
-        let old = std::mem::take(&mut self.tiles);
+        // A crop can leave tiles wholly outside the canvas; drop them so the memory
+        // is released. Partially-covered tiles stay, since part of them is still
+        // visible, and `contains` keeps the hidden part unpaintable.
+        let (ox, oy) = (self.origin_x, self.origin_y);
+        let (ex, ey) = self.end();
+        let tile = TILE_SIZE as i32;
+        self.tiles.retain(|coord, _| {
+            let x0 = coord.0 * tile;
+            let y0 = coord.1 * tile;
+            x0 + tile > ox && y0 + tile > oy && x0 < ex && y0 < ey
+        });
         self.dirty.clear();
-        for (coord, tile) in old {
-            for ly in 0..TILE_SIZE {
-                for lx in 0..TILE_SIZE {
-                    let src_x = coord.0 * TILE_SIZE as i32 + lx as i32;
-                    let src_y = coord.1 * TILE_SIZE as i32 + ly as i32;
-                    // replace_pixel clips to the new bounds, so content shifted or
-                    // cropped outside is dropped -- which is what a crop means.
-                    self.replace_pixel(src_x + dx, src_y + dy, tile.texel(lx, ly));
-                }
-            }
-        }
-        (dx, dy)
+
+        shift
     }
 
     /// Iterate all currently allocated tiles (coord + tile).
@@ -272,35 +313,58 @@ mod tests {
         assert!(is_paint(&c, 250, 290), "pixel at (250,290) lost");
     }
 
-    /// Extending up shifts content down by the growth, and the shift is *not* a
-    /// multiple of the tile size here -- which is the case that would break a
-    /// tile-key remap.
+    /// The invariant that makes this design worth having: extending upward must leave
+    /// painted content on exactly the coordinates it already had. Only the origin
+    /// moves.
+    ///
+    /// The old design re-based at zero, so this same operation moved every pixel down
+    /// by 500 -- which then forced the camera to compensate and undo rectangles to be
+    /// rewritten. Both of those disappeared with this.
     #[test]
-    fn extending_up_shifts_content_by_a_non_tile_multiple() {
+    fn extending_up_leaves_content_exactly_where_it_was() {
         let mut c = Canvas::new(300, 300);
         c.blend_pixel(10, 20, BLACK);
 
-        // Compile-time guard: this test only proves anything while the shift is
-        // NOT a whole number of tiles. If TILE_SIZE ever divides 500, the build
-        // breaks here rather than the test quietly becoming vacuous.
-        const _: () = assert!(500 % TILE_SIZE != 0);
-
-        let moved = c.resize(300, 800, Anchor::BOTTOM_LEFT);
-        assert_eq!(moved, (0, 500));
-        assert!(is_paint(&c, 10, 520), "content did not follow the shift");
+        let shift = c.resize(300, 800, Anchor::BOTTOM_LEFT);
+        assert_eq!(shift, (0, -500), "the origin should move, not the content");
+        assert_eq!(c.origin(), (0, -500));
         assert!(
-            !is_paint(&c, 10, 20),
-            "content left behind at the old position"
+            is_paint(&c, 10, 20),
+            "content moved when it should not have"
         );
     }
 
+    /// The space added above the old top edge has *negative* y, and must be paintable
+    /// -- otherwise extending upward would add unusable room.
     #[test]
-    fn extending_left_shifts_content_right() {
+    fn the_space_added_above_has_negative_coordinates_and_is_paintable() {
+        let mut c = Canvas::new(300, 300);
+        c.resize(300, 800, Anchor::BOTTOM_LEFT);
+
+        assert!(
+            c.contains(10, -400),
+            "negative y should be inside the canvas"
+        );
+        c.blend_pixel(10, -400, BLACK);
+        assert!(
+            is_paint(&c, 10, -400),
+            "could not paint above the old top edge"
+        );
+
+        // Still bounded: just past the new origin is outside.
+        assert!(!c.contains(10, -501));
+    }
+
+    #[test]
+    fn extending_left_leaves_content_exactly_where_it_was() {
         let mut c = Canvas::new(300, 300);
         c.blend_pixel(10, 20, BLACK);
-        let moved = c.resize(700, 300, Anchor::TOP_RIGHT);
-        assert_eq!(moved, (400, 0));
-        assert!(is_paint(&c, 410, 20));
+
+        let shift = c.resize(700, 300, Anchor::TOP_RIGHT);
+        assert_eq!(shift, (-400, 0));
+        assert_eq!(c.origin(), (-400, 0));
+        assert!(is_paint(&c, 10, 20));
+        assert!(c.contains(-399, 20), "the added space should be paintable");
     }
 
     /// Shrinking drops what falls outside -- that is what a crop is.
@@ -347,14 +411,17 @@ mod tests {
     }
 
     /// Whether a pixel carries paint, i.e. differs from bare paper.
-    fn is_paint(c: &Canvas, x: u32, y: u32) -> bool {
-        let coord = ((x / TILE_SIZE as u32) as i32, (y / TILE_SIZE as u32) as i32);
-        let Some(tile) = c.tile(coord) else {
+    ///
+    /// Takes *signed* coordinates, because a canvas extended upward or leftward has
+    /// negative ones. `div_euclid`/`rem_euclid` are what make that work.
+    fn is_paint(c: &Canvas, x: i32, y: i32) -> bool {
+        let tile = TILE_SIZE as i32;
+        let Some(t) = c.tile((x.div_euclid(tile), y.div_euclid(tile))) else {
             return false;
         };
-        let lx = (x % TILE_SIZE as u32) as usize;
-        let ly = (y % TILE_SIZE as u32) as usize;
+        let lx = x.rem_euclid(tile) as usize;
+        let ly = y.rem_euclid(tile) as usize;
         let paper = Canvas::paper_color()[0];
-        tile.texel(lx, ly)[0] < paper - 0.05
+        t.texel(lx, ly)[0] < paper - 0.05
     }
 }

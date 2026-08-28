@@ -24,9 +24,10 @@ use winit::window::Window;
 
 use crate::canvas_renderer::{CanvasRenderer, CANVAS_FORMAT};
 use crate::editor::StrokeOp;
-use crate::history::{self, CanvasRect, History, Op, PageResize};
+use crate::history::{self, CanvasRect, History, Op};
 use crate::stroke_layer::StrokeLayer;
 use crate::view::Placement;
+use openpaint_core::PageResize;
 
 /// Bytes per canvas texel (`Rgba16Float`), for history's memory accounting.
 const CANVAS_BYTES_PER_TEXEL: usize = 8;
@@ -147,6 +148,7 @@ impl Renderer {
             &device,
             canvas.width(),
             canvas.height(),
+            canvas.origin(),
             CANVAS_FORMAT,
             format,
         );
@@ -264,6 +266,7 @@ impl Renderer {
                                 &self.device,
                                 &mut encoder,
                                 self.canvas_renderer.texture(),
+                                self.canvas_renderer.origin(),
                                 rect,
                             );
                             let (color_linear_premul, opacity) = self.recording_paint;
@@ -291,29 +294,22 @@ impl Renderer {
     /// `record` is false when the resize *is* an undo/redo, so reverting a resize does
     /// not push another one.
     pub fn resize_canvas(&mut self, resize: PageResize, record: bool) {
-        let PageResize {
-            old_w,
-            old_h,
-            new_w,
-            new_h,
-            ..
-        } = resize;
-        let (dx, dy) = resize.offset();
-
-        // A crop loses pixels, and the only way to give them back is to have kept
-        // them. A grow needs nothing: shrinking back is lossless.
+        // A crop loses pixels, and the only way to give them back is to have kept them.
+        // A grow needs nothing: shrinking back is lossless.
         let before = if record && resize.shrinks() {
-            let snapshot = history::new_snapshot(&self.device, old_w, old_h);
+            let origin = self.canvas_renderer.origin();
+            let snapshot = history::new_snapshot(&self.device, resize.old_w, resize.old_h);
             let mut encoder = self.new_stroke_encoder();
             history::restore_region(
                 &mut encoder,
                 self.canvas_renderer.texture(),
                 &snapshot,
+                origin,
                 CanvasRect {
-                    x: 0,
-                    y: 0,
-                    w: old_w,
-                    h: old_h,
+                    x: origin.0,
+                    y: origin.1,
+                    w: resize.old_w,
+                    h: resize.old_h,
                 },
             );
             self.queue.submit(std::iter::once(encoder.finish()));
@@ -323,7 +319,7 @@ impl Renderer {
         };
 
         self.canvas_renderer
-            .resize(&self.device, &self.queue, new_w, new_h, dx, dy);
+            .resize(&self.device, &self.queue, resize);
 
         // The stroke layer's accumulation texture is canvas-sized and its bind group
         // points at it, so it is rebuilt wholesale. Pipelines are rebuilt too, which is
@@ -331,8 +327,9 @@ impl Renderer {
         // subtly wrong.
         self.stroke_layer = StrokeLayer::new(
             &self.device,
-            new_w,
-            new_h,
+            resize.new_w,
+            resize.new_h,
+            self.canvas_renderer.origin(),
             CANVAS_FORMAT,
             self.config.format,
         );
@@ -386,6 +383,7 @@ impl Renderer {
                     &mut encoder,
                     before,
                     self.canvas_renderer.texture(),
+                    self.canvas_renderer.origin(),
                     *rect,
                 );
                 self.queue.submit(std::iter::once(encoder.finish()));
@@ -398,14 +396,16 @@ impl Renderer {
 
                 // A crop's removed pixels come back from the snapshot.
                 if let Some(before) = before {
+                    let origin = self.canvas_renderer.origin();
                     let mut encoder = self.new_stroke_encoder();
                     history::restore_region(
                         &mut encoder,
                         before,
                         self.canvas_renderer.texture(),
+                        origin,
                         CanvasRect {
-                            x: 0,
-                            y: 0,
+                            x: origin.0,
+                            y: origin.1,
                             w: resize.old_w,
                             h: resize.old_h,
                         },

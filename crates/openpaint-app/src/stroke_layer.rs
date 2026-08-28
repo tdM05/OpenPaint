@@ -110,10 +110,14 @@ pub struct StrokeLayer {
 }
 
 impl StrokeLayer {
+    /// `page_origin` is where the page's top-left sits in page coordinates. Dabs
+    /// arrive in page coordinates and the accumulation texture is zero-based, so the
+    /// shader subtracts it.
     pub fn new(
         device: &wgpu::Device,
         canvas_w: u32,
         canvas_h: u32,
+        page_origin: (i32, i32),
         canvas_format: wgpu::TextureFormat,
         surface_format: wgpu::TextureFormat,
     ) -> Self {
@@ -142,7 +146,12 @@ impl StrokeLayer {
         let canvas_size_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("canvas-size-uniform"),
             contents: bytemuck::bytes_of(&CanvasSizeUniform {
-                size: [canvas_w as f32, canvas_h as f32, 0.0, 0.0],
+                size: [
+                    canvas_w as f32,
+                    canvas_h as f32,
+                    page_origin.0 as f32,
+                    page_origin.1 as f32,
+                ],
             }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
@@ -599,6 +608,7 @@ mod tests {
             &device,
             SIZE,
             SIZE,
+            (0, 0),
             crate::canvas_renderer::CANVAS_FORMAT,
             wgpu::TextureFormat::Rgba8UnormSrgb,
         );

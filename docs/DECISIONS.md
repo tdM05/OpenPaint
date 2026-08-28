@@ -340,6 +340,31 @@ exactly what it would in an app with no growth feature at all. `resize()` is sim
 never called. Supporting webtoons imposes no tax on the Photoshop-style user — that
 is a property of the tiled store, not something to be careful about.
 
+**Coordinates are stable; the page origin may be negative.** Revised 2026-08-28 after
+the first implementation proved the point. A page is a *rectangle in a signed
+coordinate space* — an origin plus an extent — not a `w × h` grid pinned at (0, 0).
+Extending leftward or upward moves the **origin**, never the content, which gives one
+invariant:
+
+> **A pixel you painted keeps its coordinate forever.**
+
+The first attempt re-based every coordinate at zero, so extending left shifted every
+pixel's x. That instability then leaked outward and needed a correction at every
+consumer: the camera had to compensate so the drawing didn't appear to lurch sideways,
+undo rectangles had to be rewritten, and every future consumer of coordinates would
+have needed the same. Those corrections were symptoms; the coordinate choice was the
+cause. Fixing the cause **deleted** code — the pixel-shuffling loop in
+`Canvas::resize`, the camera compensation, and the history-shifting machinery — rather
+than adding any.
+
+Costs exactly one subtraction at the GPU boundary, because a texture is always
+zero-based, and that mapping belongs to the renderer (`CanvasRenderer::origin`, and one
+line in the dab shader). Tile coordinates were already `i32` with
+`div_euclid`/`rem_euclid`, so the core needed no new machinery.
+
+None of this is user-facing: a page still has exact pixel dimensions, and "extend down
+by 500" still just makes it taller.
+
 **Painting clips at the page edge — for now.** Photoshop and Krita keep pixels
 outside the canvas (Photoshop's Crop has a "Delete Cropped Pixels" checkbox for
 exactly this); Procreate clips. We clip, because it is the current behaviour, has no

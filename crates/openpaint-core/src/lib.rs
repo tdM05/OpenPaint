@@ -21,7 +21,7 @@ pub use brush::{Brush, StrokeState};
 pub use canvas::Canvas;
 pub use dab::Dab;
 pub use document::{Document, Mode};
-pub use page::{Anchor, Page};
+pub use page::{Anchor, Page, PageResize};
 pub use stroke::StrokePainter;
 
 /// Crate version, surfaced so the app/UI can display it.

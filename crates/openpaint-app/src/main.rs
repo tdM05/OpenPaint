@@ -332,10 +332,12 @@ impl OpenPaint {
             return;
         }
 
+        // Content coordinates are stable, so nothing needs compensating here: the page
+        // rectangle moves around the drawing rather than the drawing moving inside it.
         self.editor.resize_page(new_w, new_h, anchor);
         if let Some(r) = self.renderer.as_mut() {
             r.resize_canvas(
-                history::PageResize {
+                openpaint_core::PageResize {
                     old_w: w,
                     old_h: h,
                     new_w,
