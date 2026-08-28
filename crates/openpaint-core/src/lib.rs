@@ -21,7 +21,7 @@ pub mod tile;
 pub use brush::{Brush, StrokeState};
 pub use canvas::Canvas;
 pub use dab::Dab;
-pub use document::{Document, Mode};
+pub use document::Document;
 pub use layer::{Blend, Layer};
 pub use page::{Page, PageRect, PageResize, Side};
 pub use stroke::StrokePainter;

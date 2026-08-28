@@ -504,7 +504,6 @@ impl OpenPaint {
             ui::PageAction::Move { from, to } => {
                 self.editor.document_mut().move_page(from, to);
             }
-            ui::PageAction::SetMode(mode) => self.editor.document_mut().set_mode(mode),
         }
         self.request_redraw();
     }
@@ -1020,7 +1019,6 @@ impl OpenPaint {
         let active_index = editor.active_layer_index();
         let page_count = editor.document().page_count();
         let active_page = editor.document().active_index();
-        let document_mode = editor.document().mode();
         let window = renderer.window().clone();
         // Borrowed, not copied: a copy would mean any future UI control that edits
         // the view silently writes to a dead value. Disjoint field borrows make
@@ -1045,7 +1043,6 @@ impl OpenPaint {
                         layers: &layers,
                         active_layer: active_index,
                         pages: (page_count, active_page),
-                        mode: document_mode,
                     },
                 );
                 ui_wants_repaint = out.wants_repaint;

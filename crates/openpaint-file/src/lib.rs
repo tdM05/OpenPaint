@@ -29,7 +29,7 @@
 //!
 //! # What is and is not saved
 //!
-//! Saved: the document structure (page rectangles, DPI, mode, the layer stack with names,
+//! Saved: the document structure (page rectangles, DPI, the layer stack with names,
 //! opacity, blend mode, visibility and **ids**), and every tile of every layer — including the
 //! ones lying outside the page, which is what makes a non-destructive crop (§5c) survive being
 //! closed and reopened. Without persistence that guarantee only lasted a session.
@@ -41,14 +41,20 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use openpaint_core::tile::{Tile, TileCoord, TILE_BYTES};
-use openpaint_core::{Blend, Document, Layer, Mode, Page, PageRect};
+use openpaint_core::{Blend, Document, Layer, Page, PageRect};
 
 /// Schema version this build writes, and the newest it can read.
 ///
 /// Bumped only for changes the *reader* cannot cope with. Adding a tile codec does not need a
 /// bump, because the codec is recorded per tile (see [`Codec`]); adding a nullable column does
 /// not either, because a reader that does not know it never asks.
-pub const SCHEMA_VERSION: i32 = 1;
+///
+/// **Version 2** dropped two columns that turned out to mean nothing: `document.mode`, once the
+/// presentation mode was removed for being a flag no code read, and `page.next_layer_id`, once
+/// the counter proved derivable from the layers themselves. Both were `NOT NULL`, so a version-1
+/// *writer* cannot fill a version-2 file -- hence the bump. Reading needs no branch at all: a
+/// version-2 reader simply stops asking for them, which works on both.
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// How a tile's bytes are encoded in the file.
 ///
@@ -158,21 +164,6 @@ fn blend_from_name(s: &str) -> Option<Blend> {
     }
 }
 
-fn mode_name(m: Mode) -> &'static str {
-    match m {
-        Mode::Pages => "pages",
-        Mode::Continuous => "continuous",
-    }
-}
-
-fn mode_from_name(s: &str) -> Option<Mode> {
-    match s {
-        "pages" => Some(Mode::Pages),
-        "continuous" => Some(Mode::Continuous),
-        _ => None,
-    }
-}
-
 /// Compress a tile, keeping whichever result is smaller.
 ///
 /// Deflate is a clear win on a partly-painted tile and a small loss on a dense one, so the
@@ -216,14 +207,11 @@ fn decode(codec: Codec, bytes: &[u8]) -> Result<Tile, Error> {
     })
 }
 
-/// Create the schema in an empty database.
-fn create_schema(db: &rusqlite::Connection) -> Result<(), Error> {
-    db.execute_batch(
-        "
+/// The structure tables, which a migration recreates and a fresh file creates.
+const STRUCTURE_SCHEMA: &str = "
         CREATE TABLE document (
             id            INTEGER PRIMARY KEY CHECK (id = 1),
             written_by    TEXT    NOT NULL,
-            mode          TEXT    NOT NULL,
             active_page   INTEGER NOT NULL
         );
         CREATE TABLE page (
@@ -233,8 +221,7 @@ fn create_schema(db: &rusqlite::Connection) -> Result<(), Error> {
             w             INTEGER NOT NULL,
             h             INTEGER NOT NULL,
             dpi           REAL    NOT NULL,
-            active_layer  INTEGER NOT NULL,
-            next_layer_id INTEGER NOT NULL
+            active_layer  INTEGER NOT NULL
         );
         CREATE TABLE layer (
             page_idx INTEGER NOT NULL REFERENCES page(idx) ON DELETE CASCADE,
@@ -246,6 +233,10 @@ fn create_schema(db: &rusqlite::Connection) -> Result<(), Error> {
             visible  INTEGER NOT NULL,
             PRIMARY KEY (page_idx, idx)
         );
+        ";
+
+/// The tile table, which no migration has needed to touch.
+const TILE_SCHEMA: &str = "
         CREATE TABLE tile (
             page_idx INTEGER NOT NULL,
             layer_id INTEGER NOT NULL,
@@ -255,8 +246,31 @@ fn create_schema(db: &rusqlite::Connection) -> Result<(), Error> {
             bytes    BLOB    NOT NULL,
             PRIMARY KEY (page_idx, layer_id, tx, ty)
         ) WITHOUT ROWID;
-        ",
-    )?;
+        ";
+
+/// Create the schema in an empty database.
+fn create_schema(db: &rusqlite::Connection) -> Result<(), Error> {
+    db.execute_batch(STRUCTURE_SCHEMA)?;
+    db.execute_batch(TILE_SCHEMA)?;
+    db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+/// Bring an older file up to the current schema.
+///
+/// The structure tables are rewritten wholesale by every save anyway, so a migration that only
+/// changes their shape can simply drop and recreate them. **Tiles are untouched** -- they are the
+/// expensive part and no migration so far has needed to.
+fn migrate(db: &rusqlite::Connection, from: i32) -> Result<(), Error> {
+    if from < 2 {
+        // v1 had `document.mode` and `page.next_layer_id`, both since found to mean nothing.
+        db.execute_batch(
+            "DROP TABLE IF EXISTS layer;
+             DROP TABLE IF EXISTS page;
+             DROP TABLE IF EXISTS document;",
+        )?;
+        db.execute_batch(STRUCTURE_SCHEMA)?;
+    }
     db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -285,6 +299,8 @@ pub fn save(
             found: existing,
             supported: SCHEMA_VERSION,
         });
+    } else if existing < SCHEMA_VERSION {
+        migrate(&db, existing)?;
     }
 
     let tx = db.transaction()?;
@@ -292,10 +308,9 @@ pub fn save(
     tx.execute("DELETE FROM page", [])?;
     tx.execute("DELETE FROM document", [])?;
     tx.execute(
-        "INSERT INTO document (id, written_by, mode, active_page) VALUES (1, ?1, ?2, ?3)",
+        "INSERT INTO document (id, written_by, active_page) VALUES (1, ?1, ?2)",
         rusqlite::params![
             concat!("openpaint ", env!("CARGO_PKG_VERSION")),
-            mode_name(document.mode()),
             document.active_index() as i64,
         ],
     )?;
@@ -306,8 +321,8 @@ pub fn save(
             .ok_or_else(|| Error::Malformed(format!("page {index} vanished while saving")))?;
         let r = page.rect();
         tx.execute(
-            "INSERT INTO page (idx, x, y, w, h, dpi, active_layer, next_layer_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO page (idx, x, y, w, h, dpi, active_layer)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 index as i64,
                 r.x,
@@ -316,11 +331,6 @@ pub fn save(
                 r.h,
                 page.dpi(),
                 page.active_index() as i64,
-                // Kept for files written before layer ids became document-wide, which stored a
-                // per-page counter here. Ignored on read: one past the highest live id is
-                // correct without it, because a save discards the undo history that made
-                // reusing a dead id dangerous.
-                i64::from(page.highest_layer_id()) + 1,
             ],
         )?;
         for (li, layer) in page.layers().iter().enumerate() {
@@ -380,20 +390,17 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
         });
     }
 
-    let (mode_text, active_page): (String, i64) = db
-        .query_row(
-            "SELECT mode, active_page FROM document WHERE id = 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+    // Deliberately selects only what every version still has, so reading needs no branch on the
+    // schema version at all.
+    let active_page: i64 = db
+        .query_row("SELECT active_page FROM document WHERE id = 1", [], |r| {
+            r.get(0)
+        })
         .map_err(|_| Error::Malformed("missing document row".into()))?;
-    let mode = mode_from_name(&mode_text)
-        .ok_or_else(|| Error::Malformed(format!("unknown mode {mode_text:?}")))?;
 
     let mut pages = Vec::new();
-    let mut page_stmt = db.prepare(
-        "SELECT idx, x, y, w, h, dpi, active_layer, next_layer_id FROM page ORDER BY idx",
-    )?;
+    let mut page_stmt =
+        db.prepare("SELECT idx, x, y, w, h, dpi, active_layer FROM page ORDER BY idx")?;
     let mut layer_stmt = db.prepare(
         "SELECT id, name, opacity, blend, visible FROM layer WHERE page_idx = ?1 ORDER BY idx",
     )?;
@@ -404,12 +411,11 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
             PageRect::new(r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?),
             r.get::<_, f64>(5)? as f32,
             r.get::<_, i64>(6)?,
-            r.get::<_, i64>(7)?,
         ))
     })?;
 
     for row in rows {
-        let (idx, rect, dpi, active_layer, _legacy_next_layer_id) = row?;
+        let (idx, rect, dpi, active_layer) = row?;
         let layers: Vec<Layer> = layer_stmt
             .query_map([idx], |r| {
                 let blend_text: String = r.get(3)?;
@@ -439,7 +445,7 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
         pages.push(page);
     }
 
-    let document = Document::restored(pages, usize::try_from(active_page).unwrap_or(0), mode)
+    let document = Document::restored(pages, usize::try_from(active_page).unwrap_or(0))
         .ok_or_else(|| Error::Malformed("document has no pages".into()))?;
 
     let mut tiles = HashMap::new();

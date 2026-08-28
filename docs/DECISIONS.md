@@ -410,19 +410,39 @@ Agreed in detail, because this is the decision that is expensive to get wrong.
 infinite, and nothing about it is unlike CSP or Photoshop. "Extend ↓ by 500" makes
 it 2480×4008. That is the whole concept.
 
-**One data model, no variants.** `Document { pages, mode }`. A webtoon is *one very
+**One data model, no variants.** `Document { pages }`. A webtoon is *one very
 tall page*; a sketchbook is *many pages*; a print comic is *many pages plus spread
 pairing*. There are deliberately **no** mode-specific code paths — two document
 types would mean two formats, two renderers, and two sets of bugs, which is exactly
 how an app acquires the bloat we are avoiding (§1).
 
-**Mode is a pure UI layer.** It *hides affordances and sets defaults*, and restricts
-nothing structurally. Webtoon mode offers only "Extend ↓" and scrolls continuously;
-page mode hides extend and navigates page-to-page; export defaults differ. The
-engine stays fully general underneath, so:
-- **Adding pages is always available**, in every mode.
-- **Extending in any direction is always possible**, whether or not the UI offers it.
+**There is no mode, and no document type.** Everything is always available:
+- **Adding pages is always available.**
+- **Extending in any direction is always possible.**
 - **Upscaling is always available.**
+
+⚠️ **Revised 2026-08-28: `Mode` (Pages / Continuous) was removed.** This section originally
+called it "a pure UI layer" that hid affordances and set defaults. Building the page panel
+showed there was nothing left for it to do, and nothing ever read it:
+- Every affordance it was meant to hide is unconditionally available by the three rules
+  above, which this same section insists on. So it could only ever have decluttered.
+- "Scrolls continuously" lost its meaning the moment this section settled that **a webtoon is
+  one very tall page** — panning a tall page is just panning. The mode was a hedge from when
+  "many pages stacked and scrolled" was still on the table.
+- What it was actually reaching for lives elsewhere: **new-document presets** (a strip versus
+  A4 at 300 DPI) are a creation-time choice, and **strip slicing** is an export option (§7).
+  Neither is a lasting property of a document.
+
+A flag no code reads is worse than no flag, because it implies behaviour that does not exist —
+the panel had a "webtoon" checkbox that changed nothing at all. Removing it makes the claim in
+this section *stronger*: not "one model plus a mode", but **one model, full stop** — nothing in
+the app needs to know what you are making.
+
+This was also the format's first real schema change (v1 → v2, dropping `document.mode` and the
+already-vestigial `page.next_layer_id`), which finally **proved** the migration story instead of
+asserting it: a test builds a v1 file by hand, loads it, saves over it, and checks the tiles
+survived and the dead columns are gone. Verified per §11a.4 — it fails with the migration
+removed.
 
 **One resize primitive:** `Page::resize(rect)` — the target **rectangle** in page
 coordinates. Extend, crop, and drag-to-resize are all just different rectangles, and

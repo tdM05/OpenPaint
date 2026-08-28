@@ -1,4 +1,4 @@
-//! A document: an ordered list of pages, plus the presentation mode.
+//! A document: an ordered list of pages.
 //!
 //! This is the model that yields all three products (`docs/DECISIONS.md` §5, §5a):
 //! a **webtoon** is one very tall page, a **sketchbook** is many pages, a **print
@@ -6,32 +6,25 @@
 //! and no mode-specific code paths — two document types would mean two formats, two
 //! renderers, and two sets of bugs.
 //!
-//! # Mode restricts nothing
+//! # There is no document type, and no mode either
 //!
-//! [`Mode`] exists so the *UI* can hide what a given kind of project doesn't need
-//! and pick sensible defaults. It is not consulted by the engine, and every
-//! capability stays available underneath it: pages can always be added, a page can
-//! always be resized in any direction, and upscaling is always possible. If you
-//! find the engine branching on `Mode`, something has gone wrong.
+//! An earlier version carried a `Mode` (Pages / Continuous) so the UI could hide what a given
+//! kind of project did not need. It was removed once it became clear nothing could consult it:
+//! every affordance it was meant to hide is unconditionally available by other decisions -- a
+//! page can always be extended in any direction, pages can always be added -- and "continuous
+//! scrolling" has nothing to scroll across once a webtoon is *one very tall page*
+//! (`docs/DECISIONS.md` §5a). A flag no code reads is worse than no flag, because it implies
+//! behaviour that does not exist.
+//!
+//! What the idea was really reaching for lives elsewhere: **new-document presets** (a strip
+//! versus A4 at 300 DPI) are a creation-time choice, and **strip slicing** is an export option
+//! (§7). Neither is a lasting property of a document.
 
 use crate::page::Page;
-
-/// What the UI should present. See the module note: this hides and defaults, it does
-/// not restrict.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Mode {
-    /// Discrete pages: navigate page-to-page, spreads make sense, extend is hidden.
-    /// Print comics and sketchbooks.
-    #[default]
-    Pages,
-    /// One tall page scrolled continuously, with "Extend ↓" offered. Webtoons.
-    Continuous,
-}
 
 pub struct Document {
     pages: Vec<Page>,
     active: usize,
-    mode: Mode,
     /// Layer ids are unique across the whole document, and never reused within a session.
     ///
     /// Document-wide rather than per page, because the renderer keys tiles by layer id alone:
@@ -44,12 +37,11 @@ pub struct Document {
 impl Document {
     /// A document with a single page.
     #[must_use]
-    pub fn new(page: Page, mode: Mode) -> Self {
+    pub fn new(page: Page) -> Self {
         let next_layer_id = page.highest_layer_id() + 1;
         Self {
             pages: vec![page],
             active: 0,
-            mode,
             next_layer_id,
         }
     }
@@ -60,7 +52,7 @@ impl Document {
     /// document with none would make each of them fallible for the sake of a state no valid
     /// file contains.
     #[must_use]
-    pub fn restored(pages: Vec<Page>, active: usize, mode: Mode) -> Option<Self> {
+    pub fn restored(pages: Vec<Page>, active: usize) -> Option<Self> {
         if pages.is_empty() {
             return None;
         }
@@ -71,18 +63,8 @@ impl Document {
         Some(Self {
             active: active.min(pages.len() - 1),
             pages,
-            mode,
             next_layer_id,
         })
-    }
-
-    #[must_use]
-    pub fn mode(&self) -> Mode {
-        self.mode
-    }
-
-    pub fn set_mode(&mut self, mode: Mode) {
-        self.mode = mode;
     }
 
     #[must_use]
@@ -234,7 +216,7 @@ mod tests {
     use crate::page::PageRect;
 
     fn doc() -> Document {
-        Document::new(Page::new(800, 1000), Mode::Pages)
+        Document::new(Page::new(800, 1000))
     }
 
     #[test]
@@ -255,12 +237,9 @@ mod tests {
         assert_eq!(d.active().width(), 400);
     }
 
-    /// Pages are addable in continuous mode too: mode hides affordances, it does not
-    /// restrict capability (§5a). If this ever fails, the engine has started
-    /// branching on mode.
     #[test]
     fn pages_can_be_added_in_continuous_mode() {
-        let mut d = Document::new(Page::new(800, 4000), Mode::Continuous);
+        let mut d = Document::new(Page::new(800, 4000));
         d.add_page(Page::new(800, 4000));
         assert_eq!(d.page_count(), 2);
     }
@@ -317,7 +296,7 @@ mod tests {
 
     #[test]
     fn resizing_the_active_page_reports_the_shift() {
-        let mut d = Document::new(Page::new(800, 1000), Mode::Continuous);
+        let mut d = Document::new(Page::new(800, 1000));
         let moved = d.active_mut().extend(crate::page::Side::Bottom, 500);
         assert_eq!(moved, (0, 0));
         assert_eq!(d.active().height(), 1500);
@@ -328,7 +307,7 @@ mod tests {
     /// layers at 0 would have their pixels land on top of each other.
     #[test]
     fn layer_ids_are_unique_across_pages() {
-        let mut d = Document::new(Page::new(100, 100), Mode::Pages);
+        let mut d = Document::new(Page::new(100, 100));
         d.add_layer();
         d.add_page_like_active();
         d.add_layer();
@@ -355,7 +334,7 @@ mod tests {
     /// layer goes above the active one.
     #[test]
     fn a_new_page_follows_the_active_one() {
-        let mut d = Document::new(Page::new(100, 100), Mode::Pages);
+        let mut d = Document::new(Page::new(100, 100));
         d.add_page_like_active();
         d.add_page_like_active();
         assert_eq!(d.page_count(), 3);
@@ -369,7 +348,7 @@ mod tests {
     /// webtoon's next page matches the strip.
     #[test]
     fn a_new_page_matches_the_one_it_follows() {
-        let mut d = Document::new(Page::new(100, 100), Mode::Pages);
+        let mut d = Document::new(Page::new(100, 100));
         d.active_mut().set_dpi(300.0);
         d.active_mut().resize(PageRect::new(-40, -70, 800, 1200));
         d.add_page_like_active();
@@ -381,7 +360,7 @@ mod tests {
     /// drawing on a different page than the one they dragged.
     #[test]
     fn reordering_pages_follows_the_selection() {
-        let mut d = Document::new(Page::new(10, 10), Mode::Pages);
+        let mut d = Document::new(Page::new(10, 10));
         d.add_page_like_active();
         d.add_page_like_active();
         assert!(d.set_active(0));
@@ -399,7 +378,7 @@ mod tests {
     /// them -- and page deletion has to be undoable for the same reason layer deletion does.
     #[test]
     fn removing_a_page_hands_it_back() {
-        let mut d = Document::new(Page::new(10, 10), Mode::Pages);
+        let mut d = Document::new(Page::new(10, 10));
         d.add_page_like_active();
         let doomed = d.active().active_layer().id();
         let page = d.remove_page(1).expect("removable");
@@ -415,7 +394,7 @@ mod tests {
     /// Restoring a page must not let a later `add_layer` reuse one of its ids.
     #[test]
     fn restoring_a_page_keeps_the_counter_ahead() {
-        let mut d = Document::new(Page::new(10, 10), Mode::Pages);
+        let mut d = Document::new(Page::new(10, 10));
         d.add_page_like_active();
         d.add_layer();
         let page = d.remove_page(1).expect("removable");

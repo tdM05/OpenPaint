@@ -36,7 +36,7 @@ impl Drop for TempFile {
 
 /// A document with two pages, several layers, and every blend mode represented.
 fn sample() -> Document {
-    let mut doc = Document::new(Page::new(1000, 1400), Mode::Continuous);
+    let mut doc = Document::new(Page::new(1000, 1400));
     doc.add_layer();
     doc.add_layer();
     {
@@ -81,7 +81,6 @@ fn a_document_round_trips_exactly() {
 
     assert_eq!(back.document.page_count(), doc.page_count());
     assert_eq!(back.document.active_index(), doc.active_index());
-    assert_eq!(back.document.mode(), doc.mode());
 
     for i in 0..doc.page_count() {
         let a = doc.page(i).expect("page");
@@ -263,12 +262,11 @@ fn saving_twice_replaces_rather_than_accumulates() {
     save(f.path(), &doc, [(key, patterned(1))]).expect("first save");
 
     // A smaller document over the top of a larger one: the extra page must not linger.
-    let doc2 = Document::new(Page::new(200, 200), Mode::Pages);
+    let doc2 = Document::new(Page::new(200, 200));
     save(f.path(), &doc2, [(key, patterned(2))]).expect("second save");
 
     let back = load(f.path()).expect("load");
     assert_eq!(back.document.page_count(), 1, "the old page survived");
-    assert_eq!(back.document.mode(), Mode::Pages);
     assert_eq!(back.tiles.len(), 1);
     assert_eq!(
         back.tiles.get(&key).expect("tile").bytes(),
@@ -301,6 +299,109 @@ fn a_newer_file_is_refused() {
         save(f.path(), &sample(), []),
         Err(Error::TooNew { .. })
     ));
+}
+
+/// A version-1 file must still open, and saving over it must bring it up to date.
+///
+/// The first real schema change, and therefore the first chance to prove the migration story
+/// rather than assert it. Version 2 dropped `document.mode` and `page.next_layer_id`, both
+/// `NOT NULL`, so a version-1 file cannot be written to without migrating -- and reading must
+/// need no branch at all, since the reader stops asking for what it no longer wants.
+#[test]
+fn a_version_one_file_migrates() {
+    let f = TempFile::new("v1");
+
+    // Build a version-1 file by hand: the old schema, with the two dead columns.
+    {
+        let db = rusqlite::Connection::open(f.path()).expect("open");
+        db.execute_batch(
+            "CREATE TABLE document (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                written_by TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                active_page INTEGER NOT NULL);
+             CREATE TABLE page (
+                idx INTEGER PRIMARY KEY, x INTEGER NOT NULL, y INTEGER NOT NULL,
+                w INTEGER NOT NULL, h INTEGER NOT NULL, dpi REAL NOT NULL,
+                active_layer INTEGER NOT NULL, next_layer_id INTEGER NOT NULL);
+             CREATE TABLE layer (
+                page_idx INTEGER NOT NULL, idx INTEGER NOT NULL, id INTEGER NOT NULL,
+                name TEXT NOT NULL, opacity REAL NOT NULL, blend TEXT NOT NULL,
+                visible INTEGER NOT NULL, PRIMARY KEY (page_idx, idx));
+             CREATE TABLE tile (
+                page_idx INTEGER NOT NULL, layer_id INTEGER NOT NULL,
+                tx INTEGER NOT NULL, ty INTEGER NOT NULL, codec INTEGER NOT NULL,
+                bytes BLOB NOT NULL, PRIMARY KEY (page_idx, layer_id, tx, ty)) WITHOUT ROWID;
+             INSERT INTO document VALUES (1, 'openpaint 0.0.0', 'continuous', 0);
+             INSERT INTO page VALUES (0, -10, -20, 700, 900, 300.0, 1, 9);
+             INSERT INTO layer VALUES (0, 0, 3, 'Ink', 1.0, 'normal', 1);
+             INSERT INTO layer VALUES (0, 1, 7, 'Shade', 0.5, 'multiply', 0);",
+        )
+        .expect("v1 schema");
+        let (codec, bytes) = encode(&patterned(4));
+        db.execute(
+            "INSERT INTO tile VALUES (0, 7, 2, -3, ?1, ?2)",
+            rusqlite::params![codec as i64, bytes],
+        )
+        .expect("v1 tile");
+        db.pragma_update(None, "user_version", 1).expect("version");
+    }
+
+    // Reading it needs no migration: everything version 2 asks for is already there.
+    let back = load(f.path()).expect("a version-1 file should still load");
+    let page = back.document.active();
+    assert_eq!(page.rect(), PageRect::new(-10, -20, 700, 900));
+    assert!((page.dpi() - 300.0).abs() < 1e-3);
+    assert_eq!(page.active_index(), 1);
+    let ids: Vec<u32> = page.layers().iter().map(Layer::id).collect();
+    assert_eq!(ids, vec![3, 7], "layer ids did not survive the old schema");
+    assert_eq!(page.layers()[1].blend, Blend::Multiply);
+    assert!(!page.layers()[1].visible);
+
+    let key = TileRef {
+        page: 0,
+        layer_id: 7,
+        coord: (2, -3),
+    };
+    assert_eq!(
+        back.tiles.get(&key).expect("the v1 tile").bytes(),
+        patterned(4).bytes()
+    );
+
+    // Saving migrates the file, keeps the tile, and leaves it at the current version.
+    save(f.path(), &back.document, []).expect("save over a v1 file");
+    {
+        let db = rusqlite::Connection::open(f.path()).expect("reopen");
+        let version: i32 = db
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION, "the file was not migrated");
+        // The dead columns are gone.
+        assert!(
+            db.prepare("SELECT mode FROM document").is_err(),
+            "document.mode survived the migration"
+        );
+        assert!(
+            db.prepare("SELECT next_layer_id FROM page").is_err(),
+            "page.next_layer_id survived the migration"
+        );
+    }
+
+    // And the tile the migration did not touch is still readable.
+    let again = load(f.path()).expect("load after migrating");
+    assert_eq!(
+        again.tiles.get(&key).expect("tile after migration").bytes(),
+        patterned(4).bytes(),
+        "the migration lost a tile"
+    );
+    let ids: Vec<u32> = again
+        .document
+        .active()
+        .layers()
+        .iter()
+        .map(Layer::id)
+        .collect();
+    assert_eq!(ids, vec![3, 7]);
 }
 
 /// Something that is not one of our documents must fail as data, not panic.
@@ -348,7 +449,7 @@ fn an_unknown_blend_mode_is_reported() {
 #[test]
 fn two_pages_keep_their_tiles_apart() {
     let f = TempFile::new("pages");
-    let mut doc = Document::new(Page::new(400, 400), Mode::Pages);
+    let mut doc = Document::new(Page::new(400, 400));
     let first_layer = doc.active().active_layer().id();
     doc.add_page_like_active();
     let second_layer = doc.active().active_layer().id();
@@ -385,7 +486,7 @@ fn two_pages_keep_their_tiles_apart() {
 #[test]
 fn pages_keep_their_own_geometry() {
     let f = TempFile::new("geometry");
-    let mut doc = Document::new(Page::new(400, 400), Mode::Pages);
+    let mut doc = Document::new(Page::new(400, 400));
     doc.add_page_like_active();
     doc.active_mut().resize(PageRect::new(-50, -60, 900, 1500));
     doc.active_mut().set_dpi(600.0);
@@ -416,8 +517,5 @@ fn every_blend_mode_has_a_stable_name() {
             Some(mode),
             "{name} did not round trip"
         );
-    }
-    for mode in [Mode::Pages, Mode::Continuous] {
-        assert_eq!(mode_from_name(mode_name(mode)), Some(mode));
     }
 }

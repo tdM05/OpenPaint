@@ -28,7 +28,7 @@
 //! `openpaint_core::raster` remain the CPU *reference* implementations, and
 //! `tests/gpu_matches_cpu.rs` is what keeps the GPU honest against them.
 
-use openpaint_core::{Brush, Dab, Document, Mode, Page, PageRect, StrokeState};
+use openpaint_core::{Brush, Dab, Document, Page, PageRect, StrokeState};
 
 /// Starting page size. A placeholder until New-document presets exist (§5a says
 /// "300 DPI A4" and friends are presets computing pixel dimensions).
@@ -113,7 +113,7 @@ impl Editor {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            document: Document::new(Page::new(PAGE_W, PAGE_H), Mode::Pages),
+            document: Document::new(Page::new(PAGE_W, PAGE_H)),
             brush: Brush::default(),
             stroke: StrokeState::new(),
             dabs: Vec::new(),

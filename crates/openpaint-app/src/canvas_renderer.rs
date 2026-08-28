@@ -870,10 +870,7 @@ pub(crate) mod tests {
 
         let mut results = Vec::new();
         for mode in openpaint_core::Blend::ALL {
-            let mut document = openpaint_core::Document::new(
-                openpaint_core::Page::new(W, H),
-                openpaint_core::Mode::Pages,
-            );
+            let mut document = openpaint_core::Document::new(openpaint_core::Page::new(W, H));
             document.add_layer();
             document.active_mut().layer_mut(1).expect("top").blend = mode;
             let doc = document.active();

@@ -22,7 +22,7 @@
 //! it.
 
 use egui::ViewportId;
-use openpaint_core::{Blend, Brush, Layer, Mode};
+use openpaint_core::{Blend, Brush, Layer};
 use winit::window::Window;
 
 use crate::editor::DEFAULT_EXTEND;
@@ -64,8 +64,6 @@ pub enum PageAction {
     Delete(usize),
     /// Move a page to a new index.
     Move { from: usize, to: usize },
-    /// Switch what the UI presents. Restricts nothing (DECISIONS §5a).
-    SetMode(Mode),
 }
 
 /// A change the layer panel wants made to the stack.
@@ -120,8 +118,6 @@ pub struct Status<'a> {
     pub active_layer: usize,
     /// How many pages the document has, and which is active.
     pub pages: (usize, usize),
-    /// What the UI is currently presenting.
-    pub mode: Mode,
 }
 
 /// What the panel wants the app to do, collected during the frame.
@@ -335,22 +331,9 @@ impl Ui {
                     ui.separator();
                     ui.heading("Pages");
                     let (page_count, active_page) = status.pages;
-                    ui.horizontal(|ui| {
-                        if ui.button("Add page").clicked() {
-                            page_action = Some(PageAction::Add);
-                        }
-                        // Mode hides affordances and sets defaults; it restricts nothing
-                        // (DECISIONS §5a), which is why it is a plain toggle rather than a
-                        // document type.
-                        let mut continuous = status.mode == Mode::Continuous;
-                        if ui.checkbox(&mut continuous, "webtoon").changed() {
-                            page_action = Some(PageAction::SetMode(if continuous {
-                                Mode::Continuous
-                            } else {
-                                Mode::Pages
-                            }));
-                        }
-                    });
+                    if ui.button("Add page").clicked() {
+                        page_action = Some(PageAction::Add);
+                    }
                     for index in 0..page_count {
                         ui.horizontal(|ui| {
                             let selected = index == active_page;
