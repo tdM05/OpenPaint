@@ -472,6 +472,120 @@ mod tests {
         );
     }
 
+    /// What the screen shows *mid-stroke*: the committed artwork must still be there, and the
+    /// stroke in progress must be visible on top of it.
+    ///
+    /// The preview had no test at all, which is how it shipped broken. Everything else stops at
+    /// "the tile holds the right pixels" or "a committed stroke reaches the screen"; neither
+    /// says anything about the frame drawn while the pen is still down.
+    #[test]
+    fn a_stroke_in_progress_shows_over_the_committed_artwork() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        const VIEW: u32 = 512;
+
+        let mut editor = Editor::new();
+        editor.brush_mut().radius = 40.0;
+        let page = editor.page_rect();
+        let mut layer = test_stroke_layer(&device);
+        let mut canvas = test_canvas(&device, page, &layer);
+        let mut history = History::new(&device);
+        let mut recording = Vec::new();
+        let mut recording_paint = ([0.0; 4], 1.0);
+
+        // A committed stroke on the left.
+        editor.stroke_begin(300.0, 500.0, 1.0);
+        editor.stroke_to(500.0, 500.0, 1.0);
+        editor.stroke_end();
+        run_frame(
+            &device,
+            &queue,
+            &mut canvas,
+            &mut layer,
+            &mut history,
+            &mut recording,
+            &mut recording_paint,
+            &mut editor,
+        );
+
+        // A second stroke still in progress -- no `stroke_end`. It starts *over* the committed
+        // one and runs off onto fresh ground, so one run covers both cases: a tile the canvas
+        // already has, and a tile it has never had.
+        editor.stroke_begin(400.0, 500.0, 1.0);
+        editor.stroke_to(900.0, 500.0, 1.0);
+        editor.stroke_to(1500.0, 500.0, 1.0);
+        run_frame(
+            &device,
+            &queue,
+            &mut canvas,
+            &mut layer,
+            &mut history,
+            &mut recording,
+            &mut recording_paint,
+            &mut editor,
+        );
+        assert!(layer.has_paint(), "the stroke should be accumulating");
+
+        let doc = openpaint_core::Page::new(page.w, page.h);
+        let mut view = crate::view::View::new();
+        view.fit(VIEW, VIEW, page);
+        canvas.begin_frame();
+        let mut enc = device.create_command_encoder(&Default::default());
+        canvas.prepare(
+            &device,
+            &queue,
+            &mut enc,
+            view.page_to_ndc(VIEW, VIEW),
+            view.visible_rect(VIEW, VIEW),
+            doc.layers(),
+            0,
+            Some(&layer),
+        );
+        queue.submit(std::iter::once(enc.finish()));
+        let screen =
+            crate::canvas_renderer::tests::draw_to_target(&device, &queue, &canvas, VIEW, VIEW);
+
+        let at = |px: f32, py: f32| {
+            let (sx, sy) = view.canvas_to_screen(px, py, VIEW, VIEW);
+            screen[(sy.round() as usize) * VIEW as usize + (sx.round() as usize)]
+        };
+        // Paper is bright; a black stroke on it is dark. Nothing here should be brighter than
+        // paper, which is what a runaway preview looks like.
+        let paper = at(1000.0, 1000.0);
+        assert!(paper[0] > 200, "the sheet should be paper: {paper:?}");
+
+        // Part of the committed stroke the new one does not cover.
+        let committed = at(320.0, 500.0);
+        assert!(
+            committed[0] < 100,
+            "the committed stroke vanished while drawing: {committed:?}"
+        );
+
+        // Where the two overlap: still paint, not a hole.
+        let overlap = at(450.0, 500.0);
+        assert!(
+            overlap[0] < 100,
+            "the overlap went blank while drawing: {overlap:?}"
+        );
+
+        let in_progress = at(1400.0, 500.0);
+        assert!(
+            in_progress[0] < 100,
+            "the stroke in progress is not visible: {in_progress:?}"
+        );
+
+        // And nowhere may be *brighter* than paper: a white box is the symptom of the preview
+        // blowing up rather than blending.
+        let brightest = screen.iter().map(|p| p[0]).max().unwrap_or(0);
+        assert!(
+            brightest <= paper[0].saturating_add(3),
+            "something is brighter than paper ({brightest} vs {}), i.e. a white box",
+            paper[0]
+        );
+    }
+
     /// Drain the editor's pending commands through the executor, as `redraw` does.
     #[allow(clippy::too_many_arguments)]
     fn run_frame(

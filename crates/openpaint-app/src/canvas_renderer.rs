@@ -584,12 +584,19 @@ impl CanvasRenderer {
             })
             .collect();
 
-        // Tiles that exist somewhere in the stack, lie inside the page, and are on screen.
-        let wanted: Vec<TileCoord> = self
-            .occupied_tiles()
-            .into_iter()
-            .filter(|c| tile_intersects(*c, self.page) && tile_intersects(*c, visible))
-            .collect();
+        // Tiles that need drawing: anything the stack holds, *plus* anything the stroke in
+        // progress has reached. The second half matters because a stroke touches tiles the
+        // canvas has never had -- they only get created when it bakes -- so without them the
+        // preview is missing exactly where the artist is drawing.
+        let mut wanted: Vec<TileCoord> = self.occupied_tiles();
+        if painting {
+            if let Some(s) = stroke {
+                wanted.extend(s.accum_tiles());
+            }
+        }
+        wanted.retain(|c| tile_intersects(*c, self.page) && tile_intersects(*c, visible));
+        wanted.sort_unstable_by_key(|c| (c.1, c.0));
+        wanted.dedup();
 
         let mut under_pressure = false;
         let mut instances = Vec::with_capacity(wanted.len());
@@ -805,7 +812,7 @@ pub fn tile_of(x: i32, y: i32) -> TileCoord {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The GPU tests render to an sRGB target, like the real surface, so a readback can be
@@ -919,7 +926,7 @@ mod tests {
     }
 
     /// Draw the canvas into an offscreen sRGB target and read it back as bytes.
-    fn draw_to_target(
+    pub(crate) fn draw_to_target(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         canvas: &CanvasRenderer,

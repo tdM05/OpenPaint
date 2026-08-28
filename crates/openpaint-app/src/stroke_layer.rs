@@ -472,6 +472,16 @@ impl StrokeLayer {
         self.map.slot(coord).map(crate::tile_pool::Slot::layer)
     }
 
+    /// Every tile the stroke in progress has accumulated into.
+    ///
+    /// The compositor needs these as well as the canvas's own tiles: a stroke reaches tiles the
+    /// canvas has never had, and until it is baked there is nothing there to draw an instance
+    /// for. Without them the preview is simply missing wherever the artist is drawing on fresh
+    /// ground -- which is most of the time.
+    pub fn accum_tiles(&self) -> impl Iterator<Item = TileCoord> + '_ {
+        self.map.iter().map(|(c, _)| c)
+    }
+
     /// The colour and opacity ceiling of the stroke in progress.
     #[must_use]
     pub fn paint(&self) -> ([f32; 4], f32) {
