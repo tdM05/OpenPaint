@@ -590,7 +590,7 @@ mod tests {
     #[test]
     fn a_negative_origin_is_inside_the_page() {
         let mut c = Canvas::new(1000, 1000);
-        c.resize(1000, 1500, openpaint_core::Anchor::BOTTOM_LEFT);
+        c.resize(openpaint_core::PageRect::new(0, -500, 1000, 1500));
         assert_eq!(c.origin(), (0, -500));
 
         let mut v = View::new();
@@ -622,15 +622,8 @@ mod tests {
         let p = (137.0_f32, 421.0_f32);
         let before = v.canvas_to_screen(p.0, p.1, SW, SH);
 
-        // Extend upward and leftward; neither the point nor the camera changes.
-        c.resize(
-            1400,
-            1500,
-            openpaint_core::Anchor {
-                h: openpaint_core::page::Horizontal::Right,
-                v: openpaint_core::page::Vertical::Bottom,
-            },
-        );
+        // Extend upward and leftward: the rectangle's origin moves, content does not.
+        c.resize(openpaint_core::PageRect::new(-400, -500, 1400, 1500));
         let after = v.canvas_to_screen(p.0, p.1, SW, SH);
 
         assert_eq!(

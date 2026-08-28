@@ -38,7 +38,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::color::{opaque_srgb8_to_linear_premul, over_premul};
-use crate::page::Anchor;
+use crate::page::PageRect;
 use crate::tile::{Tile, TileCoord, TILE_SIZE};
 
 /// Default paper color for freshly allocated tiles, as authored (near-white sRGB).
@@ -97,11 +97,16 @@ impl Canvas {
         )
     }
 
+    /// The canvas rectangle in canvas coordinates.
+    #[must_use]
+    pub fn rect(&self) -> PageRect {
+        PageRect::new(self.origin_x, self.origin_y, self.width, self.height)
+    }
+
     /// Whether a canvas coordinate lies inside the canvas.
     #[must_use]
     pub fn contains(&self, x: i32, y: i32) -> bool {
-        let (ex, ey) = self.end();
-        x >= self.origin_x && y >= self.origin_y && x < ex && y < ey
+        self.rect().contains(x, y)
     }
 
     /// Composite a linear premultiplied `src` over one canvas pixel.
@@ -162,25 +167,25 @@ impl Canvas {
         self.dirty.insert(tile_coord);
     }
 
-    /// Change the canvas size, keeping existing content where it is.
+    /// Move the canvas to a new rectangle, keeping existing content where it is.
     ///
-    /// Returns how far the **origin** moved. Content does not move at all — that is
-    /// the point of a signed origin (see the module note). Callers need the origin
-    /// delta because a GPU texture is zero-based, so its contents must be copied to a
-    /// new position within the new texture.
+    /// Returns how far the **origin** moved. Content does not move at all — that is the
+    /// point of a signed origin (see the module note). Callers need the origin delta
+    /// because a GPU texture is zero-based, so its contents must be copied to a new
+    /// position within the new texture.
     ///
-    /// No pixel is touched and no tile is rekeyed. Extending is two integers; only a
-    /// crop does any work, dropping tiles that fall entirely outside.
-    pub fn resize(&mut self, new_w: u32, new_h: u32, anchor: Anchor) -> (i32, i32) {
-        let shift = anchor.origin_shift(self.width, self.height, new_w, new_h);
-        self.origin_x += shift.0;
-        self.origin_y += shift.1;
-        self.width = new_w.max(1);
-        self.height = new_h.max(1);
+    /// No pixel is touched and no tile is rekeyed. Resizing is a few integers; only
+    /// dropping now-outside tiles does any work.
+    pub fn resize(&mut self, rect: PageRect) -> (i32, i32) {
+        let shift = (rect.x - self.origin_x, rect.y - self.origin_y);
+        self.origin_x = rect.x;
+        self.origin_y = rect.y;
+        self.width = rect.w;
+        self.height = rect.h;
 
-        // A crop can leave tiles wholly outside the canvas; drop them so the memory
-        // is released. Partially-covered tiles stay, since part of them is still
-        // visible, and `contains` keeps the hidden part unpaintable.
+        // A crop can leave tiles wholly outside the canvas; drop them so the memory is
+        // released. Partially-covered tiles stay, since part of them is still visible,
+        // and `contains` keeps the hidden part unpaintable.
         let (ox, oy) = (self.origin_x, self.origin_y);
         let (ex, ey) = self.end();
         let tile = TILE_SIZE as i32;
@@ -306,7 +311,7 @@ mod tests {
         c.blend_pixel(10, 20, BLACK);
         c.blend_pixel(250, 290, BLACK);
 
-        let moved = c.resize(300, 900, Anchor::TOP_LEFT);
+        let moved = c.resize(PageRect::new(0, 0, 300, 900));
         assert_eq!(moved, (0, 0));
         assert_eq!((c.width(), c.height()), (300, 900));
         assert!(is_paint(&c, 10, 20), "pixel at (10,20) lost");
@@ -325,7 +330,7 @@ mod tests {
         let mut c = Canvas::new(300, 300);
         c.blend_pixel(10, 20, BLACK);
 
-        let shift = c.resize(300, 800, Anchor::BOTTOM_LEFT);
+        let shift = c.resize(PageRect::new(0, -500, 300, 800));
         assert_eq!(shift, (0, -500), "the origin should move, not the content");
         assert_eq!(c.origin(), (0, -500));
         assert!(
@@ -339,7 +344,7 @@ mod tests {
     #[test]
     fn the_space_added_above_has_negative_coordinates_and_is_paintable() {
         let mut c = Canvas::new(300, 300);
-        c.resize(300, 800, Anchor::BOTTOM_LEFT);
+        c.resize(PageRect::new(0, -500, 300, 800));
 
         assert!(
             c.contains(10, -400),
@@ -360,7 +365,7 @@ mod tests {
         let mut c = Canvas::new(300, 300);
         c.blend_pixel(10, 20, BLACK);
 
-        let shift = c.resize(700, 300, Anchor::TOP_RIGHT);
+        let shift = c.resize(PageRect::new(-400, 0, 700, 300));
         assert_eq!(shift, (-400, 0));
         assert_eq!(c.origin(), (-400, 0));
         assert!(is_paint(&c, 10, 20));
@@ -374,7 +379,7 @@ mod tests {
         c.blend_pixel(50, 50, BLACK);
         c.blend_pixel(500, 500, BLACK);
 
-        c.resize(200, 200, Anchor::TOP_LEFT);
+        c.resize(PageRect::new(0, 0, 200, 200));
         assert!(is_paint(&c, 50, 50), "in-bounds content should survive");
         assert_eq!(c.width(), 200);
         // The far pixel is outside the new bounds and simply gone.
@@ -384,7 +389,7 @@ mod tests {
     #[test]
     fn resizing_an_untouched_canvas_just_changes_the_bounds() {
         let mut c = Canvas::new(100, 100);
-        let moved = c.resize(100, 500, Anchor::TOP_LEFT);
+        let moved = c.resize(PageRect::new(0, 0, 100, 500));
         assert_eq!(moved, (0, 0));
         assert_eq!(c.tiles().count(), 0, "should not have allocated anything");
         assert_eq!(c.height(), 500);
@@ -395,7 +400,7 @@ mod tests {
     #[test]
     fn the_new_space_is_paintable() {
         let mut c = Canvas::new(100, 100);
-        c.resize(100, 600, Anchor::TOP_LEFT);
+        c.resize(PageRect::new(0, 0, 100, 600));
         c.blend_pixel(50, 550, BLACK);
         assert!(
             is_paint(&c, 50, 550),
@@ -406,7 +411,7 @@ mod tests {
     #[test]
     fn a_zero_size_resize_is_clamped_rather_than_panicking() {
         let mut c = Canvas::new(100, 100);
-        c.resize(0, 0, Anchor::TOP_LEFT);
+        c.resize(PageRect::new(0, 0, 0, 0));
         assert!(c.width() >= 1 && c.height() >= 1);
     }
 

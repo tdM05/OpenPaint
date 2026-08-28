@@ -42,12 +42,8 @@ pub enum HistoryChange {
     None,
     /// Pixels changed; just redraw.
     Pixels,
-    /// The page's size changed; the editor's page must be resized to match.
-    Geometry {
-        w: u32,
-        h: u32,
-        anchor: openpaint_core::Anchor,
-    },
+    /// The page's rectangle changed; the editor's page must be moved to match.
+    Geometry { rect: openpaint_core::PageRect },
 }
 
 /// Everything an overlay needs to draw itself into the current frame.
@@ -294,11 +290,11 @@ impl Renderer {
     /// `record` is false when the resize *is* an undo/redo, so reverting a resize does
     /// not push another one.
     pub fn resize_canvas(&mut self, resize: PageResize, record: bool) {
-        // A crop loses pixels, and the only way to give them back is to have kept them.
-        // A grow needs nothing: shrinking back is lossless.
-        let before = if record && resize.shrinks() {
+        // Losing pixels is the only case that needs them saved; growing back is
+        // lossless, which is what makes undoable extends free.
+        let before = if record && resize.loses_pixels() {
             let origin = self.canvas_renderer.origin();
-            let snapshot = history::new_snapshot(&self.device, resize.old_w, resize.old_h);
+            let snapshot = history::new_snapshot(&self.device, resize.old.w, resize.old.h);
             let mut encoder = self.new_stroke_encoder();
             history::restore_region(
                 &mut encoder,
@@ -308,8 +304,8 @@ impl Renderer {
                 CanvasRect {
                     x: origin.0,
                     y: origin.1,
-                    w: resize.old_w,
-                    h: resize.old_h,
+                    w: resize.old.w,
+                    h: resize.old.h,
                 },
             );
             self.queue.submit(std::iter::once(encoder.finish()));
@@ -327,8 +323,8 @@ impl Renderer {
         // subtly wrong.
         self.stroke_layer = StrokeLayer::new(
             &self.device,
-            resize.new_w,
-            resize.new_h,
+            resize.new.w,
+            resize.new.h,
             self.canvas_renderer.origin(),
             CANVAS_FORMAT,
             self.config.format,
@@ -406,17 +402,13 @@ impl Renderer {
                         CanvasRect {
                             x: origin.0,
                             y: origin.1,
-                            w: resize.old_w,
-                            h: resize.old_h,
+                            w: resize.old.w,
+                            h: resize.old.h,
                         },
                     );
                     self.queue.submit(std::iter::once(encoder.finish()));
                 }
-                HistoryChange::Geometry {
-                    w: resize.old_w,
-                    h: resize.old_h,
-                    anchor: resize.anchor,
-                }
+                HistoryChange::Geometry { rect: resize.old }
             }
         };
         self.history.finish_undo(op);
@@ -452,11 +444,7 @@ impl Renderer {
             }
             Op::Resize { resize, .. } => {
                 self.resize_canvas(*resize, false);
-                HistoryChange::Geometry {
-                    w: resize.new_w,
-                    h: resize.new_h,
-                    anchor: resize.anchor,
-                }
+                HistoryChange::Geometry { rect: resize.new }
             }
         };
         self.history.finish_redo(op);

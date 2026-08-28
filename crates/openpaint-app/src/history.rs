@@ -153,7 +153,7 @@ impl Op {
             Self::Stroke { rect, .. } => rect.bytes(bytes_per_texel),
             Self::Resize { resize, before } => {
                 if before.is_some() {
-                    resize.old_w as usize * resize.old_h as usize * bytes_per_texel
+                    resize.old.w as usize * resize.old.h as usize * bytes_per_texel
                 } else {
                     0
                 }
@@ -352,7 +352,7 @@ fn copy_region(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openpaint_core::{Anchor, Canvas};
+    use openpaint_core::Canvas;
 
     /// One past a rect's bottom-right corner. A test helper rather than API, so
     /// callers don't mix i32 and u32 at a comparison -- which is where sign errors
@@ -375,11 +375,8 @@ mod tests {
     fn grow() -> Op {
         Op::Resize {
             resize: PageResize {
-                old_w: 100,
-                old_h: 100,
-                new_w: 100,
-                new_h: 200,
-                anchor: Anchor::TOP_LEFT,
+                old: openpaint_core::PageRect::from_size(100, 100),
+                new: openpaint_core::PageRect::from_size(100, 200),
             },
             before: None,
         }
@@ -480,11 +477,8 @@ mod tests {
         let mut h = History::new(8);
         h.push(Op::Resize {
             resize: PageResize {
-                old_w: 100,
-                old_h: 50,
-                new_w: 40,
-                new_h: 20,
-                anchor: Anchor::TOP_LEFT,
+                old: openpaint_core::PageRect::from_size(100, 50),
+                new: openpaint_core::PageRect::from_size(40, 20),
             },
             before: Some(new_snapshot(&device, 100, 50)),
         });

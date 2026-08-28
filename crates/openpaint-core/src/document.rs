@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn resizing_the_active_page_reports_the_shift() {
         let mut d = Document::new(Page::new(800, 1000), Mode::Continuous);
-        let moved = d.active_mut().extend_down(500);
+        let moved = d.active_mut().extend(crate::page::Side::Bottom, 500);
         assert_eq!(moved, (0, 0));
         assert_eq!(d.active().height(), 1500);
     }

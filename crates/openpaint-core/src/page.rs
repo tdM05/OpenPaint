@@ -1,155 +1,146 @@
 //! A page: one tiled canvas with its print metadata.
 //!
 //! Per `docs/DECISIONS.md` §5a, a page has **exact pixel dimensions** — nothing is
-//! infinite. Growing it is an explicit [`Page::resize`], which is the single
-//! primitive behind extend, crop, and (later) drag-to-resize.
+//! infinite. Resizing it is [`Page::resize`], which takes the target **rectangle**;
+//! extend, crop, and drag-to-resize are all just different rectangles.
 //!
-//! DPI lives here as *metadata*, never as something the engine reasons about:
-//! pixels are the canvas, and "300 DPI A4" is a preset that computes 2480×3508.
+//! # Why a rectangle rather than a size plus an anchor
+//!
+//! An earlier version took a size and an "anchor" saying which edges moved, because
+//! page coordinates were re-based at zero and a rectangle could not be named. Once
+//! coordinates became stable (see [`crate::canvas`]) the rectangle became the natural
+//! thing to state, and it is strictly more expressive: it can trim 10 px off the left
+//! and 30 off the right, which size-plus-anchor cannot say at all.
+//!
+//! It also collapses what used to be two easily-confused derived offsets into a
+//! subtraction, and makes the inverse of a resize simply "swap the two rectangles".
+//!
+//! DPI lives here as *metadata*, never as something the engine reasons about: pixels
+//! are the canvas, and "300 DPI A4" is a preset that computes 2480×3508.
 
 use crate::canvas::Canvas;
 
 /// Default DPI for a new page. Screen-ish; print presets set their own.
 pub const DEFAULT_DPI: f32 = 72.0;
 
-/// Where existing content sits when a page changes size.
-///
-/// The nine positions Photoshop's Canvas Size dialog offers, expressed as two
-/// independent axes rather than nine variants — which keeps the offset arithmetic
-/// to two small functions instead of a nine-arm match.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct Anchor {
-    pub h: Horizontal,
-    pub v: Vertical,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Horizontal {
-    #[default]
-    Left,
-    Center,
-    Right,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Vertical {
-    #[default]
-    Top,
-    Middle,
-    Bottom,
-}
-
-impl Anchor {
-    /// Content pinned to the top-left, i.e. what "extend down" and "extend right"
-    /// need: existing pixels keep their coordinates.
-    pub const TOP_LEFT: Self = Self {
-        h: Horizontal::Left,
-        v: Vertical::Top,
-    };
-    /// Content pinned to the bottom-left — what "extend up" needs.
-    pub const BOTTOM_LEFT: Self = Self {
-        h: Horizontal::Left,
-        v: Vertical::Bottom,
-    };
-    /// Content pinned to the top-right — what "extend left" needs.
-    pub const TOP_RIGHT: Self = Self {
-        h: Horizontal::Right,
-        v: Vertical::Top,
-    };
-    pub const CENTER: Self = Self {
-        h: Horizontal::Center,
-        v: Vertical::Middle,
-    };
-
-    /// How far the canvas **origin** moves when the size changes.
-    ///
-    /// This is the negative of [`Anchor::offset`]: content stays where it is and the
-    /// rectangle moves around it. Extending leftward with a right anchor decreases the
-    /// origin's x by the growth, so the left edge moves out and the right edge stays.
-    #[must_use]
-    pub fn origin_shift(self, old_w: u32, old_h: u32, new_w: u32, new_h: u32) -> (i32, i32) {
-        let (dx, dy) = self.offset(old_w, old_h, new_w, new_h);
-        (-dx, -dy)
-    }
-
-    /// How far content *would* move if the canvas were re-based at zero.
-    ///
-    /// Retained because it is the natural way to express an anchor, and
-    /// [`Anchor::origin_shift`] is defined from it — but note that content does **not**
-    /// move (see [`crate::canvas`]).
-    #[must_use]
-    pub fn offset(self, old_w: u32, old_h: u32, new_w: u32, new_h: u32) -> (i32, i32) {
-        let dw = new_w as i64 - old_w as i64;
-        let dh = new_h as i64 - old_h as i64;
-        let dx = match self.h {
-            Horizontal::Left => 0,
-            Horizontal::Center => dw / 2,
-            Horizontal::Right => dw,
-        };
-        let dy = match self.v {
-            Vertical::Top => 0,
-            Vertical::Middle => dh / 2,
-            Vertical::Bottom => dh,
-        };
-        (dx as i32, dy as i32)
-    }
-}
-
-/// A described page resize, from which both offsets are **derived**.
-///
-/// Deriving them removes a class of bug: an offset carried alongside the sizes can
-/// disagree with them, and the result is content placed wrongly with nothing raised.
-///
-/// Two offsets, easy to confuse, so they are named for what they move:
-/// - [`PageResize::origin_shift`] — how the page rectangle moves in page coordinates.
-///   Content does not move (see [`crate::canvas`]).
-/// - [`PageResize::content_offset`] — where old content lands inside a **zero-based
-///   texture** of the new size. The GPU needs this because a texture always starts at
-///   (0, 0), so growing upward means copying the old contents lower down.
+/// A rectangle in page coordinates. The corner may be negative, since extending
+/// leftward or upward moves the origin (see [`crate::canvas`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PageResize {
-    pub old_w: u32,
-    pub old_h: u32,
-    pub new_w: u32,
-    pub new_h: u32,
-    pub anchor: Anchor,
+pub struct PageRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
 }
 
-impl PageResize {
-    /// How the page rectangle's origin moves.
+impl PageRect {
     #[must_use]
-    pub fn origin_shift(&self) -> (i32, i32) {
-        self.anchor
-            .origin_shift(self.old_w, self.old_h, self.new_w, self.new_h)
-    }
-
-    /// Where old content lands inside a zero-based texture of the new size.
-    #[must_use]
-    pub fn content_offset(&self) -> (i32, i32) {
-        self.anchor
-            .offset(self.old_w, self.old_h, self.new_w, self.new_h)
-    }
-
-    /// The inverse resize, for undoing this one.
-    ///
-    /// Swapping the sizes and keeping the anchor suffices, because both offsets are
-    /// computed from the size difference — so the same anchor yields exactly the
-    /// opposite movement.
-    #[must_use]
-    pub fn inverted(&self) -> Self {
+    pub fn new(x: i32, y: i32, w: u32, h: u32) -> Self {
         Self {
-            old_w: self.new_w,
-            old_h: self.new_h,
-            new_w: self.old_w,
-            new_h: self.old_h,
-            anchor: self.anchor,
+            x,
+            y,
+            w: w.max(1),
+            h: h.max(1),
         }
     }
 
-    /// Whether this resize loses pixels, and therefore needs them saved to be undone.
+    /// A rectangle at the origin, for a fresh page.
     #[must_use]
-    pub fn shrinks(&self) -> bool {
-        self.new_w < self.old_w || self.new_h < self.old_h
+    pub fn from_size(w: u32, h: u32) -> Self {
+        Self::new(0, 0, w, h)
+    }
+
+    #[must_use]
+    pub fn origin(&self) -> (i32, i32) {
+        (self.x, self.y)
+    }
+
+    /// One past the bottom-right corner.
+    #[must_use]
+    pub fn end(&self) -> (i32, i32) {
+        (self.x + self.w as i32, self.y + self.h as i32)
+    }
+
+    #[must_use]
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        let (ex, ey) = self.end();
+        x >= self.x && y >= self.y && x < ex && y < ey
+    }
+
+    /// Whether this rectangle fully covers `other`.
+    ///
+    /// Used to decide whether a resize loses pixels, which is more accurate than
+    /// comparing sizes: a rectangle can move without shrinking and still drop content.
+    #[must_use]
+    pub fn covers(&self, other: &Self) -> bool {
+        let (ex, ey) = self.end();
+        let (ox, oy) = other.end();
+        self.x <= other.x && self.y <= other.y && ex >= ox && ey >= oy
+    }
+
+    /// This rectangle grown by `amount` on the given side.
+    #[must_use]
+    pub fn extended(&self, side: Side, amount: u32) -> Self {
+        let a = amount as i32;
+        match side {
+            Side::Top => Self::new(self.x, self.y - a, self.w, self.h + amount),
+            Side::Bottom => Self::new(self.x, self.y, self.w, self.h + amount),
+            Side::Left => Self::new(self.x - a, self.y, self.w + amount, self.h),
+            Side::Right => Self::new(self.x, self.y, self.w + amount, self.h),
+        }
+    }
+}
+
+/// Which edge of a page an extend grows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// A page resize, expressed as the rectangle before and after.
+///
+/// Both offsets are derived by subtraction, which is why there is no anchor and no
+/// stored offset to disagree with the sizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageResize {
+    pub old: PageRect,
+    pub new: PageRect,
+}
+
+impl PageResize {
+    /// How the page rectangle's origin moves. Content does not move.
+    #[must_use]
+    pub fn origin_shift(&self) -> (i32, i32) {
+        (self.new.x - self.old.x, self.new.y - self.old.y)
+    }
+
+    /// Where old content lands inside a **zero-based texture** of the new size.
+    ///
+    /// The GPU needs this because a texture always starts at (0, 0), so growing upward
+    /// means copying the old contents lower down. It is the negation of the origin
+    /// shift.
+    #[must_use]
+    pub fn content_offset(&self) -> (i32, i32) {
+        (self.old.x - self.new.x, self.old.y - self.new.y)
+    }
+
+    /// The inverse resize, for undoing this one — simply the two rectangles swapped.
+    #[must_use]
+    pub fn inverted(&self) -> Self {
+        Self {
+            old: self.new,
+            new: self.old,
+        }
+    }
+
+    /// Whether this resize drops any content, and therefore needs pixels saved to be
+    /// undone.
+    #[must_use]
+    pub fn loses_pixels(&self) -> bool {
+        !self.new.covers(&self.old)
     }
 }
 
@@ -177,21 +168,25 @@ impl Page {
         &mut self.canvas
     }
 
+    /// The page's rectangle in page coordinates.
+    #[must_use]
+    pub fn rect(&self) -> PageRect {
+        self.canvas.rect()
+    }
+
     #[must_use]
     pub fn width(&self) -> u32 {
         self.canvas.width()
     }
 
-    /// Top-left corner in page coordinates. Negative once the page has been extended
-    /// leftward or upward; see [`crate::canvas`] for why coordinates are stable.
-    #[must_use]
-    pub fn origin(&self) -> (i32, i32) {
-        self.canvas.origin()
-    }
-
     #[must_use]
     pub fn height(&self) -> u32 {
         self.canvas.height()
+    }
+
+    #[must_use]
+    pub fn origin(&self) -> (i32, i32) {
+        self.canvas.origin()
     }
 
     #[must_use]
@@ -203,21 +198,21 @@ impl Page {
         self.dpi = dpi.max(1.0);
     }
 
-    /// Change the page's size, keeping existing content exactly where it is.
+    /// Move the page to a new rectangle, keeping existing content exactly where it is.
     ///
     /// Returns how far the **origin** moved, which the renderer needs in order to place
     /// the old texture contents inside the new one. Nothing else needs adjusting:
     /// content coordinates are stable, so stored page coordinates stay valid.
-    pub fn resize(&mut self, new_w: u32, new_h: u32, anchor: Anchor) -> (i32, i32) {
-        self.canvas.resize(new_w, new_h, anchor)
+    pub fn resize(&mut self, rect: PageRect) -> (i32, i32) {
+        self.canvas.resize(rect)
     }
 
     /// Grow the page downward by `amount` pixels — the webtoon "Extend ↓".
     ///
-    /// `amount` is a parameter rather than a constant on purpose (DECISIONS §5a):
-    /// it is user-configurable, and later drag-to-extend feeds the same call.
-    pub fn extend_down(&mut self, amount: u32) -> (i32, i32) {
-        self.resize(self.width(), self.height() + amount, Anchor::TOP_LEFT)
+    /// `amount` is a parameter rather than a constant on purpose (DECISIONS §5a): it is
+    /// user-configurable, and drag-to-extend feeds the same call.
+    pub fn extend(&mut self, side: Side, amount: u32) -> (i32, i32) {
+        self.resize(self.rect().extended(side, amount))
     }
 }
 
@@ -226,81 +221,117 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extending_down_or_right_leaves_the_origin_alone() {
-        assert_eq!(Anchor::TOP_LEFT.origin_shift(100, 100, 100, 400), (0, 0));
-        assert_eq!(Anchor::TOP_LEFT.origin_shift(100, 100, 400, 100), (0, 0));
+    fn extending_the_bottom_or_right_leaves_the_origin_alone() {
+        let r = PageRect::from_size(100, 100);
+        assert_eq!(r.extended(Side::Bottom, 300), PageRect::new(0, 0, 100, 400));
+        assert_eq!(r.extended(Side::Right, 300), PageRect::new(0, 0, 400, 100));
     }
 
-    /// Extending upward moves the origin *up* (negative y) and leaves content alone —
-    /// the opposite of re-basing at zero, which would have moved every pixel down.
+    /// Extending upward moves the origin *up* (negative y) and leaves content alone.
     #[test]
-    fn extending_up_moves_the_origin_up() {
+    fn extending_the_top_moves_the_origin_up() {
+        let r = PageRect::from_size(100, 100);
+        assert_eq!(r.extended(Side::Top, 300), PageRect::new(0, -300, 100, 400));
+    }
+
+    #[test]
+    fn extending_the_left_moves_the_origin_left() {
+        let r = PageRect::from_size(100, 100);
         assert_eq!(
-            Anchor::BOTTOM_LEFT.origin_shift(100, 100, 100, 400),
-            (0, -300)
+            r.extended(Side::Left, 300),
+            PageRect::new(-300, 0, 400, 100)
+        );
+    }
+
+    /// The two derived offsets are exact opposites: the rectangle moving one way is the
+    /// content moving the other way within it. Confusing them is the likeliest silent
+    /// bug here, so it is pinned.
+    #[test]
+    fn the_two_offsets_are_opposites() {
+        let r = PageResize {
+            old: PageRect::from_size(100, 100),
+            new: PageRect::new(0, -500, 100, 600),
+        };
+        assert_eq!(r.origin_shift(), (0, -500));
+        assert_eq!(r.content_offset(), (0, 500));
+    }
+
+    #[test]
+    fn inverting_swaps_the_rectangles_and_reverses_both_offsets() {
+        let r = PageResize {
+            old: PageRect::new(10, 20, 300, 300),
+            new: PageRect::new(-40, -10, 800, 700),
+        };
+        let back = r.inverted();
+        assert_eq!(back.old, r.new);
+        assert_eq!(back.new, r.old);
+
+        let (ox, oy) = r.origin_shift();
+        assert_eq!(back.origin_shift(), (-ox, -oy));
+        let (cx, cy) = r.content_offset();
+        assert_eq!(back.content_offset(), (-cx, -cy));
+    }
+
+    /// Growing never loses pixels; that is what makes undoable extends free.
+    #[test]
+    fn growing_loses_nothing() {
+        let grow = PageResize {
+            old: PageRect::from_size(100, 100),
+            new: PageRect::new(0, -400, 100, 500),
+        };
+        assert!(!grow.loses_pixels());
+        assert!(
+            grow.inverted().loses_pixels(),
+            "undoing a grow drops pixels"
+        );
+    }
+
+    /// A rectangle can *move* without shrinking and still drop content. Comparing
+    /// sizes would have missed this; comparing coverage does not.
+    #[test]
+    fn a_same_size_rectangle_that_moved_loses_pixels() {
+        let slid = PageResize {
+            old: PageRect::new(0, 0, 100, 100),
+            new: PageRect::new(50, 0, 100, 100),
+        };
+        assert!(
+            slid.loses_pixels(),
+            "sliding the window drops the left strip"
         );
     }
 
     #[test]
-    fn extending_left_moves_the_origin_left() {
-        assert_eq!(
-            Anchor::TOP_RIGHT.origin_shift(100, 100, 400, 100),
-            (-300, 0)
-        );
-    }
-
-    /// The origin shift is exactly the negative of the content offset. If these ever
-    /// disagree, one of the two coordinate conventions has drifted.
-    #[test]
-    fn origin_shift_is_the_negated_content_offset() {
-        for anchor in [
-            Anchor::TOP_LEFT,
-            Anchor::BOTTOM_LEFT,
-            Anchor::TOP_RIGHT,
-            Anchor::CENTER,
-        ] {
-            let (ox, oy) = anchor.origin_shift(300, 300, 800, 700);
-            let (cx, cy) = anchor.offset(300, 300, 800, 700);
-            assert_eq!((ox, oy), (-cx, -cy), "mismatch for {anchor:?}");
-        }
+    fn covers_is_inclusive_of_an_identical_rectangle() {
+        let r = PageRect::new(-5, -5, 20, 20);
+        assert!(r.covers(&r));
     }
 
     #[test]
-    fn centering_splits_the_difference() {
-        assert_eq!(Anchor::CENTER.offset(100, 100, 300, 300), (100, 100));
-    }
-
-    /// Shrinking gives negative offsets, which is what a crop needs.
-    #[test]
-    fn shrinking_yields_negative_offsets() {
-        assert_eq!(Anchor::BOTTOM_LEFT.offset(100, 400, 100, 100), (0, -300));
-        assert_eq!(Anchor::CENTER.offset(300, 300, 100, 100), (-100, -100));
-    }
-
-    #[test]
-    fn a_new_page_has_the_requested_size() {
+    fn a_new_page_has_the_requested_size_at_the_origin() {
         let p = Page::new(800, 1200);
-        assert_eq!((p.width(), p.height()), (800, 1200));
+        assert_eq!(p.rect(), PageRect::new(0, 0, 800, 1200));
         assert_eq!(p.dpi(), DEFAULT_DPI);
     }
 
     #[test]
-    fn extend_down_grows_only_the_height() {
+    fn extending_down_grows_only_the_height() {
         let mut p = Page::new(800, 1000);
-        let moved = p.extend_down(500);
-        assert_eq!((p.width(), p.height()), (800, 1500));
+        let moved = p.extend(Side::Bottom, 500);
+        assert_eq!(p.rect(), PageRect::new(0, 0, 800, 1500));
         assert_eq!(moved, (0, 0), "extending down must not move the origin");
-        assert_eq!(p.origin(), (0, 0));
     }
 
-    /// Extending upward must leave the origin negative rather than moving content.
     #[test]
     fn extending_up_leaves_a_negative_origin() {
         let mut p = Page::new(800, 1000);
-        let shift = p.resize(800, 1500, Anchor::BOTTOM_LEFT);
+        let shift = p.extend(Side::Top, 500);
         assert_eq!(shift, (0, -500));
-        assert_eq!(p.origin(), (0, -500));
-        assert_eq!(p.height(), 1500);
+        assert_eq!(p.rect(), PageRect::new(0, -500, 800, 1500));
+    }
+
+    #[test]
+    fn a_rect_is_never_degenerate() {
+        assert_eq!(PageRect::new(0, 0, 0, 0), PageRect::new(0, 0, 1, 1));
     }
 
     #[test]
@@ -308,71 +339,5 @@ mod tests {
         let mut p = Page::new(10, 10);
         p.set_dpi(0.0);
         assert!(p.dpi() >= 1.0);
-    }
-
-    /// Inverting must reverse both offsets, since that is what undoing a resize relies
-    /// on.
-    #[test]
-    fn inverting_a_resize_reverses_both_offsets() {
-        for anchor in [
-            Anchor::TOP_LEFT,
-            Anchor::BOTTOM_LEFT,
-            Anchor::TOP_RIGHT,
-            Anchor::CENTER,
-        ] {
-            let forward = PageResize {
-                old_w: 300,
-                old_h: 300,
-                new_w: 800,
-                new_h: 700,
-                anchor,
-            };
-            let back = forward.inverted();
-            let (ox, oy) = forward.origin_shift();
-            let (bx, by) = back.origin_shift();
-            assert_eq!((bx, by), (-ox, -oy), "origin shift for {anchor:?}");
-
-            let (cx, cy) = forward.content_offset();
-            let (dx, dy) = back.content_offset();
-            assert_eq!((dx, dy), (-cx, -cy), "content offset for {anchor:?}");
-        }
-    }
-
-    /// The two offsets are opposites: the rectangle moving one way is the same as the
-    /// content moving the other way within it.
-    #[test]
-    fn the_two_offsets_are_opposites() {
-        let r = PageResize {
-            old_w: 100,
-            old_h: 100,
-            new_w: 100,
-            new_h: 600,
-            anchor: Anchor::BOTTOM_LEFT,
-        };
-        assert_eq!(r.origin_shift(), (0, -500));
-        assert_eq!(r.content_offset(), (0, 500));
-    }
-
-    #[test]
-    fn only_a_shrink_needs_pixels_saved() {
-        let grow = PageResize {
-            old_w: 100,
-            old_h: 100,
-            new_w: 100,
-            new_h: 400,
-            anchor: Anchor::TOP_LEFT,
-        };
-        assert!(!grow.shrinks());
-        assert!(grow.inverted().shrinks(), "undoing a grow is a shrink");
-
-        // Growing one axis while shrinking the other still loses pixels.
-        let mixed = PageResize {
-            old_w: 400,
-            old_h: 100,
-            new_w: 100,
-            new_h: 400,
-            anchor: Anchor::TOP_LEFT,
-        };
-        assert!(mixed.shrinks());
     }
 }

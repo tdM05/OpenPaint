@@ -263,7 +263,7 @@ impl CanvasRenderer {
     /// CPU reference has to move pixels tile by tile: the shift rarely lands on a
     /// tile boundary, but a texture copy does not care.
     pub fn resize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, resize: PageResize) {
-        let (new_w, new_h) = (resize.new_w.max(1), resize.new_h.max(1));
+        let (new_w, new_h) = (resize.new.w.max(1), resize.new.h.max(1));
         // The texture is zero-based, so old content moves *within* it even though it
         // does not move in page coordinates.
         let (dx, dy) = resize.content_offset();
@@ -502,11 +502,8 @@ mod tests {
             &device,
             &queue,
             PageResize {
-                old_w: SIZE,
-                old_h: SIZE,
-                new_w: SIZE,
-                new_h: SIZE * 2,
-                anchor: openpaint_core::Anchor::TOP_LEFT,
+                old: openpaint_core::PageRect::from_size(SIZE, SIZE),
+                new: openpaint_core::PageRect::from_size(SIZE, SIZE * 2),
             },
         );
 
@@ -556,11 +553,8 @@ mod tests {
             &device,
             &queue,
             PageResize {
-                old_w: SIZE,
-                old_h: SIZE,
-                new_w: SIZE,
-                new_h: SIZE * 2,
-                anchor: openpaint_core::Anchor::BOTTOM_LEFT,
+                old: openpaint_core::PageRect::from_size(SIZE, SIZE),
+                new: openpaint_core::PageRect::new(0, -(SIZE as i32), SIZE, SIZE * 2),
             },
         );
 
@@ -608,11 +602,8 @@ mod tests {
             &device,
             &queue,
             PageResize {
-                old_w: SIZE,
-                old_h: SIZE,
-                new_w: half,
-                new_h: half,
-                anchor: openpaint_core::Anchor::TOP_LEFT,
+                old: openpaint_core::PageRect::from_size(SIZE, SIZE),
+                new: openpaint_core::PageRect::from_size(half, half),
             },
         );
         let size = r.texture().size();

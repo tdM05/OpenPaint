@@ -28,7 +28,7 @@
 //! `openpaint_core::raster` remain the CPU *reference* implementations, and
 //! `tests/gpu_matches_cpu.rs` is what keeps the GPU honest against them.
 
-use openpaint_core::{Anchor, Brush, Canvas, Dab, Document, Mode, Page, StrokeState};
+use openpaint_core::{Brush, Canvas, Dab, Document, Mode, Page, PageRect, StrokeState};
 
 use crate::history::{BoundsBuilder, CanvasRect};
 
@@ -165,11 +165,11 @@ impl Editor {
     /// Callers must act on that offset: GPU textures copy their contents to it, and
     /// anything storing page coordinates (undo rectangles *and* the dab positions
     /// kept for redo) must be shifted by the same amount.
-    pub fn resize_page(&mut self, new_w: u32, new_h: u32, anchor: Anchor) -> (i32, i32) {
+    pub fn resize_page(&mut self, rect: PageRect) -> (i32, i32) {
         // A resize during a stroke would leave the in-progress accumulation keyed to
         // stale coordinates, so end it first.
         self.stroke_end();
-        self.document.active_mut().resize(new_w, new_h, anchor)
+        self.document.active_mut().resize(rect)
     }
 
     /// Stroke commands and their dabs, for the renderer to execute.

@@ -315,11 +315,19 @@ engine stays fully general underneath, so:
 - **Extending in any direction is always possible**, whether or not the UI offers it.
 - **Upscaling is always available.**
 
-**One resize primitive:** `Page::resize(new_w, new_h, anchor)`, where `anchor` says
-where existing content sits in the new bounds. Extend-down is
-`resize(w, h + n, TopLeft)`; extend-up is the same with `BottomLeft`; crop is a
-smaller size; drag-to-resize later is a UI affordance over the same call. `n` is a
-**parameter with a default**, stored in settings — never a constant in code.
+**One resize primitive:** `Page::resize(rect)` — the target **rectangle** in page
+coordinates. Extend, crop, and drag-to-resize are all just different rectangles, and
+`Page::extend(side, amount)` is a convenience that computes one.
+
+An earlier version took a size plus an "anchor" naming which edges moved, because
+coordinates were re-based at zero and a rectangle could not be named. Once coordinates
+became stable (§5a below), the rectangle became the natural thing to state and the
+anchor had nothing left to contribute — a dragged rectangle already says which edges
+moved. It is also strictly more expressive: it can trim 10 px off the left and 30 off
+the right, which size-plus-anchor cannot express. `Anchor` was deleted.
+
+The extend amount is a **parameter with a default**, stored in settings — never a
+constant in code.
 
 **Pixels are the canvas; DPI is metadata.** "300 DPI A4" is a *preset* that computes
 2480×3508, not a mode the engine knows about. Upscaling is supported (as CSP's

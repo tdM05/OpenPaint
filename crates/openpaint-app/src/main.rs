@@ -61,7 +61,7 @@ use winit::window::{Window, WindowId};
 use editor::Editor;
 use input::{InputBackend, PenEvent, PenSample};
 use input_mouse::MouseBackend;
-use openpaint_core::Anchor;
+use openpaint_core::{PageRect, Side};
 use renderer::Renderer;
 use view::{View, ROTATE_STEP};
 
@@ -107,15 +107,6 @@ struct OpenPaint {
     /// "Windows Ink reentrancy" note - without this, a re-entered frame can
     /// deadlock on a lock its own interrupted outer call is holding.
     in_dispatch: bool,
-}
-
-/// Which edge an Extend adds to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExtendDir {
-    Down,
-    Up,
-    Left,
-    Right,
 }
 
 /// In-progress canvas navigation.
@@ -269,38 +260,38 @@ impl OpenPaint {
         match change {
             renderer::HistoryChange::None => {}
             renderer::HistoryChange::Pixels => self.request_redraw(),
-            renderer::HistoryChange::Geometry { w, h, anchor } => {
-                self.editor.resize_page(w, h, anchor);
+            renderer::HistoryChange::Geometry { rect } => {
+                self.editor.resize_page(rect);
                 self.request_redraw();
             }
         }
     }
 
-    /// Grow the current page in one direction and keep everything consistent.
+    /// Grow the current page on one side.
     ///
-    /// The single place that knows a resize has three consequences: the page's
-    /// dimensions change, the GPU textures must be re-created with content copied to
-    /// the new offset, and stored page coordinates (undo rectangles and the dab
-    /// positions kept for redo) must be shifted to match. Missing the third would
-    /// silently corrupt history, which is why it goes through one function.
-    fn extend_page(&mut self, dir: ExtendDir, amount: u32) {
+    /// A convenience over [`OpenPaint::apply_page_rect`]: it only works out the target
+    /// rectangle, so every resize shares the same guards and consequences.
+    fn extend_page(&mut self, side: Side, amount: u32) {
         if amount == 0 {
             return;
         }
-        let (w, h) = {
-            let page = self.editor.document().active();
-            (page.width(), page.height())
-        };
-        let (wanted_w, wanted_h, anchor) = match dir {
-            ExtendDir::Down => (
-                w.saturating_add(0),
-                h.saturating_add(amount),
-                Anchor::TOP_LEFT,
-            ),
-            ExtendDir::Up => (w, h.saturating_add(amount), Anchor::BOTTOM_LEFT),
-            ExtendDir::Right => (w.saturating_add(amount), h, Anchor::TOP_LEFT),
-            ExtendDir::Left => (w.saturating_add(amount), h, Anchor::TOP_RIGHT),
-        };
+        let target = self
+            .editor
+            .document()
+            .active()
+            .rect()
+            .extended(side, amount);
+        self.apply_page_rect(target);
+    }
+
+    /// Move the current page to a new rectangle, keeping everything consistent.
+    ///
+    /// The single place that knows a resize has consequences beyond the page itself: the
+    /// GPU textures must be re-created with content copied to the new offset, and the
+    /// operation must be recorded so it can be undone. Extend, crop, and drag-to-resize
+    /// all come through here.
+    fn apply_page_rect(&mut self, target: PageRect) {
+        let old = self.editor.document().active().rect();
 
         // The canvas is one texture, so the page cannot exceed what the device will
         // allocate. Requesting more used to panic inside wgpu; clamp and say so.
@@ -308,21 +299,23 @@ impl OpenPaint {
             .renderer
             .as_ref()
             .map_or(8192, Renderer::max_canvas_dimension);
-        let Some((new_w, new_h)) = editor::clamp_page_size((w, h), (wanted_w, wanted_h), max)
+        let Some((new_w, new_h)) =
+            editor::clamp_page_size((old.w, old.h), (target.w, target.h), max)
         else {
             self.status_message = Some(format!(
-                "Page is at the {max} px limit -- a tiled canvas is needed to go further"
+                "Page is already {}x{}; nothing to change (limit {max} px)",
+                old.w, old.h
             ));
             self.request_redraw();
             return;
         };
-        if (new_w, new_h) != (wanted_w, wanted_h) {
-            self.status_message = Some(format!("Extend clamped to the {max} px texture limit"));
+        if (new_w, new_h) != (target.w, target.h) {
+            self.status_message = Some(format!("Clamped to the {max} px texture limit"));
         }
 
         // A size within the dimension limit can still be far too much memory to
-        // allocate, and a failed allocation is a device error -- another crash, just
-        // a different one.
+        // allocate, and a failed allocation is a device error -- another crash, just a
+        // different one.
         if !editor::fits_pixel_budget(new_w, new_h) {
             let mpx = editor::MAX_CANVAS_PIXELS / (1024 * 1024);
             self.status_message = Some(format!(
@@ -332,25 +325,27 @@ impl OpenPaint {
             return;
         }
 
-        // Content coordinates are stable, so nothing needs compensating here: the page
+        let new = PageRect::new(target.x, target.y, new_w, new_h);
+        let resize = openpaint_core::PageResize { old, new };
+        let lost = resize.loses_pixels();
+
+        // Content coordinates are stable, so nothing needs compensating: the page
         // rectangle moves around the drawing rather than the drawing moving inside it.
-        self.editor.resize_page(new_w, new_h, anchor);
+        self.editor.resize_page(new);
         if let Some(r) = self.renderer.as_mut() {
-            r.resize_canvas(
-                openpaint_core::PageResize {
-                    old_w: w,
-                    old_h: h,
-                    new_w,
-                    new_h,
-                    anchor,
-                },
-                true,
-            );
+            r.resize_canvas(resize, true);
+        }
+
+        if lost {
+            // Say so, because pixels just disappeared. Undo gets them back.
+            self.status_message = Some(format!(
+                "Page is now {new_w}x{new_h}; cropped pixels are restorable with Ctrl+Z"
+            ));
         }
 
         // Deliberately does NOT re-fit. Photoshop keeps your zoom through a canvas
-        // resize, and having the camera jump on every extend is disorienting when you
-        // are working zoomed in -- press 0 to fit.
+        // resize, and having the camera jump is disorienting when working zoomed in --
+        // press 0 to fit.
         self.request_redraw();
     }
 
@@ -620,8 +615,8 @@ impl OpenPaint {
 
         // Applied after the frame, not inside the overlay closure: resizing
         // re-creates the very GPU resources the frame is drawing with.
-        if let Some((dir, amount)) = extend_request {
-            self.extend_page(dir, amount);
+        if let Some((side, amount)) = extend_request {
+            self.extend_page(side, amount);
         }
 
         match result {

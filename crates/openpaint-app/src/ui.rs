@@ -28,7 +28,7 @@ use winit::window::Window;
 use crate::editor::DEFAULT_EXTEND;
 use crate::renderer::Overlay;
 use crate::view::View;
-use crate::ExtendDir;
+use openpaint_core::Side;
 
 /// Width of the side panel in logical points.
 const PANEL_WIDTH: f32 = 280.0;
@@ -53,7 +53,7 @@ pub struct Status<'a> {
 pub struct Outcome {
     /// egui wants another frame soon.
     pub wants_repaint: bool,
-    pub extend: Option<(ExtendDir, u32)>,
+    pub extend: Option<(Side, u32)>,
 }
 
 pub struct Ui {
@@ -268,16 +268,16 @@ impl Ui {
                     );
                     ui.horizontal(|ui| {
                         if ui.button("Extend down").clicked() {
-                            extend = Some((ExtendDir::Down, extend_amount));
+                            extend = Some((Side::Bottom, extend_amount));
                         }
                         if ui.button("up").clicked() {
-                            extend = Some((ExtendDir::Up, extend_amount));
+                            extend = Some((Side::Top, extend_amount));
                         }
                         if ui.button("left").clicked() {
-                            extend = Some((ExtendDir::Left, extend_amount));
+                            extend = Some((Side::Left, extend_amount));
                         }
                         if ui.button("right").clicked() {
-                            extend = Some((ExtendDir::Right, extend_amount));
+                            extend = Some((Side::Right, extend_amount));
                         }
                     });
                     ui.label(
