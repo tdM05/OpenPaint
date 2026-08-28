@@ -534,6 +534,17 @@ same shape.
    reintroduce it and confirm the new test fails. Done for the stroke-gap fix; it
    failed by 0.955 at one pixel, which is what made the test trustworthy.
 
+5. **`PostMessage` cannot fake mouse *hover*.** Posted `WM_MOUSEMOVE` reaches winit
+   fine — pan, zoom and wheel all test that way — but Windows' mouse-leave tracking
+   follows the **real** cursor, so `WM_MOUSELEAVE` fires immediately afterwards.
+   egui then receives `PointerMoved` followed at once by `PointerGone`, discards the
+   position, and no widget can ever be hovered or clicked. Symptom: egui reports
+   `pointer_latest_pos() == None` while events are visibly arriving.
+   To drive a widget, move the **real** cursor with `SetCursorPos` first; posted
+   button messages then work. This cost several rebuilds chasing a non-existent bug,
+   twice — the honest default is: **UI interaction is verified by a human**, and only
+   engine-level behaviour is verified by injection.
+
 ---
 
 ## 11. Decisions still OPEN

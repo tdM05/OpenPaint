@@ -25,11 +25,36 @@ use egui::ViewportId;
 use openpaint_core::Brush;
 use winit::window::Window;
 
+use crate::editor::DEFAULT_EXTEND;
 use crate::renderer::Overlay;
 use crate::view::View;
+use crate::ExtendDir;
 
 /// Width of the side panel in logical points.
 const PANEL_WIDTH: f32 = 280.0;
+
+/// Read-only state the panel displays.
+///
+/// A struct rather than more parameters: `render` had already grown to the point of
+/// needing an `allow(too_many_arguments)` once, and that was a signal rather than a
+/// lint to silence.
+pub struct Status<'a> {
+    /// Undo depth, redo depth, snapshot bytes held.
+    pub history: (usize, usize, usize),
+    pub last_export: Option<&'a str>,
+    pub page_size: (u32, u32),
+}
+
+/// What the panel wants the app to do, collected during the frame.
+///
+/// Actions are returned rather than performed, because some of them (extending the
+/// page) re-create the GPU resources the current frame is still drawing with.
+#[derive(Default)]
+pub struct Outcome {
+    /// egui wants another frame soon.
+    pub wants_repaint: bool,
+    pub extend: Option<(ExtendDir, u32)>,
+}
 
 pub struct Ui {
     ctx: egui::Context,
@@ -38,6 +63,9 @@ pub struct Ui {
     /// Screen-space rect (physical pixels) egui is currently occupying, so canvas
     /// input can be excluded from it.
     occupied: egui::Rect,
+    /// How much an Extend adds. Lives in the UI because it is a user preference; it
+    /// will move to settings when those exist (DECISIONS §5a: never a constant).
+    extend_amount: u32,
 }
 
 impl Ui {
@@ -63,6 +91,7 @@ impl Ui {
             state,
             renderer,
             occupied: egui::Rect::NOTHING,
+            extend_amount: DEFAULT_EXTEND,
         }
     }
 
@@ -89,20 +118,19 @@ impl Ui {
 
     /// Build the panel, render it over the frame, and apply any edits to `brush`.
     ///
-    /// Returns `true` if egui wants another frame soon (an animation, a hover
-    /// fade, a drag in progress). The caller **must** honor it: painting is
-    /// demand-driven, and egui is only interactive while frames keep coming.
+    /// The returned [`Outcome`] carries both whether egui wants another frame soon
+    /// -- which the caller **must** honor, since painting is demand-driven and egui
+    /// is only interactive while frames keep coming -- and any action the panel
+    /// requested.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         window: &Window,
         gpu: Overlay<'_>,
         brush: &mut Brush,
         view: &View,
-        history: (usize, usize, usize),
-        last_export: Option<&str>,
-    ) -> bool {
+        status: Status<'_>,
+    ) -> Outcome {
         let Overlay {
             device,
             queue,
@@ -112,6 +140,8 @@ impl Ui {
         } = gpu;
         let input = self.state.take_egui_input(window);
         let mut color_srgb = brush.color_srgb8();
+        let mut extend = None;
+        let mut extend_amount = self.extend_amount;
 
         let output = self.ctx.run(input, |ctx| {
             egui::SidePanel::left("brush-panel")
@@ -199,7 +229,7 @@ impl Ui {
                     );
                     ui.separator();
                     ui.heading("History");
-                    let (undo_depth, redo_depth, bytes) = history;
+                    let (undo_depth, redo_depth, bytes) = status.history;
                     ui.label(format!(
                         "Undo {undo_depth}   Redo {redo_depth}   ({:.1} MiB)",
                         bytes as f32 / (1024.0 * 1024.0)
@@ -222,13 +252,48 @@ impl Ui {
                         .small()
                         .weak(),
                     );
-                    if let Some(msg) = last_export {
+                    if let Some(msg) = status.last_export {
                         ui.label(egui::RichText::new(msg).small());
                     }
+                    ui.separator();
+                    ui.heading("Page");
+                    ui.label(format!(
+                        "{} x {} px",
+                        status.page_size.0, status.page_size.1
+                    ));
+                    ui.add(
+                        egui::Slider::new(&mut extend_amount, 32..=4096)
+                            .logarithmic(true)
+                            .text("Extend by (px)"),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Extend down").clicked() {
+                            extend = Some((ExtendDir::Down, extend_amount));
+                        }
+                        if ui.button("up").clicked() {
+                            extend = Some((ExtendDir::Up, extend_amount));
+                        }
+                        if ui.button("left").clicked() {
+                            extend = Some((ExtendDir::Left, extend_amount));
+                        }
+                        if ui.button("right").clicked() {
+                            extend = Some((ExtendDir::Right, extend_amount));
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "All four directions exist in the engine; the real UI \
+                             will show only what a mode needs (DECISIONS 5a). This \
+                             is a debug panel, so it shows everything.",
+                        )
+                        .small()
+                        .weak(),
+                    );
                 });
         });
 
         brush.set_color_srgb8(color_srgb);
+        self.extend_amount = extend_amount;
 
         // Record which pixels egui owns, in physical coordinates, for
         // `blocks_point`. `used_rect` is in logical points.
@@ -281,9 +346,12 @@ impl Ui {
         // egui asks for the next frame via `repaint_delay`; zero means "as soon as
         // possible". Anything that animates or tracks a drag reports zero while it
         // is active, and idles otherwise, so this does not spin.
-        output
-            .viewport_output
-            .get(&ViewportId::ROOT)
-            .is_some_and(|v| v.repaint_delay.is_zero())
+        Outcome {
+            wants_repaint: output
+                .viewport_output
+                .get(&ViewportId::ROOT)
+                .is_some_and(|v| v.repaint_delay.is_zero()),
+            extend,
+        }
     }
 }

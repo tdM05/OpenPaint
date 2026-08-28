@@ -50,6 +50,10 @@ pub struct CanvasRenderer {
     texture: wgpu::Texture,
     /// Kept so the stroke layer can bake into the canvas.
     view: wgpu::TextureView,
+    /// Retained so the bind group can be rebuilt when the page is resized and the
+    /// texture is replaced.
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     placement_buf: wgpu::Buffer,
@@ -69,48 +73,7 @@ impl CanvasRenderer {
         // format exactly (openpaint_core::tile) so uploads are a straight byte
         // copy. Linear is not optional: the surface is an *Srgb format, so wgpu
         // encodes on write, and handing it sRGB values would double-encode them.
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("canvas-texture"),
-            size: wgpu::Extent3d {
-                width: canvas_w,
-                height: canvas_h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: CANVAS_FORMAT,
-            // RENDER_ATTACHMENT so the GPU stroke layer can bake into it
-            // (crate::stroke_layer). COPY_DST is only for the initial paper fill.
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-
-        // Initialize the whole texture to the paper color so unpainted area
-        // reads as a clean sheet.
-        let init = vec_paper(canvas_w, canvas_h, Canvas::paper_color());
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &init,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(canvas_w * texel_bytes()),
-                rows_per_image: Some(canvas_h),
-            },
-            wgpu::Extent3d {
-                width: canvas_w,
-                height: canvas_h,
-                depth_or_array_layers: 1,
-            },
-        );
+        let texture = create_canvas_texture(device, queue, canvas_w, canvas_h);
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -226,6 +189,8 @@ impl CanvasRenderer {
         Self {
             texture,
             view,
+            bind_group_layout,
+            sampler,
             pipeline,
             bind_group,
             placement_buf,
@@ -284,6 +249,100 @@ impl CanvasRenderer {
         queue.write_buffer(&self.placement_buf, 0, bytemuck::bytes_of(&uniform));
     }
 
+    /// Replace the canvas texture with a differently-sized one, copying existing
+    /// content to `(dx, dy)`.
+    ///
+    /// One texture copy, which is why resizing is cheap on the GPU even though the
+    /// CPU reference has to move pixels tile by tile: the shift rarely lands on a
+    /// tile boundary, but a texture copy does not care.
+    pub fn resize(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        new_w: u32,
+        new_h: u32,
+        dx: i32,
+        dy: i32,
+    ) {
+        let old = std::mem::replace(
+            &mut self.texture,
+            create_canvas_texture(device, queue, new_w, new_h),
+        );
+        self.view = self
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        // The overlapping region, in both textures' coordinates. Clamped so a crop
+        // (negative offset) copies only what actually lands inside.
+        let old_size = old.size();
+        let src_x = (-dx).max(0) as u32;
+        let src_y = (-dy).max(0) as u32;
+        let dst_x = dx.max(0) as u32;
+        let dst_y = dy.max(0) as u32;
+        let w = old_size
+            .width
+            .saturating_sub(src_x)
+            .min(new_w.saturating_sub(dst_x));
+        let h = old_size
+            .height
+            .saturating_sub(src_y)
+            .min(new_h.saturating_sub(dst_y));
+
+        if w > 0 && h > 0 {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("canvas-resize"),
+            });
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &old,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: src_x,
+                        y: src_y,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: dst_x,
+                        y: dst_y,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // The bind group referenced the old view, so it has to be rebuilt.
+        self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("canvas-bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.placement_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+    }
+
     /// The canvas texture itself, for history's region copies.
     #[must_use]
     pub fn texture(&self) -> &wgpu::Texture {
@@ -304,6 +363,60 @@ impl CanvasRenderer {
     }
 }
 
+/// Create a canvas texture of the given size, filled with paper.
+///
+/// Shared by construction and resize so the two cannot drift in usage flags or
+/// initial contents.
+fn create_canvas_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    width: u32,
+    height: u32,
+) -> wgpu::Texture {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("canvas-texture"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: CANVAS_FORMAT,
+        // RENDER_ATTACHMENT so the GPU stroke layer can bake into it
+        // (crate::stroke_layer). COPY_SRC for history snapshots, export, and resize;
+        // COPY_DST for the initial paper fill.
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+
+    let init = vec_paper(width.max(1), height.max(1), Canvas::paper_color());
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &init,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(width.max(1) * texel_bytes()),
+            rows_per_image: Some(height.max(1)),
+        },
+        wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+    );
+    texture
+}
+
 /// Bytes per texel of the canvas texture (RGBA f16).
 fn texel_bytes() -> u32 {
     (TILE_CHANNELS * std::mem::size_of::<f16>()) as u32
@@ -317,4 +430,209 @@ fn vec_paper(w: u32, h: u32, rgba_linear_premul: [f32; 4]) -> Vec<u8> {
         .collect();
     let row: Vec<f16> = texel.repeat((w * h) as usize);
     bytemuck::cast_slice(&row).to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_gpu::{readback, try_device, SIZE};
+
+    /// Paint one texel of a known colour by uploading it directly.
+    fn mark(queue: &wgpu::Queue, texture: &wgpu::Texture, x: u32, y: u32, value: [f32; 4]) {
+        let texel: Vec<half::f16> = value.iter().map(|c| half::f16::from_f32(*c)).collect();
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&texel),
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(texel_bytes()),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Extending down must leave every existing pixel exactly where it was, and the
+    /// added region must be paper.
+    ///
+    /// This is where a resize can go silently wrong: swap the source and destination
+    /// origins in the texture copy and content shifts to the wrong place with no
+    /// error at all.
+    #[test]
+    fn resizing_down_preserves_content_and_papers_the_new_area() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+
+        let canvas = Canvas::new(SIZE, SIZE);
+        let mut r = CanvasRenderer::new(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            &canvas,
+        );
+
+        let red = [1.0, 0.0, 0.0, 1.0];
+        mark(&queue, r.texture(), 7, 9, red);
+
+        // Grow downward: content must not move.
+        r.resize(&device, &queue, SIZE, SIZE * 2, 0, 0);
+
+        let size = r.texture().size();
+        assert_eq!((size.width, size.height), (SIZE, SIZE * 2));
+
+        let pixels = read_full(&device, &queue, r.texture(), SIZE, SIZE * 2);
+        let at = |x: u32, y: u32| pixels[(y * SIZE + x) as usize];
+        assert!(
+            at(7, 9)[0] > 0.9 && at(7, 9)[1] < 0.1,
+            "mark lost: {:?}",
+            at(7, 9)
+        );
+
+        // A pixel in the newly added region must be paper.
+        let paper = Canvas::paper_color();
+        let new_area = at(7, SIZE + 20);
+        assert!(
+            (new_area[0] - paper[0]).abs() < 0.01,
+            "new area is not paper: {new_area:?}"
+        );
+    }
+
+    /// Extending *upward* shifts content down by the growth. Getting this direction
+    /// backwards would move content off the top instead.
+    #[test]
+    fn resizing_up_shifts_content_down() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+
+        let canvas = Canvas::new(SIZE, SIZE);
+        let mut r = CanvasRenderer::new(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            &canvas,
+        );
+        let red = [1.0, 0.0, 0.0, 1.0];
+        mark(&queue, r.texture(), 7, 9, red);
+
+        // Same growth, but anchored at the bottom, so dy = SIZE.
+        r.resize(&device, &queue, SIZE, SIZE * 2, 0, SIZE as i32);
+
+        let pixels = read_full(&device, &queue, r.texture(), SIZE, SIZE * 2);
+        let at = |x: u32, y: u32| pixels[(y * SIZE + x) as usize];
+        assert!(
+            at(7, SIZE + 9)[0] > 0.9,
+            "content did not follow the shift: {:?}",
+            at(7, SIZE + 9)
+        );
+        let paper = Canvas::paper_color();
+        assert!(
+            (at(7, 9)[0] - paper[0]).abs() < 0.01,
+            "old position should now be paper: {:?}",
+            at(7, 9)
+        );
+    }
+
+    /// A crop must keep the part that lands inside and not fail on the part that
+    /// doesn't -- the copy extent has to be clamped, or wgpu rejects it.
+    #[test]
+    fn cropping_keeps_the_overlapping_region() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+
+        let canvas = Canvas::new(SIZE, SIZE);
+        let mut r = CanvasRenderer::new(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            &canvas,
+        );
+        mark(&queue, r.texture(), 5, 5, [1.0, 0.0, 0.0, 1.0]);
+
+        let half = SIZE / 2;
+        r.resize(&device, &queue, half, half, 0, 0);
+        let size = r.texture().size();
+        assert_eq!((size.width, size.height), (half, half));
+
+        let pixels = read_full(&device, &queue, r.texture(), half, half);
+        assert!(
+            pixels[(5 * half + 5) as usize][0] > 0.9,
+            "in-bounds mark lost"
+        );
+    }
+
+    /// Read an arbitrary-sized canvas texture back, handling row padding.
+    fn read_full(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        w: u32,
+        h: u32,
+    ) -> Vec<[f32; 4]> {
+        let unpadded = w * texel_bytes();
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = unpadded.div_ceil(align) * align;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("resize-readback"),
+            size: u64::from(padded) * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let mapped = buffer.slice(..).get_mapped_range();
+        let mut out = Vec::with_capacity((w * h) as usize);
+        for row in 0..h {
+            let start = (row * padded) as usize;
+            let end = start + unpadded as usize;
+            let halves: &[half::f16] = bytemuck::cast_slice(&mapped[start..end]);
+            for c in halves.as_chunks::<4>().0 {
+                out.push([c[0].to_f32(), c[1].to_f32(), c[2].to_f32(), c[3].to_f32()]);
+            }
+        }
+        out
+    }
+
+    /// Silence the unused warning for readback, which is only used by other modules.
+    #[allow(dead_code)]
+    fn _uses_readback() {
+        let _ = readback;
+    }
 }

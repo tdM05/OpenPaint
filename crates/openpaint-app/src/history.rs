@@ -282,6 +282,57 @@ impl History {
         self.enforce_budget();
     }
 
+    /// Shift every stored coordinate by `(dx, dy)` after a page resize.
+    ///
+    /// Returns `false` if history had to be discarded instead.
+    ///
+    /// Both the rectangles **and** the dab positions need shifting: rectangles say
+    /// where to put a before-image back, and the dabs are replayed at their recorded
+    /// positions for redo. Missing either would silently restore or repaint in the
+    /// wrong place, which is why this is one operation rather than two.
+    ///
+    /// When a shifted rectangle would fall outside the new bounds — a crop, not an
+    /// extend — the whole history is dropped. Partial history cannot be restored
+    /// correctly and dropping it is the honest outcome. (Growing a page never
+    /// triggers this, since the new bounds always contain the old content.)
+    pub fn shift(&mut self, dx: i32, dy: i32, new_w: u32, new_h: u32) -> bool {
+        let fits = |r: &CanvasRect| {
+            let x = r.x as i64 + i64::from(dx);
+            let y = r.y as i64 + i64::from(dy);
+            x >= 0
+                && y >= 0
+                && x + i64::from(r.w) <= i64::from(new_w)
+                && y + i64::from(r.h) <= i64::from(new_h)
+        };
+        let all_fit = self
+            .undo
+            .iter()
+            .chain(&self.redo)
+            .all(|entry| fits(&entry.rect));
+
+        if !all_fit {
+            self.clear();
+            return false;
+        }
+
+        for entry in self.undo.iter_mut().chain(&mut self.redo) {
+            entry.rect.x = (entry.rect.x as i64 + i64::from(dx)) as u32;
+            entry.rect.y = (entry.rect.y as i64 + i64::from(dy)) as u32;
+            for dab in &mut entry.dabs {
+                dab.x += dx as f32;
+                dab.y += dy as f32;
+            }
+        }
+        true
+    }
+
+    /// Drop all history, releasing its snapshots.
+    pub fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.bytes = 0;
+    }
+
     /// Drop the oldest undo levels until within budget.
     ///
     /// Oldest-first: recent history is what users reach for. A single stroke larger
@@ -454,5 +505,158 @@ mod tests {
             "region outside the rect was restored too: {:?}",
             after[outside]
         );
+    }
+
+    /// A 1x1 snapshot, so history entries can be built without a real canvas.
+    fn stub_entry(rect: CanvasRect, dabs: Vec<Dab>) -> Option<Entry> {
+        let (device, _queue) = crate::test_gpu::try_device()?;
+        let before = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("stub-snapshot"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: CANVAS_FORMAT,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        Some(Entry {
+            rect,
+            before,
+            dabs,
+            color_linear_premul: [0.0, 0.0, 0.0, 1.0],
+            opacity: 1.0,
+        })
+    }
+
+    /// Extending up shifts every existing pixel down, so history must follow --
+    /// **both** the rectangle (where a before-image goes back) and the dab positions
+    /// (replayed for redo). Missing either restores or repaints in the wrong place,
+    /// and neither would raise an error.
+    #[test]
+    fn shifting_moves_both_rects_and_dab_positions() {
+        let rect = CanvasRect {
+            x: 10,
+            y: 20,
+            w: 30,
+            h: 40,
+        };
+        let Some(entry) = stub_entry(rect, vec![dab(100.0, 200.0, 5.0)]) else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+
+        let mut h = History::new(8);
+        h.push(entry);
+
+        // Extending upward by 500 on a page that grew 1000 -> 1500 tall.
+        assert!(
+            h.shift(0, 500, 1000, 1500),
+            "growth should preserve history"
+        );
+
+        let e = h.pop_undo().expect("entry still present");
+        assert_eq!((e.rect.x, e.rect.y), (10, 520), "rect not shifted");
+        assert_eq!(
+            (e.dabs[0].x, e.dabs[0].y),
+            (100.0, 700.0),
+            "dabs not shifted"
+        );
+    }
+
+    /// Growing a page can never push a snapshot out of bounds, so history always
+    /// survives an extend. This is the case that must not regress -- silently
+    /// dropping undo on every extend would be a miserable bug to notice.
+    #[test]
+    fn growing_always_preserves_history() {
+        let rect = CanvasRect {
+            x: 0,
+            y: 0,
+            w: 1000,
+            h: 1000,
+        };
+        let Some(entry) = stub_entry(rect, vec![]) else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let mut h = History::new(8);
+        h.push(entry);
+
+        assert!(h.shift(0, 0, 1000, 4000), "extend down");
+        assert_eq!(h.undo_depth(), 1);
+        assert!(h.shift(500, 0, 1500, 4000), "extend left");
+        assert_eq!(h.undo_depth(), 1);
+    }
+
+    /// A crop can move a snapshot outside the page. Partial history cannot be
+    /// restored correctly, so it is discarded outright rather than left to corrupt.
+    #[test]
+    fn cropping_out_of_bounds_discards_history() {
+        let rect = CanvasRect {
+            x: 400,
+            y: 400,
+            w: 200,
+            h: 200,
+        };
+        let Some(entry) = stub_entry(rect, vec![]) else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let mut h = History::new(8);
+        h.push(entry);
+
+        assert!(!h.shift(0, 0, 300, 300), "should report history discarded");
+        assert_eq!(h.undo_depth(), 0);
+        assert_eq!(h.redo_depth(), 0);
+        assert_eq!(h.bytes_held(), 0, "byte accounting left stale");
+    }
+
+    /// The redo stack must be shifted too, or redoing after an extend repaints in
+    /// the wrong place.
+    #[test]
+    fn shifting_covers_the_redo_stack() {
+        let rect = CanvasRect {
+            x: 5,
+            y: 5,
+            w: 10,
+            h: 10,
+        };
+        let Some(entry) = stub_entry(rect, vec![dab(50.0, 60.0, 4.0)]) else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let mut h = History::new(8);
+        h.push(entry);
+        let undone = h.pop_undo().expect("entry");
+        h.finish_undo(undone);
+        assert_eq!(h.redo_depth(), 1);
+
+        assert!(h.shift(100, 0, 2000, 2000));
+        let e = h.pop_redo().expect("redo entry");
+        assert_eq!(e.rect.x, 105);
+        assert_eq!(e.dabs[0].x, 150.0);
+    }
+
+    #[test]
+    fn clearing_releases_everything() {
+        let rect = CanvasRect {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+        };
+        let Some(entry) = stub_entry(rect, vec![]) else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let mut h = History::new(8);
+        h.push(entry);
+        h.clear();
+        assert_eq!(h.undo_depth(), 0);
+        assert_eq!(h.bytes_held(), 0);
     }
 }

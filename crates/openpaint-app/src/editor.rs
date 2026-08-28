@@ -28,14 +28,20 @@
 //! `openpaint_core::raster` remain the CPU *reference* implementations, and
 //! `tests/gpu_matches_cpu.rs` is what keeps the GPU honest against them.
 
-use openpaint_core::{Brush, Canvas, Dab, StrokeState};
+use openpaint_core::{Anchor, Brush, Canvas, Dab, Document, Mode, Page, StrokeState};
 
 use crate::history::{BoundsBuilder, CanvasRect};
 
-/// Fixed test-bed canvas size for the Phase 0 slice. The real document/page
-/// model (growable and multi-page) arrives in Phase 2; see OPEN_QUESTIONS Q13.
-const CANVAS_W: u32 = 2048;
-const CANVAS_H: u32 = 2048;
+/// Starting page size. A placeholder until New-document presets exist (§5a says
+/// "300 DPI A4" and friends are presets computing pixel dimensions).
+const PAGE_W: u32 = 2048;
+const PAGE_H: u32 = 2048;
+
+/// Default amount an Extend adds, in pixels.
+///
+/// A default, not a rule: §5a requires this be user-configurable, and drag-to-extend
+/// later feeds the same call with whatever the drag produced.
+pub const DEFAULT_EXTEND: u32 = 512;
 
 /// One step of the stroke command stream the renderer executes on the GPU.
 ///
@@ -61,7 +67,7 @@ pub enum StrokeOp {
 }
 
 pub struct Editor {
-    canvas: Canvas,
+    document: Document,
     brush: Brush,
     /// Dab spacing continuity across input samples, for the stroke in progress.
     stroke: StrokeState,
@@ -84,7 +90,7 @@ impl Editor {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            canvas: Canvas::new(CANVAS_W, CANVAS_H),
+            document: Document::new(Page::new(PAGE_W, PAGE_H), Mode::Pages),
             brush: Brush::default(),
             stroke: StrokeState::new(),
             dabs: Vec::new(),
@@ -94,14 +100,32 @@ impl Editor {
         }
     }
 
+    /// The canvas of the page being edited.
     #[must_use]
     pub fn canvas(&self) -> &Canvas {
-        &self.canvas
+        self.document.active().canvas()
     }
 
     /// Mutable canvas access, for the renderer to drain dirty tiles.
     pub fn canvas_mut(&mut self) -> &mut Canvas {
-        &mut self.canvas
+        self.document.active_mut().canvas_mut()
+    }
+
+    #[must_use]
+    pub fn document(&self) -> &Document {
+        &self.document
+    }
+
+    /// Resize the page being edited, returning how far existing content moved.
+    ///
+    /// Callers must act on that offset: GPU textures copy their contents to it, and
+    /// anything storing page coordinates (undo rectangles *and* the dab positions
+    /// kept for redo) must be shifted by the same amount.
+    pub fn resize_page(&mut self, new_w: u32, new_h: u32, anchor: Anchor) -> (i32, i32) {
+        // A resize during a stroke would leave the in-progress accumulation keyed to
+        // stale coordinates, so end it first.
+        self.stroke_end();
+        self.document.active_mut().resize(new_w, new_h, anchor)
     }
 
     /// Stroke commands and their dabs, for the renderer to execute.
@@ -163,9 +187,8 @@ impl Editor {
     /// End the current stroke, committing it to the canvas.
     pub fn stroke_end(&mut self) {
         if self.drawing {
-            let bounds = self
-                .bounds
-                .to_rect(self.canvas.width(), self.canvas.height());
+            let (w, h) = (self.canvas().width(), self.canvas().height());
+            let bounds = self.bounds.to_rect(w, h);
             self.ops.push(StrokeOp::End { bounds });
         }
         self.drawing = false;

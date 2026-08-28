@@ -61,6 +61,7 @@ use winit::window::{Window, WindowId};
 use editor::Editor;
 use input::{InputBackend, PenEvent, PenSample};
 use input_mouse::MouseBackend;
+use openpaint_core::Anchor;
 use renderer::Renderer;
 use view::{View, ROTATE_STEP};
 
@@ -106,6 +107,15 @@ struct OpenPaint {
     /// "Windows Ink reentrancy" note - without this, a re-entered frame can
     /// deadlock on a lock its own interrupted outer call is holding.
     in_dispatch: bool,
+}
+
+/// Which edge an Extend adds to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtendDir {
+    Down,
+    Up,
+    Left,
+    Right,
 }
 
 /// In-progress canvas navigation.
@@ -248,6 +258,42 @@ impl OpenPaint {
         self.pen_events.clear();
         self.input.poll(&mut self.pen_events);
         self.apply_pen_events();
+    }
+
+    /// Grow the current page in one direction and keep everything consistent.
+    ///
+    /// The single place that knows a resize has three consequences: the page's
+    /// dimensions change, the GPU textures must be re-created with content copied to
+    /// the new offset, and stored page coordinates (undo rectangles and the dab
+    /// positions kept for redo) must be shifted to match. Missing the third would
+    /// silently corrupt history, which is why it goes through one function.
+    fn extend_page(&mut self, dir: ExtendDir, amount: u32) {
+        if amount == 0 {
+            return;
+        }
+        let (w, h) = {
+            let page = self.editor.document().active();
+            (page.width(), page.height())
+        };
+        let (new_w, new_h, anchor) = match dir {
+            ExtendDir::Down => (w, h + amount, Anchor::TOP_LEFT),
+            ExtendDir::Up => (w, h + amount, Anchor::BOTTOM_LEFT),
+            ExtendDir::Right => (w + amount, h, Anchor::TOP_LEFT),
+            ExtendDir::Left => (w + amount, h, Anchor::TOP_RIGHT),
+        };
+
+        let (dx, dy) = self.editor.resize_page(new_w, new_h, anchor);
+        let history_kept = match self.renderer.as_mut() {
+            Some(r) => r.resize_canvas(new_w, new_h, dx, dy),
+            None => true,
+        };
+        if !history_kept {
+            self.last_export = Some("Undo history cleared by the resize".to_owned());
+        }
+
+        // Show the new extent, so the user can see what they just added.
+        self.view.request_fit();
+        self.request_redraw();
     }
 
     /// Handle undo/redo shortcuts. Returns `true` if the event was consumed.
@@ -477,8 +523,13 @@ impl OpenPaint {
 
         let mut ui_wants_repaint = false;
         let mut ui_inset_left = None;
+        let mut extend_request = None;
         let history_status = renderer.history_status();
         let last_export = self.last_export.clone();
+        let page_size = {
+            let page = editor.document().active();
+            (page.width(), page.height())
+        };
         let window = renderer.window().clone();
         // Borrowed, not copied: a copy would mean any future UI control that edits
         // the view silently writes to a dead value. Disjoint field borrows make
@@ -486,14 +537,19 @@ impl OpenPaint {
         let view = &self.view;
         let result = renderer.render(placement, |gpu| {
             if let Some(ui) = ui {
-                ui_wants_repaint = ui.render(
+                let out = ui.render(
                     &window,
                     gpu,
                     editor.brush_mut(),
                     view,
-                    history_status,
-                    last_export.as_deref(),
+                    ui::Status {
+                        history: history_status,
+                        last_export: last_export.as_deref(),
+                        page_size,
+                    },
                 );
+                ui_wants_repaint = out.wants_repaint;
+                extend_request = out.extend;
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
@@ -504,6 +560,12 @@ impl OpenPaint {
         let refit_queued = ui_inset_left.is_some_and(|inset| self.view.set_inset_left(inset));
         if ui_wants_repaint || refit_queued {
             self.request_redraw();
+        }
+
+        // Applied after the frame, not inside the overlay closure: resizing
+        // re-creates the very GPU resources the frame is drawing with.
+        if let Some((dir, amount)) = extend_request {
+            self.extend_page(dir, amount);
         }
 
         match result {

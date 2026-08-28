@@ -257,6 +257,32 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 
+    /// React to the page being resized: re-create the GPU resources that are sized
+    /// to the canvas, and shift history so it still refers to the right pixels.
+    ///
+    /// Returns `false` if history had to be discarded (a crop moved a snapshot out
+    /// of bounds), so the caller can say so rather than leaving the user to notice.
+    pub fn resize_canvas(&mut self, new_w: u32, new_h: u32, dx: i32, dy: i32) -> bool {
+        self.canvas_renderer
+            .resize(&self.device, &self.queue, new_w, new_h, dx, dy);
+
+        // The stroke layer's accumulation texture is canvas-sized, and its bind
+        // group points at it, so it is rebuilt wholesale. Pipelines are rebuilt too,
+        // which is wasteful -- but resizing is rare and a partial rebuild would be
+        // easy to get subtly wrong.
+        self.stroke_layer = StrokeLayer::new(
+            &self.device,
+            new_w,
+            new_h,
+            CANVAS_FORMAT,
+            self.config.format,
+        );
+        // Any in-progress stroke belonged to the old geometry.
+        self.recording.clear();
+
+        self.history.shift(dx, dy, new_w, new_h)
+    }
+
     /// Read the canvas back and write it as an sRGB PNG.
     ///
     /// Stalls on the GPU while the readback maps, which is acceptable for an

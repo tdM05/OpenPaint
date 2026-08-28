@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::color::{opaque_srgb8_to_linear_premul, over_premul};
+use crate::page::Anchor;
 use crate::tile::{Tile, TileCoord, TILE_SIZE};
 
 /// Default paper color for freshly allocated tiles, as authored (near-white sRGB).
@@ -111,6 +112,45 @@ impl Canvas {
             .or_insert_with(|| Tile::filled(Self::paper_color()));
         tile.set_texel(lx, ly, linear_premul);
         self.dirty.insert(tile_coord);
+    }
+
+    /// Change the canvas size, keeping existing content at `anchor`.
+    ///
+    /// Returns how far content moved, in pixels. Callers need that: GPU textures
+    /// copy their old contents to the same offset, and anything storing canvas
+    /// coordinates (undo rectangles) must be shifted by it.
+    ///
+    /// Pixels genuinely move here rather than tile keys being remapped, because the
+    /// shift is rarely a multiple of the tile size — extending up by 500 with 256px
+    /// tiles offsets content by 500, so each destination tile draws from two source
+    /// tiles. Doing it per pixel is obviously correct and this is the reference
+    /// implementation (clarity over speed); the app's real pixels live on the GPU,
+    /// where the same operation is a single texture copy.
+    pub fn resize(&mut self, new_w: u32, new_h: u32, anchor: Anchor) -> (i32, i32) {
+        let (dx, dy) = anchor.offset(self.width, self.height, new_w, new_h);
+        self.width = new_w.max(1);
+        self.height = new_h.max(1);
+
+        // Nothing painted, or nothing to move: just the new bounds.
+        if self.tiles.is_empty() {
+            self.dirty.clear();
+            return (dx, dy);
+        }
+
+        let old = std::mem::take(&mut self.tiles);
+        self.dirty.clear();
+        for (coord, tile) in old {
+            for ly in 0..TILE_SIZE {
+                for lx in 0..TILE_SIZE {
+                    let src_x = coord.0 * TILE_SIZE as i32 + lx as i32;
+                    let src_y = coord.1 * TILE_SIZE as i32 + ly as i32;
+                    // replace_pixel clips to the new bounds, so content shifted or
+                    // cropped outside is dropped -- which is what a crop means.
+                    self.replace_pixel(src_x + dx, src_y + dy, tile.texel(lx, ly));
+                }
+            }
+        }
+        (dx, dy)
     }
 
     /// Iterate all currently allocated tiles (coord + tile).
@@ -216,5 +256,105 @@ mod tests {
     /// don't fail on representation error.
     fn round_f16(v: f32) -> f32 {
         half::f16::from_f32(v).to_f32()
+    }
+
+    /// Extending down must leave every painted pixel exactly where it was.
+    #[test]
+    fn extending_down_preserves_content_in_place() {
+        let mut c = Canvas::new(300, 300);
+        c.blend_pixel(10, 20, BLACK);
+        c.blend_pixel(250, 290, BLACK);
+
+        let moved = c.resize(300, 900, Anchor::TOP_LEFT);
+        assert_eq!(moved, (0, 0));
+        assert_eq!((c.width(), c.height()), (300, 900));
+        assert!(is_paint(&c, 10, 20), "pixel at (10,20) lost");
+        assert!(is_paint(&c, 250, 290), "pixel at (250,290) lost");
+    }
+
+    /// Extending up shifts content down by the growth, and the shift is *not* a
+    /// multiple of the tile size here -- which is the case that would break a
+    /// tile-key remap.
+    #[test]
+    fn extending_up_shifts_content_by_a_non_tile_multiple() {
+        let mut c = Canvas::new(300, 300);
+        c.blend_pixel(10, 20, BLACK);
+
+        // Compile-time guard: this test only proves anything while the shift is
+        // NOT a whole number of tiles. If TILE_SIZE ever divides 500, the build
+        // breaks here rather than the test quietly becoming vacuous.
+        const _: () = assert!(500 % TILE_SIZE != 0);
+
+        let moved = c.resize(300, 800, Anchor::BOTTOM_LEFT);
+        assert_eq!(moved, (0, 500));
+        assert!(is_paint(&c, 10, 520), "content did not follow the shift");
+        assert!(
+            !is_paint(&c, 10, 20),
+            "content left behind at the old position"
+        );
+    }
+
+    #[test]
+    fn extending_left_shifts_content_right() {
+        let mut c = Canvas::new(300, 300);
+        c.blend_pixel(10, 20, BLACK);
+        let moved = c.resize(700, 300, Anchor::TOP_RIGHT);
+        assert_eq!(moved, (400, 0));
+        assert!(is_paint(&c, 410, 20));
+    }
+
+    /// Shrinking drops what falls outside -- that is what a crop is.
+    #[test]
+    fn shrinking_crops_content_outside_the_new_bounds() {
+        let mut c = Canvas::new(600, 600);
+        c.blend_pixel(50, 50, BLACK);
+        c.blend_pixel(500, 500, BLACK);
+
+        c.resize(200, 200, Anchor::TOP_LEFT);
+        assert!(is_paint(&c, 50, 50), "in-bounds content should survive");
+        assert_eq!(c.width(), 200);
+        // The far pixel is outside the new bounds and simply gone.
+        assert!(c.tile((1, 1)).is_none() && c.tile((2, 2)).is_none());
+    }
+
+    #[test]
+    fn resizing_an_untouched_canvas_just_changes_the_bounds() {
+        let mut c = Canvas::new(100, 100);
+        let moved = c.resize(100, 500, Anchor::TOP_LEFT);
+        assert_eq!(moved, (0, 0));
+        assert_eq!(c.tiles().count(), 0, "should not have allocated anything");
+        assert_eq!(c.height(), 500);
+    }
+
+    /// Painting must work in the newly-added space, which is the whole point of
+    /// extending.
+    #[test]
+    fn the_new_space_is_paintable() {
+        let mut c = Canvas::new(100, 100);
+        c.resize(100, 600, Anchor::TOP_LEFT);
+        c.blend_pixel(50, 550, BLACK);
+        assert!(
+            is_paint(&c, 50, 550),
+            "could not paint in the extended area"
+        );
+    }
+
+    #[test]
+    fn a_zero_size_resize_is_clamped_rather_than_panicking() {
+        let mut c = Canvas::new(100, 100);
+        c.resize(0, 0, Anchor::TOP_LEFT);
+        assert!(c.width() >= 1 && c.height() >= 1);
+    }
+
+    /// Whether a pixel carries paint, i.e. differs from bare paper.
+    fn is_paint(c: &Canvas, x: u32, y: u32) -> bool {
+        let coord = ((x / TILE_SIZE as u32) as i32, (y / TILE_SIZE as u32) as i32);
+        let Some(tile) = c.tile(coord) else {
+            return false;
+        };
+        let lx = (x % TILE_SIZE as u32) as usize;
+        let ly = (y % TILE_SIZE as u32) as usize;
+        let paper = Canvas::paper_color()[0];
+        tile.texel(lx, ly)[0] < paper - 0.05
     }
 }
