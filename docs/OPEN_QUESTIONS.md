@@ -221,6 +221,29 @@ per-stroke (assumed) or finer; interaction with the growable/multi-page model.
 its ownership model has to be settled first or both get reworked. This is the same
 sequencing risk already noted against the Phase-2 page model.
 
+### Q14. Pen input cannot reach the UI layer - ARCHITECTURAL, blocks any real UI
+Surfaced 2026-08-27 when the egui debug panel landed: **only the mouse can operate
+it.** Pen input arrives through octotablet, which bypasses winit's event stream
+entirely, so egui never sees a pen event and cannot hover, click, or drag a widget.
+
+Harmless for a debug panel, fatal for the real UI - a drawing app whose buttons
+cannot be pressed with the pen is unusable, and the pen is the primary input device
+by design (DECISIONS section 2).
+
+Interim mitigation in place: `Ui::blocks_point` reports the rect egui occupies and
+`Gpu::stroke_begin` refuses to paint there, so strokes don't land "through" the
+panel. That is a hit-test, not input routing - it stops the pen painting under the
+UI but does not let the pen *use* the UI.
+
+**The real fix is to stop treating pen input as canvas-only.** Pen events should
+enter a single input-dispatch layer that offers them to the UI first and the canvas
+second, exactly as winit events are handled now. That means synthesizing UI-facing
+pointer events from `PenEvent`, or feeding egui raw events directly.
+**Open:** where that dispatch layer lives, and whether it is worth building against
+egui at all given egui is explicitly throwaway (DECISIONS section 3) - it may be
+better to solve once, properly, when the real UI framework is chosen (Q4). Until
+then the mouse operates the UI and the pen draws.
+
 ## Lower-priority / later
 
 ### Q8. PSD compatibility depth

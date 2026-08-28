@@ -39,6 +39,7 @@ mod input;
 mod input_mouse;
 #[cfg(target_os = "windows")]
 mod input_pen;
+mod ui;
 
 use std::error::Error;
 use std::sync::Arc;
@@ -153,6 +154,12 @@ impl OpenPaint {
                 return;
             }
             _ => {}
+        }
+
+        // The debug panel gets first refusal on anything left. If it took the
+        // event, it must not also become a brush stroke.
+        if gpu.ui_handled_event(&event) {
+            return;
         }
 
         // Everything else is offered to the input backend, which turns native

@@ -37,6 +37,9 @@ pub struct Gpu {
     /// makes flow build up toward the opacity ceiling instead of darkening on
     /// every overlap; see `openpaint_core::stroke`.
     painter: openpaint_core::StrokePainter,
+    /// Throwaway debug panel (see `crate::ui`). Owned here because it draws into
+    /// the same frame and edits the brush.
+    ui: crate::ui::Ui,
     drawing: bool,
 
     window: Arc<Window>,
@@ -102,6 +105,7 @@ impl Gpu {
 
         let canvas = Canvas::new(CANVAS_W, CANVAS_H);
         let canvas_renderer = CanvasRenderer::new(&device, &queue, format, &canvas);
+        let ui = crate::ui::Ui::new(&device, format, &window);
         canvas_renderer.update_placement(&queue, config.width, config.height);
 
         Ok(Self {
@@ -116,6 +120,7 @@ impl Gpu {
             stroke: StrokeState::new(),
             dabs: Vec::new(),
             painter: openpaint_core::StrokePainter::new(),
+            ui,
             drawing: false,
             window,
         })
@@ -168,6 +173,9 @@ impl Gpu {
 
     /// Begin a stroke at a pen sample (if it lands on the canvas).
     pub fn stroke_begin(&mut self, s: &PenSample) {
+        if self.ui_blocks_point(s.x, s.y) {
+            return;
+        }
         if let Some((cx, cy)) = self.to_canvas(s.x, s.y) {
             // A fresh stroke resets accumulation, so its opacity ceiling is
             // independent of the previous stroke's.
@@ -243,9 +251,41 @@ impl Gpu {
             self.canvas_renderer.draw(&mut pass);
         }
 
+        // Panel draws over the canvas, in the same frame.
+        let surface_size = [self.config.width, self.config.height];
+        self.ui.render(
+            &self.window,
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &view,
+            surface_size,
+            &mut self.brush,
+        );
+
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
         Ok(())
+    }
+
+    /// Offer a window event to the debug panel first. Returns `true` if the panel
+    /// consumed it, in which case it must not be treated as canvas input.
+    pub fn ui_handled_event(&mut self, event: &winit::event::WindowEvent) -> bool {
+        let consumed = self.ui.on_window_event(&self.window, event);
+        // egui is animated (hover highlights, sliders), so keep painting while it
+        // wants to.
+        if consumed {
+            self.window.request_redraw();
+        }
+        consumed
+    }
+
+    /// Whether a window-space point is over the panel rather than the canvas.
+    ///
+    /// Needed for the pen specifically: pen input never reaches egui, so egui's
+    /// own pointer capture cannot exclude it (see `crate::ui`).
+    pub fn ui_blocks_point(&self, x: f64, y: f64) -> bool {
+        self.ui.blocks_point(x, y)
     }
 
     pub fn window(&self) -> &Window {

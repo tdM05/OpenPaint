@@ -57,6 +57,25 @@ pub fn opaque_srgb8_to_linear_premul(rgb: [u8; 3]) -> [f32; 4] {
     ]
 }
 
+/// Convert one linear channel to an 8-bit sRGB channel.
+#[must_use]
+pub fn linear_to_srgb8(c: f32) -> u8 {
+    (linear_to_srgb(c.clamp(0.0, 1.0)) * 255.0).round() as u8
+}
+
+/// Inverse of [`opaque_srgb8_to_linear_premul`], for round-tripping an authored
+/// color back into a UI color picker.
+///
+/// Assumes opaque (alpha 1.0), so premultiplication is a no-op to undo.
+#[must_use]
+pub fn opaque_linear_premul_to_srgb8(premul: [f32; 4]) -> [u8; 3] {
+    [
+        linear_to_srgb8(premul[0]),
+        linear_to_srgb8(premul[1]),
+        linear_to_srgb8(premul[2]),
+    ]
+}
+
 /// Scale a linear premultiplied color by a coverage/alpha factor.
 ///
 /// Because the value is premultiplied, coverage scales **all four** channels —
@@ -113,6 +132,22 @@ mod tests {
     fn mid_grey_is_not_half_in_linear() {
         let lin = srgb8_to_linear(128);
         assert!((lin - 0.2159).abs() < 0.001, "got {lin}");
+    }
+
+    /// The color picker round-trip must be exact, or dragging a slider would
+    /// slowly drift the brush color.
+    #[test]
+    fn authored_color_roundtrips_through_linear() {
+        for rgb in [
+            [0, 0, 0],
+            [255, 255, 255],
+            [20, 20, 24],
+            [250, 249, 246],
+            [1, 128, 254],
+        ] {
+            let back = opaque_linear_premul_to_srgb8(opaque_srgb8_to_linear_premul(rgb));
+            assert_eq!(back, rgb);
+        }
     }
 
     #[test]

@@ -27,7 +27,7 @@
 //! curve, and modulation of parameters by pressure/tilt/velocity through curves.
 //! Only radius is pressure-driven so far.
 
-use crate::color::opaque_srgb8_to_linear_premul;
+use crate::color::{opaque_linear_premul_to_srgb8, opaque_srgb8_to_linear_premul};
 use crate::dab::Dab;
 
 /// Brush parameters. Sizes are in canvas pixels.
@@ -101,6 +101,12 @@ impl Brush {
     #[must_use]
     pub fn color_linear_premul(&self) -> [f32; 4] {
         self.color_linear_premul
+    }
+
+    /// The brush color as authored 8-bit sRGB, for display in a color picker.
+    #[must_use]
+    pub fn color_srgb8(&self) -> [u8; 3] {
+        opaque_linear_premul_to_srgb8(self.color_linear_premul)
     }
 
     /// Effective dab radius for a given pressure in `0.0..=1.0`.

@@ -23,6 +23,13 @@ bytemuck = { version = "1", features = ["derive"] }
 # Half-precision floats, to build Rgba16Float upload buffers matching the tile
 # format in openpaint-core.
 half = { version = "2", features = ["bytemuck"] }
+# Throwaway debug UI for engine work (DECISIONS section 3: the real CSP-like UI is
+# a later, deliberately reversible decision). Pinned to the 0.29 line because that
+# is what targets wgpu 22 / winit 0.30 -- a mismatch duplicates wgpu and the types
+# stop lining up.
+egui = "0.29"
+egui-wgpu = "0.29"
+egui-winit = { version = "0.29", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Native tablet/pen input (Windows Ink) behind our InputBackend trait. Windows-
