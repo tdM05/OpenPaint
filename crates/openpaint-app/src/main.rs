@@ -168,6 +168,12 @@ struct OpenPaint {
     pending_sample_ms: Option<f64>,
     /// Rolling latency and frame-time measurements.
     perf: perf::Perf,
+    /// Path smoothing, applied between the pen and the brush.
+    ///
+    /// Lives here rather than in [`Editor`] because it conditions *input*, and input is the
+    /// shell's job — the same reason `to_canvas` is here. It is stateful across a stroke, so it
+    /// cannot be a free function.
+    stabilizer: openpaint_core::Stabilizer,
 }
 
 /// Which file dialog is in flight, and where its answer will arrive.
@@ -277,6 +283,7 @@ impl Default for OpenPaint {
             file_dialog: None,
             pending_sample_ms: None,
             perf: perf::Perf::default(),
+            stabilizer: openpaint_core::Stabilizer::default(),
         }
     }
 }
@@ -308,7 +315,7 @@ impl OpenPaint {
                     return;
                 }
                 if let Some((cx, cy)) = self.to_canvas(sample) {
-                    self.editor.stroke_begin(cx, cy, sample.pressure);
+                    self.stroke_start(cx, cy, sample.pressure, sample.time_ms());
                     self.note_latency_input(sample);
                     self.request_redraw();
                 }
@@ -338,7 +345,7 @@ impl OpenPaint {
                 }
                 for sample in samples {
                     if let Some((cx, cy)) = self.to_canvas(sample) {
-                        self.editor.stroke_to(cx, cy, sample.pressure);
+                        self.stroke_continue(cx, cy, sample.pressure, sample.time_ms());
                     }
                 }
                 // The newest sample in the batch is the one at the tip of the stroke, which is
@@ -356,7 +363,7 @@ impl OpenPaint {
                 }
                 // Queues the bake that commits the stroke; demand-driven painting
                 // means it needs a frame requested or it simply never happens.
-                self.editor.stroke_end();
+                self.stroke_finish();
                 self.request_redraw();
             }
         }
@@ -401,6 +408,38 @@ impl OpenPaint {
         }
         self.nav.cursor = Some(next);
         true
+    }
+
+    /// Begin a stroke from an input sample in canvas coordinates, through smoothing.
+    ///
+    /// These three methods exist as their own seam rather than inline in the event handlers so
+    /// they can be tested without a window: the editor is headless, so a test can drive them and
+    /// read the dabs back. Every bug this session lived in a layer that had no test.
+    fn stroke_start(&mut self, cx: f32, cy: f32, pressure: f32, t_ms: f64) {
+        // Strength is read once, at the press. Dragging the slider mid-stroke must not change the
+        // filter under a line already being drawn.
+        self.stabilizer
+            .set_strength(self.editor.brush().stabilization);
+        let s = self.stabilizer.begin(cx, cy, pressure, t_ms);
+        self.editor.stroke_begin(s.x, s.y, s.pressure);
+    }
+
+    /// Extend the stroke with another input sample.
+    fn stroke_continue(&mut self, cx: f32, cy: f32, pressure: f32, t_ms: f64) {
+        let s = self.stabilizer.push(cx, cy, pressure, t_ms);
+        self.editor.stroke_to(s.x, s.y, s.pressure);
+    }
+
+    /// End the stroke, first carrying the line to where the pen actually lifted.
+    ///
+    /// Smoothing trails by design, so without the tail every stabilized stroke would stop short of
+    /// its own endpoint — ruining tapers and leaving strokes that should meet apart. The tail is
+    /// empty when smoothing is off.
+    fn stroke_finish(&mut self) {
+        for s in self.stabilizer.finish() {
+            self.editor.stroke_to(s.x, s.y, s.pressure);
+        }
+        self.editor.stroke_end();
     }
 
     /// Mark this sample as the one whose latency the next presented frame will measure.
@@ -1938,6 +1977,94 @@ mod tests {
         app.note_pointer(10.0, 20.0);
         app.crop = Some(crop::Crop::new(app.editor.page_rect()));
         assert!(app.brush_cursor().is_none());
+    }
+
+    /// Draw a straight rightward stroke at 1 px/ms and report the dabs it produced.
+    ///
+    /// One pixel per millisecond makes the numbers legible: a lag of *n* ms is a shortfall of
+    /// *n* px, so the stabilizer's advertised cost can be read straight off the geometry.
+    /// `finish` chooses whether the pen-lift convergence runs, which is what isolates the lag
+    /// from the correction for it.
+    #[cfg(test)]
+    fn drag_right(stabilization: f32, length: u32, finish: bool) -> Vec<openpaint_core::Dab> {
+        let mut app = OpenPaint::default();
+        app.editor.brush_mut().stabilization = stabilization;
+
+        app.stroke_start(0.0, 100.0, 1.0, 0.0);
+        for i in 1..=length {
+            app.stroke_continue(i as f32, 100.0, 1.0, f64::from(i));
+        }
+        if finish {
+            app.stroke_finish();
+        }
+
+        let (_, dabs) = app.editor.pending_stroke();
+        dabs.to_vec()
+    }
+
+    /// Where the drawn line had reached, in page pixels.
+    #[cfg(test)]
+    fn reached(dabs: &[openpaint_core::Dab]) -> f32 {
+        dabs.last().expect("the drag must produce dabs").x
+    }
+
+    /// With smoothing off, the line has to be exactly where the pen was.
+    #[test]
+    fn an_unstabilized_stroke_follows_the_pen_exactly() {
+        let dabs = drag_right(0.0, 300, true);
+        for dab in &dabs {
+            assert!(
+                (dab.y - 100.0).abs() < 1e-3,
+                "smoothing is off, so nothing should have moved off the line: y = {}",
+                dab.y
+            );
+        }
+        // Within one dab spacing of the end: dabs land at spacing intervals, so the last one sits
+        // slightly short by construction.
+        assert!(
+            reached(&dabs) > 295.0,
+            "the line stopped at {} instead of near 300",
+            reached(&dabs)
+        );
+    }
+
+    /// The lag half of the feature, through the real code path.
+    ///
+    /// At full strength the time constant is 50 ms, and this drag runs at 1 px/ms, so the drawn
+    /// line should sit ~50 px behind the pen when it lifts. Measured with the convergence tail
+    /// suppressed, so it is the filter being observed rather than the correction for it.
+    #[test]
+    fn a_stabilized_stroke_trails_the_pen_while_drawing() {
+        let smoothed = reached(&drag_right(1.0, 300, false));
+        let raw = reached(&drag_right(0.0, 300, false));
+
+        assert!(
+            raw - smoothed > 40.0 && raw - smoothed < 60.0,
+            "expected ~50 px of trail at 50 ms and 1 px/ms, got {} (raw reached {raw}, \
+             smoothed {smoothed})",
+            raw - smoothed
+        );
+    }
+
+    /// The correction half, and the one that breaks silently.
+    ///
+    /// A one-pole filter never catches up, so without the pen-lift convergence every stabilized
+    /// stroke would stop ~50 px short at this strength — which reads as the app losing the end of
+    /// every line, taper and all.
+    #[test]
+    fn a_stabilized_stroke_still_ends_where_the_pen_did() {
+        let finished = reached(&drag_right(1.0, 300, true));
+        let unfinished = reached(&drag_right(1.0, 300, false));
+
+        assert!(
+            finished > 295.0,
+            "the stroke ended at {finished} instead of near 300"
+        );
+        assert!(
+            finished - unfinished > 40.0,
+            "the convergence tail moved the end by only {}, so it is not doing its job",
+            finished - unfinished
+        );
     }
 
     /// The ring reports the size of the mark *on screen*, so it has to track zoom.

@@ -455,6 +455,56 @@ produce mouse motion at all — whether Windows synthesises it depends on the
 driver and on what RealTimeStylus consumes. The backend that already knows the
 pose is the one that can answer reliably.
 
+### 4h. Stabilization is a filter in time, and it states its own price — landed 2026-08-28
+
+Hand tremor sits around 8–12 Hz and cheap digitizers quantize on top, so a slowly
+drawn line comes out wobbly however steady the intent. `openpaint-core/src/stabilizer.rs`
+is a one-pole filter chasing the pen: `alpha = 1 - exp(-dt / tau)`.
+
+**`dt` is elapsed time, not "one sample".** This is the decision, and it is why
+§4f's clock had to land first. A fixed alpha per sample — the version almost
+everyone writes — is wrong twice over:
+
+- **It varies with hardware.** A 200 Hz tablet steps through the filter four
+  times as often as a 50 Hz one and converges four times faster. The same gesture
+  would draw differently on two tablets, and the setting would need re-tuning per
+  device.
+- **It varies with drawing speed.** Slow movement means more samples per unit
+  distance, so more smoothing exactly where the artist is being careful — the
+  opposite of what is wanted.
+
+Both vanish when `tau` is a duration. A test pins this by running the same path at
+1 ms and 2 ms report intervals and asserting they agree, *and* by running a
+fixed-alpha filter alongside and asserting it does not — so the tolerance cannot
+be what passes the test.
+
+**The lag is exact, so the UI states it.** A one-pole filter following steady
+movement settles exactly `tau` behind. `Stabilizer::lag_ms` is therefore a fact,
+not an estimate, and the slider reads "adds about N ms of lag. Compare against the
+stroke time under Speed." A control that spends the top quality axis (§4.1) must
+say what it is spending, and §4f is what made that sayable.
+
+**Ending where the pen ended.** A trailing filter never catches up, so at pen-lift
+the line is short by roughly the lag distance — at full strength and a brisk
+stroke, ~50 px. Left alone that reads as the app losing the end of every line.
+`finish` converges the remainder rather than jumping it, so the approach
+decelerates like the rest of the stroke, then lands exactly on the true endpoint.
+Two tests cover the two halves separately, with the tail suppressed in one, so the
+filter and the correction for it cannot mask each other.
+
+**Default: off.** Deliberately not a guess. How much smoothing an artist needs
+depends on their hand and their digitizer, and this project has measured neither on
+any hardware. Inventing a nonzero constant is what this document exists to prevent;
+the priced slider lets the choice be made with the number visible, and a default
+can be *earned* from real use. Per-brush rather than global, for the same reason
+each tool keeps its own radius: inking wants a lot, sketching wants none.
+
+**Where it lives:** the app's input path (`stroke_start` / `stroke_continue` /
+`stroke_finish`), between the pen and the brush — stabilization conditions input,
+and input is the shell's job. Those three methods exist as a named seam so they can
+be driven headlessly in tests, since every bug found this session lived in a layer
+that had none.
+
 ---
 
 ## 5. Document model — the core differentiator

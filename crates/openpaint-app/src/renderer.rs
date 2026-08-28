@@ -148,10 +148,27 @@ impl Renderer {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
+            // Fifo, deliberately: a paint app is not a game, and tearing across a canvas you are
+            // staring at is worse than a frame of latency. It also idles instead of spinning,
+            // which matters on the battery-powered §2 target.
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            // One, not the usual two. Frame latency is how many frames the driver will accept
+            // before making us wait, so it is *bought* latency: at two, a stroke can sit finished
+            // in the queue for an extra display refresh before anyone sees it. Two exists to keep
+            // GPUs fed when frames are expensive and irregular; ours cost ~1 ms of work against a
+            // 16.7 ms refresh, so there is nothing to smooth over and the second frame of buffer
+            // is pure delay.
+            //
+            // **Kept, but unproven.** Measured stroke latency was 16.6 ms mean / 19.1 peak at two
+            // and 16.4 / 19.3 at one — no change. That is expected rather than reassuring: our
+            // measurement stops when `present` returns, and the presentation queue this setting
+            // governs is entirely downstream of that, so the experiment could not have shown a
+            // win even if there were one. It stays at one because frames are cheap enough that the
+            // extra buffer cannot help, and DECISIONS §4.1 says which way to lean when a trade is
+            // unresolved. Reading the tablet's own clock (Q10a.3) is what would settle it.
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &config);
 

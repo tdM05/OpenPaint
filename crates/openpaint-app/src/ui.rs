@@ -324,6 +324,30 @@ impl Ui {
                             ui.add(egui::Slider::new(&mut brush.spacing, 0.01..=1.0).text("Spacing"));
 
                             ui.separator();
+                            ui.add(
+                                egui::Slider::new(&mut brush.stabilization, 0.0..=1.0)
+                                    .text("Stabilization"),
+                            );
+                            // The control states its own price. Smoothing is bought with latency
+                            // and the amount is exactly knowable (a one-pole filter trails its
+                            // input by its time constant), so there is no excuse for making the
+                            // artist discover the cost by feel -- especially with latency named
+                            // the top quality axis in DECISIONS §4.1.
+                            ui.label(
+                                egui::RichText::new(if brush.stabilization <= 0.0 {
+                                    "Off. Smooths pen shake; costs latency, priced here.".to_owned()
+                                } else {
+                                    format!(
+                                        "Smooths pen shake, and adds about {:.0} ms of lag. \
+                                         Compare against the stroke time under Speed.",
+                                        openpaint_core::Stabilizer::lag_ms(brush.stabilization)
+                                    )
+                                })
+                                .small()
+                                .weak(),
+                            );
+
+                            ui.separator();
                             ui.add(egui::Slider::new(&mut brush.flow, 0.0..=1.0).text("Flow"));
                             ui.add(egui::Slider::new(&mut brush.opacity, 0.0..=1.0).text("Opacity"));
                             ui.label(
