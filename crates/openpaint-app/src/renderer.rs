@@ -157,6 +157,16 @@ impl Renderer {
         self.config.format
     }
 
+    /// Largest canvas dimension the device will allocate.
+    ///
+    /// The canvas is one texture for now, so this is a hard ceiling on page size.
+    /// It is 8192 with the default limits we deliberately request (DECISIONS §2);
+    /// the tiled cache (Q13) is what removes it.
+    #[must_use]
+    pub fn max_canvas_dimension(&self) -> u32 {
+        self.device.limits().max_texture_dimension_2d
+    }
+
     /// Surface size in physical pixels.
     #[must_use]
     pub fn size_px(&self) -> (u32, u32) {

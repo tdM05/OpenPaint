@@ -99,9 +99,9 @@ struct OpenPaint {
     /// Canvas navigation (pan/zoom) state. Kept in the shell rather than the
     /// view because it is *interaction* state, not camera state.
     nav: Nav,
-    /// Result of the most recent export, shown in the panel so the outcome isn't
-    /// only visible in a console the user may not be watching.
-    last_export: Option<String>,
+    /// Most recent notable outcome (export, resize refusal, history loss), shown in
+    /// the panel so it isn't only visible in a console the user may not be watching.
+    status_message: Option<String>,
     /// Set while we're inside one of our own event handlers, so a nested
     /// message pump can't re-enter our GPU/input work. See the module-level
     /// "Windows Ink reentrancy" note - without this, a re-entered frame can
@@ -170,7 +170,7 @@ impl Default for OpenPaint {
             input: Box::new(MouseBackend::new()),
             pen_events: Vec::new(),
             nav: Nav::default(),
-            last_export: None,
+            status_message: None,
             in_dispatch: false,
         }
     }
@@ -275,12 +275,46 @@ impl OpenPaint {
             let page = self.editor.document().active();
             (page.width(), page.height())
         };
-        let (new_w, new_h, anchor) = match dir {
-            ExtendDir::Down => (w, h + amount, Anchor::TOP_LEFT),
-            ExtendDir::Up => (w, h + amount, Anchor::BOTTOM_LEFT),
-            ExtendDir::Right => (w + amount, h, Anchor::TOP_LEFT),
-            ExtendDir::Left => (w + amount, h, Anchor::TOP_RIGHT),
+        let (wanted_w, wanted_h, anchor) = match dir {
+            ExtendDir::Down => (
+                w.saturating_add(0),
+                h.saturating_add(amount),
+                Anchor::TOP_LEFT,
+            ),
+            ExtendDir::Up => (w, h.saturating_add(amount), Anchor::BOTTOM_LEFT),
+            ExtendDir::Right => (w.saturating_add(amount), h, Anchor::TOP_LEFT),
+            ExtendDir::Left => (w.saturating_add(amount), h, Anchor::TOP_RIGHT),
         };
+
+        // The canvas is one texture, so the page cannot exceed what the device will
+        // allocate. Requesting more used to panic inside wgpu; clamp and say so.
+        let max = self
+            .renderer
+            .as_ref()
+            .map_or(8192, Renderer::max_canvas_dimension);
+        let Some((new_w, new_h)) = editor::clamp_page_size((w, h), (wanted_w, wanted_h), max)
+        else {
+            self.status_message = Some(format!(
+                "Page is at the {max} px limit -- a tiled canvas is needed to go further"
+            ));
+            self.request_redraw();
+            return;
+        };
+        if (new_w, new_h) != (wanted_w, wanted_h) {
+            self.status_message = Some(format!("Extend clamped to the {max} px texture limit"));
+        }
+
+        // A size within the dimension limit can still be far too much memory to
+        // allocate, and a failed allocation is a device error -- another crash, just
+        // a different one.
+        if !editor::fits_pixel_budget(new_w, new_h) {
+            let mpx = editor::MAX_CANVAS_PIXELS / (1024 * 1024);
+            self.status_message = Some(format!(
+                "{new_w}x{new_h} exceeds the interim {mpx} Mpx single-texture budget;                  a tiled canvas is needed to go further"
+            ));
+            self.request_redraw();
+            return;
+        }
 
         let (dx, dy) = self.editor.resize_page(new_w, new_h, anchor);
         let history_kept = match self.renderer.as_mut() {
@@ -288,7 +322,7 @@ impl OpenPaint {
             None => true,
         };
         if !history_kept {
-            self.last_export = Some("Undo history cleared by the resize".to_owned());
+            self.status_message = Some("Undo history cleared by the resize".to_owned());
         }
 
         // Show the new extent, so the user can see what they just added.
@@ -362,7 +396,7 @@ impl OpenPaint {
             return;
         };
         let path = export::default_path();
-        self.last_export = Some(match renderer.export_png(&path) {
+        self.status_message = Some(match renderer.export_png(&path) {
             Ok(()) => {
                 // Absolute, because a bare relative name leaves the user hunting
                 // for the file -- the working directory is not obvious when the app
@@ -525,7 +559,7 @@ impl OpenPaint {
         let mut ui_inset_left = None;
         let mut extend_request = None;
         let history_status = renderer.history_status();
-        let last_export = self.last_export.clone();
+        let status_message = self.status_message.clone();
         let page_size = {
             let page = editor.document().active();
             (page.width(), page.height())
@@ -544,7 +578,7 @@ impl OpenPaint {
                     view,
                     ui::Status {
                         history: history_status,
-                        last_export: last_export.as_deref(),
+                        message: status_message.as_deref(),
                         page_size,
                     },
                 );

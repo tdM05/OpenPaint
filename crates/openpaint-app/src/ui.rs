@@ -41,7 +41,7 @@ const PANEL_WIDTH: f32 = 280.0;
 pub struct Status<'a> {
     /// Undo depth, redo depth, snapshot bytes held.
     pub history: (usize, usize, usize),
-    pub last_export: Option<&'a str>,
+    pub message: Option<&'a str>,
     pub page_size: (u32, u32),
 }
 
@@ -252,7 +252,7 @@ impl Ui {
                         .small()
                         .weak(),
                     );
-                    if let Some(msg) = status.last_export {
+                    if let Some(msg) = status.message {
                         ui.label(egui::RichText::new(msg).small());
                     }
                     ui.separator();

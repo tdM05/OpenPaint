@@ -66,6 +66,50 @@ pub enum StrokeOp {
     End { bounds: Option<CanvasRect> },
 }
 
+/// Interim cap on total canvas pixels, while the canvas is a single texture.
+///
+/// The dimension limit alone is not enough protection: 8192x8192 at `Rgba16Float` is
+/// **512 MiB** for the canvas plus 128 MiB for the stroke accumulation buffer, which
+/// a Surface sharing system memory will simply fail to allocate — and a failed
+/// allocation is a device error, i.e. another crash.
+///
+/// 16 Mpx keeps the canvas at ~128 MiB and the accumulation buffer at ~32 MiB, which
+/// is defensible on integrated graphics. It permits e.g. 2048x8192 or 4096x4096.
+/// The tiled resident cache (OPEN_QUESTIONS Q13) removes this entirely, because only
+/// the visible working set is ever resident.
+pub const MAX_CANVAS_PIXELS: u64 = 16 * 1024 * 1024;
+
+/// Whether a page of this size fits the interim single-texture budget.
+#[must_use]
+pub fn fits_pixel_budget(w: u32, h: u32) -> bool {
+    u64::from(w) * u64::from(h) <= MAX_CANVAS_PIXELS
+}
+
+/// Clamp a requested page size to what the GPU can actually allocate.
+///
+/// Returns `None` when no growth is possible at all, so the caller can say so
+/// instead of attempting a resize that changes nothing.
+///
+/// This exists because the canvas is currently **one texture**, so the page can
+/// never exceed `max_dimension` — 8192 with the default wgpu limits we deliberately
+/// stay within (DECISIONS §2). Exceeding it used to panic inside
+/// `Device::create_texture`, which is not an acceptable outcome for pressing a
+/// button. The real answer is the tiled resident cache (OPEN_QUESTIONS Q13), which
+/// removes the ceiling entirely; until then this is the honest boundary.
+#[must_use]
+pub fn clamp_page_size(
+    current: (u32, u32),
+    requested: (u32, u32),
+    max_dimension: u32,
+) -> Option<(u32, u32)> {
+    let w = requested.0.min(max_dimension).max(1);
+    let h = requested.1.min(max_dimension).max(1);
+    if (w, h) == current {
+        return None;
+    }
+    Some((w, h))
+}
+
 pub struct Editor {
     document: Document,
     brush: Brush,
@@ -405,5 +449,63 @@ mod tests {
         let mut e = Editor::new();
         e.stroke_begin(-500.0, -500.0, 1.0);
         assert_eq!(e.pending_stroke().1.len(), 1);
+    }
+
+    #[test]
+    fn a_normal_extend_is_not_clamped() {
+        assert_eq!(
+            clamp_page_size((2048, 2048), (2048, 2560), 8192),
+            Some((2048, 2560))
+        );
+    }
+
+    /// The case that used to panic inside wgpu: a request past the texture limit.
+    #[test]
+    fn extending_past_the_limit_clamps_to_it() {
+        assert_eq!(
+            clamp_page_size((2048, 8000), (2048, 9216), 8192),
+            Some((2048, 8192))
+        );
+    }
+
+    /// Already at the ceiling: there is nothing to do, and the caller needs to know
+    /// rather than resize to the same size and report success.
+    #[test]
+    fn no_growth_available_reports_none() {
+        assert_eq!(clamp_page_size((2048, 8192), (2048, 9216), 8192), None);
+    }
+
+    #[test]
+    fn width_and_height_clamp_independently() {
+        assert_eq!(
+            clamp_page_size((8192, 1000), (9000, 2000), 8192),
+            Some((8192, 2000))
+        );
+    }
+
+    #[test]
+    fn a_zero_request_is_clamped_to_something_drawable() {
+        assert_eq!(clamp_page_size((100, 100), (0, 0), 8192), Some((1, 1)));
+    }
+
+    /// The dimension limit alone would still permit 8192x8192, which is 512 MiB and
+    /// would fail to allocate on the target hardware -- another crash, just a
+    /// different one.
+    #[test]
+    fn the_pixel_budget_rejects_sizes_the_dimension_limit_allows() {
+        assert!(!fits_pixel_budget(8192, 8192));
+        assert!(fits_pixel_budget(2048, 2048), "the default page must fit");
+        assert!(
+            fits_pixel_budget(2048, 8192),
+            "a tall webtoon-ish page should fit"
+        );
+        assert!(fits_pixel_budget(4096, 4096));
+        assert!(!fits_pixel_budget(4096, 8192));
+    }
+
+    /// A4 at 300 DPI has to fit, or the print workflow is impossible.
+    #[test]
+    fn a4_at_300_dpi_fits_the_budget() {
+        assert!(fits_pixel_budget(2480, 3508));
     }
 }

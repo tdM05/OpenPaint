@@ -297,6 +297,19 @@ without a GPU.
 
 **Still outstanding, deliberately:**
 
+0. ⚠️ **The whole-canvas texture now has a user-visible ceiling, found by crash.**
+   Extending repeatedly panicked inside `Device::create_texture`:
+   `Dimension Y value 9216 exceeds the limit of 8192`. Fixed to degrade gracefully
+   (clamp + explain), but the underlying limit is real and it **blocks the webtoon
+   use case outright** — a tall strip needs more than 8192 px.
+   Two separate ceilings, both interim guards in `editor.rs`:
+   - **Dimension:** 8192, from the default wgpu limits we deliberately request.
+   - **Memory:** a 16 Mpx budget, because 8192×8192 at `Rgba16Float` is 512 MiB for
+     the canvas plus 128 MiB for the stroke buffer. A failed allocation is a device
+     error, i.e. another crash — so the dimension clamp alone was not enough.
+   Both vanish with the tiled resident cache, which makes this the next piece of work
+   rather than a deferred nicety.
+
 1. **Whole-canvas GPU textures** (`canvas_renderer.rs`, `stroke_layer.rs`).
    Contradicts the bounded-tile-cache requirement in DECISIONS §2 / Q13. Now *two*
    canvas-sized textures: the canvas (~34 MB at 2048², `Rgba16Float`) and the
