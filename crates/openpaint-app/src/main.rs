@@ -1348,6 +1348,19 @@ impl OpenPaint {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                // Over the panel, the wheel belongs to the panel: it is taller than the window
+                // and has to be scrollable. egui does get first refusal on events before this
+                // handler runs, but it only reports a scroll as consumed once it has a scrollable
+                // area under the pointer *as of the last frame* -- so on the first notch after
+                // the pointer arrives, the canvas would jump. Asking where the pointer is costs
+                // nothing and does not depend on a frame having happened.
+                if self
+                    .nav
+                    .cursor
+                    .is_some_and(|(cx, cy)| self.ui_blocks_point(cx, cy))
+                {
+                    return false;
+                }
                 let notches = match delta {
                     MouseScrollDelta::LineDelta(_, y) => *y,
                     // Trackpads report pixels; ~50px per notch feels close to a

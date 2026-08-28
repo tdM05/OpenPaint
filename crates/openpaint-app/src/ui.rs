@@ -271,394 +271,403 @@ impl Ui {
             let panel = egui::SidePanel::left("brush-panel")
                 .exact_width(PANEL_WIDTH)
                 .show(ctx, |ui| {
-                    ui.heading("Tool");
-                    ui.horizontal(|ui| {
-                        for tool in Tool::ALL {
-                            if ui
-                                .selectable_label(status.tool == tool, tool.label())
-                                .clicked()
-                            {
-                                tool_action = Some(tool);
-                            }
-                        }
-                    });
-                    ui.label(
-                        egui::RichText::new(
-                            "B and E switch tool. Each keeps its own size, because an eraser \
-                             almost never wants the brush's. [ and ] resize; Shift+[ and \
-                             Shift+] rotate the canvas.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-
-                    ui.separator();
-                    ui.heading("Brush");
-                    ui.add_space(4.0);
-
-                    ui.add(
-                        egui::Slider::new(&mut brush.radius, 0.5..=400.0)
-                            .logarithmic(true)
-                            .text("Size (radius px)"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut brush.hardness, 0.0..=1.0)
-                            .text("Hardness")
-                            .custom_formatter(|v, _| {
-                                // Name the ends, because a bare number gives no
-                                // clue which way round it goes.
-                                match v {
-                                    v if v <= 0.001 => "0.00 soft".to_owned(),
-                                    v if v >= 0.999 => "1.00 hard".to_owned(),
-                                    v => format!("{v:.2}"),
-                                }
-                            }),
-                    );
-                    ui.add(egui::Slider::new(&mut brush.spacing, 0.01..=1.0).text("Spacing"));
-
-                    ui.separator();
-                    ui.add(egui::Slider::new(&mut brush.flow, 0.0..=1.0).text("Flow"));
-                    ui.add(egui::Slider::new(&mut brush.opacity, 0.0..=1.0).text("Opacity"));
-                    ui.label(
-                        egui::RichText::new(
-                            "Flow = paint per dab. Opacity = ceiling for the whole \
-                             stroke. Set flow low and opacity mid to see build-up \
-                             stop at the ceiling; lift and stroke again to go darker.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("Color");
-                        ui.color_edit_button_srgb(&mut color_srgb);
-                    });
-
-                    ui.separator();
-                    if ui.button("Reset to defaults").clicked() {
-                        *brush = Brush::default();
-                        color_srgb = brush.color_srgb8();
-                    }
-
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Spacing is a fraction of diameter (Photoshop ~0.25), so \n                             dabs land every {:.2} px.",
-                            brush.radius * 2.0 * brush.spacing
-                        ))
-                        .small()
-                        .weak(),
-                    );
-                    ui.separator();
-                    ui.heading("View");
-                    ui.label(format!(
-                        "Zoom {:.0}%    Rotation {:.0} deg",
-                        view.scale() * 100.0,
-                        view.rotation().to_degrees()
-                    ));
-                    ui.label(
-                        egui::RichText::new(
-                            "Wheel zooms at the cursor. Space+drag or middle-drag pans. \
-                             [ and ] rotate. 0 fits, 1 goes to 100%.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    ui.label(
-                        egui::RichText::new(
-                            "Navigation is mouse/keyboard only for now: pen input \
-                             bypasses the UI layer (Q14).",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    ui.separator();
-                    ui.heading("History");
-                    let (undo_depth, redo_depth, bytes) = status.history;
-                    ui.label(format!(
-                        "Undo {undo_depth}   Redo {redo_depth}   ({:.1} MiB)",
-                        bytes as f32 / (1024.0 * 1024.0)
-                    ));
-                    ui.label(
-                        egui::RichText::new(
-                            "Ctrl+Z undoes, Ctrl+Shift+Z or Ctrl+Y redoes. Snapshots cover \
-                             only the tiles a stroke touched.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    ui.separator();
-                    ui.heading("Pages");
-                    let (page_count, active_page) = status.pages;
-                    if ui.button("Add page").clicked() {
-                        page_action = Some(PageAction::Add);
-                    }
-                    for index in 0..page_count {
-                        ui.horizontal(|ui| {
-                            let selected = index == active_page;
-                            if ui
-                                .selectable_label(selected, format!("Page {}", index + 1))
-                                .clicked()
-                            {
-                                page_action = Some(PageAction::Select(index));
-                            }
-                            if selected {
-                                if ui
-                                    .add_enabled(index > 0, egui::Button::new("Up"))
-                                    .clicked()
-                                {
-                                    page_action = Some(PageAction::Move {
-                                        from: index,
-                                        to: index - 1,
-                                    });
-                                }
-                                if ui
-                                    .add_enabled(index + 1 < page_count, egui::Button::new("Down"))
-                                    .clicked()
-                                {
-                                    page_action = Some(PageAction::Move {
-                                        from: index,
-                                        to: index + 1,
-                                    });
-                                }
-                                // The last page cannot go: a document must have somewhere to
-                                // draw.
-                                if ui
-                                    .add_enabled(page_count > 1, egui::Button::new("Delete"))
-                                    .clicked()
-                                {
-                                    page_action = Some(PageAction::Delete(index));
-                                }
-                            }
-                        });
-                    }
-                    ui.label(
-                        egui::RichText::new(
-                            "A webtoon is one very tall page, a sketchbook is many -- one model \
-                             either way (DECISIONS §5a). Deleting a page is undoable.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-
-                    ui.separator();
-                    ui.heading("Layers");
-                    if ui.button("Add layer").clicked() {
-                        layer_action = Some(LayerAction::Add);
-                    }
-                    // Top-down, because that is how every drawing app shows a stack and how
-                    // artists talk about it -- the document stores it bottom-first.
-                    let count = status.layers.len();
-                    for (index, layer) in status.layers.iter().enumerate().rev() {
-                        let selected = index == status.active_layer;
-                        ui.push_id(layer.id(), |ui| {
+                    // Scrollable, because the panel already stands taller than a window and
+                    // every section below the fold was simply unreachable -- the speed readout
+                    // was invisible on a laptop screen. `auto_shrink` off so it fills the panel
+                    // instead of collapsing onto its content.
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            ui.heading("Tool");
                             ui.horizontal(|ui| {
-                                let mut visible = layer.visible;
-                                if ui.checkbox(&mut visible, "").changed() {
-                                    layer_action =
-                                        Some(LayerAction::SetVisible { index, visible });
-                                }
-                                if ui.selectable_label(selected, &layer.name).clicked() {
-                                    layer_action = Some(LayerAction::Select(index));
-                                }
-                            });
-                            if selected {
-                                ui.horizontal(|ui| {
-                                    let mut opacity = layer.opacity;
+                                for tool in Tool::ALL {
                                     if ui
-                                        .add(
-                                            egui::Slider::new(&mut opacity, 0.0..=1.0)
-                                                .text("opacity"),
-                                        )
-                                        .changed()
-                                    {
-                                        layer_action =
-                                            Some(LayerAction::SetOpacity { index, opacity });
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    egui::ComboBox::from_id_salt("blend")
-                                        .selected_text(layer.blend.label())
-                                        .show_ui(ui, |ui| {
-                                            for mode in Blend::ALL {
-                                                if ui
-                                                    .selectable_label(
-                                                        layer.blend == mode,
-                                                        mode.label(),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    layer_action = Some(LayerAction::SetBlend {
-                                                        index,
-                                                        blend: mode,
-                                                    });
-                                                }
-                                            }
-                                        });
-                                    if ui
-                                        .add_enabled(index + 1 < count, egui::Button::new("Up"))
+                                        .selectable_label(status.tool == tool, tool.label())
                                         .clicked()
                                     {
-                                        layer_action = Some(LayerAction::Move {
-                                            from: index,
-                                            to: index + 1,
-                                        });
+                                        tool_action = Some(tool);
                                     }
-                                    if ui.add_enabled(index > 0, egui::Button::new("Down")).clicked()
-                                    {
-                                        layer_action = Some(LayerAction::Move {
-                                            from: index,
-                                            to: index - 1,
-                                        });
-                                    }
-                                    // The last layer cannot go: a page with nowhere to paint is
-                                    // a state every caller would have to special-case.
-                                    if ui
-                                        .add_enabled(count > 1, egui::Button::new("Delete"))
-                                        .clicked()
-                                    {
-                                        layer_action = Some(LayerAction::Delete(index));
-                                    }
-                                });
-                            }
-                        });
-                    }
-                    ui.label(
-                        egui::RichText::new(
-                            "Multiply darkens what is under it, Screen lightens. Deleting a \
-                             layer is undoable -- otherwise it would not be offered.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-
-                    ui.separator();
-                    ui.heading("Canvas memory");
-                    let (used, capacity) = status.residency;
-                    ui.label(format!(
-                        "GPU {used} / {capacity} tiles ({:.0} of {:.0} MiB)",
-                        used as f32 * 0.5,
-                        capacity as f32 * 0.5
-                    ));
-                    if status.spilled > 0 {
-                        let (out, back) = status.traffic;
-                        ui.label(format!(
-                            "CPU {} tiles ({:.0} MiB), {out} out / {back} back",
-                            status.spilled,
-                            status.spilled as f32 * 0.5
-                        ));
-                    }
-                    if ui.button("Trim to canvas").clicked() {
-                        trim = true;
-                    }
-                    ui.label(
-                        egui::RichText::new(
-                            "Cropping keeps the pixels outside the page, so nothing is lost \
-                             by accident. Trim discards them for good -- undoably.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    ui.separator();
-                    ui.heading("Speed");
-                    // Shown in the app, not only logged, because the number has to be visible at
-                    // the moment something feels wrong -- that is when it is worth reading, and a
-                    // log read afterwards cannot tell you what you were doing at the time.
-                    match status.perf.input {
-                        Some((mean, peak)) => {
-                            ui.label(format!("Stroke {mean:.1} ms, peak {peak:.1}"));
-                        }
-                        None => {
-                            ui.label("Stroke -- draw something");
-                        }
-                    }
-                    if let Some((mean, peak)) = status.perf.frame {
-                        ui.label(format!("Frame {mean:.1} ms, peak {peak:.1}"));
-                    }
-                    ui.label(
-                        egui::RichText::new(
-                            "Stroke time is from the sample reaching us to the frame being \
-                             presented. It leaves out the tablet, the driver and the display, \
-                             so the real figure is higher.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    ui.separator();
-                    ui.heading("Export");
-                    ui.label(
-                        egui::RichText::new(
-                            "Ctrl+S writes a PNG in the working directory. Not a \
-                             save format yet: that waits for the page model (Q6).",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    if let Some(msg) = status.message {
-                        ui.label(egui::RichText::new(msg).small());
-                    }
-                    ui.separator();
-                    ui.heading("Page");
-                    ui.label(format!(
-                        "{} x {} px",
-                        status.page_size.0, status.page_size.1
-                    ));
-                    ui.add(
-                        egui::Slider::new(&mut extend_amount, 32..=4096)
-                            .logarithmic(true)
-                            .text("Extend by (px)"),
-                    );
-                    ui.horizontal(|ui| {
-                        if ui.button("Extend down").clicked() {
-                            extend = Some((Side::Bottom, extend_amount));
-                        }
-                        if ui.button("up").clicked() {
-                            extend = Some((Side::Top, extend_amount));
-                        }
-                        if ui.button("left").clicked() {
-                            extend = Some((Side::Left, extend_amount));
-                        }
-                        if ui.button("right").clicked() {
-                            extend = Some((Side::Right, extend_amount));
-                        }
-                    });
-                    ui.label(
-                        egui::RichText::new(
-                            "All four directions exist in the engine; the real UI \
-                             will show only what a mode needs (DECISIONS 5a). This \
-                             is a debug panel, so it shows everything.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    ui.separator();
-                    match status.crop_rect {
-                        None => {
-                            if ui.button("Crop / resize by dragging").clicked() {
-                                crop_action = Some(CropAction::Start);
-                            }
-                        }
-                        Some((x, y, w, h)) => {
-                            ui.label(format!("Crop to {w} x {h} at ({x}, {y})"));
-                            ui.horizontal(|ui| {
-                                if ui.button("Apply").clicked() {
-                                    crop_action = Some(CropAction::Apply);
-                                }
-                                if ui.button("Cancel").clicked() {
-                                    crop_action = Some(CropAction::Cancel);
                                 }
                             });
                             ui.label(
                                 egui::RichText::new(
-                                    "Drag an edge or corner; drag inside to move it. Dragging \
-                                     outward extends the page. Enter applies, Escape cancels.",
+                                    "B and E switch tool. Each keeps its own size, because an eraser \
+                                     almost never wants the brush's. [ and ] resize; Shift+[ and \
+                                     Shift+] rotate the canvas.",
                                 )
                                 .small()
                                 .weak(),
                             );
-                        }
-                    }
+
+                            ui.separator();
+                            ui.heading("Brush");
+                            ui.add_space(4.0);
+
+                            ui.add(
+                                egui::Slider::new(&mut brush.radius, 0.5..=400.0)
+                                    .logarithmic(true)
+                                    .text("Size (radius px)"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut brush.hardness, 0.0..=1.0)
+                                    .text("Hardness")
+                                    .custom_formatter(|v, _| {
+                                        // Name the ends, because a bare number gives no
+                                        // clue which way round it goes.
+                                        match v {
+                                            v if v <= 0.001 => "0.00 soft".to_owned(),
+                                            v if v >= 0.999 => "1.00 hard".to_owned(),
+                                            v => format!("{v:.2}"),
+                                        }
+                                    }),
+                            );
+                            ui.add(egui::Slider::new(&mut brush.spacing, 0.01..=1.0).text("Spacing"));
+
+                            ui.separator();
+                            ui.add(egui::Slider::new(&mut brush.flow, 0.0..=1.0).text("Flow"));
+                            ui.add(egui::Slider::new(&mut brush.opacity, 0.0..=1.0).text("Opacity"));
+                            ui.label(
+                                egui::RichText::new(
+                                    "Flow = paint per dab. Opacity = ceiling for the whole \
+                                     stroke. Set flow low and opacity mid to see build-up \
+                                     stop at the ceiling; lift and stroke again to go darker.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label("Color");
+                                ui.color_edit_button_srgb(&mut color_srgb);
+                            });
+
+                            ui.separator();
+                            if ui.button("Reset to defaults").clicked() {
+                                *brush = Brush::default();
+                                color_srgb = brush.color_srgb8();
+                            }
+
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Spacing is a fraction of diameter (Photoshop ~0.25), so \n                             dabs land every {:.2} px.",
+                                    brush.radius * 2.0 * brush.spacing
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                            ui.separator();
+                            ui.heading("View");
+                            ui.label(format!(
+                                "Zoom {:.0}%    Rotation {:.0} deg",
+                                view.scale() * 100.0,
+                                view.rotation().to_degrees()
+                            ));
+                            ui.label(
+                                egui::RichText::new(
+                                    "Wheel zooms at the cursor. Space+drag or middle-drag pans. \
+                                     [ and ] rotate. 0 fits, 1 goes to 100%.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "Navigation is mouse/keyboard only for now: pen input \
+                                     bypasses the UI layer (Q14).",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            ui.separator();
+                            ui.heading("History");
+                            let (undo_depth, redo_depth, bytes) = status.history;
+                            ui.label(format!(
+                                "Undo {undo_depth}   Redo {redo_depth}   ({:.1} MiB)",
+                                bytes as f32 / (1024.0 * 1024.0)
+                            ));
+                            ui.label(
+                                egui::RichText::new(
+                                    "Ctrl+Z undoes, Ctrl+Shift+Z or Ctrl+Y redoes. Snapshots cover \
+                                     only the tiles a stroke touched.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            ui.separator();
+                            ui.heading("Pages");
+                            let (page_count, active_page) = status.pages;
+                            if ui.button("Add page").clicked() {
+                                page_action = Some(PageAction::Add);
+                            }
+                            for index in 0..page_count {
+                                ui.horizontal(|ui| {
+                                    let selected = index == active_page;
+                                    if ui
+                                        .selectable_label(selected, format!("Page {}", index + 1))
+                                        .clicked()
+                                    {
+                                        page_action = Some(PageAction::Select(index));
+                                    }
+                                    if selected {
+                                        if ui
+                                            .add_enabled(index > 0, egui::Button::new("Up"))
+                                            .clicked()
+                                        {
+                                            page_action = Some(PageAction::Move {
+                                                from: index,
+                                                to: index - 1,
+                                            });
+                                        }
+                                        if ui
+                                            .add_enabled(index + 1 < page_count, egui::Button::new("Down"))
+                                            .clicked()
+                                        {
+                                            page_action = Some(PageAction::Move {
+                                                from: index,
+                                                to: index + 1,
+                                            });
+                                        }
+                                        // The last page cannot go: a document must have somewhere to
+                                        // draw.
+                                        if ui
+                                            .add_enabled(page_count > 1, egui::Button::new("Delete"))
+                                            .clicked()
+                                        {
+                                            page_action = Some(PageAction::Delete(index));
+                                        }
+                                    }
+                                });
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "A webtoon is one very tall page, a sketchbook is many -- one model \
+                                     either way (DECISIONS §5a). Deleting a page is undoable.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+
+                            ui.separator();
+                            ui.heading("Layers");
+                            if ui.button("Add layer").clicked() {
+                                layer_action = Some(LayerAction::Add);
+                            }
+                            // Top-down, because that is how every drawing app shows a stack and how
+                            // artists talk about it -- the document stores it bottom-first.
+                            let count = status.layers.len();
+                            for (index, layer) in status.layers.iter().enumerate().rev() {
+                                let selected = index == status.active_layer;
+                                ui.push_id(layer.id(), |ui| {
+                                    ui.horizontal(|ui| {
+                                        let mut visible = layer.visible;
+                                        if ui.checkbox(&mut visible, "").changed() {
+                                            layer_action =
+                                                Some(LayerAction::SetVisible { index, visible });
+                                        }
+                                        if ui.selectable_label(selected, &layer.name).clicked() {
+                                            layer_action = Some(LayerAction::Select(index));
+                                        }
+                                    });
+                                    if selected {
+                                        ui.horizontal(|ui| {
+                                            let mut opacity = layer.opacity;
+                                            if ui
+                                                .add(
+                                                    egui::Slider::new(&mut opacity, 0.0..=1.0)
+                                                        .text("opacity"),
+                                                )
+                                                .changed()
+                                            {
+                                                layer_action =
+                                                    Some(LayerAction::SetOpacity { index, opacity });
+                                            }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            egui::ComboBox::from_id_salt("blend")
+                                                .selected_text(layer.blend.label())
+                                                .show_ui(ui, |ui| {
+                                                    for mode in Blend::ALL {
+                                                        if ui
+                                                            .selectable_label(
+                                                                layer.blend == mode,
+                                                                mode.label(),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            layer_action = Some(LayerAction::SetBlend {
+                                                                index,
+                                                                blend: mode,
+                                                            });
+                                                        }
+                                                    }
+                                                });
+                                            if ui
+                                                .add_enabled(index + 1 < count, egui::Button::new("Up"))
+                                                .clicked()
+                                            {
+                                                layer_action = Some(LayerAction::Move {
+                                                    from: index,
+                                                    to: index + 1,
+                                                });
+                                            }
+                                            if ui.add_enabled(index > 0, egui::Button::new("Down")).clicked()
+                                            {
+                                                layer_action = Some(LayerAction::Move {
+                                                    from: index,
+                                                    to: index - 1,
+                                                });
+                                            }
+                                            // The last layer cannot go: a page with nowhere to paint is
+                                            // a state every caller would have to special-case.
+                                            if ui
+                                                .add_enabled(count > 1, egui::Button::new("Delete"))
+                                                .clicked()
+                                            {
+                                                layer_action = Some(LayerAction::Delete(index));
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "Multiply darkens what is under it, Screen lightens. Deleting a \
+                                     layer is undoable -- otherwise it would not be offered.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+
+                            ui.separator();
+                            ui.heading("Canvas memory");
+                            let (used, capacity) = status.residency;
+                            ui.label(format!(
+                                "GPU {used} / {capacity} tiles ({:.0} of {:.0} MiB)",
+                                used as f32 * 0.5,
+                                capacity as f32 * 0.5
+                            ));
+                            if status.spilled > 0 {
+                                let (out, back) = status.traffic;
+                                ui.label(format!(
+                                    "CPU {} tiles ({:.0} MiB), {out} out / {back} back",
+                                    status.spilled,
+                                    status.spilled as f32 * 0.5
+                                ));
+                            }
+                            if ui.button("Trim to canvas").clicked() {
+                                trim = true;
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "Cropping keeps the pixels outside the page, so nothing is lost \
+                                     by accident. Trim discards them for good -- undoably.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            ui.separator();
+                            ui.heading("Speed");
+                            // Shown in the app, not only logged, because the number has to be visible at
+                            // the moment something feels wrong -- that is when it is worth reading, and a
+                            // log read afterwards cannot tell you what you were doing at the time.
+                            match status.perf.input {
+                                Some((mean, peak)) => {
+                                    ui.label(format!("Stroke {mean:.1} ms, peak {peak:.1}"));
+                                }
+                                None => {
+                                    ui.label("Stroke -- draw something");
+                                }
+                            }
+                            if let Some((mean, peak)) = status.perf.frame {
+                                ui.label(format!("Frame {mean:.1} ms, peak {peak:.1}"));
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "Stroke time is from the sample reaching us to the frame being \
+                                     presented. It leaves out the tablet, the driver and the display, \
+                                     so the real figure is higher.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            ui.separator();
+                            ui.heading("Export");
+                            ui.label(
+                                egui::RichText::new(
+                                    "Ctrl+E writes a PNG in the working directory. Ctrl+S \
+                                     saves the document itself, Ctrl+Shift+S under a new \
+                                     name, Ctrl+O opens one and Ctrl+N starts one.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            if let Some(msg) = status.message {
+                                ui.label(egui::RichText::new(msg).small());
+                            }
+                            ui.separator();
+                            ui.heading("Page");
+                            ui.label(format!(
+                                "{} x {} px",
+                                status.page_size.0, status.page_size.1
+                            ));
+                            ui.add(
+                                egui::Slider::new(&mut extend_amount, 32..=4096)
+                                    .logarithmic(true)
+                                    .text("Extend by (px)"),
+                            );
+                            ui.horizontal(|ui| {
+                                if ui.button("Extend down").clicked() {
+                                    extend = Some((Side::Bottom, extend_amount));
+                                }
+                                if ui.button("up").clicked() {
+                                    extend = Some((Side::Top, extend_amount));
+                                }
+                                if ui.button("left").clicked() {
+                                    extend = Some((Side::Left, extend_amount));
+                                }
+                                if ui.button("right").clicked() {
+                                    extend = Some((Side::Right, extend_amount));
+                                }
+                            });
+                            ui.label(
+                                egui::RichText::new(
+                                    "All four directions exist in the engine; the real UI \
+                                     will show only what a mode needs (DECISIONS 5a). This \
+                                     is a debug panel, so it shows everything.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            ui.separator();
+                            match status.crop_rect {
+                                None => {
+                                    if ui.button("Crop / resize by dragging").clicked() {
+                                        crop_action = Some(CropAction::Start);
+                                    }
+                                }
+                                Some((x, y, w, h)) => {
+                                    ui.label(format!("Crop to {w} x {h} at ({x}, {y})"));
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Apply").clicked() {
+                                            crop_action = Some(CropAction::Apply);
+                                        }
+                                        if ui.button("Cancel").clicked() {
+                                            crop_action = Some(CropAction::Cancel);
+                                        }
+                                    });
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Drag an edge or corner; drag inside to move it. Dragging \
+                                             outward extends the page. Enter applies, Escape cancels.",
+                                        )
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
+                            }
+                        });
                 });
             panel_rect = panel.response.rect;
 
