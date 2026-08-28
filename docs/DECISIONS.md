@@ -478,11 +478,15 @@ Both vanish when `tau` is a duration. A test pins this by running the same path 
 fixed-alpha filter alongside and asserting it does not — so the tolerance cannot
 be what passes the test.
 
-**The lag is exact, so the UI states it.** A one-pole filter following steady
-movement settles exactly `tau` behind. `Stabilizer::lag_ms` is therefore a fact,
-not an estimate, and the slider reads "adds about N ms of lag. Compare against the
-stroke time under Speed." A control that spends the top quality axis (§4.1) must
-say what it is spending, and §4f is what made that sayable.
+**The setting is denominated in its own price.** A one-pole filter following
+steady movement settles exactly `tau` behind, so `tau` *is* the added latency, in
+milliseconds. The control is therefore in milliseconds, not a 0–1 strength: an
+abstract strength needs a maximum to scale against, and any such maximum is a
+number somebody made up — the first version of this had exactly that invented
+constant, and it took one question to expose it. Now `MAX_LAG_MS` bounds only how
+far a slider travels, and changing it changes nothing else, precisely because the
+unit is real. A control that spends the top quality axis (§4.1) should spend it in
+units the artist can compare against the §4f readout.
 
 **Ending where the pen ended.** A trailing filter never catches up, so at pen-lift
 the line is short by roughly the lag distance — at full strength and a brisk

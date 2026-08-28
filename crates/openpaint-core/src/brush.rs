@@ -47,12 +47,12 @@ pub struct Brush {
     /// Per *stroke*, not per dab and not per layer: overlapping dabs build toward
     /// this and stop, but a second stroke builds on top. See [`crate::stroke`].
     pub opacity: f32,
-    /// Path smoothing, `0.0..=1.0`. See [`crate::stabilizer`].
+    /// How far the line may trail the pen, in milliseconds. See [`crate::stabilizer`].
     ///
     /// Per brush rather than global, because it is a property of how a tool is used: inking wants
     /// a lot, sketching wants none, and an eraser wants whatever the hand doing the erasing wants.
     /// Same reasoning as each tool keeping its own radius.
-    pub stabilization: f32,
+    pub stabilization_ms: f32,
     /// Brush color, linear and premultiplied (see [`crate::color`]).
     ///
     /// Stored converted rather than as authored sRGB so the per-pixel inner loop
@@ -76,7 +76,7 @@ impl Default for Brush {
             // DECISIONS objects to; the slider states its own cost in milliseconds instead, so the
             // choice is made with the number visible. A default can be earned once real use says
             // what it should be.
-            stabilization: 0.0,
+            stabilization_ms: 0.0,
             color_linear_premul: opaque_srgb8_to_linear_premul([20, 20, 24]),
         }
     }

@@ -419,7 +419,7 @@ impl OpenPaint {
         // Strength is read once, at the press. Dragging the slider mid-stroke must not change the
         // filter under a line already being drawn.
         self.stabilizer
-            .set_strength(self.editor.brush().stabilization);
+            .set_lag_ms(self.editor.brush().stabilization_ms);
         let s = self.stabilizer.begin(cx, cy, pressure, t_ms);
         self.editor.stroke_begin(s.x, s.y, s.pressure);
     }
@@ -1986,9 +1986,9 @@ mod tests {
     /// `finish` chooses whether the pen-lift convergence runs, which is what isolates the lag
     /// from the correction for it.
     #[cfg(test)]
-    fn drag_right(stabilization: f32, length: u32, finish: bool) -> Vec<openpaint_core::Dab> {
+    fn drag_right(lag_ms: f32, length: u32, finish: bool) -> Vec<openpaint_core::Dab> {
         let mut app = OpenPaint::default();
-        app.editor.brush_mut().stabilization = stabilization;
+        app.editor.brush_mut().stabilization_ms = lag_ms;
 
         app.stroke_start(0.0, 100.0, 1.0, 0.0);
         for i in 1..=length {
@@ -2035,7 +2035,7 @@ mod tests {
     /// suppressed, so it is the filter being observed rather than the correction for it.
     #[test]
     fn a_stabilized_stroke_trails_the_pen_while_drawing() {
-        let smoothed = reached(&drag_right(1.0, 300, false));
+        let smoothed = reached(&drag_right(50.0, 300, false));
         let raw = reached(&drag_right(0.0, 300, false));
 
         assert!(
@@ -2053,8 +2053,8 @@ mod tests {
     /// every line, taper and all.
     #[test]
     fn a_stabilized_stroke_still_ends_where_the_pen_did() {
-        let finished = reached(&drag_right(1.0, 300, true));
-        let unfinished = reached(&drag_right(1.0, 300, false));
+        let finished = reached(&drag_right(50.0, 300, true));
+        let unfinished = reached(&drag_right(50.0, 300, false));
 
         assert!(
             finished > 295.0,

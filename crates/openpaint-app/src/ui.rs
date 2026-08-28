@@ -325,23 +325,25 @@ impl Ui {
 
                             ui.separator();
                             ui.add(
-                                egui::Slider::new(&mut brush.stabilization, 0.0..=1.0)
-                                    .text("Stabilization"),
+                                egui::Slider::new(
+                                    &mut brush.stabilization_ms,
+                                    0.0..=openpaint_core::stabilizer::MAX_LAG_MS,
+                                )
+                                .text("Stabilization (ms)"),
                             );
-                            // The control states its own price. Smoothing is bought with latency
-                            // and the amount is exactly knowable (a one-pole filter trails its
-                            // input by its time constant), so there is no excuse for making the
-                            // artist discover the cost by feel -- especially with latency named
-                            // the top quality axis in DECISIONS §4.1.
+                            // The control is denominated in its own price. A one-pole filter trails
+                            // its input by exactly its time constant, so the setting *is* the
+                            // latency it adds -- there is no abstract "strength" to translate, and
+                            // no invented maximum to scale against. Latency being the top quality
+                            // axis (DECISIONS §4.1), the artist should be spending it in units they
+                            // can compare with the Speed readout.
                             ui.label(
-                                egui::RichText::new(if brush.stabilization <= 0.0 {
-                                    "Off. Smooths pen shake; costs latency, priced here.".to_owned()
+                                egui::RichText::new(if brush.stabilization_ms <= 0.0 {
+                                    "Off. Smooths pen shake; the cost is lag, in the same \
+                                     milliseconds as the stroke time under Speed."
                                 } else {
-                                    format!(
-                                        "Smooths pen shake, and adds about {:.0} ms of lag. \
-                                         Compare against the stroke time under Speed.",
-                                        openpaint_core::Stabilizer::lag_ms(brush.stabilization)
-                                    )
+                                    "Smooths pen shake. The line trails the pen by this long, \
+                                     on top of the stroke time under Speed."
                                 })
                                 .small()
                                 .weak(),

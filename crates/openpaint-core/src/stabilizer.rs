@@ -27,12 +27,15 @@
 //! Defining the filter in time removes both. `tau` is a duration, and the amount of smoothing is a
 //! property of the setting alone.
 //!
-//! # The lag is knowable, and therefore honest
+//! # The setting *is* the lag
 //!
-//! A one-pole filter tracking a steady movement settles exactly `tau` behind it. So the cost of
-//! this feature is not a mystery to be discovered by feel — it is [`Stabilizer::lag_ms`], and the
-//! UI states it. That matters because latency is the project's top quality axis (DECISIONS §4.1):
-//! a control that trades latency away must say how much it is spending.
+//! A one-pole filter tracking a steady movement settles exactly `tau` behind it. So `tau` is not an
+//! abstract strength that happens to cost latency — it is the latency, in milliseconds, exactly.
+//!
+//! The setting is therefore expressed in milliseconds rather than as a 0–1 strength. An abstract
+//! strength would need a maximum to scale against, and any such maximum is a number somebody made
+//! up; worse, it would hide the one fact the artist most needs, given that latency is this
+//! project's top quality axis (DECISIONS §4.1). "24 ms of lag" is a price. "0.48" is a mystery.
 //!
 //! # Ending where the pen ended
 //!
@@ -44,12 +47,14 @@
 //!
 //! [`PenSample`]: https://docs.rs/  (the app's input type; see `openpaint-app/src/input.rs`)
 
-/// Smoothing time constant at full strength, in milliseconds.
+/// The largest lag a control should offer, in milliseconds.
 ///
-/// 50 ms is about three frames at 60 Hz: unmistakably smoothed and unmistakably laggy, which is
-/// what the top of a range should be. The scale is linear in strength so the whole slider is
-/// usable — a squared curve would make the bottom half do nothing.
-const MAX_TAU_MS: f32 = 50.0;
+/// **A UI range, not a limit of the filter** — the maths works at any value. 200 ms is about twelve
+/// frames at 60 Hz, well past the point where drawing feels like dragging a weight on a string, so
+/// it covers even the heaviest inking use with room to spare. Raising it changes nothing except how
+/// far a slider can travel, precisely because the setting is a real unit rather than a fraction of
+/// this number.
+pub const MAX_LAG_MS: f32 = 200.0;
 
 /// How many convergence steps [`Stabilizer::finish`] will take before it simply lands.
 ///
@@ -87,18 +92,13 @@ pub struct Stabilizer {
 }
 
 impl Stabilizer {
-    /// Set smoothing strength, `0.0..=1.0`. Zero disables it entirely.
-    pub fn set_strength(&mut self, strength: f32) {
-        self.tau_ms = MAX_TAU_MS * strength.clamp(0.0, 1.0);
-    }
-
-    /// How much latency a given strength costs, in milliseconds.
+    /// Set how far the line may trail the pen, in milliseconds. Zero disables smoothing entirely.
     ///
-    /// Exact, not an estimate: a one-pole filter following steady movement settles exactly `tau`
-    /// behind it. Exposed so the UI can price the control it is offering.
-    #[must_use]
-    pub fn lag_ms(strength: f32) -> f32 {
-        MAX_TAU_MS * strength.clamp(0.0, 1.0)
+    /// The argument is both the filter's time constant and, exactly, the latency it adds — see the
+    /// module note. Negative values are clamped; there is no upper clamp, because there is no value
+    /// at which the filter stops being correct, only values at which it stops being pleasant.
+    pub fn set_lag_ms(&mut self, lag_ms: f32) {
+        self.tau_ms = lag_ms.max(0.0);
     }
 
     /// Start a stroke. The first point is never moved — a stroke has to begin under the pen.
@@ -168,9 +168,9 @@ mod tests {
     use super::*;
 
     /// Walk a straight ramp and report where the smoothed point ends up.
-    fn ramp(strength: f32, rate_ms: f64, duration_ms: f64) -> Smoothed {
+    fn ramp(lag_ms: f32, rate_ms: f64, duration_ms: f64) -> Smoothed {
         let mut s = Stabilizer::default();
-        s.set_strength(strength);
+        s.set_lag_ms(lag_ms);
         let mut out = s.begin(0.0, 0.0, 1.0, 0.0);
         let mut t = rate_ms;
         while t <= duration_ms {
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn the_first_point_is_never_moved() {
         let mut s = Stabilizer::default();
-        s.set_strength(1.0);
+        s.set_lag_ms(50.0);
         let got = s.begin(12.0, 34.0, 0.7, 0.0);
         assert_eq!(
             got,
@@ -232,8 +232,8 @@ mod tests {
     /// rates keeps that term under a pixel.
     #[test]
     fn smoothing_is_defined_in_time_not_in_samples() {
-        let at_2ms = ramp(0.5, 2.0, 200.0).x;
-        let at_1ms = ramp(0.5, 1.0, 200.0).x;
+        let at_2ms = ramp(25.0, 2.0, 200.0).x;
+        let at_1ms = ramp(25.0, 1.0, 200.0).x;
         assert!(
             (at_2ms - at_1ms).abs() < 1.0,
             "halving the report rate moved the result: {at_2ms} vs {at_1ms}"
@@ -263,31 +263,32 @@ mod tests {
         );
     }
 
-    /// `lag_ms` is a promise, so it has to match what the filter actually does.
+    /// The setting is stated in milliseconds of lag, so it has to *be* milliseconds of lag.
+    ///
+    /// This is the claim the UI repeats to the artist, and the reason the control is expressed in a
+    /// real unit rather than an abstract strength. If the two ever drifted apart, the slider would
+    /// be quoting a made-up number with a units label on it, which is worse than quoting nothing.
     #[test]
-    fn the_advertised_lag_is_the_real_lag() {
-        for strength in [0.2_f32, 0.5, 1.0] {
-            // 1 px per ms, run long enough to settle, so the shortfall in pixels *is* the lag in
-            // milliseconds.
-            let settled = ramp(strength, 1.0, 600.0);
-            let shortfall = 600.0 - settled.x;
-            let promised = Stabilizer::lag_ms(strength);
+    fn the_setting_is_the_lag_in_milliseconds() {
+        for lag in [10.0_f32, 25.0, 50.0, 120.0] {
+            // 1 px per ms, run well past settling, so the shortfall in pixels *is* the lag in ms.
+            let settled = ramp(lag, 1.0, lag as f64 * 12.0);
+            let shortfall = lag as f64 * 12.0 - f64::from(settled.x);
             assert!(
-                (shortfall - promised).abs() < 1.5,
-                "at strength {strength} the UI promises {promised} ms but the filter trails \
-                 {shortfall} px at 1 px/ms"
+                (shortfall - f64::from(lag)).abs() < 1.5,
+                "set to {lag} ms, but the filter trails {shortfall} px at 1 px/ms"
             );
         }
     }
 
     #[test]
-    fn more_strength_lags_further() {
+    fn more_lag_trails_further() {
         let mut previous = f32::MAX;
-        for strength in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
-            let x = ramp(strength, 4.0, 400.0).x;
+        for lag in [0.0_f32, 12.0, 25.0, 50.0, 100.0, MAX_LAG_MS] {
+            let x = ramp(lag, 4.0, 400.0).x;
             assert!(
                 x < previous,
-                "strength {strength} did not trail further than the step below it"
+                "{lag} ms did not trail further than the step below it"
             );
             previous = x;
         }
@@ -297,7 +298,7 @@ mod tests {
     #[test]
     fn jitter_is_reduced() {
         let mut s = Stabilizer::default();
-        s.set_strength(0.6);
+        s.set_lag_ms(30.0);
         s.begin(0.0, 0.0, 1.0, 0.0);
 
         let mut raw_error = 0.0_f32;
@@ -326,7 +327,7 @@ mod tests {
     #[test]
     fn the_stroke_ends_exactly_where_the_pen_did() {
         let mut s = Stabilizer::default();
-        s.set_strength(1.0);
+        s.set_lag_ms(50.0);
         s.begin(0.0, 0.0, 1.0, 0.0);
         for i in 1..=50 {
             s.push(i as f32 * 3.0, 0.0, 1.0, f64::from(i) * 4.0);
@@ -362,7 +363,7 @@ mod tests {
     #[test]
     fn a_clock_going_backwards_does_not_explode() {
         let mut s = Stabilizer::default();
-        s.set_strength(0.5);
+        s.set_lag_ms(25.0);
         s.begin(0.0, 0.0, 1.0, 100.0);
         let got = s.push(50.0, 0.0, 1.0, 40.0);
         assert!(
