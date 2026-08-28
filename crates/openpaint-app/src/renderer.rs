@@ -179,11 +179,14 @@ impl Renderer {
         if ops.is_empty() {
             return;
         }
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("stroke-encoder"),
-            });
+
+        // Upload every dab once, up front. Per-batch uploads would be clobbered:
+        // all of a submission's buffer writes are applied before any of its command
+        // buffers execute. See StrokeLayer::upload_dabs.
+        self.stroke_layer
+            .upload_dabs(&self.device, &self.queue, dabs);
+
+        let mut encoder = self.new_stroke_encoder();
 
         for op in ops {
             match *op {
@@ -191,16 +194,19 @@ impl Renderer {
                     color_linear_premul,
                     opacity,
                 } => {
-                    self.stroke_layer.begin_stroke(&mut encoder);
+                    // Paint is a uniform written from the queue, so it has the same
+                    // ordering hazard: a second stroke in the same frame would
+                    // otherwise overwrite the first one's colour before either drew.
+                    // Submitting here keeps each stroke's paint with its own draws.
+                    self.submit_stroke_encoder(&mut encoder);
                     self.stroke_layer
                         .set_paint(&self.queue, color_linear_premul, opacity);
+                    self.stroke_layer.begin_stroke(&mut encoder);
                 }
                 StrokeOp::Dabs { start, len } => {
-                    let Some(slice) = dabs.get(start..start + len) else {
-                        continue;
-                    };
-                    self.stroke_layer
-                        .add_dabs(&self.device, &self.queue, &mut encoder, slice);
+                    if start + len <= dabs.len() {
+                        self.stroke_layer.stamp_range(&mut encoder, start, len);
+                    }
                 }
                 StrokeOp::End => {
                     self.stroke_layer
@@ -210,6 +216,20 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    fn new_stroke_encoder(&self) -> wgpu::CommandEncoder {
+        self.device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("stroke-encoder"),
+            })
+    }
+
+    /// Submit the work recorded so far and hand back a fresh encoder, so queue
+    /// writes that follow are ordered after it.
+    fn submit_stroke_encoder(&self, encoder: &mut wgpu::CommandEncoder) {
+        let finished = std::mem::replace(encoder, self.new_stroke_encoder());
+        self.queue.submit(std::iter::once(finished.finish()));
     }
 
     /// Draw one frame: clear the backdrop, draw the canvas, then the overlay.

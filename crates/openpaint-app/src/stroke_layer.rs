@@ -404,14 +404,19 @@ impl StrokeLayer {
         self.dirty = false;
     }
 
-    /// Stamp dabs into the accumulation texture.
-    pub fn add_dabs(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        dabs: &[Dab],
-    ) {
+    /// Upload a whole frame's dabs in one go.
+    ///
+    /// Deliberately separate from stamping, and this separation is load-bearing:
+    /// `Queue::write_buffer` does **not** interleave with recorded draws. Every
+    /// write in a submission is applied *before* any command buffer in it executes,
+    /// so writing the same buffer once per batch and drawing between writes means
+    /// all the draws see only the last batch's data. That produced visible gaps in
+    /// fast strokes, where several input batches land in one frame.
+    ///
+    /// Uploading once and drawing sub-ranges avoids the hazard entirely, and suits
+    /// the data anyway: the editor already hands over a flat dab buffer with its
+    /// commands indexing into it.
+    pub fn upload_dabs(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dabs: &[Dab]) {
         if dabs.is_empty() {
             return;
         }
@@ -430,7 +435,14 @@ impl StrokeLayer {
             });
         }
         queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&data));
+    }
 
+    /// Stamp dabs `[start, start + len)` of the uploaded buffer into the
+    /// accumulation texture.
+    pub fn stamp_range(&mut self, encoder: &mut wgpu::CommandEncoder, start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
         let mut pass = encoder
             .begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("dab-pass"),
@@ -452,7 +464,7 @@ impl StrokeLayer {
         pass.set_pipeline(&self.dab_pipeline);
         pass.set_bind_group(0, &self.canvas_size_group, &[]);
         pass.set_vertex_buffer(0, self.instances.slice(..));
-        pass.draw(0..6, 0..data.len() as u32);
+        pass.draw(0..6, start as u32..(start + len) as u32);
         drop(pass);
 
         self.dirty = true;
@@ -593,6 +605,12 @@ mod tests {
 
     /// Rasterize `dabs` on the GPU and read the canvas back as linear f32 RGBA.
     fn gpu_render(dabs: &[Dab], opacity: f32) -> Vec<[f32; 4]> {
+        gpu_render_batched(dabs, opacity, 1)
+    }
+
+    /// As `gpu_render`, but stamping the dabs in `batches` separate draw calls
+    /// within one frame -- which is what a fast stroke produces.
+    fn gpu_render_batched(dabs: &[Dab], opacity: f32, batches: usize) -> Vec<[f32; 4]> {
         let (device, queue) = try_device().expect("checked by caller");
 
         let canvas_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -649,7 +667,16 @@ mod tests {
         let mut encoder = device.create_command_encoder(&Default::default());
         layer.begin_stroke(&mut encoder);
         layer.set_paint(&queue, BLACK, opacity);
-        layer.add_dabs(&device, &queue, &mut encoder, dabs);
+        layer.upload_dabs(&device, &queue, dabs);
+        // Split into `batches` draw calls, mimicking several input batches landing
+        // in a single frame.
+        let per = dabs.len().div_ceil(batches.max(1));
+        let mut start = 0;
+        while start < dabs.len() {
+            let len = per.min(dabs.len() - start);
+            layer.stamp_range(&mut encoder, start, len);
+            start += len;
+        }
         layer.bake(&mut encoder, &canvas_view);
 
         let bytes = (SIZE * SIZE * 8) as wgpu::BufferAddress;
@@ -833,5 +860,45 @@ mod tests {
             "GPU passed the opacity ceiling: darkest {darkest}, floor {}",
             paper * (1.0 - opacity)
         );
+    }
+
+    /// Regression: a fast stroke delivers several input batches in one frame, so the
+    /// dabs are stamped in several draw calls. Splitting them must be
+    /// indistinguishable from one call.
+    ///
+    /// This failed before `upload_dabs` was separated from stamping: writing the
+    /// instance buffer once per batch looks correct, but `Queue::write_buffer`
+    /// applies every write in a submission *before* any of its command buffers run,
+    /// so all the draws saw only the final batch. It showed up as visible gaps in
+    /// fast strokes -- worse the faster the stroke, because more batches landed per
+    /// frame.
+    #[test]
+    fn batching_dabs_does_not_change_the_result() {
+        let Some(_) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+
+        // A long run of overlapping dabs, like a fast stroke across the canvas.
+        let dabs: Vec<Dab> = (0..48)
+            .map(|i| dab(20.0 + i as f32 * 1.8, 64.0, 9.0, 0.5, 0.6))
+            .collect();
+
+        let one_call = gpu_render_batched(&dabs, 1.0, 1);
+        assert!(any_paint(&one_call), "produced no paint at all");
+
+        for batches in [2, 5, 12] {
+            let split = gpu_render_batched(&dabs, 1.0, batches);
+            let (worst, at) = max_difference(&one_call, &split);
+            assert!(
+                worst < 0.01,
+                "{batches} batches differ from 1 by {worst} at ({}, {}); \
+                 one {:?} split {:?}",
+                at as u32 % SIZE,
+                at as u32 / SIZE,
+                one_call[at],
+                split[at]
+            );
+        }
     }
 }
