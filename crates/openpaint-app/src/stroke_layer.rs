@@ -148,6 +148,8 @@ pub struct StrokeLayer {
     stamp_records: Vec<TileCoord>,
     dab_pipeline: wgpu::RenderPipeline,
     bake_pipeline: wgpu::RenderPipeline,
+    /// Same geometry and the same accumulation; only the blend differs.
+    erase_pipeline: wgpu::RenderPipeline,
     paint_group: wgpu::BindGroup,
     /// Bound at group 0 during the dab pass, where the accumulation array is the render
     /// target and must not also be sampled.
@@ -162,6 +164,8 @@ pub struct StrokeLayer {
     instance_capacity: usize,
     /// Paint captured at stroke start, which the compositor needs to show the preview.
     paint: ([f32; 4], f32),
+    /// Whether the stroke in progress removes paint rather than adding it.
+    erase: bool,
     /// The camera and page last published, so the page can be refreshed without the
     /// caller having to supply a camera it does not have.
     frame: (PageToNdc, PageRect),
@@ -392,7 +396,8 @@ impl StrokeLayer {
         let composite = |label: &str,
                          vs: &str,
                          format: wgpu::TextureFormat,
-                         buffers: &[wgpu::VertexBufferLayout]| {
+                         buffers: &[wgpu::VertexBufferLayout],
+                         blend: wgpu::BlendState| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
@@ -407,9 +412,7 @@ impl StrokeLayer {
                     entry_point: "paint_fs",
                     targets: &[Some(wgpu::ColorTargetState {
                         format,
-                        // Premultiplied "over": the fragment outputs premultiplied paint,
-                        // so this needs no destination read in the shader.
-                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        blend: Some(blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                     compilation_options: Default::default(),
@@ -422,7 +425,35 @@ impl StrokeLayer {
             })
         };
 
-        let bake_pipeline = composite("bake-pipeline", "bake_vs", canvas_format, &[]);
+        // Premultiplied "over": the fragment outputs premultiplied paint, so this needs no
+        // destination read in the shader.
+        let bake_pipeline = composite(
+            "bake-pipeline",
+            "bake_vs",
+            canvas_format,
+            &[],
+            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+        );
+        // Erasing is `dst * (1 - coverage)`, which the blend unit computes with a zero source
+        // factor -- so the *same* fragment shader serves both, and an eraser cannot drift from
+        // the brush in shape, falloff or spacing. It scales the premultiplied colour along with
+        // the alpha, which is exactly right: premultiplied means coverage already lives in every
+        // channel.
+        let erase_blend = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Zero,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let erase_pipeline = composite(
+            "erase-pipeline",
+            "bake_vs",
+            canvas_format,
+            &[],
+            wgpu::BlendState {
+                color: erase_blend,
+                alpha: erase_blend,
+            },
+        );
 
         let instance_capacity = 256;
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
@@ -438,6 +469,7 @@ impl StrokeLayer {
             stamp_records: Vec::new(),
             dab_pipeline,
             bake_pipeline,
+            erase_pipeline,
             paint_group,
             empty_group,
             tile_group,
@@ -448,6 +480,7 @@ impl StrokeLayer {
             instances,
             instance_capacity,
             paint: ([0.0; 4], 1.0),
+            erase: false,
             frame: (
                 PageToNdc {
                     x_row: [0.0; 3],
@@ -486,6 +519,13 @@ impl StrokeLayer {
     #[must_use]
     pub fn paint(&self) -> ([f32; 4], f32) {
         self.paint
+    }
+
+    /// Whether the stroke in progress removes paint. The compositor needs it to preview
+    /// correctly, since erasing is not "painting the paper colour".
+    #[must_use]
+    pub fn erases(&self) -> bool {
+        self.erase
     }
 
     /// Whether the layer holds any paint that still needs showing or baking.
@@ -587,8 +627,15 @@ impl StrokeLayer {
     }
 
     /// Update the stroke colour and opacity used when compositing.
-    pub fn set_paint(&mut self, queue: &wgpu::Queue, color_linear_premul: [f32; 4], opacity: f32) {
+    pub fn set_paint(
+        &mut self,
+        queue: &wgpu::Queue,
+        color_linear_premul: [f32; 4],
+        opacity: f32,
+        erase: bool,
+    ) {
         self.paint = (color_linear_premul, opacity.clamp(0.0, 1.0));
+        self.erase = erase;
         queue.write_buffer(
             &self.paint_buf,
             0,
@@ -804,7 +851,11 @@ impl StrokeLayer {
                     occlusion_query_set: None,
                 })
                 .forget_lifetime();
-            pass.set_pipeline(&self.bake_pipeline);
+            pass.set_pipeline(if self.erase {
+                &self.erase_pipeline
+            } else {
+                &self.bake_pipeline
+            });
             pass.set_bind_group(0, &self.paint_group, &[]);
             let offset = self.offset_of(Region::Bake, index as u32);
             pass.set_bind_group(1, &self.tile_group, &[offset]);
@@ -915,7 +966,7 @@ mod tests {
         // Every uniform written once, before the single submission -- the ordering rule
         // this module exists to respect.
         layer.set_page(&queue, page);
-        layer.set_paint(&queue, BLACK, opacity);
+        layer.set_paint(&queue, BLACK, opacity, false);
         layer.upload_dabs(&device, &queue, dabs);
 
         let mut encoder = device.create_command_encoder(&Default::default());
@@ -1105,7 +1156,7 @@ mod tests {
         let mut canvas = test_canvas(&device, page, &layer);
 
         layer.set_page(&queue, page);
-        layer.set_paint(&queue, BLACK, 1.0);
+        layer.set_paint(&queue, BLACK, 1.0, false);
         layer.upload_dabs(&device, &queue, &dabs);
         let mut encoder = device.create_command_encoder(&Default::default());
         layer.begin_stroke();

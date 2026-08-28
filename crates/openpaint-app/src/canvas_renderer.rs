@@ -594,7 +594,12 @@ impl CanvasRenderer {
                     stroke_color[2],
                     stroke_opacity,
                 ],
-                counts: [layers.len() as u32, active as u32, u32::from(painting), 0],
+                counts: [
+                    layers.len() as u32,
+                    active as u32,
+                    u32::from(painting),
+                    u32::from(stroke.is_some_and(StrokeLayer::erases)),
+                ],
                 misc: [TILE_SIZE as f32, 0.0, 0.0, 0.0],
             }),
         );

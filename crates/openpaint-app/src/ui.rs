@@ -21,6 +21,7 @@
 //! for the pen specifically, because egui's own pointer-capture logic never sees
 //! it.
 
+use crate::editor::Tool;
 use egui::ViewportId;
 use openpaint_core::{Blend, Brush, Layer};
 use winit::window::Window;
@@ -118,6 +119,8 @@ pub struct Status<'a> {
     pub active_layer: usize,
     /// How many pages the document has, and which is active.
     pub pages: (usize, usize),
+    /// The tool strokes currently use.
+    pub tool: Tool,
 }
 
 /// What the panel wants the app to do, collected during the frame.
@@ -136,6 +139,8 @@ pub struct Outcome {
     pub layer: Option<LayerAction>,
     /// At most one page change per frame.
     pub page: Option<PageAction>,
+    /// Switch tool.
+    pub tool: Option<Tool>,
 }
 
 pub struct Ui {
@@ -228,11 +233,34 @@ impl Ui {
         let mut trim = false;
         let mut layer_action = None;
         let mut page_action = None;
+        let mut tool_action = None;
 
         let output = self.ctx.run(input, |ctx| {
             egui::SidePanel::left("brush-panel")
                 .exact_width(PANEL_WIDTH)
                 .show(ctx, |ui| {
+                    ui.heading("Tool");
+                    ui.horizontal(|ui| {
+                        for tool in Tool::ALL {
+                            if ui
+                                .selectable_label(status.tool == tool, tool.label())
+                                .clicked()
+                            {
+                                tool_action = Some(tool);
+                            }
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "B and E switch tool. Each keeps its own size, because an eraser \
+                             almost never wants the brush's. [ and ] resize; Shift+[ and \
+                             Shift+] rotate the canvas.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+
+                    ui.separator();
                     ui.heading("Brush");
                     ui.add_space(4.0);
 
@@ -674,6 +702,7 @@ impl Ui {
             trim,
             layer: layer_action,
             page: page_action,
+            tool: tool_action,
         }
     }
 }

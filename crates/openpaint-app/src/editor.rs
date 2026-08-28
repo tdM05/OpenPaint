@@ -53,6 +53,11 @@ pub enum StrokeOp {
     Begin {
         color_linear_premul: [f32; 4],
         opacity: f32,
+        /// Whether this stroke removes paint instead of adding it.
+        ///
+        /// Captured at stroke start like the colour, and for the same reason: switching tool
+        /// mid-stroke would otherwise produce a stroke that is half paint and half hole.
+        erase: bool,
     },
     /// Stamp dabs `[start, start + len)` of the accompanying dab buffer.
     Dabs { start: usize, len: usize },
@@ -62,6 +67,37 @@ pub enum StrokeOp {
     /// asking the editor to track a bounding rectangle for history's benefit was both
     /// less precise and a second place for the page-clipping rule to live.
     End,
+}
+
+/// What a stroke does to the layer it lands on.
+///
+/// Deliberately not a "brush type": the dab geometry, spacing, falloff and pressure response are
+/// identical, and the only difference is how the accumulated coverage is composited -- paint
+/// blends over, erase multiplies by its complement. Anything that changed the *shape* of a stroke
+/// would belong in `openpaint_core::brush` instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Tool {
+    #[default]
+    Brush,
+    Eraser,
+}
+
+impl Tool {
+    /// Every tool, in the order the UI lists them.
+    pub const ALL: [Self; 2] = [Self::Brush, Self::Eraser];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Brush => "Brush",
+            Self::Eraser => "Eraser",
+        }
+    }
+
+    #[must_use]
+    pub fn erases(self) -> bool {
+        matches!(self, Self::Eraser)
+    }
 }
 
 /// Largest page dimension, in pixels.
@@ -93,7 +129,13 @@ pub fn clamp_page_size(current: (u32, u32), requested: (u32, u32)) -> Option<(u3
 
 pub struct Editor {
     document: Document,
-    brush: Brush,
+    /// One brush per tool, indexed by `Tool as usize`.
+    ///
+    /// Separate settings because an eraser almost always wants a different size from the brush,
+    /// and sharing one would make every size change fight the other tool. An array rather than
+    /// named fields so a third tool is a variant and a default, not a new field everywhere.
+    brushes: [Brush; Tool::ALL.len()],
+    tool: Tool,
     /// Dab spacing continuity across input samples, for the stroke in progress.
     stroke: StrokeState,
     /// Dabs emitted since the renderer last consumed them.
@@ -114,7 +156,8 @@ impl Editor {
     pub fn new() -> Self {
         Self {
             document: Document::new(Page::new(PAGE_W, PAGE_H)),
-            brush: Brush::default(),
+            brushes: [Brush::default(), Brush::default()],
+            tool: Tool::Brush,
             stroke: StrokeState::new(),
             dabs: Vec::new(),
             ops: Vec::new(),
@@ -199,8 +242,28 @@ impl Editor {
     }
 
     /// Mutable brush access, for the UI to edit settings.
+    /// Which tool strokes currently use.
+    #[must_use]
+    pub fn tool(&self) -> Tool {
+        self.tool
+    }
+
+    /// Switch tool. Ends any stroke first, since a stroke's mode is fixed at its start.
+    pub fn set_tool(&mut self, tool: Tool) {
+        if self.tool != tool {
+            self.stroke_end();
+            self.tool = tool;
+        }
+    }
+
+    /// The active tool's brush.
+    #[must_use]
+    pub fn brush(&self) -> &Brush {
+        &self.brushes[self.tool as usize]
+    }
+
     pub fn brush_mut(&mut self) -> &mut Brush {
-        &mut self.brush
+        &mut self.brushes[self.tool as usize]
     }
 
     /// Whether a stroke is currently in progress.
@@ -214,13 +277,19 @@ impl Editor {
         // A fresh stroke resets accumulation, so its opacity ceiling is
         // independent of the previous stroke's.
         self.ops.push(StrokeOp::Begin {
-            color_linear_premul: self.brush.color_linear_premul(),
-            opacity: self.brush.opacity,
+            color_linear_premul: self.brush().color_linear_premul(),
+            opacity: self.brush().opacity,
+            erase: self.tool.erases(),
         });
         self.drawing = true;
         let from = self.dabs.len();
-        self.brush
-            .stroke_begin(&mut self.dabs, &mut self.stroke, cx, cy, pressure);
+        self.brushes[self.tool as usize].stroke_begin(
+            &mut self.dabs,
+            &mut self.stroke,
+            cx,
+            cy,
+            pressure,
+        );
         self.record_dabs(from);
     }
 
@@ -230,8 +299,13 @@ impl Editor {
             return;
         }
         let from = self.dabs.len();
-        self.brush
-            .stroke_to(&mut self.dabs, &mut self.stroke, cx, cy, pressure);
+        self.brushes[self.tool as usize].stroke_to(
+            &mut self.dabs,
+            &mut self.stroke,
+            cx,
+            cy,
+            pressure,
+        );
         self.record_dabs(from);
     }
 
@@ -304,6 +378,7 @@ mod tests {
             Some(StrokeOp::Begin {
                 color_linear_premul,
                 opacity,
+                ..
             }) => {
                 assert_eq!(*color_linear_premul, expected);
                 assert!((*opacity - 0.25).abs() < 1e-6);

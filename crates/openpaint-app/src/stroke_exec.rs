@@ -39,7 +39,7 @@ pub struct StrokeExec<'a> {
     /// Dabs of the stroke being recorded, accumulated across frames so redo can replay it.
     pub recording: &'a mut Vec<Dab>,
     /// Paint of the stroke being recorded, captured at `Begin`.
-    pub recording_paint: &'a mut ([f32; 4], f32),
+    pub recording_paint: &'a mut ([f32; 4], f32, bool),
 }
 
 impl StrokeExec<'_> {
@@ -78,12 +78,13 @@ impl StrokeExec<'_> {
         if let Some(StrokeOp::Begin {
             color_linear_premul,
             opacity,
+            erase,
         }) = ops.first()
         {
             self.recording.clear();
-            *self.recording_paint = (*color_linear_premul, *opacity);
+            *self.recording_paint = (*color_linear_premul, *opacity, *erase);
             self.stroke
-                .set_paint(self.queue, *color_linear_premul, *opacity);
+                .set_paint(self.queue, *color_linear_premul, *opacity, *erase);
             self.stroke.begin_stroke();
         }
 
@@ -140,13 +141,14 @@ impl StrokeExec<'_> {
 
         match before {
             Some(before) => {
-                let (color_linear_premul, opacity) = *self.recording_paint;
+                let (color_linear_premul, opacity, erase) = *self.recording_paint;
                 self.history.push(Op::Stroke {
                     layer: self.layer,
                     before,
                     dabs: std::mem::take(self.recording),
                     color_linear_premul,
                     opacity,
+                    erase,
                 });
                 false
             }
@@ -192,6 +194,7 @@ mod tests {
         StrokeOp::Begin {
             color_linear_premul: [0.0; 4],
             opacity: 1.0,
+            erase: false,
         }
     }
 
@@ -252,7 +255,7 @@ mod tests {
         let mut canvas = test_canvas(&device, page, &layer);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
-        let mut recording_paint = ([0.0; 4], 1.0);
+        let mut recording_paint = ([0.0; 4], 1.0, false);
 
         // Frame 1: pen down and a drag, exactly as `handle_pen_event` produces.
         editor.stroke_begin(400.0, 400.0, 1.0);
@@ -308,7 +311,7 @@ mod tests {
         let mut canvas = test_canvas(&device, page, &layer);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
-        let mut recording_paint = ([0.0; 4], 1.0);
+        let mut recording_paint = ([0.0; 4], 1.0, false);
 
         editor.stroke_begin(500.0, 500.0, 1.0);
         editor.stroke_end();
@@ -343,7 +346,7 @@ mod tests {
         let mut canvas = test_canvas(&device, page, &layer);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
-        let mut recording_paint = ([0.0; 4], 1.0);
+        let mut recording_paint = ([0.0; 4], 1.0, false);
 
         // Far apart, so each lands in its own tile and one cannot mask the other.
         editor.stroke_begin(200.0, 200.0, 1.0);
@@ -403,7 +406,7 @@ mod tests {
         );
         let mut history = History::new(&device);
         let mut recording = Vec::new();
-        let mut recording_paint = ([0.0; 4], 1.0);
+        let mut recording_paint = ([0.0; 4], 1.0, false);
 
         // A short stroke inside one tile, so it certainly fits and certainly lands.
         editor.stroke_begin(100.0, 100.0, 1.0);
@@ -493,7 +496,7 @@ mod tests {
         let mut canvas = test_canvas(&device, page, &layer);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
-        let mut recording_paint = ([0.0; 4], 1.0);
+        let mut recording_paint = ([0.0; 4], 1.0, false);
 
         // A committed stroke on the left.
         editor.stroke_begin(300.0, 500.0, 1.0);
@@ -606,7 +609,7 @@ mod tests {
         let mut canvas = test_canvas(&device, page, &layer);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
-        let mut recording_paint = ([0.0; 4], 1.0);
+        let mut recording_paint = ([0.0; 4], 1.0, false);
 
         // Two layers with a stroke each, so the save has to keep them apart.
         editor.stroke_begin(400.0, 400.0, 1.0);
@@ -716,6 +719,185 @@ mod tests {
         }
     }
 
+    /// Erasing must remove coverage, not paint the paper colour over it.
+    ///
+    /// The distinction is the whole point and it is invisible on a single layer over paper, where
+    /// both look identical. So this puts the erased layer *above* another one: only true removal
+    /// reveals what is beneath.
+    #[test]
+    fn erasing_removes_coverage_rather_than_painting_over_it() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+
+        let mut editor = Editor::new();
+        editor.brush_mut().radius = 40.0;
+        editor.brush_mut().hardness = 1.0;
+        let page = editor.page_rect();
+        let mut layer = test_stroke_layer(&device);
+        let mut canvas = test_canvas(&device, page, &layer);
+        let mut history = History::new(&device);
+        let mut recording = Vec::new();
+        let mut recording_paint = ([0.0; 4], 1.0, false);
+
+        // Bottom layer: paint across the area.
+        let bottom = editor.active_layer_id();
+        editor.stroke_begin(400.0, 400.0, 1.0);
+        editor.stroke_to(800.0, 400.0, 1.0);
+        editor.stroke_end();
+        run_frame_on(
+            &device,
+            &queue,
+            &mut canvas,
+            &mut layer,
+            &mut history,
+            &mut recording,
+            &mut recording_paint,
+            &mut editor,
+            bottom,
+        );
+
+        // Top layer: paint over the same area, then erase part of it.
+        editor.document_mut().add_layer();
+        let top = editor.active_layer_id();
+        editor.stroke_begin(400.0, 400.0, 1.0);
+        editor.stroke_to(800.0, 400.0, 1.0);
+        editor.stroke_end();
+        run_frame_on(
+            &device,
+            &queue,
+            &mut canvas,
+            &mut layer,
+            &mut history,
+            &mut recording,
+            &mut recording_paint,
+            &mut editor,
+            top,
+        );
+
+        let painted =
+            crate::test_gpu::readback_tile(&device, &queue, &canvas, LayerId(top), (2, 1))
+                .expect("resident");
+        let at = |t: &Vec<[f32; 4]>, x: usize, y: usize| {
+            t[(y % openpaint_core::tile::TILE_SIZE) * openpaint_core::tile::TILE_SIZE
+                + (x % openpaint_core::tile::TILE_SIZE)]
+        };
+        assert!(
+            at(&painted, 600, 400)[3] > 0.9,
+            "the top layer should be opaque there: {:?}",
+            at(&painted, 600, 400)
+        );
+
+        editor.set_tool(crate::editor::Tool::Eraser);
+        editor.brush_mut().radius = 40.0;
+        editor.brush_mut().hardness = 1.0;
+        editor.stroke_begin(600.0, 400.0, 1.0);
+        editor.stroke_to(620.0, 400.0, 1.0);
+        editor.stroke_end();
+        run_frame_on(
+            &device,
+            &queue,
+            &mut canvas,
+            &mut layer,
+            &mut history,
+            &mut recording,
+            &mut recording_paint,
+            &mut editor,
+            top,
+        );
+
+        let erased = crate::test_gpu::readback_tile(&device, &queue, &canvas, LayerId(top), (2, 1))
+            .expect("resident");
+        let hole = at(&erased, 610, 400);
+        assert!(
+            hole[3] < 0.05,
+            "the erase left coverage behind, so it painted rather than removed: {hole:?}"
+        );
+        // Premultiplied: removing coverage must take the colour with it, or the hole keeps a
+        // ghost that shows up the moment anything is composited under it.
+        assert!(
+            hole[0].abs() < 0.05 && hole[1].abs() < 0.05 && hole[2].abs() < 0.05,
+            "colour survived the erase: {hole:?}"
+        );
+
+        // Away from the erase the top layer is untouched.
+        let kept = at(&erased, 450, 400);
+        assert!(kept[3] > 0.9, "the erase spread too far: {kept:?}");
+
+        // And the layer *below* still has its paint -- the erase must not have reached it.
+        let under =
+            crate::test_gpu::readback_tile(&device, &queue, &canvas, LayerId(bottom), (2, 1))
+                .expect("resident");
+        assert!(
+            at(&under, 610, 400)[3] > 0.9,
+            "the erase went through to the layer below: {:?}",
+            at(&under, 610, 400)
+        );
+    }
+
+    /// Redo has to replay an erase as an erase. It replays dabs rather than storing an after-image,
+    /// so an unrecorded mode would come back as a black stroke -- the worst kind of undo bug,
+    /// because it looks like it worked.
+    #[test]
+    fn redoing_an_erase_erases_again() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+
+        let mut editor = Editor::new();
+        editor.brush_mut().radius = 40.0;
+        editor.brush_mut().hardness = 1.0;
+        let page = editor.page_rect();
+        let mut layer = test_stroke_layer(&device);
+        let mut canvas = test_canvas(&device, page, &layer);
+        let mut history = History::new(&device);
+        let mut recording = Vec::new();
+        let mut recording_paint = ([0.0; 4], 1.0, false);
+        let id = editor.active_layer_id();
+
+        editor.stroke_begin(400.0, 400.0, 1.0);
+        editor.stroke_to(800.0, 400.0, 1.0);
+        editor.stroke_end();
+        run_frame_on(
+            &device,
+            &queue,
+            &mut canvas,
+            &mut layer,
+            &mut history,
+            &mut recording,
+            &mut recording_paint,
+            &mut editor,
+            id,
+        );
+
+        editor.set_tool(crate::editor::Tool::Eraser);
+        editor.brush_mut().radius = 40.0;
+        editor.brush_mut().hardness = 1.0;
+        editor.stroke_begin(600.0, 400.0, 1.0);
+        editor.stroke_to(620.0, 400.0, 1.0);
+        editor.stroke_end();
+        run_frame_on(
+            &device,
+            &queue,
+            &mut canvas,
+            &mut layer,
+            &mut history,
+            &mut recording,
+            &mut recording_paint,
+            &mut editor,
+            id,
+        );
+
+        // The op history recorded it; replaying must reproduce a hole, not a stroke.
+        let op = history.pop_undo().expect("the erase was recorded");
+        match &op {
+            Op::Stroke { erase, .. } => assert!(*erase, "the erase was recorded as paint"),
+            _ => panic!("the last operation was not a stroke"),
+        }
+    }
+
     /// Drain the editor's pending commands through the executor, as `redraw` does.
     #[allow(clippy::too_many_arguments)]
     fn run_frame(
@@ -725,7 +907,7 @@ mod tests {
         layer: &mut StrokeLayer,
         history: &mut History,
         recording: &mut Vec<Dab>,
-        recording_paint: &mut ([f32; 4], f32),
+        recording_paint: &mut ([f32; 4], f32, bool),
         editor: &mut Editor,
     ) {
         run_frame_on(
@@ -750,7 +932,7 @@ mod tests {
         layer: &mut StrokeLayer,
         history: &mut History,
         recording: &mut Vec<Dab>,
-        recording_paint: &mut ([f32; 4], f32),
+        recording_paint: &mut ([f32; 4], f32, bool),
         editor: &mut Editor,
         layer_id: u32,
     ) {

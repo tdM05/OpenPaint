@@ -81,8 +81,9 @@ pub struct Renderer {
     /// replay it. A stroke spans many frames, and each frame's dabs are cleared
     /// once executed, so history has to keep its own copy.
     recording: Vec<openpaint_core::Dab>,
-    /// Paint of the stroke being recorded, captured at Begin.
-    recording_paint: ([f32; 4], f32),
+    /// Paint of the stroke being recorded, captured at Begin: colour, opacity ceiling, and
+    /// whether it erases.
+    recording_paint: ([f32; 4], f32, bool),
     /// Set when a stroke could not be recorded for undo because the snapshot pool was
     /// full even after evicting everything.
     unrecordable: bool,
@@ -172,7 +173,7 @@ impl Renderer {
             stroke_layer,
             history,
             recording: Vec::new(),
-            recording_paint: ([0.0; 4], 1.0),
+            recording_paint: ([0.0; 4], 1.0, false),
             unrecordable: false,
             pressured: false,
             window,
@@ -577,6 +578,7 @@ impl Renderer {
                 dabs,
                 color_linear_premul,
                 opacity,
+                erase,
                 ..
             } => {
                 // Replayed rather than restored from an after-image: half the memory, and
@@ -585,7 +587,7 @@ impl Renderer {
                 let page = self.canvas_renderer.page();
                 self.stroke_layer.set_page(&self.queue, page);
                 self.stroke_layer
-                    .set_paint(&self.queue, *color_linear_premul, *opacity);
+                    .set_paint(&self.queue, *color_linear_premul, *opacity, *erase);
                 self.stroke_layer
                     .upload_dabs(&self.device, &self.queue, dabs);
 

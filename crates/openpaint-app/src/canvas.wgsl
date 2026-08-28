@@ -35,7 +35,8 @@ struct Params {
     paper: vec4<f32>,
     // In-progress stroke: rgb is its colour (linear, unpremultiplied), w its opacity ceiling.
     stroke: vec4<f32>,
-    // x = layer count, y = index of the active layer, z = 1 while a stroke is in progress.
+    // x = layer count, y = index of the active layer, z = 1 while a stroke is in progress,
+    // w = 1 when that stroke is an erase.
     counts: vec4<u32>,
     // x = tile size in pixels.
     misc: vec4<f32>,
@@ -189,8 +190,15 @@ fn composite_fs(in: TileOut) -> @location(0) vec4<f32> {
         if (i == active_layer && stroke_slot != ABSENT) {
             let raw = textureSampleLevel(accum, samp, in.uv, i32(stroke_slot), 0.0).r;
             let a = clamp(raw, 0.0, 1.0) * params.stroke.w;
-            let s = vec4<f32>(params.stroke.rgb * a, a);
-            src = s + src * (1.0 - a);
+            if (params.counts.w != 0u) {
+                // Erasing removes coverage. Not "painting the paper colour": on a layer above
+                // others, an erase has to reveal what is beneath, and premultiplied means the
+                // one multiply scales colour and coverage together.
+                src = src * (1.0 - a);
+            } else {
+                let s = vec4<f32>(params.stroke.rgb * a, a);
+                src = s + src * (1.0 - a);
+            }
         }
 
         if (info.opacity <= 0.0) {

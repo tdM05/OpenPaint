@@ -76,6 +76,17 @@ use view::{View, ROTATE_STEP};
 /// handle is equally easy to hit whether you are at 10% or 800%.
 const CROP_GRAB_PX: f32 = 10.0;
 
+/// Multiplier per brush-size keypress.
+///
+/// Multiplicative rather than a fixed increment, because size is perceived logarithmically: one
+/// press at radius 4 should feel like one press at radius 40.
+const BRUSH_STEP: f32 = 1.15;
+
+/// Brush radius limits. The lower bound keeps a single-pixel brush reachable; the upper is past
+/// any useful blocking-in brush on the largest page.
+const MIN_BRUSH_RADIUS: f32 = 0.5;
+const MAX_BRUSH_RADIUS: f32 = 512.0;
+
 /// Fallback drain cadence for a polled input backend.
 ///
 /// Windows Ink normally posts a thread message when new pen data lands, which
@@ -631,6 +642,28 @@ impl OpenPaint {
         self.request_redraw();
     }
 
+    /// Resize the active tool's brush by a factor, and say what it became.
+    ///
+    /// The status line matters more than it looks: the pen cannot reach the panel (Q14), so
+    /// without feedback the only way to know the new size is to draw with it.
+    fn scale_brush(&mut self, factor: f32) -> bool {
+        let brush = self.editor.brush_mut();
+        brush.radius = (brush.radius * factor).clamp(MIN_BRUSH_RADIUS, MAX_BRUSH_RADIUS);
+        let radius = brush.radius;
+        let tool = self.editor.tool().label();
+        self.status_message = Some(format!("{tool} size {:.1} px", radius * 2.0));
+        self.request_redraw();
+        true
+    }
+
+    /// Switch tool from the keyboard.
+    fn pick_tool(&mut self, tool: editor::Tool) -> bool {
+        self.editor.set_tool(tool);
+        self.status_message = Some(tool.label().to_owned());
+        self.request_redraw();
+        true
+    }
+
     /// Where Ctrl+S writes and Ctrl+O reads, until there is a file dialog.
     ///
     /// A fixed name in the working directory, matching how PNG export already behaves. Choosing
@@ -840,7 +873,8 @@ impl OpenPaint {
     ///   - space + drag, or middle-drag, pans
     ///   - wheel zooms about the cursor
     ///   - Ctrl+0 fits the canvas, Ctrl+1 goes to 100%
-    ///   - `[` / `]` rotate about the cursor, Ctrl+0 also resets rotation
+    ///   - `[` / `]` resize the brush, Shift+`[` / Shift+`]` rotate about the cursor
+    ///   - `b` / `e` choose brush or eraser
     fn handle_navigation(&mut self, event: &WindowEvent) -> bool {
         use winit::event::{ElementState, MouseButton, MouseScrollDelta};
         use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
@@ -904,8 +938,18 @@ impl OpenPaint {
                 // you want for a held modifier-style action anyway.
                 if pressed {
                     let step = match key.physical_key {
-                        PhysicalKey::Code(KeyCode::BracketLeft) => Some(-ROTATE_STEP),
-                        PhysicalKey::Code(KeyCode::BracketRight) => Some(ROTATE_STEP),
+                        // Only with Shift: the bare brackets resize the brush, as they do in
+                        // every art app, and that is the far more frequent action.
+                        PhysicalKey::Code(KeyCode::BracketLeft)
+                            if self.nav.modifiers.shift_key() =>
+                        {
+                            Some(-ROTATE_STEP)
+                        }
+                        PhysicalKey::Code(KeyCode::BracketRight)
+                            if self.nav.modifiers.shift_key() =>
+                        {
+                            Some(ROTATE_STEP)
+                        }
                         _ => None,
                     };
                     if let Some(step) = step {
@@ -923,20 +967,30 @@ impl OpenPaint {
                         }
                         true
                     }
-                    // Digits by logical key: stable across layouts.
-                    Key::Character(c) if pressed => match c.as_str() {
-                        "0" => {
-                            self.view.request_fit();
-                            self.request_redraw();
-                            true
+                    // By logical key, so these are stable across keyboard layouts. Modifiers
+                    // are excluded so Ctrl+S and friends are not eaten here.
+                    Key::Character(c) if pressed && !self.nav.modifiers.control_key() => {
+                        match c.as_str() {
+                            "0" => {
+                                self.view.request_fit();
+                                self.request_redraw();
+                                true
+                            }
+                            "1" => {
+                                self.view.set_scale_about(1.0, self.nav.anchor(w, h), w, h);
+                                self.request_redraw();
+                                true
+                            }
+                            // Multiplicative, because brush sizes are perceived that way: one
+                            // step at radius 4 should feel like one step at radius 40, which a
+                            // fixed increment does not.
+                            "[" => self.scale_brush(1.0 / BRUSH_STEP),
+                            "]" => self.scale_brush(BRUSH_STEP),
+                            "b" | "B" => self.pick_tool(editor::Tool::Brush),
+                            "e" | "E" => self.pick_tool(editor::Tool::Eraser),
+                            _ => false,
                         }
-                        "1" => {
-                            self.view.set_scale_about(1.0, self.nav.anchor(w, h), w, h);
-                            self.request_redraw();
-                            true
-                        }
-                        _ => false,
-                    },
+                    }
                     _ => false,
                 }
             }
@@ -1003,6 +1057,7 @@ impl OpenPaint {
         let mut crop_request = None;
         let mut trim_request = false;
         let mut layer_request = None;
+        let mut tool_request = None;
         let mut page_request = None;
         let history_status = renderer.history_status();
         let residency = renderer.residency();
@@ -1017,6 +1072,7 @@ impl OpenPaint {
         // gymnastics avoiding it would need.
         let layers = editor.layers().to_vec();
         let active_index = editor.active_layer_index();
+        let active_tool = editor.tool();
         let page_count = editor.document().page_count();
         let active_page = editor.document().active_index();
         let window = renderer.window().clone();
@@ -1043,6 +1099,7 @@ impl OpenPaint {
                         layers: &layers,
                         active_layer: active_index,
                         pages: (page_count, active_page),
+                        tool: active_tool,
                     },
                 );
                 ui_wants_repaint = out.wants_repaint;
@@ -1051,6 +1108,7 @@ impl OpenPaint {
                 trim_request = out.trim;
                 layer_request = out.layer;
                 page_request = out.page;
+                tool_request = out.tool;
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
@@ -1074,6 +1132,10 @@ impl OpenPaint {
             self.status_message = Some(
                 "Too much of the canvas is visible at once to keep on the GPU; zoom in.".to_owned(),
             );
+        }
+        if let Some(tool) = tool_request {
+            self.editor.set_tool(tool);
+            self.request_redraw();
         }
         if let Some(action) = page_request {
             self.apply_page_action(action);
