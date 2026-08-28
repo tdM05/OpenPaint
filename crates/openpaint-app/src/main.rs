@@ -34,12 +34,14 @@
 //!      pump can never re-enter our GPU or input work part-way through.
 
 mod canvas_renderer;
-mod gpu;
+mod editor;
 mod input;
 mod input_mouse;
 #[cfg(target_os = "windows")]
 mod input_pen;
+mod renderer;
 mod ui;
+mod view;
 
 use std::error::Error;
 use std::sync::Arc;
@@ -51,9 +53,11 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
-use gpu::Gpu;
-use input::{InputBackend, PenEvent};
+use editor::Editor;
+use input::{InputBackend, PenEvent, PenSample};
 use input_mouse::MouseBackend;
+use renderer::Renderer;
+use view::View;
 
 /// Fallback drain cadence for a polled input backend.
 ///
@@ -64,10 +68,23 @@ use input_mouse::MouseBackend;
 /// with real latency numbers in step 6.
 const POLL_INTERVAL: Duration = Duration::from_millis(4);
 
-/// App state. The GPU context is created lazily in `resumed`, per the winit
-/// 0.30 lifecycle contract.
+/// The application shell: it owns the pieces and wires them together, and holds
+/// no engine logic of its own.
+///
+/// Four separate concerns, deliberately not one object (see `renderer.rs`):
+///   - [`Editor`] - the document, brush, and stroke state. No GPU, no UI.
+///   - [`View`] - where the canvas sits on screen, and the screen/canvas
+///     transform. This is where pan/zoom/rotate will land.
+///   - [`Renderer`] - wgpu resources and frame presentation. No document, no UI.
+///   - [`ui::Ui`] - the throwaway debug panel, reached only through the
+///     renderer's overlay callback so the renderer stays UI-agnostic.
+///
+/// GPU and UI are created lazily in `resumed`, per the winit 0.30 lifecycle.
 struct OpenPaint {
-    gpu: Option<Gpu>,
+    editor: Editor,
+    view: View,
+    renderer: Option<Renderer>,
+    ui: Option<ui::Ui>,
     /// The active input source. Boxed so the backend is swappable at runtime;
     /// the rest of the app only sees `PenEvent`s, never the concrete backend.
     input: Box<dyn InputBackend>,
@@ -75,7 +92,7 @@ struct OpenPaint {
     pen_events: Vec<PenEvent>,
     /// Set while we're inside one of our own event handlers, so a nested
     /// message pump can't re-enter our GPU/input work. See the module-level
-    /// "Windows Ink reentrancy" note — without this, a re-entered frame can
+    /// "Windows Ink reentrancy" note - without this, a re-entered frame can
     /// deadlock on a lock its own interrupted outer call is holding.
     in_dispatch: bool,
 }
@@ -83,7 +100,10 @@ struct OpenPaint {
 impl Default for OpenPaint {
     fn default() -> Self {
         Self {
-            gpu: None,
+            editor: Editor::new(),
+            view: View::new(),
+            renderer: None,
+            ui: None,
             input: Box::new(MouseBackend::new()),
             pen_events: Vec::new(),
             in_dispatch: false,
@@ -92,39 +112,137 @@ impl Default for OpenPaint {
 }
 
 impl OpenPaint {
-    /// Apply a decoded pen event to the canvas.
-    fn handle_pen_event(gpu: &mut Gpu, event: &PenEvent) {
+    /// Apply a decoded pen event, mapping window coordinates to canvas space.
+    ///
+    /// The coordinate transform lives in [`View`] rather than here or in the
+    /// editor, so the mapping used for input can never drift from the one used to
+    /// draw the canvas.
+    fn handle_pen_event(&mut self, event: &PenEvent) {
         match event {
-            PenEvent::Down(sample) => gpu.stroke_begin(sample),
-            PenEvent::Move(samples) => {
-                for sample in samples {
-                    gpu.stroke_to(sample);
+            PenEvent::Down(sample) => {
+                // Don't paint underneath the UI. This check is needed for the pen
+                // specifically, because pen input never reaches egui and so egui's
+                // own pointer capture cannot exclude it (OPEN_QUESTIONS Q14).
+                if self.ui_blocks_point(sample) {
+                    return;
+                }
+                if let Some((cx, cy)) = self.to_canvas(sample) {
+                    self.editor.stroke_begin(cx, cy, sample.pressure);
+                    self.request_redraw();
                 }
             }
-            PenEvent::Up => gpu.stroke_end(),
+            PenEvent::Move(samples) => {
+                if !self.editor.is_drawing() {
+                    return;
+                }
+                for sample in samples {
+                    if let Some((cx, cy)) = self.to_canvas(sample) {
+                        self.editor.stroke_to(cx, cy, sample.pressure);
+                    }
+                }
+                self.request_redraw();
+            }
+            PenEvent::Up => self.editor.stroke_end(),
         }
+    }
+
+    /// Map a pen sample from window pixels to canvas pixels.
+    fn to_canvas(&self, sample: &PenSample) -> Option<(f32, f32)> {
+        let renderer = self.renderer.as_ref()?;
+        let (w, h) = renderer.size_px();
+        self.view
+            .screen_to_canvas(sample.x, sample.y, w, h, self.editor.canvas())
+    }
+
+    fn ui_blocks_point(&self, sample: &PenSample) -> bool {
+        self.ui
+            .as_ref()
+            .is_some_and(|ui| ui.blocks_point(sample.x, sample.y))
+    }
+
+    fn request_redraw(&self) {
+        if let Some(renderer) = self.renderer.as_ref() {
+            renderer.window().request_redraw();
+        }
+    }
+
+    /// Apply a batch of pen events, reusing the scratch buffer.
+    fn apply_pen_events(&mut self) {
+        if self.pen_events.is_empty() {
+            return;
+        }
+        let events = std::mem::take(&mut self.pen_events);
+        for pe in &events {
+            self.handle_pen_event(pe);
+        }
+        // Put the allocation back for next time.
+        self.pen_events = events;
+        self.pen_events.clear();
     }
 
     /// Drain the input backend and apply whatever it produced.
     ///
-    /// Only ever called from `about_to_wait` — see the module-level reentrancy
+    /// Only ever called from `about_to_wait` - see the module-level reentrancy
     /// note for why touching the backend from a window/paint event deadlocks.
     fn drain_input(&mut self) {
         self.pen_events.clear();
         self.input.poll(&mut self.pen_events);
-        if let Some(gpu) = self.gpu.as_mut() {
-            for pe in self.pen_events.drain(..) {
-                Self::handle_pen_event(gpu, &pe);
+        self.apply_pen_events();
+    }
+
+    /// Draw one frame: canvas first, then the UI on top of it.
+    fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        // Disjoint field borrows, so the overlay closure can touch the editor and
+        // the UI while the renderer is mutably borrowed.
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let ui = self.ui.as_mut();
+        let editor = &mut self.editor;
+
+        renderer.upload_canvas(editor.canvas_mut());
+        let (w, h) = renderer.size_px();
+        let placement = self.view.placement(w, h, editor.canvas());
+
+        let mut ui_wants_repaint = false;
+        let mut ui_inset_left = None;
+        let window = renderer.window().clone();
+        let result = renderer.render(placement, |gpu| {
+            if let Some(ui) = ui {
+                ui_wants_repaint = ui.render(&window, gpu, editor.brush_mut());
+                ui_inset_left = Some(ui.inset_left_px());
             }
+        });
+
+        // Keep the canvas centered in the area the panel leaves free.
+        if let Some(inset) = ui_inset_left {
+            self.view.set_inset_left(inset);
+        }
+        if ui_wants_repaint {
+            self.request_redraw();
+        }
+
+        match result {
+            Ok(()) => {}
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                if let Some(r) = self.renderer.as_mut() {
+                    r.reconfigure();
+                }
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                eprintln!("GPU out of memory - exiting");
+                event_loop.exit();
+            }
+            Err(wgpu::SurfaceError::Timeout) => {}
         }
     }
 
     /// The real body of [`ApplicationHandler::window_event`], wrapped by the
     /// reentrancy guard.
     fn dispatch_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
-        let Some(gpu) = self.gpu.as_mut() else {
+        if self.renderer.is_none() {
             return;
-        };
+        }
 
         // Window/lifecycle events the shell handles directly.
         match &event {
@@ -133,24 +251,16 @@ impl OpenPaint {
                 return;
             }
             WindowEvent::Resized(new_size) => {
-                gpu.resize(*new_size);
-                gpu.window().request_redraw();
+                if let Some(r) = self.renderer.as_mut() {
+                    r.resize(*new_size);
+                }
+                self.request_redraw();
                 return;
             }
             WindowEvent::RedrawRequested => {
                 // Render only. Input is drained in `about_to_wait`; draining it
                 // here is what deadlocked step 5 (module-level note).
-                match gpu.render() {
-                    Ok(()) => {}
-                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                        gpu.reconfigure();
-                    }
-                    Err(wgpu::SurfaceError::OutOfMemory) => {
-                        eprintln!("GPU out of memory — exiting");
-                        event_loop.exit();
-                    }
-                    Err(wgpu::SurfaceError::Timeout) => {}
-                }
+                self.redraw(event_loop);
                 return;
             }
             _ => {}
@@ -158,8 +268,17 @@ impl OpenPaint {
 
         // The debug panel gets first refusal on anything left. If it took the
         // event, it must not also become a brush stroke.
-        if gpu.ui_handled_event(&event) {
-            return;
+        //
+        // Always request a frame afterwards, consumed or not: egui processes
+        // queued input during its own render, so with demand-driven painting it
+        // cannot react - or even decide whether to consume the *next* event -
+        // unless a frame follows.
+        if let (Some(ui), Some(renderer)) = (self.ui.as_mut(), self.renderer.as_ref()) {
+            let consumed = ui.on_window_event(renderer.window(), &event);
+            renderer.window().request_redraw();
+            if consumed {
+                return;
+            }
         }
 
         // Everything else is offered to the input backend, which turns native
@@ -167,15 +286,13 @@ impl OpenPaint {
         self.pen_events.clear();
         self.input
             .process_window_event(&event, &mut self.pen_events);
-        for pe in self.pen_events.drain(..) {
-            Self::handle_pen_event(gpu, &pe);
-        }
+        self.apply_pen_events();
     }
 }
 
 impl ApplicationHandler for OpenPaint {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.gpu.is_some() {
+        if self.renderer.is_some() {
             return;
         }
 
@@ -203,15 +320,20 @@ impl ApplicationHandler for OpenPaint {
             self.input = Box::new(pen);
         }
 
-        match Gpu::new(window) {
-            Ok(gpu) => {
-                println!("{} — {}", openpaint_core::hello(), openpaint_core::VERSION);
+        match Renderer::new(window.clone(), self.editor.canvas()) {
+            Ok(renderer) => {
+                println!("{} - {}", openpaint_core::hello(), openpaint_core::VERSION);
                 println!("input backend: {}", self.input.name());
+                self.ui = Some(ui::Ui::new(
+                    renderer.device(),
+                    renderer.surface_format(),
+                    &window,
+                ));
                 // Ask for the first frame explicitly. Redraws are demand-driven
-                // now (strokes and resizes request them), so nothing else would
-                // paint the initial canvas.
-                gpu.window().request_redraw();
-                self.gpu = Some(gpu);
+                // (strokes, resizes, and UI activity request them), so nothing
+                // else would paint the initial canvas.
+                renderer.window().request_redraw();
+                self.renderer = Some(renderer);
             }
             Err(err) => {
                 eprintln!("failed to initialize GPU: {err}");

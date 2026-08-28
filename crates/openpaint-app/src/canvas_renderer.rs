@@ -4,24 +4,32 @@
 //! the whole canvas, initialized to the paper color. When tiles change, upload
 //! just those tiles as sub-rectangles (`write_texture`) — so we still only
 //! touch changed regions, preserving the point of the tile model. The texture
-//! is drawn as a single quad, fitted and centered in the window.
+//! is drawn as a single quad, positioned by `crate::view::View`.
+//!
+//! ⚠️ **One whole-canvas texture is a known Phase-0 shortcut and contradicts a
+//! decision we have already made.** DECISIONS §2 requires the GPU to hold a
+//! *bounded* set of resident tiles, because an A4 page at 300 DPI is ~70 MB per
+//! layer at `Rgba16Float` and a webtoon strip is unbounded — neither fits in a
+//! Surface's shared graphics memory. At the current 2048² this costs ~34 MB and
+//! works fine, so it is deliberately deferred to the GPU-rasterization work,
+//! which needs to touch this file anyway. Tracked as OPEN_QUESTIONS Q13.
 
 use half::f16;
 use openpaint_core::tile::{TILE_BYTES, TILE_CHANNELS, TILE_SIZE};
 use openpaint_core::Canvas;
 use wgpu::util::DeviceExt;
 
+use crate::view::Placement;
+
 /// Uniform matching `Placement` in canvas.wgsl (std140: two vec2 -> 16 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Placement {
+struct PlacementUniform {
     min_ndc: [f32; 2],
     max_ndc: [f32; 2],
 }
 
 pub struct CanvasRenderer {
-    canvas_w: u32,
-    canvas_h: u32,
     texture: wgpu::Texture,
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
@@ -91,7 +99,7 @@ impl CanvasRenderer {
 
         let placement_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("placement-uniform"),
-            contents: bytemuck::bytes_of(&Placement {
+            contents: bytemuck::bytes_of(&PlacementUniform {
                 min_ndc: [-1.0, 1.0],
                 max_ndc: [1.0, -1.0],
             }),
@@ -190,8 +198,6 @@ impl CanvasRenderer {
         });
 
         Self {
-            canvas_w,
-            canvas_h,
             texture,
             pipeline,
             bind_group,
@@ -240,28 +246,18 @@ impl CanvasRenderer {
         }
     }
 
-    /// Recompute where the canvas quad sits: fit-and-center inside the surface
-    /// with a small margin, preserving the canvas aspect ratio.
-    pub fn update_placement(&self, queue: &wgpu::Queue, surface_w: u32, surface_h: u32) {
-        let sw = surface_w.max(1) as f32;
-        let sh = surface_h.max(1) as f32;
-        let cw = self.canvas_w as f32;
-        let ch = self.canvas_h as f32;
-
-        let margin = 0.94; // leave a little breathing room around the canvas
-        let scale = (sw / cw).min(sh / ch) * margin;
-        let draw_w = cw * scale;
-        let draw_h = ch * scale;
-
-        // Half-extents in NDC.
-        let hx = draw_w / sw;
-        let hy = draw_h / sh;
-
-        let placement = Placement {
-            min_ndc: [-hx, hy],
-            max_ndc: [hx, -hy],
+    /// Upload where the canvas quad should be drawn, as computed by
+    /// [`crate::view::View`].
+    ///
+    /// The renderer deliberately does not compute this itself: the same transform
+    /// has to map input back to canvas space, and keeping one owner is what stops
+    /// the two drifting apart.
+    pub fn set_placement(&self, queue: &wgpu::Queue, placement: Placement) {
+        let uniform = PlacementUniform {
+            min_ndc: placement.min_ndc,
+            max_ndc: placement.max_ndc,
         };
-        queue.write_buffer(&self.placement_buf, 0, bytemuck::bytes_of(&placement));
+        queue.write_buffer(&self.placement_buf, 0, bytemuck::bytes_of(&uniform));
     }
 
     /// Record draw commands into an existing render pass.
@@ -269,39 +265,6 @@ impl CanvasRenderer {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.draw(0..6, 0..1);
-    }
-
-    /// Map a window pixel position to a canvas pixel position using the same
-    /// fit-and-center math as `update_placement`. Returns `None` if the point
-    /// falls outside the drawn canvas quad. Kept here so screen->canvas mapping
-    /// can never drift from the placement used for drawing.
-    pub fn screen_to_canvas(
-        &self,
-        px: f64,
-        py: f64,
-        surface_w: u32,
-        surface_h: u32,
-    ) -> Option<(f32, f32)> {
-        let sw = surface_w.max(1) as f32;
-        let sh = surface_h.max(1) as f32;
-        let cw = self.canvas_w as f32;
-        let ch = self.canvas_h as f32;
-
-        let margin = 0.94;
-        let scale = (sw / cw).min(sh / ch) * margin;
-        let draw_w = cw * scale;
-        let draw_h = ch * scale;
-
-        // Quad is centered in the surface.
-        let left = (sw - draw_w) * 0.5;
-        let top = (sh - draw_h) * 0.5;
-
-        let lx = px as f32 - left;
-        let ly = py as f32 - top;
-        if lx < 0.0 || ly < 0.0 || lx > draw_w || ly > draw_h {
-            return None;
-        }
-        Some((lx / scale, ly / scale))
     }
 }
 

@@ -8,6 +8,12 @@
 //!
 //! Consequently: **optimize for clarity, not speed.** If this and the GPU
 //! disagree, this one is right by definition, so it has to be obviously correct.
+//!
+//! ⚠️ Status check: there is currently **no production call site** — strokes paint
+//! through [`crate::stroke::StrokePainter`], which is the correct path for
+//! anything with more than one dab. So the "reference implementation" role is real
+//! but not yet earned; it becomes load-bearing when the GPU rasterizer lands and
+//! has something to be compared against. Tracked in OPEN_QUESTIONS Q15.
 
 use crate::canvas::Canvas;
 use crate::color::scale_premul;

@@ -25,6 +25,8 @@ use egui::ViewportId;
 use openpaint_core::Brush;
 use winit::window::Window;
 
+use crate::renderer::Overlay;
+
 /// Width of the side panel in logical points.
 const PANEL_WIDTH: f32 = 280.0;
 
@@ -69,6 +71,13 @@ impl Ui {
         self.state.on_window_event(window, event).consumed
     }
 
+    /// Physical pixels of the left edge the panel occupies, so the canvas can be
+    /// centered in the area actually visible rather than partly underneath it.
+    #[must_use]
+    pub fn inset_left_px(&self) -> f32 {
+        self.occupied.max.x.max(0.0)
+    }
+
     /// Whether a point in physical window pixels lies over the panel.
     ///
     /// Used to keep pen strokes from painting underneath the UI. egui's own
@@ -83,17 +92,14 @@ impl Ui {
     /// fade, a drag in progress). The caller **must** honor it: painting is
     /// demand-driven, and egui is only interactive while frames keep coming.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn render(
-        &mut self,
-        window: &Window,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        target: &wgpu::TextureView,
-        surface_size: [u32; 2],
-        brush: &mut Brush,
-    ) -> bool {
+    pub fn render(&mut self, window: &Window, gpu: Overlay<'_>, brush: &mut Brush) -> bool {
+        let Overlay {
+            device,
+            queue,
+            encoder,
+            target,
+            size_px,
+        } = gpu;
         let input = self.state.take_egui_input(window);
         let mut color_srgb = brush.color_srgb8();
 
@@ -180,7 +186,7 @@ impl Ui {
             self.renderer.update_texture(device, queue, *id, delta);
         }
         let desc = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: surface_size,
+            size_in_pixels: size_px,
             pixels_per_point: output.pixels_per_point,
         };
         self.renderer

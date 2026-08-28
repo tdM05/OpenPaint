@@ -244,6 +244,47 @@ egui at all given egui is explicitly throwaway (DECISIONS section 3) - it may be
 better to solve once, properly, when the real UI framework is chosen (Q4). Until
 then the mouse operates the UI and the pen draws.
 
+### Q15. Tracked Phase-0 shortcuts (audited 2026-08-27)
+An honest inventory, so none of these go quiet. Each says why it is deferred
+rather than pretending it isn't there.
+
+**Fixed in the audit** (was: `Gpu` was simultaneously the renderer, the document
+owner, the stroke state machine, and the UI host): split into `Editor` (document +
+brush + stroke), `View` (screen/canvas transform, where pan/zoom will live),
+`Renderer` (wgpu only), and `ui` reached through a renderer overlay callback. The
+app crate went from 0 tests to 12, because `Editor` and `View` are now testable
+without a GPU.
+
+**Still outstanding, deliberately:**
+
+1. **One whole-canvas GPU texture** (`canvas_renderer.rs`). Contradicts the
+   bounded-tile-cache requirement in DECISIONS §2 / Q13. Harmless at 2048²
+   (~34 MB) and fatal at 300 DPI or webtoon sizes. Deferred because the GPU
+   rasterization work has to rewrite this file anyway — doing it twice would be
+   waste, not caution.
+2. **Only one input backend is active at a time.** The mouse backend is dropped
+   the moment the pen connects, so mouse drawing only works via octotablet's
+   *emulated* mouse tool, which always reports pressure 1.0. Deferred because the
+   proper fix is a single input-dispatch layer that multiplexes sources and offers
+   events to the UI before the canvas — which is the same work as Q14. Doing them
+   together avoids building the layer twice.
+3. **`PenSample::time_ms` is still hardcoded `0.0`.** octotablet already provides
+   `ToolEvent::Frame(Option<FrameTimestamp>)`. Until it is wired, prediction,
+   stabilization, and *any* latency measurement are impossible — so this is a
+   prerequisite for the step-6 `WM_POINTER` decision, not an optional extra.
+   Cheap; just not yet load-bearing.
+4. **`tilt` is captured but unused.** Surface Pen reports real tilt (the Veikk does
+   not), so there is finally hardware to develop against when tilt-driven brushes
+   arrive.
+5. **`openpaint_core::raster` has no production call site.** The app paints through
+   `StrokePainter` instead. It is the reference implementation the GPU rasterizer
+   will be validated against, which is a real role — but an unearned one until
+   that rasterizer exists. If GPU rasterization slips far, revisit whether this is
+   a spec or just weight.
+
+Not shortcuts, simply unbuilt and scheduled: pan/zoom/rotate, GPU dab
+rasterization, `Document`/`Page`, layers, undo, and the tuned falloff curve (Q7a).
+
 ## Lower-priority / later
 
 ### Q8. PSD compatibility depth
