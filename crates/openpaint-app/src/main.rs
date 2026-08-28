@@ -109,7 +109,12 @@ struct OpenPaint {
 #[derive(Default)]
 struct Nav {
     /// Cursor position in physical pixels, needed to anchor zoom and rotation.
-    cursor: (f64, f64),
+    ///
+    /// `None` until the pointer has actually been somewhere. Defaulting to (0, 0)
+    /// would silently anchor the first zoom at the window's top-left corner --
+    /// which is reachable in practice (wheel over the window without moving first,
+    /// e.g. a trackpad gesture) and looks like the canvas leaping away.
+    cursor: Option<(f64, f64)>,
     /// True while space is held, which arms pan-on-drag (Photoshop/CSP habit).
     space_held: bool,
     /// Where a pan drag last was, if one is in progress.
@@ -125,6 +130,13 @@ impl Nav {
     /// and paint simultaneously.
     fn is_active(&self) -> bool {
         self.space_held || self.panning_from.is_some()
+    }
+
+    /// Where to anchor zoom and rotation: the pointer if we've seen it, otherwise
+    /// the centre of the surface.
+    fn anchor(&self, surface_w: u32, surface_h: u32) -> (f64, f64) {
+        self.cursor
+            .unwrap_or((f64::from(surface_w) / 2.0, f64::from(surface_h) / 2.0))
     }
 }
 
@@ -240,8 +252,7 @@ impl OpenPaint {
 
         match event {
             WindowEvent::CursorMoved { position, .. } => {
-                let last = self.nav.cursor;
-                self.nav.cursor = (position.x, position.y);
+                self.nav.cursor = Some((position.x, position.y));
                 if let Some(from) = self.nav.panning_from {
                     let dx = (position.x - from.0) as f32;
                     let dy = (position.y - from.1) as f32;
@@ -250,7 +261,6 @@ impl OpenPaint {
                     self.request_redraw();
                     return true;
                 }
-                let _ = last;
                 false
             }
 
@@ -259,7 +269,7 @@ impl OpenPaint {
                     || (self.nav.space_held && matches!(button, MouseButton::Left));
                 match (state, start_pan) {
                     (ElementState::Pressed, true) => {
-                        self.nav.panning_from = Some(self.nav.cursor);
+                        self.nav.panning_from = Some(self.nav.anchor(w, h));
                         true
                     }
                     (ElementState::Released, _) if self.nav.panning_from.is_some() => {
@@ -278,7 +288,8 @@ impl OpenPaint {
                     MouseScrollDelta::PixelDelta(p) => (p.y / 50.0) as f32,
                 };
                 if notches != 0.0 {
-                    self.view.zoom_by_notches(notches, self.nav.cursor, w, h);
+                    self.view
+                        .zoom_by_notches(notches, self.nav.anchor(w, h), w, h);
                     self.request_redraw();
                 }
                 true
@@ -299,7 +310,7 @@ impl OpenPaint {
                         _ => None,
                     };
                     if let Some(step) = step {
-                        self.view.rotate_by(step, self.nav.cursor, w, h);
+                        self.view.rotate_by(step, self.nav.anchor(w, h), w, h);
                         self.request_redraw();
                         return true;
                     }
@@ -321,7 +332,7 @@ impl OpenPaint {
                             true
                         }
                         "1" => {
-                            self.view.set_scale_about(1.0, self.nav.cursor, w, h);
+                            self.view.set_scale_about(1.0, self.nav.anchor(w, h), w, h);
                             self.request_redraw();
                             true
                         }
@@ -355,10 +366,13 @@ impl OpenPaint {
         let mut ui_wants_repaint = false;
         let mut ui_inset_left = None;
         let window = renderer.window().clone();
-        let view = self.view;
+        // Borrowed, not copied: a copy would mean any future UI control that edits
+        // the view silently writes to a dead value. Disjoint field borrows make
+        // this fine alongside the mutable borrows of `renderer` and `editor`.
+        let view = &self.view;
         let result = renderer.render(placement, |gpu| {
             if let Some(ui) = ui {
-                ui_wants_repaint = ui.render(&window, gpu, editor.brush_mut(), &view);
+                ui_wants_repaint = ui.render(&window, gpu, editor.brush_mut(), view);
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
