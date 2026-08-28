@@ -50,7 +50,11 @@ pub struct Dab {
     pub y: f32,
     /// Radius in canvas pixels, after pressure has been applied.
     pub radius: f32,
-    /// Edge softness in `0.0..=1.0`: 0 = hard edge, 1 = fully soft falloff.
+    /// Edge hardness in `0.0..=1.0`: **1 = hard edge, 0 = fully soft falloff**.
+    ///
+    /// Oriented to match Photoshop and CSP, where Hardness 100% is a crisp edge
+    /// (DECISIONS §1a). Getting this backwards would invert every brush preset we
+    /// ever ship, so there is a test pinning the convention.
     pub hardness: f32,
     /// How much paint this dab deposits, in `0.0..=1.0`.
     ///
@@ -91,9 +95,10 @@ impl Dab {
     /// Coverage as a function of distance from the dab center.
     #[must_use]
     pub fn coverage_at_distance(&self, dist: f32) -> f32 {
-        // hardness=1 -> falloff starts at the very center (very soft);
-        // hardness=0 -> solid until ~1px from the edge (hard, still AA'd).
-        let inner = (self.radius * (1.0 - self.hardness)).max(0.0);
+        // Radius of the solid core, outside which coverage ramps to zero.
+        // hardness=1 -> core fills the dab (hard edge, still AA'd at the rim);
+        // hardness=0 -> no core, so falloff starts at the very center (softest).
+        let inner = (self.radius * self.hardness).max(0.0);
         if dist <= inner {
             1.0
         } else if dist >= self.radius {
@@ -149,14 +154,29 @@ mod tests {
         }
     }
 
-    /// A hard brush should be solid almost to its edge; a soft one should start
-    /// falling off immediately. If these invert, hardness is backwards.
+    /// Pins the Photoshop/CSP convention: **hardness 1 is hard, 0 is soft.**
+    /// This was inverted once; the slider felt backwards to use, which is exactly
+    /// what a wrong orientation feels like.
     #[test]
-    fn hardness_controls_where_falloff_starts() {
-        let hard = dab(10.0, 0.0);
-        let soft = dab(10.0, 1.0);
+    fn hardness_one_is_hard_and_zero_is_soft() {
+        let hard = dab(10.0, 1.0);
+        let soft = dab(10.0, 0.0);
+        // Hard: still fully covered near the rim.
         assert_eq!(hard.coverage_at_distance(9.0), 1.0);
+        // Soft: already falling off close to the center.
+        assert!(soft.coverage_at_distance(5.0) < 0.6);
         assert!(soft.coverage_at_distance(9.0) < 0.2);
+    }
+
+    /// Coverage at a given distance must rise with hardness, at every radius.
+    #[test]
+    fn higher_hardness_means_more_coverage_everywhere() {
+        let mut prev = -1.0;
+        for h in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let c = dab(10.0, h).coverage_at_distance(6.0);
+            assert!(c >= prev, "hardness {h} gave less coverage than the last");
+            prev = c;
+        }
     }
 
     #[test]

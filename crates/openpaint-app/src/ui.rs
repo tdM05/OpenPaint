@@ -109,7 +109,19 @@ impl Ui {
                             .logarithmic(true)
                             .text("Size (radius px)"),
                     );
-                    ui.add(egui::Slider::new(&mut brush.hardness, 0.0..=1.0).text("Hardness"));
+                    ui.add(
+                        egui::Slider::new(&mut brush.hardness, 0.0..=1.0)
+                            .text("Hardness")
+                            .custom_formatter(|v, _| {
+                                // Name the ends, because a bare number gives no
+                                // clue which way round it goes.
+                                match v {
+                                    v if v <= 0.001 => "0.00 soft".to_owned(),
+                                    v if v >= 0.999 => "1.00 hard".to_owned(),
+                                    v => format!("{v:.2}"),
+                                }
+                            }),
+                    );
                     ui.add(egui::Slider::new(&mut brush.spacing, 0.01..=1.0).text("Spacing"));
 
                     ui.separator();

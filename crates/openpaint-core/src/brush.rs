@@ -3,7 +3,7 @@
 //! This is the architectural seed of the real brush engine: a stroke is not a
 //! polyline, it's a series of round *dabs* stamped along the path at a fixed
 //! fraction of the brush diameter (the "spacing", ~25% in Photoshop). Each dab
-//! has a soft falloff from center to edge (hardness). Building it this way now
+//! has a falloff from center to edge controlled by hardness. Building it this way now
 //! means the path toward Photoshop/CSP-quality brushes is incremental tuning,
 //! not a rewrite.
 //!
@@ -35,7 +35,8 @@ use crate::dab::Dab;
 pub struct Brush {
     /// Dab radius at full pressure, in pixels.
     pub radius: f32,
-    /// Edge softness in `0.0..=1.0`: 0 = hard edge, 1 = fully soft falloff.
+    /// Edge hardness in `0.0..=1.0`: 1 = hard edge, 0 = fully soft. Matches
+    /// Photoshop/CSP orientation -- see [`crate::dab::Dab::hardness`].
     pub hardness: f32,
     /// Dab spacing as a fraction of diameter (Photoshop default ≈ 0.25).
     pub spacing: f32,
