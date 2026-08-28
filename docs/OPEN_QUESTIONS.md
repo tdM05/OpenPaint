@@ -285,6 +285,28 @@ without a GPU.
 Not shortcuts, simply unbuilt and scheduled: pan/zoom/rotate, GPU dab
 rasterization, `Document`/`Page`, layers, undo, and the tuned falloff curve (Q7a).
 
+### Q16. Input bindings are hardcoded, not data
+DECISIONS section 6 states that input mapping should be **data** -- every action a
+bindable, user-remappable command. The navigation bindings added with pan/zoom
+(space+drag / middle-drag to pan, wheel to zoom, `[`/`]` to rotate, `0` to fit, `1`
+for 100%) are hardcoded in `main.rs::handle_navigation` instead.
+
+Deliberate, for now: a command table plus binding storage plus a remapping UI is
+real structure, and building it around five navigation actions would be designing
+for a command set we cannot yet see. The right moment is when tools, brushes, and
+layer operations exist and the shape of a "command" is actually known.
+
+**What to preserve until then:** navigation already routes through one function, so
+there is a single place to convert. Notable detail worth keeping -- rotation is
+matched on *physical* key position rather than logical character, because bracket
+keys do not reliably resolve to a character (they arrive `Unidentified` under
+synthetic input, and vary by layout). A future binding system needs to express both
+"this character" and "this key position".
+
+**Also open:** whether a stroke should be cancellable mid-flight (pressing space
+part-way through a stroke currently suppresses further painting but does not undo
+what has landed).
+
 ## Lower-priority / later
 
 ### Q8. PSD compatibility depth

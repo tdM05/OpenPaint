@@ -26,6 +26,7 @@ use openpaint_core::Brush;
 use winit::window::Window;
 
 use crate::renderer::Overlay;
+use crate::view::View;
 
 /// Width of the side panel in logical points.
 const PANEL_WIDTH: f32 = 280.0;
@@ -92,7 +93,13 @@ impl Ui {
     /// fade, a drag in progress). The caller **must** honor it: painting is
     /// demand-driven, and egui is only interactive while frames keep coming.
     #[must_use]
-    pub fn render(&mut self, window: &Window, gpu: Overlay<'_>, brush: &mut Brush) -> bool {
+    pub fn render(
+        &mut self,
+        window: &Window,
+        gpu: Overlay<'_>,
+        brush: &mut Brush,
+        view: &View,
+    ) -> bool {
         let Overlay {
             device,
             queue,
@@ -161,6 +168,29 @@ impl Ui {
                             "Spacing is a fraction of diameter (Photoshop ~0.25), so \n                             dabs land every {:.2} px.",
                             brush.radius * 2.0 * brush.spacing
                         ))
+                        .small()
+                        .weak(),
+                    );
+                    ui.separator();
+                    ui.heading("View");
+                    ui.label(format!(
+                        "Zoom {:.0}%    Rotation {:.0} deg",
+                        view.scale() * 100.0,
+                        view.rotation().to_degrees()
+                    ));
+                    ui.label(
+                        egui::RichText::new(
+                            "Wheel zooms at the cursor. Space+drag or middle-drag pans. \
+                             [ and ] rotate. 0 fits, 1 goes to 100%.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Navigation is mouse/keyboard only for now: pen input \
+                             bypasses the UI layer (Q14).",
+                        )
                         .small()
                         .weak(),
                     );

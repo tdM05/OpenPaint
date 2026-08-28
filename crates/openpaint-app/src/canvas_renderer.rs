@@ -21,12 +21,25 @@ use wgpu::util::DeviceExt;
 
 use crate::view::Placement;
 
-/// Uniform matching `Placement` in canvas.wgsl (std140: two vec2 -> 16 bytes).
+/// Uniform matching `Placement` in canvas.wgsl.
+///
+/// Four canvas corners in NDC, packed two per `vec4` so the uniform layout is
+/// unambiguous (a bare `vec2` array in uniform space has a 16-byte stride, which
+/// is an easy way to get silent corruption).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct PlacementUniform {
-    min_ndc: [f32; 2],
-    max_ndc: [f32; 2],
+    tl_tr: [f32; 4],
+    bl_br: [f32; 4],
+}
+
+impl From<Placement> for PlacementUniform {
+    fn from(p: Placement) -> Self {
+        Self {
+            tl_tr: [p.tl[0], p.tl[1], p.tr[0], p.tr[1]],
+            bl_br: [p.bl[0], p.bl[1], p.br[0], p.br[1]],
+        }
+    }
 }
 
 pub struct CanvasRenderer {
@@ -91,7 +104,9 @@ impl CanvasRenderer {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("canvas-sampler"),
-            // Nearest keeps pixels crisp at 100%; we revisit filtering with zoom.
+            // Nearest when magnifying, so zooming in shows real pixels rather
+            // than a blur -- what you want when inspecting brush edges. Linear
+            // when minifying, so a zoomed-out canvas doesn't alias into noise.
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
@@ -100,8 +115,8 @@ impl CanvasRenderer {
         let placement_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("placement-uniform"),
             contents: bytemuck::bytes_of(&PlacementUniform {
-                min_ndc: [-1.0, 1.0],
-                max_ndc: [1.0, -1.0],
+                tl_tr: [-1.0, 1.0, 1.0, 1.0],
+                bl_br: [-1.0, -1.0, 1.0, -1.0],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -253,10 +268,7 @@ impl CanvasRenderer {
     /// has to map input back to canvas space, and keeping one owner is what stops
     /// the two drifting apart.
     pub fn set_placement(&self, queue: &wgpu::Queue, placement: Placement) {
-        let uniform = PlacementUniform {
-            min_ndc: placement.min_ndc,
-            max_ndc: placement.max_ndc,
-        };
+        let uniform = PlacementUniform::from(placement);
         queue.write_buffer(&self.placement_buf, 0, bytemuck::bytes_of(&uniform));
     }
 

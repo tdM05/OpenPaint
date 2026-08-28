@@ -57,7 +57,7 @@ use editor::Editor;
 use input::{InputBackend, PenEvent, PenSample};
 use input_mouse::MouseBackend;
 use renderer::Renderer;
-use view::View;
+use view::{View, ROTATE_STEP};
 
 /// Fallback drain cadence for a polled input backend.
 ///
@@ -90,11 +90,42 @@ struct OpenPaint {
     input: Box<dyn InputBackend>,
     /// Scratch buffer reused each event to avoid per-event allocation.
     pen_events: Vec<PenEvent>,
+    /// Canvas navigation (pan/zoom) state. Kept in the shell rather than the
+    /// view because it is *interaction* state, not camera state.
+    nav: Nav,
     /// Set while we're inside one of our own event handlers, so a nested
     /// message pump can't re-enter our GPU/input work. See the module-level
     /// "Windows Ink reentrancy" note - without this, a re-entered frame can
     /// deadlock on a lock its own interrupted outer call is holding.
     in_dispatch: bool,
+}
+
+/// In-progress canvas navigation.
+///
+/// Bindings are hardcoded here for now. DECISIONS section 6 wants input mapping to
+/// be data (a remappable command table), but with only a handful of navigation
+/// actions that would be speculative structure before the command set is known.
+/// Tracked as OPEN_QUESTIONS Q16.
+#[derive(Default)]
+struct Nav {
+    /// Cursor position in physical pixels, needed to anchor zoom and rotation.
+    cursor: (f64, f64),
+    /// True while space is held, which arms pan-on-drag (Photoshop/CSP habit).
+    space_held: bool,
+    /// Where a pan drag last was, if one is in progress.
+    panning_from: Option<(f64, f64)>,
+}
+
+impl Nav {
+    /// Whether navigation is currently swallowing input, in which case a stroke
+    /// must not also start.
+    ///
+    /// This matters more than it looks: mouse drags reach us as *pen* events via
+    /// octotablet's emulated mouse tool, so without this a space-drag would pan
+    /// and paint simultaneously.
+    fn is_active(&self) -> bool {
+        self.space_held || self.panning_from.is_some()
+    }
 }
 
 impl Default for OpenPaint {
@@ -106,6 +137,7 @@ impl Default for OpenPaint {
             ui: None,
             input: Box::new(MouseBackend::new()),
             pen_events: Vec::new(),
+            nav: Nav::default(),
             in_dispatch: false,
         }
     }
@@ -123,7 +155,7 @@ impl OpenPaint {
                 // Don't paint underneath the UI. This check is needed for the pen
                 // specifically, because pen input never reaches egui and so egui's
                 // own pointer capture cannot exclude it (OPEN_QUESTIONS Q14).
-                if self.ui_blocks_point(sample) {
+                if self.ui_blocks_point(sample) || self.nav.is_active() {
                     return;
                 }
                 if let Some((cx, cy)) = self.to_canvas(sample) {
@@ -132,7 +164,7 @@ impl OpenPaint {
                 }
             }
             PenEvent::Move(samples) => {
-                if !self.editor.is_drawing() {
+                if !self.editor.is_drawing() || self.nav.is_active() {
                     return;
                 }
                 for sample in samples {
@@ -190,6 +222,119 @@ impl OpenPaint {
         self.apply_pen_events();
     }
 
+    /// Handle canvas navigation: pan, zoom, rotate, fit. Returns `true` if the
+    /// event was navigation and should go no further.
+    ///
+    /// Bindings follow Photoshop/CSP habits (DECISIONS section 1a):
+    ///   - space + drag, or middle-drag, pans
+    ///   - wheel zooms about the cursor
+    ///   - Ctrl+0 fits the canvas, Ctrl+1 goes to 100%
+    ///   - `[` / `]` rotate about the cursor, Ctrl+0 also resets rotation
+    fn handle_navigation(&mut self, event: &WindowEvent) -> bool {
+        use winit::event::{ElementState, MouseButton, MouseScrollDelta};
+        use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+
+        let Some((w, h)) = self.renderer.as_ref().map(Renderer::size_px) else {
+            return false;
+        };
+
+        match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                let last = self.nav.cursor;
+                self.nav.cursor = (position.x, position.y);
+                if let Some(from) = self.nav.panning_from {
+                    let dx = (position.x - from.0) as f32;
+                    let dy = (position.y - from.1) as f32;
+                    self.view.pan_by_screen(dx, dy);
+                    self.nav.panning_from = Some((position.x, position.y));
+                    self.request_redraw();
+                    return true;
+                }
+                let _ = last;
+                false
+            }
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                let start_pan = matches!(button, MouseButton::Middle)
+                    || (self.nav.space_held && matches!(button, MouseButton::Left));
+                match (state, start_pan) {
+                    (ElementState::Pressed, true) => {
+                        self.nav.panning_from = Some(self.nav.cursor);
+                        true
+                    }
+                    (ElementState::Released, _) if self.nav.panning_from.is_some() => {
+                        self.nav.panning_from = None;
+                        true
+                    }
+                    _ => false,
+                }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                let notches = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => *y,
+                    // Trackpads report pixels; ~50px per notch feels close to a
+                    // wheel click without being twitchy.
+                    MouseScrollDelta::PixelDelta(p) => (p.y / 50.0) as f32,
+                };
+                if notches != 0.0 {
+                    self.view.zoom_by_notches(notches, self.nav.cursor, w, h);
+                    self.request_redraw();
+                }
+                true
+            }
+
+            WindowEvent::KeyboardInput { event: key, .. } => {
+                let pressed = key.state == ElementState::Pressed;
+
+                // Rotation is matched on *physical* key position, not the logical
+                // character. Two reasons: bracket keys don't always resolve to a
+                // character (they arrive as `Unidentified` under synthetic input,
+                // and layouts differ), and position-consistent bindings are what
+                // you want for a held modifier-style action anyway.
+                if pressed {
+                    let step = match key.physical_key {
+                        PhysicalKey::Code(KeyCode::BracketLeft) => Some(-ROTATE_STEP),
+                        PhysicalKey::Code(KeyCode::BracketRight) => Some(ROTATE_STEP),
+                        _ => None,
+                    };
+                    if let Some(step) = step {
+                        self.view.rotate_by(step, self.nav.cursor, w, h);
+                        self.request_redraw();
+                        return true;
+                    }
+                }
+
+                match &key.logical_key {
+                    Key::Named(NamedKey::Space) => {
+                        self.nav.space_held = pressed;
+                        if !pressed {
+                            self.nav.panning_from = None;
+                        }
+                        true
+                    }
+                    // Digits by logical key: stable across layouts.
+                    Key::Character(c) if pressed => match c.as_str() {
+                        "0" => {
+                            self.view.request_fit();
+                            self.request_redraw();
+                            true
+                        }
+                        "1" => {
+                            self.view.set_scale_about(1.0, self.nav.cursor, w, h);
+                            self.request_redraw();
+                            true
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                }
+            }
+
+            _ => false,
+        }
+    }
+
     /// Draw one frame: canvas first, then the UI on top of it.
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         // Disjoint field borrows, so the overlay closure can touch the editor and
@@ -202,23 +347,27 @@ impl OpenPaint {
 
         renderer.upload_canvas(editor.canvas_mut());
         let (w, h) = renderer.size_px();
+        // Fitting needs both the surface size and the UI inset, so it is deferred
+        // to here rather than done at construction.
+        self.view.apply_pending_fit(w, h, editor.canvas());
         let placement = self.view.placement(w, h, editor.canvas());
 
         let mut ui_wants_repaint = false;
         let mut ui_inset_left = None;
         let window = renderer.window().clone();
+        let view = self.view;
         let result = renderer.render(placement, |gpu| {
             if let Some(ui) = ui {
-                ui_wants_repaint = ui.render(&window, gpu, editor.brush_mut());
+                ui_wants_repaint = ui.render(&window, gpu, editor.brush_mut(), &view);
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
 
-        // Keep the canvas centered in the area the panel leaves free.
-        if let Some(inset) = ui_inset_left {
-            self.view.set_inset_left(inset);
-        }
-        if ui_wants_repaint {
+        // Keep the canvas centered in the area the panel leaves free. The first
+        // fit necessarily ran before the UI existed, so learning the inset queues
+        // another one -- which needs a frame to actually apply.
+        let refit_queued = ui_inset_left.is_some_and(|inset| self.view.set_inset_left(inset));
+        if ui_wants_repaint || refit_queued {
             self.request_redraw();
         }
 
@@ -254,6 +403,8 @@ impl OpenPaint {
                 if let Some(r) = self.renderer.as_mut() {
                     r.resize(*new_size);
                 }
+                // Re-fit if the user hasn't taken manual control of the view.
+                self.view.surface_resized();
                 self.request_redraw();
                 return;
             }
@@ -279,6 +430,12 @@ impl OpenPaint {
             if consumed {
                 return;
             }
+        }
+
+        // Canvas navigation. Before the input backend, so a pan drag is not also
+        // interpreted as a stroke.
+        if self.handle_navigation(&event) {
+            return;
         }
 
         // Everything else is offered to the input backend, which turns native
