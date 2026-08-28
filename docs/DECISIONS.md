@@ -188,6 +188,26 @@ Photoshop's falloff curve (Q7a) rather than eyeball it. The existing CPU
 `Canvas::blend_pixel` path is retained as the **reference implementation** that
 tests compare GPU output against.
 
+**BUILT (2026-08-27).** GPU dab rasterization lives in
+`openpaint-app/src/stroke_layer.rs` + `stroke.wgsl`. Structure worth knowing:
+- Dabs stamp into a **single-channel accumulation texture**, and the canvas is not
+  touched until the stroke ends. Mid-stroke the stroke is composited on top for the
+  preview; on stroke end it is baked into the canvas once.
+- That is what lets the flow/opacity model work with **no snapshot and no
+  readback** — the CPU reference needs a snapshot precisely because it composites
+  into the canvas on every update.
+- The accumulation formula `a += flow·cov·(1−a)` *is* standard "over" blending, so
+  blend factors `(One, OneMinusSrc)` make the hardware compute it. The fragment
+  shader only outputs `flow · coverage`.
+- **Consequence: the GPU is now authoritative for pixels.** The CPU `Canvas` holds
+  the document's dimensions and the tile machinery the future cache/readback will
+  use (Q13), but not painted pixels.
+- The falloff curve therefore exists **twice** — `Dab::coverage_at_distance` and
+  `dab_fs` in the shader. Two copies of a curve drift, so
+  `stroke_layer.rs`'s tests rasterize the same dabs both ways and compare pixels.
+  That test is what makes keeping the CPU reference worthwhile rather than dead
+  weight.
+
 **Accumulation, not rasterization, is the hard part — DONE.** Dabs within one
 stroke cannot simply be alpha-blended in a batch: **flow** accumulates per dab
 while **opacity** caps the stroke's total contribution, per *stroke* rather than

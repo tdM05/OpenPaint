@@ -40,6 +40,7 @@ mod input_mouse;
 #[cfg(target_os = "windows")]
 mod input_pen;
 mod renderer;
+mod stroke_layer;
 mod ui;
 mod view;
 
@@ -186,7 +187,12 @@ impl OpenPaint {
                 }
                 self.request_redraw();
             }
-            PenEvent::Up => self.editor.stroke_end(),
+            PenEvent::Up => {
+                // Queues the bake that commits the stroke; demand-driven painting
+                // means it needs a frame requested or it simply never happens.
+                self.editor.stroke_end();
+                self.request_redraw();
+            }
         }
     }
 
@@ -355,6 +361,16 @@ impl OpenPaint {
         };
         let ui = self.ui.as_mut();
         let editor = &mut self.editor;
+
+        // Execute any queued stroke work before the frame reads the canvas.
+        // Borrowed, not cloned: this runs every frame a stroke is active, so a
+        // copy here would be an allocation per frame on the interactive path.
+        // `renderer` and `editor` are disjoint fields, so both borrows coexist.
+        if editor.has_pending_stroke() {
+            let (ops, dabs) = editor.pending_stroke();
+            renderer.apply_stroke(ops, dabs);
+            editor.clear_pending_stroke();
+        }
 
         renderer.upload_canvas(editor.canvas_mut());
         let (w, h) = renderer.size_px();

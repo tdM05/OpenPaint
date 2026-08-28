@@ -42,8 +42,14 @@ impl From<Placement> for PlacementUniform {
     }
 }
 
+/// Pixel format of the canvas texture: linear premultiplied RGBA f16, matching
+/// `openpaint_core::tile` exactly (DECISIONS §4b).
+pub const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
 pub struct CanvasRenderer {
     texture: wgpu::Texture,
+    /// Kept so the stroke layer can bake into the canvas.
+    view: wgpu::TextureView,
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     placement_buf: wgpu::Buffer,
@@ -73,8 +79,12 @@ impl CanvasRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            format: CANVAS_FORMAT,
+            // RENDER_ATTACHMENT so the GPU stroke layer can bake into it
+            // (crate::stroke_layer). COPY_DST is only for the initial paper fill.
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
 
@@ -214,6 +224,7 @@ impl CanvasRenderer {
 
         Self {
             texture,
+            view,
             pipeline,
             bind_group,
             placement_buf,
@@ -270,6 +281,12 @@ impl CanvasRenderer {
     pub fn set_placement(&self, queue: &wgpu::Queue, placement: Placement) {
         let uniform = PlacementUniform::from(placement);
         queue.write_buffer(&self.placement_buf, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    /// The canvas texture as a render target, for the stroke layer to bake into.
+    #[must_use]
+    pub fn target_view(&self) -> &wgpu::TextureView {
+        &self.view
     }
 
     /// Record draw commands into an existing render pass.

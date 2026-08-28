@@ -22,7 +22,9 @@ use std::sync::Arc;
 use openpaint_core::Canvas;
 use winit::window::Window;
 
-use crate::canvas_renderer::CanvasRenderer;
+use crate::canvas_renderer::{CanvasRenderer, CANVAS_FORMAT};
+use crate::editor::StrokeOp;
+use crate::stroke_layer::StrokeLayer;
 use crate::view::Placement;
 
 /// Everything an overlay needs to draw itself into the current frame.
@@ -42,6 +44,8 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     canvas_renderer: CanvasRenderer,
+    /// GPU dab rasterization and the in-progress stroke.
+    stroke_layer: StrokeLayer,
     window: Arc<Window>,
 }
 
@@ -109,6 +113,13 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let canvas_renderer = CanvasRenderer::new(&device, &queue, format, canvas);
+        let stroke_layer = StrokeLayer::new(
+            &device,
+            canvas.width(),
+            canvas.height(),
+            CANVAS_FORMAT,
+            format,
+        );
 
         Ok(Self {
             surface,
@@ -116,6 +127,7 @@ impl Renderer {
             queue,
             config,
             canvas_renderer,
+            stroke_layer,
             window,
         })
     }
@@ -156,6 +168,48 @@ impl Renderer {
     /// of the app state.
     pub fn upload_canvas(&mut self, canvas: &mut Canvas) {
         self.canvas_renderer.upload_dirty(&self.queue, canvas);
+    }
+
+    /// Execute the editor's pending stroke commands on the GPU.
+    ///
+    /// Submitted separately from [`Renderer::render`] and before it, so the canvas
+    /// texture is already up to date by the time the frame reads it. An extra
+    /// submit per frame is immaterial next to avoiding one per input sample.
+    pub fn apply_stroke(&mut self, ops: &[StrokeOp], dabs: &[openpaint_core::Dab]) {
+        if ops.is_empty() {
+            return;
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("stroke-encoder"),
+            });
+
+        for op in ops {
+            match *op {
+                StrokeOp::Begin {
+                    color_linear_premul,
+                    opacity,
+                } => {
+                    self.stroke_layer.begin_stroke(&mut encoder);
+                    self.stroke_layer
+                        .set_paint(&self.queue, color_linear_premul, opacity);
+                }
+                StrokeOp::Dabs { start, len } => {
+                    let Some(slice) = dabs.get(start..start + len) else {
+                        continue;
+                    };
+                    self.stroke_layer
+                        .add_dabs(&self.device, &self.queue, &mut encoder, slice);
+                }
+                StrokeOp::End => {
+                    self.stroke_layer
+                        .bake(&mut encoder, self.canvas_renderer.target_view());
+                }
+            }
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
     }
 
     /// Draw one frame: clear the backdrop, draw the canvas, then the overlay.
@@ -208,6 +262,13 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             self.canvas_renderer.draw(&mut pass);
+            // The in-progress stroke is not in the canvas texture yet, so it is
+            // composited on top for the preview. It uses the same placement, so it
+            // pans, zooms, and rotates with the canvas.
+            if self.stroke_layer.has_paint() {
+                self.stroke_layer
+                    .draw_preview(&self.queue, &mut pass, placement);
+            }
         }
 
         overlay(Overlay {

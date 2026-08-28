@@ -257,11 +257,14 @@ without a GPU.
 
 **Still outstanding, deliberately:**
 
-1. **One whole-canvas GPU texture** (`canvas_renderer.rs`). Contradicts the
-   bounded-tile-cache requirement in DECISIONS §2 / Q13. Harmless at 2048²
-   (~34 MB) and fatal at 300 DPI or webtoon sizes. Deferred because the GPU
-   rasterization work has to rewrite this file anyway — doing it twice would be
-   waste, not caution.
+1. **Whole-canvas GPU textures** (`canvas_renderer.rs`, `stroke_layer.rs`).
+   Contradicts the bounded-tile-cache requirement in DECISIONS §2 / Q13. Now *two*
+   canvas-sized textures: the canvas (~34 MB at 2048², `Rgba16Float`) and the
+   stroke accumulation buffer (~8 MB, `R16Float`). Harmless at 2048², fatal at
+   300 DPI or webtoon sizes. **No longer deferred for the previous reason** — GPU
+   rasterization has landed and did not need to rewrite the tile layout, so this is
+   now the standalone next piece of the Q13 work rather than a side effect of
+   something else.
 2. **Only one input backend is active at a time.** The mouse backend is dropped
    the moment the pen connects, so mouse drawing only works via octotablet's
    *emulated* mouse tool, which always reports pressure 1.0. Deferred because the
@@ -276,11 +279,23 @@ without a GPU.
 4. **`tilt` is captured but unused.** Surface Pen reports real tilt (the Veikk does
    not), so there is finally hardware to develop against when tilt-driven brushes
    arrive.
-5. **`openpaint_core::raster` has no production call site.** The app paints through
-   `StrokePainter` instead. It is the reference implementation the GPU rasterizer
-   will be validated against, which is a real role — but an unearned one until
-   that rasterizer exists. If GPU rasterization slips far, revisit whether this is
-   a spec or just weight.
+5. ~~**`openpaint_core::raster` has no production call site.**~~ **RESOLVED.** Both
+   `raster` and `stroke` are now genuinely the CPU *reference*: painting happens on
+   the GPU, and `stroke_layer.rs`'s tests rasterize identical dabs through both
+   paths and compare the resulting pixels. That is what guards the falloff curve,
+   which necessarily exists twice (Rust and WGSL). The role is earned.
+
+6. **The CPU `Canvas` no longer holds painted pixels.** The GPU is authoritative
+   (DECISIONS §4a). `Canvas` carries dimensions plus the tile machinery that the
+   eventual cache and readback will build on. Until readback exists there is **no
+   way to save, export, or undo** — all three need pixels back on the CPU, and all
+   three are Q13's dependents.
+
+7. **Verified by test, not by hand:** the GPU/CPU pixel comparison covers the paint
+   math, but the *wiring* from real pen input through to the GPU can only be
+   confirmed by drawing. Injected input cannot reach RealTimeStylus unless the
+   window is foreground, and Windows refuses to grant that to a background process.
+   So a human draw remains the acceptance test for input-path changes.
 
 Not shortcuts, simply unbuilt and scheduled: pan/zoom/rotate, GPU dab
 rasterization, `Document`/`Page`, layers, undo, and the tuned falloff curve (Q7a).
