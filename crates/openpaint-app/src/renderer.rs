@@ -83,7 +83,7 @@ pub struct Renderer {
     recording: Vec<openpaint_core::Dab>,
     /// Paint of the stroke being recorded, captured at Begin: colour, opacity ceiling, and
     /// whether it erases.
-    recording_paint: ([f32; 4], f32, bool),
+    recording_paint: ([f32; 4], f32, crate::editor::PaintMode),
     /// Set when a stroke could not be recorded for undo because the snapshot pool was
     /// full even after evicting everything.
     unrecordable: bool,
@@ -190,7 +190,7 @@ impl Renderer {
             stroke_layer,
             history,
             recording: Vec::new(),
-            recording_paint: ([0.0; 4], 1.0, false),
+            recording_paint: ([0.0; 4], 1.0, crate::editor::PaintMode::Normal),
             unrecordable: false,
             pressured: false,
             window,
@@ -605,7 +605,7 @@ impl Renderer {
                 dabs,
                 color_linear_premul,
                 opacity,
-                erase,
+                mode,
                 ..
             } => {
                 // Replayed rather than restored from an after-image: half the memory, and
@@ -614,7 +614,7 @@ impl Renderer {
                 let page = self.canvas_renderer.page();
                 self.stroke_layer.set_page(&self.queue, page);
                 self.stroke_layer
-                    .set_paint(&self.queue, *color_linear_premul, *opacity, *erase);
+                    .set_paint(&self.queue, *color_linear_premul, *opacity, *mode);
                 self.stroke_layer
                     .upload_dabs(&self.device, &self.queue, dabs);
 

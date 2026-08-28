@@ -83,6 +83,8 @@ pub struct Layer {
     pub opacity: f32,
     pub blend: Blend,
     pub visible: bool,
+    /// Freeze this layer's transparency. See [`Layer::locks_alpha`].
+    pub lock_alpha: bool,
 }
 
 impl Layer {
@@ -98,6 +100,7 @@ impl Layer {
         opacity: f32,
         blend: Blend,
         visible: bool,
+        lock_alpha: bool,
     ) -> Self {
         Self {
             id,
@@ -105,6 +108,7 @@ impl Layer {
             opacity,
             blend,
             visible,
+            lock_alpha,
         }
     }
 
@@ -118,6 +122,7 @@ impl Layer {
             opacity: 1.0,
             blend: Blend::Normal,
             visible: true,
+            lock_alpha: false,
         }
     }
 
@@ -125,6 +130,18 @@ impl Layer {
     #[must_use]
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// Whether this layer's transparency is frozen.
+    ///
+    /// **The definition is exactly that: alpha cannot change.** Painting is confined to pixels that
+    /// already have coverage, which is how colour goes inside line art without a selection — and it
+    /// also means an eraser cannot remove anything here, because removing is a change in alpha. A
+    /// looser definition ("painting is masked, erasing still works") would make the guarantee
+    /// conditional on which tool you happened to be holding, which is not a guarantee.
+    #[must_use]
+    pub fn locks_alpha(&self) -> bool {
+        self.lock_alpha
     }
 
     /// Opacity clamped to the range the compositor accepts.

@@ -54,7 +54,7 @@ use openpaint_core::{Blend, Document, Layer, Page, PageRect};
 /// the counter proved derivable from the layers themselves. Both were `NOT NULL`, so a version-1
 /// *writer* cannot fill a version-2 file -- hence the bump. Reading needs no branch at all: a
 /// version-2 reader simply stops asking for them, which works on both.
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// How a tile's bytes are encoded in the file.
 ///
@@ -233,6 +233,7 @@ const STRUCTURE_SCHEMA: &str = "
             opacity  REAL    NOT NULL,
             blend    TEXT    NOT NULL,
             visible  INTEGER NOT NULL,
+            lock_alpha INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (page_idx, idx)
         );
         ";
@@ -280,6 +281,16 @@ fn create_schema(db: &rusqlite::Connection) -> Result<(), Error> {
 fn migrate(db: &rusqlite::Connection, from: i32) -> Result<(), Error> {
     if from < 2 {
         // v1 had `document.mode` and `page.next_layer_id`, both since found to mean nothing.
+        db.execute_batch(
+            "DROP TABLE IF EXISTS layer;
+             DROP TABLE IF EXISTS page;
+             DROP TABLE IF EXISTS document;",
+        )?;
+        db.execute_batch(STRUCTURE_SCHEMA)?;
+    }
+    if from < 4 {
+        // v4 added `layer.lock_alpha`. The structure tables are rewritten by every save regardless,
+        // so recreating them is cheaper than an ALTER and keeps one definition of their shape.
         db.execute_batch(
             "DROP TABLE IF EXISTS layer;
              DROP TABLE IF EXISTS page;
@@ -365,8 +376,8 @@ pub fn save(
         )?;
         for (li, layer) in page.layers().iter().enumerate() {
             tx.execute(
-                "INSERT INTO layer (page_idx, idx, id, name, opacity, blend, visible)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO layer (page_idx, idx, id, name, opacity, blend, visible, lock_alpha)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
                     index as i64,
                     li as i64,
@@ -375,6 +386,7 @@ pub fn save(
                     layer.opacity,
                     blend_name(layer.blend),
                     i64::from(layer.visible),
+                    i64::from(layer.lock_alpha),
                 ],
             )?;
         }
@@ -454,9 +466,21 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
     let mut pages = Vec::new();
     let mut page_stmt =
         db.prepare("SELECT idx, x, y, w, h, dpi, active_layer FROM page ORDER BY idx")?;
-    let mut layer_stmt = db.prepare(
-        "SELECT id, name, opacity, blend, visible FROM layer WHERE page_idx = ?1 ORDER BY idx",
-    )?;
+    let mut layer_stmt = db
+        .prepare(
+            "SELECT id, name, opacity, blend, visible, lock_alpha
+         FROM layer WHERE page_idx = ?1 ORDER BY idx",
+        )
+        // v4 added `lock_alpha`. Prefer the richer query and fall back to one that supplies the default
+        // in SQL, which is the same tolerance `meta` already uses: **absence reads as the default**, so
+        // reading still needs no branch on the schema version. Layers will grow more flags -- clipping,
+        // position lock -- and this is the pattern each should follow.
+        .or_else(|_| {
+            db.prepare(
+                "SELECT id, name, opacity, blend, visible, 0
+             FROM layer WHERE page_idx = ?1 ORDER BY idx",
+            )
+        })?;
 
     let rows = page_stmt.query_map([], |r| {
         Ok((
@@ -478,13 +502,16 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
                     r.get::<_, f64>(2)? as f32,
                     blend_text,
                     r.get::<_, i64>(4)? != 0,
+                    r.get::<_, i64>(5)? != 0,
                 ))
             })?
             .map(|row| {
-                let (id, name, opacity, blend_text, visible) = row?;
+                let (id, name, opacity, blend_text, visible, lock_alpha) = row?;
                 let blend = blend_from_name(&blend_text)
                     .ok_or_else(|| Error::Malformed(format!("unknown blend {blend_text:?}")))?;
-                Ok(Layer::restored(id, name, opacity, blend, visible))
+                Ok(Layer::restored(
+                    id, name, opacity, blend, visible, lock_alpha,
+                ))
             })
             .collect::<Result<_, Error>>()?;
 

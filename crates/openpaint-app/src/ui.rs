@@ -104,6 +104,8 @@ pub enum LayerAction {
     Move { from: usize, to: usize },
     /// Show or hide a layer.
     SetVisible { index: usize, visible: bool },
+    /// Freeze or unfreeze a layer's transparency.
+    SetLockAlpha { index: usize, lock: bool },
     /// Set a layer's opacity.
     SetOpacity { index: usize, opacity: f32 },
     /// Set a layer's blend mode.
@@ -517,6 +519,19 @@ impl Ui {
                                         }
                                         if ui.selectable_label(selected, &layer.name).clicked() {
                                             layer_action = Some(LayerAction::Select(index));
+                                        }
+                                        // In the row, next to visibility, because both are per-layer
+                                        // switches an artist flips constantly while colouring.
+                                        let mut lock = layer.lock_alpha;
+                                        if ui
+                                            .toggle_value(&mut lock, "α")
+                                            .on_hover_text(
+                                                "Lock alpha: paint only where this layer already                                                  has pixels, and never change its transparency.                                                  How colour goes inside line art without a                                                  selection.",
+                                            )
+                                            .changed()
+                                        {
+                                            layer_action =
+                                                Some(LayerAction::SetLockAlpha { index, lock });
                                         }
                                     });
                                     if selected {

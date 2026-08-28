@@ -391,6 +391,54 @@ engine is written:
 On-disk storage format is a **separate, later** decision (Q6) — 16-bit in memory
 does not oblige 16-bit on disk.
 
+### 4i. Alpha lock and the eyedropper — landed 2026-08-28
+
+Two halves of being able to colour, and both landed as *variations of existing
+machinery* rather than new subsystems, which is the test of whether §4a's
+dab-based design was the right shape.
+
+**Alpha lock is a third blend state.** `src * dst.a + dst * (1 - src.a)` —
+source-atop. For the alpha channel that reduces to `dst.a` exactly
+(`src.a*dst.a + dst.a*(1-src.a) == dst.a`), so coverage **cannot** change however
+hard you scrub: no mask, no read of the render target, no second shader. The same
+trick that made the eraser a blend variation (§4a) rather than its own code path,
+and the same payoff: a locked stroke cannot drift from an unlocked one in shape,
+falloff or spacing, because it *is* the same rasterization.
+
+`erase: bool` became `PaintMode { Normal, Erase, LockAlpha }`. An enum because
+exactly one applies: "erase" and "lock alpha" are contradictory instructions — one
+removes coverage, the other forbids coverage from changing — so a state carrying
+both has no defined meaning and should not be constructible. It threads through
+history, because **redo replays dabs** and a redo that used the *current* lock
+state rather than the stroke's would not reproduce the stroke.
+
+**The definition is strict, and that decides the eraser question.** Alpha lock
+means alpha cannot change. Erasing is nothing but a change in alpha. So erasing a
+locked layer is *refused*, with a message, rather than performed as an invisible
+no-op — a tool that silently does nothing reads as a broken app. A looser
+definition ("painting is masked, erasing still works") would make the guarantee
+conditional on which tool you happened to be holding, which is not a guarantee.
+
+**The eyedropper samples the composited image**, folded with `export::blend_over`
+— the same arithmetic as `composite_fs` and already pinned to it by the compositor
+cross-check. So it returns the *displayed* colour by construction rather than by a
+second implementation that resembles one. Over the paper too, since the paper is
+on screen: sampling blank canvas gives the colour visible there, not a transparent
+nothing a picker would have to invent a value for. Bound to Alt rather than a tool
+palette entry, because that is how the tool is used and the palette does not exist
+yet.
+
+It needed `TileStore::snapshot_some`: sampling one pixel wants one tile per layer,
+and reading the whole working set to answer a click would be absurd. The readback
+plumbing `snapshot_all` had is now shared with it, so the copy-alignment reasoning
+exists once.
+
+**Format v4** adds `layer.lock_alpha`. Reading prefers the richer query and falls
+back to one supplying the default in SQL — the same tolerance the v3 `meta` table
+uses, so **absence reads as the default** and reading still needs no branch on the
+schema version. Layers will grow more flags (clipping, position lock); this is the
+pattern each should follow.
+
 ### 4f. Latency is measured, not felt — landed 2026-08-28
 
 §4.1 has called input latency the project's top quality axis since the first day,

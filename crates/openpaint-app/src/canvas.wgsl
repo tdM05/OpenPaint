@@ -190,13 +190,20 @@ fn composite_fs(in: TileOut) -> @location(0) vec4<f32> {
         if (i == active_layer && stroke_slot != ABSENT) {
             let raw = textureSampleLevel(accum, samp, in.uv, i32(stroke_slot), 0.0).r;
             let a = clamp(raw, 0.0, 1.0) * params.stroke.w;
-            if (params.counts.w != 0u) {
+            // 0 = normal, 1 = erase, 2 = alpha lock. Each branch mirrors one of the three bake
+            // blend states in stroke_layer.rs, so the live preview *is* the committed arithmetic
+            // rather than an approximation of it.
+            let s = vec4<f32>(params.stroke.rgb * a, a);
+            if (params.counts.w == 1u) {
                 // Erasing removes coverage. Not "painting the paper colour": on a layer above
                 // others, an erase has to reveal what is beneath, and premultiplied means the
                 // one multiply scales colour and coverage together.
                 src = src * (1.0 - a);
+            } else if (params.counts.w == 2u) {
+                // Source-atop. The alpha channel reduces to `src.a` unchanged, which is the whole
+                // guarantee alpha lock makes.
+                src = s * src.a + src * (1.0 - a);
             } else {
-                let s = vec4<f32>(params.stroke.rgb * a, a);
                 src = s + src * (1.0 - a);
             }
         }

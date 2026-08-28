@@ -85,9 +85,9 @@ pub enum Op {
         dabs: Vec<Dab>,
         color_linear_premul: [f32; 4],
         opacity: f32,
-        /// Whether it removed paint. Redo replays the dabs, so without this an erase would be
+        /// How it was applied. Redo replays the dabs, so without this an erase would be
         /// redone as a black stroke.
-        erase: bool,
+        mode: crate::editor::PaintMode,
     },
     /// Geometry only. Nothing is saved because nothing is destroyed (DECISIONS §5c).
     Resize { resize: PageResize },
@@ -319,7 +319,7 @@ mod tests {
             dabs: Vec::new(),
             color_linear_premul: [0.0; 4],
             opacity: 1.0,
-            erase: false,
+            mode: crate::editor::PaintMode::Normal,
         }
     }
 

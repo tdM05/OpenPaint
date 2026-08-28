@@ -57,7 +57,7 @@ pub enum StrokeOp {
         ///
         /// Captured at stroke start like the colour, and for the same reason: switching tool
         /// mid-stroke would otherwise produce a stroke that is half paint and half hole.
-        erase: bool,
+        mode: PaintMode,
     },
     /// Stamp dabs `[start, start + len)` of the accompanying dab buffer.
     Dabs { start: usize, len: usize },
@@ -125,6 +125,25 @@ pub fn clamp_page_size(current: (u32, u32), requested: (u32, u32)) -> Option<(u3
         return None;
     }
     Some((w, h))
+}
+
+/// How a stroke is combined with the layer it lands on.
+///
+/// An enum rather than two booleans because exactly one applies. "Erase" and "lock alpha" are
+/// contradictory instructions — one removes coverage, the other forbids coverage from changing —
+/// so a state carrying both would have no defined meaning, and the compiler should not let one be
+/// constructed. See [`openpaint_core::Layer::locks_alpha`].
+///
+/// Each mode is the *same* dab rasterization with a different blend, which is why adding one costs
+/// a `BlendState` and not a code path: see `stroke_layer.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaintMode {
+    /// Paint over what is there.
+    Normal,
+    /// Remove coverage.
+    Erase,
+    /// Paint only where coverage already exists, leaving alpha exactly as it was.
+    LockAlpha,
 }
 
 pub struct Editor {
@@ -281,14 +300,41 @@ impl Editor {
         self.drawing
     }
 
+    /// How the next stroke would be applied, or `None` if it could not do anything.
+    ///
+    /// `None` is erasing on an alpha-locked layer. Alpha lock means alpha cannot change, and
+    /// erasing is nothing but a change in alpha, so the combination has no possible effect. Refused
+    /// rather than performed as an invisible no-op: a tool that silently does nothing reads as a
+    /// broken app, and the caller can say why instead.
+    #[must_use]
+    pub fn paint_mode(&self) -> Option<PaintMode> {
+        let locked = self
+            .document
+            .active()
+            .layer(self.active_layer_index())
+            .is_some_and(openpaint_core::Layer::locks_alpha);
+        match (self.tool.erases(), locked) {
+            (true, true) => None,
+            (true, false) => Some(PaintMode::Erase),
+            (false, true) => Some(PaintMode::LockAlpha),
+            (false, false) => Some(PaintMode::Normal),
+        }
+    }
+
     /// Begin a stroke at a canvas-space position.
+    ///
+    /// Does nothing when [`Editor::paint_mode`] has no mode to offer. Checked here as well as by the
+    /// caller so that neither layer depends on the other remembering.
     pub fn stroke_begin(&mut self, cx: f32, cy: f32, pressure: f32) {
+        let Some(mode) = self.paint_mode() else {
+            return;
+        };
         // A fresh stroke resets accumulation, so its opacity ceiling is
         // independent of the previous stroke's.
         self.ops.push(StrokeOp::Begin {
             color_linear_premul: self.brush().color_linear_premul(),
             opacity: self.brush().opacity,
-            erase: self.tool.erases(),
+            mode,
         });
         self.drawing = true;
         let from = self.dabs.len();

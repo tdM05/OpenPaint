@@ -39,7 +39,7 @@ pub struct StrokeExec<'a> {
     /// Dabs of the stroke being recorded, accumulated across frames so redo can replay it.
     pub recording: &'a mut Vec<Dab>,
     /// Paint of the stroke being recorded, captured at `Begin`.
-    pub recording_paint: &'a mut ([f32; 4], f32, bool),
+    pub recording_paint: &'a mut ([f32; 4], f32, crate::editor::PaintMode),
 }
 
 impl StrokeExec<'_> {
@@ -78,13 +78,13 @@ impl StrokeExec<'_> {
         if let Some(StrokeOp::Begin {
             color_linear_premul,
             opacity,
-            erase,
+            mode,
         }) = ops.first()
         {
             self.recording.clear();
-            *self.recording_paint = (*color_linear_premul, *opacity, *erase);
+            *self.recording_paint = (*color_linear_premul, *opacity, *mode);
             self.stroke
-                .set_paint(self.queue, *color_linear_premul, *opacity, *erase);
+                .set_paint(self.queue, *color_linear_premul, *opacity, *mode);
             self.stroke.begin_stroke();
         }
 
@@ -141,14 +141,14 @@ impl StrokeExec<'_> {
 
         match before {
             Some(before) => {
-                let (color_linear_premul, opacity, erase) = *self.recording_paint;
+                let (color_linear_premul, opacity, mode) = *self.recording_paint;
                 self.history.push(Op::Stroke {
                     layer: self.layer,
                     before,
                     dabs: std::mem::take(self.recording),
                     color_linear_premul,
                     opacity,
-                    erase,
+                    mode,
                 });
                 false
             }
@@ -194,7 +194,7 @@ mod tests {
         StrokeOp::Begin {
             color_linear_premul: [0.0; 4],
             opacity: 1.0,
-            erase: false,
+            mode: crate::editor::PaintMode::Normal,
         }
     }
 
@@ -255,7 +255,7 @@ mod tests {
         let mut canvas = test_canvas(&device, page, &layer);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
-        let mut recording_paint = ([0.0; 4], 1.0, false);
+        let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
         // Frame 1: pen down and a drag, exactly as `handle_pen_event` produces.
         editor.stroke_begin(400.0, 400.0, 1.0);
@@ -311,7 +311,7 @@ mod tests {
         let mut canvas = test_canvas(&device, page, &layer);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
-        let mut recording_paint = ([0.0; 4], 1.0, false);
+        let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
         editor.stroke_begin(500.0, 500.0, 1.0);
         editor.stroke_end();
@@ -346,7 +346,7 @@ mod tests {
         let mut canvas = test_canvas(&device, page, &layer);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
-        let mut recording_paint = ([0.0; 4], 1.0, false);
+        let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
         // Far apart, so each lands in its own tile and one cannot mask the other.
         editor.stroke_begin(200.0, 200.0, 1.0);
@@ -406,7 +406,7 @@ mod tests {
         );
         let mut history = History::new(&device);
         let mut recording = Vec::new();
-        let mut recording_paint = ([0.0; 4], 1.0, false);
+        let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
         // A short stroke inside one tile, so it certainly fits and certainly lands.
         editor.stroke_begin(100.0, 100.0, 1.0);
@@ -496,7 +496,7 @@ mod tests {
         let mut canvas = test_canvas(&device, page, &layer);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
-        let mut recording_paint = ([0.0; 4], 1.0, false);
+        let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
         // A committed stroke on the left.
         editor.stroke_begin(300.0, 500.0, 1.0);
@@ -609,7 +609,7 @@ mod tests {
         let mut canvas = test_canvas(&device, page, &layer);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
-        let mut recording_paint = ([0.0; 4], 1.0, false);
+        let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
         // Two layers with a stroke each, so the save has to keep them apart.
         editor.stroke_begin(400.0, 400.0, 1.0);
@@ -739,7 +739,7 @@ mod tests {
         let mut canvas = test_canvas(&device, page, &layer);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
-        let mut recording_paint = ([0.0; 4], 1.0, false);
+        let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
         // Bottom layer: paint across the area.
         let bottom = editor.active_layer_id();
@@ -854,7 +854,7 @@ mod tests {
         let mut canvas = test_canvas(&device, page, &layer);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
-        let mut recording_paint = ([0.0; 4], 1.0, false);
+        let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
         let id = editor.active_layer_id();
 
         editor.stroke_begin(400.0, 400.0, 1.0);
@@ -893,7 +893,11 @@ mod tests {
         // The op history recorded it; replaying must reproduce a hole, not a stroke.
         let op = history.pop_undo().expect("the erase was recorded");
         match &op {
-            Op::Stroke { erase, .. } => assert!(*erase, "the erase was recorded as paint"),
+            Op::Stroke { mode, .. } => assert_eq!(
+                *mode,
+                crate::editor::PaintMode::Erase,
+                "the erase was recorded as paint"
+            ),
             _ => panic!("the last operation was not a stroke"),
         }
     }
@@ -939,7 +943,7 @@ mod tests {
             let mut canvas = test_canvas(&device, page, &layer);
             let mut history = History::new(&device);
             let mut recording = Vec::new();
-            let mut recording_paint = ([0.0; 4], 1.0, false);
+            let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
             let painted_id = editor.active_layer_id();
             editor.document_mut().add_layer();
@@ -1038,6 +1042,147 @@ mod tests {
         }
     }
 
+    /// Alpha lock means alpha cannot change. Not "mostly", not "except at the edges".
+    ///
+    /// Paints a half-covered patch, locks the layer, then scrubs a much larger stroke of a different
+    /// colour across it and past its edges. Three things have to hold:
+    ///
+    /// - **every pixel keeps its exact alpha**, inside the patch, outside it, and across the soft
+    ///   boundary where a masking implementation would leak;
+    /// - **colour inside the patch changes**, or the lock has simply disabled painting;
+    /// - **nothing appears outside the patch**, which is the whole point.
+    ///
+    /// The patch is deliberately at partial alpha: with an opaque patch, "preserved alpha" and
+    /// "wrote 1.0" are indistinguishable, and that is exactly the bug a source-atop blend could
+    /// have.
+    #[test]
+    fn alpha_lock_cannot_change_coverage() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        const SIDE: u32 = 200;
+
+        let mut editor = Editor::new();
+        editor.resize_page(openpaint_core::PageRect::from_size(SIDE, SIDE));
+        let page = editor.page_rect();
+        let mut layer = test_stroke_layer(&device);
+        let mut canvas = test_canvas(&device, page, &layer);
+        let mut history = History::new(&device);
+        let mut recording = Vec::new();
+        let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
+        let id = editor.active_layer_id();
+
+        // A half-covered square in the middle, uploaded directly so the starting alpha is exact.
+        let mut cpu = openpaint_core::Canvas::new(SIDE, SIDE);
+        for y in 60..140 {
+            for x in 60..140 {
+                // Premultiplied red at alpha 0.5.
+                cpu.replace_pixel(x, y, [0.5, 0.0, 0.0, 0.5]);
+            }
+        }
+        {
+            let mut enc = device.create_command_encoder(&Default::default());
+            canvas.upload_dirty(&device, &queue, &mut enc, LayerId(id), &mut cpu);
+            queue.submit(std::iter::once(enc.finish()));
+        }
+        let before = crate::test_gpu::readback_tile(&device, &queue, &canvas, LayerId(id), (0, 0))
+            .expect("the layer should be resident");
+
+        // Lock it, then scrub right across the patch and well beyond it.
+        editor
+            .document_mut()
+            .active_mut()
+            .layer_mut(0)
+            .expect("the layer")
+            .lock_alpha = true;
+        assert_eq!(
+            editor.paint_mode(),
+            Some(crate::editor::PaintMode::LockAlpha),
+            "the layer flag has to reach the paint mode, or this test proves nothing"
+        );
+        editor.brush_mut().radius = 30.0;
+        editor.brush_mut().hardness = 1.0;
+        editor.brush_mut().set_color_srgb8([0, 0, 255]);
+        editor.stroke_begin(20.0, 100.0, 1.0);
+        editor.stroke_to(180.0, 100.0, 1.0);
+        editor.stroke_end();
+        run_frame_on(
+            &device,
+            &queue,
+            &mut canvas,
+            &mut layer,
+            &mut history,
+            &mut recording,
+            &mut recording_paint,
+            &mut editor,
+            id,
+        );
+
+        let after = crate::test_gpu::readback_tile(&device, &queue, &canvas, LayerId(id), (0, 0))
+            .expect("the layer should still be resident");
+
+        let at = |t: &Vec<[f32; 4]>, x: usize, y: usize| t[y * openpaint_core::tile::TILE_SIZE + x];
+
+        // 1. Alpha is untouched everywhere the stroke went, including across the patch boundary.
+        let mut checked = 0;
+        for x in 20..180 {
+            for y in 85..115 {
+                let a0 = at(&before, x, y)[3];
+                let a1 = at(&after, x, y)[3];
+                assert!(
+                    (a1 - a0).abs() < 0.004,
+                    "alpha changed at ({x}, {y}): {a0} -> {a1}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 4000, "the sweep covered almost nothing");
+
+        // 2. Colour inside the patch really did change, or the lock just disabled the brush.
+        let inside_before = at(&before, 100, 100);
+        let inside_after = at(&after, 100, 100);
+        assert!(
+            inside_after[2] > inside_before[2] + 0.1,
+            "no blue arrived inside the locked patch: {inside_before:?} -> {inside_after:?}"
+        );
+
+        // 3. And nothing appeared outside it.
+        let outside = at(&after, 30, 100);
+        assert!(
+            outside[3] < 0.004 && outside[2] < 0.004,
+            "paint escaped onto transparent pixels: {outside:?}"
+        );
+    }
+
+    /// Erasing on an alpha-locked layer is refused rather than performed as an invisible no-op.
+    #[test]
+    fn erasing_a_locked_layer_is_refused() {
+        let mut editor = Editor::new();
+        editor
+            .document_mut()
+            .active_mut()
+            .layer_mut(0)
+            .expect("the layer")
+            .lock_alpha = true;
+        editor.set_tool(crate::editor::Tool::Eraser);
+
+        assert_eq!(
+            editor.paint_mode(),
+            None,
+            "alpha lock forbids changing alpha, and erasing is nothing else"
+        );
+        editor.stroke_begin(10.0, 10.0, 1.0);
+        assert!(
+            !editor.is_drawing(),
+            "a stroke that cannot do anything must not start"
+        );
+        assert!(
+            !editor.has_pending_stroke(),
+            "and must queue no work for the renderer"
+        );
+    }
+
     /// Drain the editor's pending commands through the executor, as `redraw` does.
     #[allow(clippy::too_many_arguments)]
     fn run_frame(
@@ -1047,7 +1192,7 @@ mod tests {
         layer: &mut StrokeLayer,
         history: &mut History,
         recording: &mut Vec<Dab>,
-        recording_paint: &mut ([f32; 4], f32, bool),
+        recording_paint: &mut ([f32; 4], f32, crate::editor::PaintMode),
         editor: &mut Editor,
     ) {
         run_frame_on(
@@ -1072,7 +1217,7 @@ mod tests {
         layer: &mut StrokeLayer,
         history: &mut History,
         recording: &mut Vec<Dab>,
-        recording_paint: &mut ([f32; 4], f32, bool),
+        recording_paint: &mut ([f32; 4], f32, crate::editor::PaintMode),
         editor: &mut Editor,
         layer_id: u32,
     ) {

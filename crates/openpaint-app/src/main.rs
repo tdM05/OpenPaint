@@ -432,6 +432,17 @@ impl OpenPaint {
     /// they can be tested without a window: the editor is headless, so a test can drive them and
     /// read the dabs back. Every bug this session lived in a layer that had no test.
     fn stroke_start(&mut self, cx: f32, cy: f32, pressure: f32, t_ms: f64) {
+        // Say why nothing is going to happen. `Editor::stroke_begin` refuses this case on its own,
+        // so the stroke is safe either way -- but a tool that silently does nothing reads as a bug,
+        // and the artist has no way to guess which of two settings is in their way.
+        if self.editor.paint_mode().is_none() {
+            self.status_message = Some(
+                "This layer's alpha is locked, so the eraser cannot remove anything.                  Unlock it, or paint instead."
+                    .to_owned(),
+            );
+            self.request_redraw();
+            return;
+        }
         // Strength is read once, at the press. Dragging the slider mid-stroke must not change the
         // filter under a line already being drawn.
         self.stabilizer
@@ -871,6 +882,15 @@ impl OpenPaint {
                 if let Some(l) = self.editor.document_mut().active_mut().layer_mut(index) {
                     l.visible = visible;
                 }
+            }
+            ui::LayerAction::SetLockAlpha { index, lock } => {
+                // Not undoable, deliberately, and the same call as visibility: it changes no pixels.
+                // Putting a switch in the undo stack would make Ctrl+Z toggle settings instead of
+                // reversing artwork, which is the more surprising behaviour by far.
+                if let Some(l) = self.editor.document_mut().active_mut().layer_mut(index) {
+                    l.lock_alpha = lock;
+                }
+                self.mark_dirty();
             }
             ui::LayerAction::SetOpacity { index, opacity } => {
                 if let Some(l) = self.editor.document_mut().active_mut().layer_mut(index) {

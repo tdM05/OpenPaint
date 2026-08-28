@@ -602,3 +602,55 @@ fn a_file_without_the_meta_table_still_loads() {
         Some("again")
     );
 }
+
+/// Alpha lock is a document property, so it has to survive a round trip.
+///
+/// And a pre-v4 file must still load: the column is new, and reading falls back to supplying its
+/// default in SQL rather than branching on the schema version.
+#[test]
+fn alpha_lock_round_trips_and_older_files_default_it_off() {
+    let f = TempFile::new("lock-alpha");
+    let mut doc = sample();
+    // Two layers, so the test can tell "locked" from "every layer came back locked".
+    doc.add_layer();
+    doc.active_mut().layer_mut(0).expect("layer").lock_alpha = true;
+    save(f.path(), &doc, [], &[]).expect("save");
+
+    let back = load(f.path()).expect("load");
+    assert!(
+        back.document.active().layers()[0].lock_alpha,
+        "the lock did not survive the file"
+    );
+    assert!(
+        !back.document.active().layers()[1].lock_alpha,
+        "an unlocked layer must not come back locked"
+    );
+
+    // Now make it look like a v3 file, which had no such column at all.
+    {
+        let db = rusqlite::Connection::open(f.path()).expect("reopen");
+        db.execute_batch(
+            "CREATE TABLE layer_old AS SELECT page_idx, idx, id, name, opacity, blend, visible
+             FROM layer;
+             DROP TABLE layer;
+             ALTER TABLE layer_old RENAME TO layer;",
+        )
+        .expect("drop the column");
+        db.pragma_update(None, "user_version", 3)
+            .expect("downgrade");
+    }
+
+    let old = load(f.path()).expect("a v3 file must still load");
+    assert!(
+        old.document.active().layers().iter().all(|l| !l.lock_alpha),
+        "a file written before the column existed should read as unlocked"
+    );
+
+    // And saving migrates it forward, column and all.
+    save(f.path(), &old.document, [], &[]).expect("save migrates");
+    let db = rusqlite::Connection::open(f.path()).expect("reopen");
+    let version: i32 = db
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .expect("version");
+    assert_eq!(version, SCHEMA_VERSION);
+}

@@ -661,7 +661,11 @@ impl CanvasRenderer {
                     layers.len() as u32,
                     active as u32,
                     u32::from(painting),
-                    u32::from(stroke.is_some_and(StrokeLayer::erases)),
+                    stroke.map_or(0, |s| match s.mode() {
+                        crate::editor::PaintMode::Normal => 0,
+                        crate::editor::PaintMode::Erase => 1,
+                        crate::editor::PaintMode::LockAlpha => 2,
+                    }),
                 ],
                 misc: [TILE_SIZE as f32, 0.0, 0.0, 0.0],
             }),

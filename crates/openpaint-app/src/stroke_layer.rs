@@ -150,6 +150,7 @@ pub struct StrokeLayer {
     bake_pipeline: wgpu::RenderPipeline,
     /// Same geometry and the same accumulation; only the blend differs.
     erase_pipeline: wgpu::RenderPipeline,
+    lock_pipeline: wgpu::RenderPipeline,
     paint_group: wgpu::BindGroup,
     /// Bound at group 0 during the dab pass, where the accumulation array is the render
     /// target and must not also be sampled.
@@ -165,7 +166,7 @@ pub struct StrokeLayer {
     /// Paint captured at stroke start, which the compositor needs to show the preview.
     paint: ([f32; 4], f32),
     /// Whether the stroke in progress removes paint rather than adding it.
-    erase: bool,
+    mode: crate::editor::PaintMode,
     /// The camera and page last published, so the page can be refreshed without the
     /// caller having to supply a camera it does not have.
     frame: (PageToNdc, PageRect),
@@ -455,6 +456,27 @@ impl StrokeLayer {
             },
         );
 
+        // Alpha lock is source-atop: `src * dst.a + dst * (1 - src.a)`. For the alpha channel that
+        // reduces to `dst.a` exactly -- `src.a * dst.a + dst.a * (1 - src.a) == dst.a` -- so
+        // coverage cannot change however hard you scrub, without a mask, a read of the target, or a
+        // second shader. A third blend state, and again the same fragment shader, so a locked stroke
+        // cannot drift from an unlocked one in shape, falloff or spacing.
+        let lock_blend = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::DstAlpha,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let lock_pipeline = composite(
+            "lock-alpha-pipeline",
+            "bake_vs",
+            canvas_format,
+            &[],
+            wgpu::BlendState {
+                color: lock_blend,
+                alpha: lock_blend,
+            },
+        );
+
         let instance_capacity = 256;
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dab-instances"),
@@ -470,6 +492,7 @@ impl StrokeLayer {
             dab_pipeline,
             bake_pipeline,
             erase_pipeline,
+            lock_pipeline,
             paint_group,
             empty_group,
             tile_group,
@@ -480,7 +503,7 @@ impl StrokeLayer {
             instances,
             instance_capacity,
             paint: ([0.0; 4], 1.0),
-            erase: false,
+            mode: crate::editor::PaintMode::Normal,
             frame: (
                 PageToNdc {
                     x_row: [0.0; 3],
@@ -524,8 +547,8 @@ impl StrokeLayer {
     /// Whether the stroke in progress removes paint. The compositor needs it to preview
     /// correctly, since erasing is not "painting the paper colour".
     #[must_use]
-    pub fn erases(&self) -> bool {
-        self.erase
+    pub fn mode(&self) -> crate::editor::PaintMode {
+        self.mode
     }
 
     /// Whether the layer holds any paint that still needs showing or baking.
@@ -632,10 +655,10 @@ impl StrokeLayer {
         queue: &wgpu::Queue,
         color_linear_premul: [f32; 4],
         opacity: f32,
-        erase: bool,
+        mode: crate::editor::PaintMode,
     ) {
         self.paint = (color_linear_premul, opacity.clamp(0.0, 1.0));
-        self.erase = erase;
+        self.mode = mode;
         queue.write_buffer(
             &self.paint_buf,
             0,
@@ -851,10 +874,10 @@ impl StrokeLayer {
                     occlusion_query_set: None,
                 })
                 .forget_lifetime();
-            pass.set_pipeline(if self.erase {
-                &self.erase_pipeline
-            } else {
-                &self.bake_pipeline
+            pass.set_pipeline(match self.mode {
+                crate::editor::PaintMode::Normal => &self.bake_pipeline,
+                crate::editor::PaintMode::Erase => &self.erase_pipeline,
+                crate::editor::PaintMode::LockAlpha => &self.lock_pipeline,
             });
             pass.set_bind_group(0, &self.paint_group, &[]);
             let offset = self.offset_of(Region::Bake, index as u32);
@@ -966,7 +989,7 @@ mod tests {
         // Every uniform written once, before the single submission -- the ordering rule
         // this module exists to respect.
         layer.set_page(&queue, page);
-        layer.set_paint(&queue, BLACK, opacity, false);
+        layer.set_paint(&queue, BLACK, opacity, crate::editor::PaintMode::Normal);
         layer.upload_dabs(&device, &queue, dabs);
 
         let mut encoder = device.create_command_encoder(&Default::default());
@@ -1156,7 +1179,7 @@ mod tests {
         let mut canvas = test_canvas(&device, page, &layer);
 
         layer.set_page(&queue, page);
-        layer.set_paint(&queue, BLACK, 1.0, false);
+        layer.set_paint(&queue, BLACK, 1.0, crate::editor::PaintMode::Normal);
         layer.upload_dabs(&device, &queue, &dabs);
         let mut encoder = device.create_command_encoder(&Default::default());
         layer.begin_stroke();
