@@ -31,6 +31,23 @@ Primary purposes:
 Design/UX north star: **CSP and Procreate**. We like CSP's design and layout.
 We explicitly do NOT want Krita's bloat or its layout/interaction choices.
 
+### 1a. CSP EX is the north star for UX — but NOT for internals
+Decided 2026-08-27, to keep design decisions simple and consistent: when in
+doubt about *what a feature should be or look like*, do what CSP EX does. Its
+UX, feature model, layout, tool/sub-tool hierarchy, brush setting sections, and
+page management are the reference.
+
+**Three places where copying CSP would be a downgrade — deviate deliberately:**
+1. **Color depth.** CSP works at 8 bits per channel and composites in sRGB. We
+   use linear `Rgba16Float` (§4b). CSP's ceiling shows up as banding in gradients
+   and dark fringing on soft brush edges. Do not follow it down.
+2. **Rendering architecture.** CSP is largely CPU-based with GPU acceleration
+   bolted on, which is why it struggles with large canvases and many layers.
+   Follow Procreate's GPU-first model instead (§4a).
+3. **File format.** CSP's is closed. Ours is an open documented container (§7).
+
+Short version: **CSP for UX, Procreate-and-better for the engine.**
+
 ### Explicitly NOT doing
 - **Not building on / forking Krita.** It's GPL, ~1M+ lines of C++/Qt, and its
   bloat *is* the codebase. Its UI is welded to Qt; matching a CSP feel means
@@ -178,6 +195,41 @@ stroke needs its own accumulation buffer with max-alpha semantics, composited on
 the layer once at stroke end. Getting this wrong is the single most common way
 brush clones feel wrong, and it's the reason dab order and stroke boundaries have
 to be first-class in the design.
+
+### 4c. Brush modularity → composable per *dab*, fixed per *pixel*
+
+The question was whether to make brush features arbitrary plug-in components
+(Blender-modifier style) so users can invent brushes. Answer: **yes, but only on
+the per-dab side of the boundary.** Two real reasons, neither of them "other
+apps don't do it":
+
+**1. Loop nesting, not component cost.** Components are cheap; it matters which
+loop they sit in. Dabs per stroke are in the hundreds, pixels per stroke in the
+millions (see `openpaint-core/src/dab.rs` for the arithmetic) — three to four
+orders of magnitude. Per-dab dispatch is free. Per-pixel, a *dynamic* stage list
+is not expressible on a GPU at all: WGSL has no function pointers and WebGPU no
+dynamic shader linking. It degrades into either shader-permutation explosion
+(2^N variants; lazily compiling one mid-stroke is a frame hitch exactly while
+drawing) or an uber-shader whose register pressure drops occupancy so a plain
+round brush runs at the speed of the most complex brush. On the Surface-class
+target (§2) neither is affordable.
+
+**2. Composition needs a uniform type.** Blender modifiers compose arbitrarily
+because every one is `Mesh → Mesh`. Brush stages are heterogeneous — some adjust
+scalars, some inject randomness, some change dab *count*, some change pixel
+appearance — so "any stage in any order" has no well-defined semantics ("what
+does Texture-before-Spacing mean?"). But there *is* a uniform type available:
+`Dab → Dab`. That composes cleanly in any order, and it covers most of what
+users actually want to invent with — size and pressure response, scatter, jitter,
+angle, roundness, spacing, color dynamics, tilt response.
+
+So: **per-dab is a composable, serializable, user-authored stage list. Per-pixel
+dab appearance is one fixed parameterized shader**, extended deliberately by
+adding parameters rather than by arbitrary composition.
+
+This also matches CSP's actual model (§1a): a fixed set of toggleable setting
+sections, each optionally driven by pressure/tilt/velocity through a curve —
+which is the modulation layer, evaluated per dab.
 
 ### 4b. Tile pixel format → linear, premultiplied, `Rgba16Float`
 
