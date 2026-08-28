@@ -107,9 +107,10 @@ the composite target and per-stroke accumulation buffer — which does not fit i
 Surface's shared graphics memory. Therefore:
 - The GPU holds a **bounded pool of resident tiles**, never the whole document.
   **Done** — `tile_pool.rs`, capacity fixed at startup from a byte budget.
-- A tile budget + eviction policy is a **first-class early component**. The budget
-  exists; **spilling non-resident tiles to CPU/disk is the remaining half** and is
-  what OPEN_QUESTIONS Q13 still tracks.
+- A tile budget + eviction policy is a **first-class early component**. **Done** -
+  `tile_store.rs` spills non-resident tiles to the CPU, so document size is not limited
+  by graphics memory. The budget itself is a heuristic on adapter type, because wgpu
+  exposes no memory query (Q13).
 
 ### Development vs. validation — CONFIRMED SETUP
 - **Code is written on Linux (SSH).** The **tablet lives on the author's Windows
@@ -222,6 +223,34 @@ mid-stroke preview and the committed result identical.
 That snapshot is exactly the copy-on-write tile snapshot undo needs (Q13). **A
 correct brush and undo share one mechanism**, which is why this landed before
 either layers or history.
+
+### 4e. Layers composite per tile, through a cache — decided 2026-08-28
+
+Settled before writing the layer stack, because it decides the shape of everything above it.
+Rather than drawing N layers to the screen each frame, the stack is composited **per tile**
+into a cache tile, and only the cache is drawn.
+
+Four consequences, and together they are the reason:
+
+1. **Blend modes stop needing a destination read.** The compositor *samples* each layer as a
+   texture, so Multiply, Screen and Overlay are plain shader maths. The obvious alternative -
+   compositing through an intermediate page-sized target so the blend unit can read it - would
+   have reintroduced exactly the ceiling 4d removed.
+2. **Residency stops scaling with layer count.** Peak need is the visible cache tiles, the
+   active layer, and one tile per layer *transiently* while recompositing. A screenful of a
+   20-layer document fits in a couple of hundred tiles, so a single 256-layer array texture is
+   enough and the pool needs no multi-texture complication.
+3. **Display cost is independent of layer count** - one instanced draw - and recompositing
+   touches only tiles that changed.
+4. **The stroke preview stops being a special case.** It slots into the middle of the stack by
+   recompositing the touched tiles with the accumulation injected at the active layer's
+   position: same compositor, same maths. So the preview is *exactly* the committed result
+   rather than an approximation of it, which is the property the current separate preview pass
+   only approximates.
+
+One thing this changes about pixels: **a layer tile is transparent where unpainted, not
+paper.** The paper moves to the bottom of the compositor, where the sheet quad effectively is
+today.
 
 ### 4c. Brush modularity → composable per *dab*, fixed per *pixel*
 

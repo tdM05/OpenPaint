@@ -86,6 +86,22 @@ impl Tile {
         bytemuck::cast_slice(&self.texels)
     }
 
+    /// Build a tile from raw bytes in the same layout [`Tile::bytes`] produces.
+    ///
+    /// The inverse of `bytes`, for pixels arriving from somewhere else: a tile read back off
+    /// the GPU when residency spills it to the CPU, and eventually a tile read from a file.
+    /// Returns `None` on a wrong-sized input rather than panicking, because both of those
+    /// sources are external and a length mismatch is data, not a bug.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != TILE_BYTES {
+            return None;
+        }
+        Some(Self {
+            texels: bytemuck::cast_slice(bytes).to_vec(),
+        })
+    }
+
     /// Read one texel at local `(x, y)` as linear premultiplied `f32`.
     #[must_use]
     pub fn texel(&self, x: usize, y: usize) -> [f32; 4] {

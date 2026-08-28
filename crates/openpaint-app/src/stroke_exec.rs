@@ -120,7 +120,8 @@ impl StrokeExec<'_> {
     fn commit(&mut self, encoder: &mut wgpu::CommandEncoder, page: PageRect) -> bool {
         let tiles = self.layer.tiles_to_bake(page);
         if tiles.is_empty() || self.recording.is_empty() {
-            self.layer.bake(self.queue, encoder, self.canvas);
+            self.layer
+                .bake(self.device, self.queue, encoder, self.canvas);
             return false;
         }
 
@@ -128,7 +129,8 @@ impl StrokeExec<'_> {
         // GPU-to-GPU copy per tile, so nothing comes back to the CPU on the interactive
         // path.
         let before = self.history.snapshot_tiles(encoder, self.canvas, &tiles);
-        self.layer.bake(self.queue, encoder, self.canvas);
+        self.layer
+            .bake(self.device, self.queue, encoder, self.canvas);
 
         match before {
             Some(before) => {
@@ -238,7 +240,7 @@ mod tests {
         let page = editor.canvas().rect();
 
         let cpu = Canvas::new(page.w, page.h);
-        let mut canvas = CanvasRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, &cpu);
+        let mut canvas = crate::test_gpu::test_canvas(&device, &cpu);
         let mut layer =
             StrokeLayer::new(&device, CANVAS_FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
         let mut history = History::new(&device);
@@ -296,7 +298,7 @@ mod tests {
         editor.brush_mut().radius = 20.0;
         let page = editor.canvas().rect();
         let cpu = Canvas::new(page.w, page.h);
-        let mut canvas = CanvasRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, &cpu);
+        let mut canvas = crate::test_gpu::test_canvas(&device, &cpu);
         let mut layer =
             StrokeLayer::new(&device, CANVAS_FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
         let mut history = History::new(&device);
@@ -333,7 +335,7 @@ mod tests {
         editor.brush_mut().radius = 15.0;
         let page = editor.canvas().rect();
         let cpu = Canvas::new(page.w, page.h);
-        let mut canvas = CanvasRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, &cpu);
+        let mut canvas = crate::test_gpu::test_canvas(&device, &cpu);
         let mut layer =
             StrokeLayer::new(&device, CANVAS_FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
         let mut history = History::new(&device);
@@ -370,6 +372,104 @@ mod tests {
             at(1600, 1600)
         );
         assert_eq!(history.undo_depth(), 2);
+    }
+
+    /// The point of residency, end to end: paint a stroke, force its tiles off the GPU by
+    /// starving the pool, then bring them back and check the pixels are still there.
+    ///
+    /// A tiny budget rather than a huge canvas, because the failure mode is about eviction,
+    /// not size -- and this keeps the test fast enough to run every time.
+    #[test]
+    fn paint_survives_being_spilled_and_restored() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+
+        let mut editor = Editor::new();
+        editor.brush_mut().radius = 30.0;
+        let page = editor.canvas().rect();
+        let cpu = Canvas::new(page.w, page.h);
+
+        // Room for four tiles, so a stroke across several forces eviction of its own tiles.
+        let mut canvas = CanvasRenderer::new(
+            &device,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            &cpu,
+            4 * openpaint_core::tile::TILE_BYTES as u64,
+        );
+        let mut layer =
+            StrokeLayer::new(&device, CANVAS_FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let mut history = History::new(&device);
+        let mut recording = Vec::new();
+        let mut recording_paint = ([0.0; 4], 1.0);
+
+        // A short stroke inside one tile, so it certainly fits and certainly lands.
+        editor.stroke_begin(100.0, 100.0, 1.0);
+        editor.stroke_to(150.0, 150.0, 1.0);
+        editor.stroke_end();
+        run_frame(
+            &device,
+            &queue,
+            &mut canvas,
+            &mut layer,
+            &mut history,
+            &mut recording,
+            &mut recording_paint,
+            &mut editor,
+        );
+        assert!(
+            canvas.slot((0, 0)).is_some(),
+            "tile (0,0) should be resident"
+        );
+
+        // Now paint far away, over enough new tiles that (0,0) has to be evicted. Each stroke
+        // is its own frame, because a tile touched in the current frame is deliberately not an
+        // eviction candidate.
+        for i in 0..6 {
+            canvas.begin_frame();
+            let x = 700.0 + i as f32 * 300.0;
+            editor.stroke_begin(x, 700.0, 1.0);
+            editor.stroke_to(x + 40.0, 740.0, 1.0);
+            editor.stroke_end();
+            run_frame(
+                &device,
+                &queue,
+                &mut canvas,
+                &mut layer,
+                &mut history,
+                &mut recording,
+                &mut recording_paint,
+                &mut editor,
+            );
+        }
+        assert!(
+            canvas.slot((0, 0)).is_none(),
+            "tile (0,0) should have been evicted by now"
+        );
+        assert!(canvas.traffic().0 > 0, "nothing was ever read back");
+
+        // Ask for it back and confirm the paint is intact.
+        canvas.begin_frame();
+        let mut enc = device.create_command_encoder(&Default::default());
+        assert!(
+            canvas
+                .make_resident(&device, &queue, &mut enc, (0, 0))
+                .is_some(),
+            "the spilled tile could not be restored"
+        );
+        queue.submit(std::iter::once(enc.finish()));
+
+        // Just this tile: most of the canvas is spilled on purpose, so a whole-page readback
+        // would (correctly) refuse.
+        let tile = crate::test_gpu::readback_tile(&device, &queue, &canvas, (0, 0))
+            .expect("resident after the restore");
+        let paper = Canvas::paper_color()[0];
+        let texel = tile[125 * openpaint_core::tile::TILE_SIZE + 125];
+        assert!(
+            texel[0] < paper - 0.05,
+            "the stroke did not survive the round trip: {texel:?}"
+        );
     }
 
     /// Drain the editor's pending commands through the executor, as `redraw` does.

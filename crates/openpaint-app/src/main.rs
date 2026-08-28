@@ -48,6 +48,7 @@ mod stroke_layer;
 #[cfg(test)]
 mod test_gpu;
 mod tile_pool;
+mod tile_store;
 mod ui;
 mod view;
 
@@ -750,6 +751,10 @@ impl OpenPaint {
         // to here rather than done at construction.
         self.view.apply_pending_fit(w, h, editor.canvas());
         let xform = self.view.page_to_ndc(w, h);
+        // What the viewport covers, in page coordinates. Residency is bounded, so the
+        // *visible* set is the working set: without this the renderer would try to restore
+        // the whole document from the CPU every frame.
+        let visible = self.view.visible_rect(w, h);
 
         let mut ui_wants_repaint = false;
         let mut ui_inset_left = None;
@@ -758,6 +763,7 @@ impl OpenPaint {
         let mut trim_request = false;
         let history_status = renderer.history_status();
         let residency = renderer.residency();
+        let (spilled, traffic) = renderer.spill_status();
         let status_message = self.status_message.clone();
         let page_size = {
             let page = editor.document().active();
@@ -768,7 +774,7 @@ impl OpenPaint {
         // the view silently writes to a dead value. Disjoint field borrows make
         // this fine alongside the mutable borrows of `renderer` and `editor`.
         let view = &self.view;
-        let result = renderer.render(xform, |gpu| {
+        let result = renderer.render(xform, visible, |gpu| {
             if let Some(ui) = ui {
                 let out = ui.render(
                     &window,
@@ -782,6 +788,8 @@ impl OpenPaint {
                         crop: crop_overlay.as_ref(),
                         crop_rect,
                         residency,
+                        spilled,
+                        traffic,
                     },
                 );
                 ui_wants_repaint = out.wants_repaint;
@@ -804,6 +812,13 @@ impl OpenPaint {
         // re-creates the very GPU resources the frame is drawing with.
         if let Some((side, amount)) = extend_request {
             self.extend_page(side, amount);
+        }
+        // Zoomed far out on a heavily painted document, the visible tiles can outnumber the
+        // pool. Say so rather than quietly drawing part of the canvas.
+        if self.renderer.as_ref().is_some_and(Renderer::pressured) {
+            self.status_message = Some(
+                "Too much of the canvas is visible at once to keep on the GPU; zoom in.".to_owned(),
+            );
         }
         if trim_request {
             self.trim_to_page();

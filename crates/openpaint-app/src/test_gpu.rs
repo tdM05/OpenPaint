@@ -40,6 +40,20 @@ pub fn try_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     .ok()
 }
 
+/// A canvas renderer with a residency budget generous enough that tests exercising the
+/// *paint* path are not also fighting eviction.
+///
+/// Tests that mean to exercise eviction build a [`crate::tile_store::TileStore`] with a
+/// deliberately tiny budget instead.
+pub fn test_canvas(device: &wgpu::Device, cpu: &Canvas) -> CanvasRenderer {
+    CanvasRenderer::new(
+        device,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        cpu,
+        128 * 1024 * 1024,
+    )
+}
+
 /// Read the page region of a tiled canvas back as linear f32 RGBA, row-major.
 ///
 /// Area with no resident tile reads as paper, matching what the sheet quad draws — so a
@@ -74,9 +88,12 @@ pub fn readback_page(
 
     let mut encoder = device.create_command_encoder(&Default::default());
     for (i, coord) in coords.iter().enumerate() {
-        let Some(slot) = canvas.slot(*coord) else {
-            continue;
-        };
+        // Loudly, not silently: a spilled tile would otherwise read back as paper and a
+        // comparison against the CPU reference would fail for a reason that looks like a
+        // rasterization bug.
+        let slot = canvas
+            .slot(*coord)
+            .unwrap_or_else(|| panic!("tile {coord:?} is not resident; raise the test budget"));
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
                 texture: canvas.pool().texture(),
@@ -132,6 +149,63 @@ pub fn readback_page(
         }
     }
     out
+}
+
+/// Read one resident tile back as linear f32 RGBA, row-major within the tile.
+///
+/// For tests where most of the canvas is deliberately spilled, so whole-page readback would
+/// (correctly) refuse.
+pub fn readback_tile(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    canvas: &CanvasRenderer,
+    coord: openpaint_core::tile::TileCoord,
+) -> Option<Vec<[f32; 4]>> {
+    let slot = canvas.slot(coord)?;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("tile-readback"),
+        size: TILE_BYTES as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        wgpu::ImageCopyTexture {
+            texture: canvas.pool().texture(),
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: 0,
+                y: 0,
+                z: slot.layer(),
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::ImageCopyBuffer {
+            buffer: &buffer,
+            layout: wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(TILE_SIZE as u32 * 8),
+                rows_per_image: Some(TILE_SIZE as u32),
+            },
+        },
+        wgpu::Extent3d {
+            width: TILE_SIZE as u32,
+            height: TILE_SIZE as u32,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::Maintain::Wait);
+    let view = buffer.slice(..).get_mapped_range();
+    Some(
+        bytemuck::cast_slice::<u8, half::f16>(&view)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| [c[0].to_f32(), c[1].to_f32(), c[2].to_f32(), c[3].to_f32()])
+            .collect(),
+    )
 }
 
 /// Largest per-channel difference between two readbacks, and where it is.

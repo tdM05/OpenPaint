@@ -209,7 +209,7 @@ blending (to avoid dark edge fringing). Tracked so we hold ourselves to it.
 
 ---
 
-### Q13. Tile residency + who owns tile pixels — HALF RESOLVED 2026-08-28
+### Q13. Tile residency + who owns tile pixels — ✅ RESOLVED 2026-08-28
 Falls out of the Surface-class target and "any canvas size" (DECISIONS §2): the
 GPU can only hold a bounded working set of tiles, so ownership has to be explicit.
 
@@ -252,33 +252,46 @@ Built; see DECISIONS §4d for the design and what it deleted. Delivered:
 - Both page-size ceilings gone. The only remaining page limit is 65536 px per side, and
   it is coordinate precision, not memory.
 
-## ⚠️ STILL OPEN — spilling, and therefore true "any canvas size"
+## ✅ RESOLVED — spilling, and therefore "any canvas size"
 
-The pool bounds residency, but non-resident tiles currently have **nowhere to go**. When
-it fills, painting stops and the status bar says so. That is honest, not finished:
-DECISIONS §2 requires any canvas size, and a long webtoon inked throughout exceeds
-96 MiB of tiles.
+Built; `tile_store.rs`. The GPU is authoritative for resident tiles and the CPU holds the
+rest, so **document size is no longer limited by graphics memory**.
 
-What is left:
-- **Async readback on eviction** (`map_async`, never stalling a frame) into a CPU tile
-  store, and re-upload on demand. `openpaint_core::Canvas` already holds CPU tiles and
-  `upload_dirty` is already the re-upload seam, so the shape exists.
-- **Eviction policy.** Nothing tracks use order yet — the pool is a slab, deliberately,
-  with `TileMap` owning the key→layer mapping, so an LRU belongs beside the map rather
-  than inside the pool.
-- **How the budget adapts to available memory.** 96 MiB is a fixed guess. Query wgpu
-  limits, or measure?
-- **On-disk backing** for documents larger than RAM, and its relationship to the native
-  format (Q6).
-- **Undo snapshots spilling too.** They have their own 64 MiB pool and currently evict
-  the oldest operation rather than spilling it.
+- **Clean tiles evict for free.** A tile uploaded from the CPU and not painted since is
+  already backed, so eviction just frees the layer. Panning a large document evicts almost
+  entirely clean tiles, which is what keeps the common case cheap.
+- **Dirty eviction never stalls a frame.** The copy goes out in its own submission and the
+  layer is freed immediately - submissions run in order, so a later reuse cannot overtake the
+  copy. Buffers map asynchronously and drain over following frames; asking for a tile whose
+  readback is still in flight forces a resolve.
+- **A victim must be from an earlier frame.** Correctness, not policy: eviction is submitted
+  *before* the caller's still-unsubmitted encoder, so evicting a tile the current frame has
+  already painted into would read pre-paint contents and lose that paint. DECISIONS 11a.2
+  again, in a third costume.
+- **Use ordering is a counter, not a list** - O(1) to touch, O(n) only when choosing a victim.
+- **Viewport culling became mandatory.** With residency bounded and spilling in place, the
+  visible set *is* the working set; asking for every tile in the document would restore the
+  whole thing from the CPU every frame. `View::visible_rect` supplies the bound.
+- Verified per 11a.4: with the readback deliberately discarded, the round-trip test fails.
 
-Also worth revisiting once residency is under pressure: the canvas draw currently emits
-an instance for **every** resident tile intersecting the page, not just the ones on
-screen. Correct and cheap at ~200 tiles; viewport culling is the obvious next step when
-the resident set is large. And zoomed-out quality is still unfiltered beyond a single
-mip — a real resolution pyramid (as CSP and Procreate both have) is a separate piece of
-work, not a regression from the single-texture version, which had no mips either.
+**Budget: a heuristic, not a measurement.** wgpu exposes no way to ask how much graphics
+memory exists, so `tile_store::budget_for` picks from `AdapterInfo::device_type` - 64 MiB on
+integrated (shared memory, DECISIONS 2), 128 MiB on discrete. Named honestly rather than
+dressed up as adaptive. It wants to be a user setting once there is somewhere to put one.
+
+## ⚠️ STILL OPEN — zoomed-out views of a heavily painted document
+
+The one place residency still shows through. Zoom far enough out on a large, heavily painted
+canvas and the *visible* tiles outnumber the pool; the app says so and asks you to zoom in,
+which is honest but not good.
+
+The real fix is a **resolution pyramid** - draw a downsampled level when zoomed out, as CSP
+and Procreate both do. That also fixes a quality problem that predates tiling: zoomed-out
+views are minified with no mips at all, so they alias. Worth doing as one piece of work, and
+it is not a regression from the single-texture version, which had no mips either.
+
+Also still open: **undo snapshots do not spill.** They have their own 64 MiB pool and evict
+the oldest operation rather than writing it to the CPU.
 
 ### Q14. Pen input cannot reach the UI layer - ARCHITECTURAL, blocks any real UI
 Surfaced 2026-08-27 when the egui debug panel landed: **only the mouse can operate

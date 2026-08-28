@@ -28,7 +28,8 @@ use half::f16;
 use openpaint_core::tile::{TileCoord, TILE_BYTES, TILE_CHANNELS, TILE_SIZE};
 use openpaint_core::{Canvas, PageRect};
 
-use crate::tile_pool::{layers_for_budget, TileMap, TilePool};
+use crate::tile_pool::{Slot, TilePool};
+use crate::tile_store::{Init, LayerId, Pressure, TileKey, TileStore};
 use crate::view::PageToNdc;
 
 /// Pixel format of canvas tiles: linear premultiplied RGBA f16, matching
@@ -38,16 +39,11 @@ pub const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Bytes per canvas texel (RGBA f16).
 pub const CANVAS_BYTES_PER_TEXEL: u32 = (TILE_CHANNELS * std::mem::size_of::<f16>()) as u32;
 
-/// GPU memory the resident canvas tiles may occupy.
+/// The layer being drawn and painted.
 ///
-/// Chosen for the Surface-class target (DECISIONS §2), where graphics memory is shared
-/// with the system: 96 MiB is 192 tiles, enough to hold an A4 page at 300 DPI fully
-/// inked (140 tiles) without asking a laptop to give up a sixth of a gigabyte.
-///
-/// This bounds *residency*, not canvas size. Exceeding it is a normal condition on a long
-/// webtoon and is what spilling to CPU/disk answers (Q13); until that lands, the pool
-/// reports exhaustion rather than pretending.
-pub const CANVAS_BUDGET_BYTES: u64 = 96 * 1024 * 1024;
+/// One layer for now. Named rather than hardcoded at every call site so that adding the
+/// stack is a change to who supplies it, not a hunt through the file.
+pub const ACTIVE_LAYER: LayerId = LayerId(0);
 
 /// Uniform matching `Xform` in canvas.wgsl.
 #[repr(C)]
@@ -70,8 +66,7 @@ struct TileInstance {
 }
 
 pub struct CanvasRenderer {
-    pool: TilePool,
-    map: TileMap,
+    store: TileStore,
     /// The page rectangle. Drawing and painting are bounded by it; storage is not.
     page: PageRect,
     bind_group: wgpu::BindGroup,
@@ -89,21 +84,9 @@ impl CanvasRenderer {
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
         canvas: &Canvas,
+        budget_bytes: u64,
     ) -> Self {
-        let capacity = layers_for_budget(device, CANVAS_BYTES_PER_TEXEL, CANVAS_BUDGET_BYTES);
-        let pool = TilePool::new(
-            device,
-            "canvas-tiles",
-            CANVAS_FORMAT,
-            capacity,
-            CANVAS_BYTES_PER_TEXEL,
-            // RENDER_ATTACHMENT so a stroke can bake into a tile; COPY_SRC/DST for undo
-            // snapshots, export, and CPU-reference uploads.
-            wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST,
-        );
+        let store = TileStore::new(device, budget_bytes);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("canvas-sampler"),
@@ -158,7 +141,13 @@ impl CanvasRenderer {
             ],
         });
 
-        let bind_group = make_bind_group(device, &bind_group_layout, &xform_buf, &pool, &sampler);
+        let bind_group = make_bind_group(
+            device,
+            &bind_group_layout,
+            &xform_buf,
+            store.pool(),
+            &sampler,
+        );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("canvas-shader"),
@@ -247,8 +236,7 @@ impl CanvasRenderer {
         });
 
         Self {
-            pool,
-            map: TileMap::default(),
+            store,
             page: canvas.rect(),
             bind_group,
             sheet_pipeline,
@@ -277,84 +265,131 @@ impl CanvasRenderer {
 
     #[must_use]
     pub fn pool(&self) -> &TilePool {
-        &self.pool
+        self.store.pool()
     }
 
     /// Resident tile count and capacity, for display.
     #[must_use]
     pub fn residency(&self) -> (u32, u32) {
-        (self.pool.used(), self.pool.capacity())
+        self.store.residency()
+    }
+
+    /// Tiles held on the CPU because they did not fit on the GPU.
+    #[must_use]
+    pub fn spilled_count(&self) -> usize {
+        self.store.spilled_count()
+    }
+
+    /// Readbacks and re-uploads so far, for spotting a thrashing budget.
+    #[must_use]
+    pub fn traffic(&self) -> (u64, u64) {
+        self.store.traffic()
+    }
+
+    /// Start a frame: drain finished spills and advance residency's frame counter.
+    pub fn begin_frame(&mut self) {
+        self.store.begin_frame();
     }
 
     /// The pool layer holding `coord`, if it is resident.
     #[must_use]
-    pub fn slot(&self, coord: TileCoord) -> Option<&crate::tile_pool::Slot> {
-        self.map.slot(coord)
+    pub fn slot(&self, coord: TileCoord) -> Option<&Slot> {
+        self.store.slot(TileKey::new(ACTIVE_LAYER, coord))
     }
 
-    /// Every resident tile coordinate.
+    /// Every tile the canvas holds, resident or spilled.
     pub fn tiles(&self) -> impl Iterator<Item = TileCoord> + '_ {
-        self.map.iter().map(|(c, _)| c)
+        self.store
+            .keys()
+            .filter(|k| k.layer == ACTIVE_LAYER)
+            .map(|k| k.coord)
+    }
+
+    /// Make sure `coord` is on the GPU, restoring it from the CPU if it had spilled.
+    ///
+    /// Returns `None` when it is not a tile this canvas has, so callers that only want
+    /// existing pixels do not accidentally create empty ones.
+    pub fn make_resident(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        coord: TileCoord,
+    ) -> Option<u32> {
+        let key = TileKey::new(ACTIVE_LAYER, coord);
+        if !self.store.contains(key) {
+            return None;
+        }
+        self.store
+            .ensure(
+                device,
+                queue,
+                encoder,
+                key,
+                // Unreachable: the tile exists, so this is a restore, not a creation.
+                Init::Clear(paper_clear_color(Canvas::paper_color())),
+            )
+            .ok()
+    }
+
+    /// Note that a tile's pixels changed, so residency owes it a readback if it spills.
+    pub fn mark_dirty(&mut self, coord: TileCoord) {
+        self.store.mark_dirty(TileKey::new(ACTIVE_LAYER, coord));
     }
 
     /// Make sure `coord` has a tile, clearing a fresh one to paper.
     ///
-    /// Returns `None` when the pool is full — a real, reachable state that the caller has
-    /// to report rather than paint through. Fresh tiles are cleared to paper rather than
-    /// transparent so a partially-covered tile shows sheet, not a hole, in the parts the
-    /// brush has not reached.
+    /// Fresh tiles are cleared to paper rather than transparent so a partially-covered tile
+    /// shows sheet, not a hole, in the parts the brush has not reached. That changes when
+    /// layers land: a *layer* is transparent where unpainted, and the paper moves to the
+    /// bottom of the compositor.
     pub fn ensure_tile(
         &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        coord: TileCoord,
+    ) -> Result<u32, Pressure> {
+        self.store.ensure(
+            device,
+            queue,
+            encoder,
+            TileKey::new(ACTIVE_LAYER, coord),
+            Init::Clear(paper_clear_color(Canvas::paper_color())),
+        )
+    }
+
+    /// Make sure `coord` has a tile, **without** clearing it to paper, for a caller that is
+    /// about to overwrite every texel.
+    ///
+    /// The clear is skipped rather than merely wasted. Clearing goes through the encoder while
+    /// a full upload goes through `Queue::write_texture`, and every queue write in a
+    /// submission is applied *before* any of its commands run -- so a paper clear here would
+    /// be reordered *after* the upload and wipe it. The export test is what caught that.
+    fn ensure_tile_for_full_write(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         coord: TileCoord,
     ) -> Option<u32> {
-        if let Some(slot) = self.map.slot(coord) {
-            return Some(slot.layer());
-        }
-        let slot = self.pool.alloc()?;
-        let layer = slot.layer();
-        self.pool
-            .clear_layer(encoder, &slot, paper_clear_color(Canvas::paper_color()));
-        // The insert must happen outside `debug_assert!`, which does not evaluate its
-        // expression in a release build -- see DECISIONS 11a.6. Freeing a displaced slot
-        // rather than dropping it means a logic error cannot also leak a layer.
-        let displaced = self.map.insert(coord, slot);
-        debug_assert!(displaced.is_none(), "tile {coord:?} was already mapped");
-        if let Some(slot) = displaced {
-            self.pool.free(slot);
-        }
-        Some(layer)
-    }
-
-    /// Make sure `coord` has a tile, **without** clearing it, for a caller that is about to
-    /// overwrite every texel.
-    ///
-    /// Not an optimisation -- a correctness requirement. Clearing goes through the encoder
-    /// while a full upload goes through `Queue::write_texture`, and every queue write in a
-    /// submission is applied *before* any of its commands run. So a clear here would be
-    /// reordered *after* the upload and wipe it. The test that exports a known canvas is
-    /// what caught this.
-    fn ensure_tile_for_full_write(&mut self, coord: TileCoord) -> Option<u32> {
-        if let Some(slot) = self.map.slot(coord) {
-            return Some(slot.layer());
-        }
-        let slot = self.pool.alloc()?;
-        let layer = slot.layer();
-        // The insert must happen outside `debug_assert!`, which does not evaluate its
-        // expression in a release build -- see DECISIONS 11a.6. Freeing a displaced slot
-        // rather than dropping it means a logic error cannot also leak a layer.
-        let displaced = self.map.insert(coord, slot);
-        debug_assert!(displaced.is_none(), "tile {coord:?} was already mapped");
-        if let Some(slot) = displaced {
-            self.pool.free(slot);
-        }
-        Some(layer)
+        self.store
+            .ensure(
+                device,
+                queue,
+                encoder,
+                TileKey::new(ACTIVE_LAYER, coord),
+                Init::Untouched,
+            )
+            .ok()
     }
 
     /// The tile at `coord` as a render target, for a stroke to bake into.
     #[must_use]
     pub fn tile_target(&self, coord: TileCoord) -> Option<&wgpu::TextureView> {
-        self.map.slot(coord).map(|s| self.pool.layer_view(s))
+        self.store
+            .slot(TileKey::new(ACTIVE_LAYER, coord))
+            .map(|s| self.store.pool().layer_view(s))
     }
 
     /// Drop every tile that lies entirely outside the page, handing the caller their
@@ -362,10 +397,9 @@ impl CanvasRenderer {
     ///
     /// The only operation that discards pixels — see [`CanvasRenderer::take_tile`].
     pub fn tiles_outside_page(&self) -> Vec<TileCoord> {
-        self.map
-            .iter()
-            .map(|(c, _)| c)
-            .filter(|c| !tile_intersects(*c, self.page))
+        let page = self.page;
+        self.tiles()
+            .filter(|c| !tile_intersects(*c, page))
             .collect()
     }
 
@@ -375,28 +409,24 @@ impl CanvasRenderer {
     /// is *not* freed here: the caller decides whether to return it to the pool or keep it
     /// alive as a snapshot, and the move-only slot is what makes that choice explicit.
     #[must_use]
-    pub fn take_tile(&mut self, coord: TileCoord) -> Option<crate::tile_pool::Slot> {
-        self.map.take(coord)
+    pub fn take_tile(&mut self, coord: TileCoord) -> Option<Slot> {
+        self.store.remove(TileKey::new(ACTIVE_LAYER, coord))
     }
 
     /// Put a tile back, e.g. when undoing a Trim. Returns any displaced slot.
     #[must_use = "the displaced slot must be returned to a pool"]
-    pub fn put_tile(
-        &mut self,
-        coord: TileCoord,
-        slot: crate::tile_pool::Slot,
-    ) -> Option<crate::tile_pool::Slot> {
-        self.map.insert(coord, slot)
+    pub fn put_tile(&mut self, coord: TileCoord, slot: Slot) -> Option<Slot> {
+        self.store.insert(TileKey::new(ACTIVE_LAYER, coord), slot)
     }
 
     /// Allocate a bare tile without clearing it, for a caller that will overwrite it.
-    pub fn alloc_bare(&mut self) -> Option<crate::tile_pool::Slot> {
-        self.pool.alloc()
+    pub fn alloc_bare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Slot> {
+        self.store.alloc_bare(device, queue)
     }
 
     /// Return a layer to the canvas pool.
-    pub fn release(&mut self, slot: crate::tile_pool::Slot) {
-        self.pool.free(slot);
+    pub fn release(&mut self, slot: Slot) {
+        self.store.release(slot);
     }
 
     /// Upload the CPU reference canvas's dirty tiles.
@@ -404,18 +434,24 @@ impl CanvasRenderer {
     /// The GPU is authoritative for painting (DECISIONS §4a), so in normal use there is
     /// nothing here: `openpaint_core::Canvas` holds no pixels unless the CPU reference
     /// path put them there. This is the seam that keeps that path usable.
-    pub fn upload_dirty(&mut self, queue: &wgpu::Queue, canvas: &mut Canvas) {
+    pub fn upload_dirty(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        canvas: &mut Canvas,
+    ) {
         for coord in canvas.take_dirty() {
             let Some(tile) = canvas.tile(coord) else {
                 continue;
             };
-            let Some(layer) = self.ensure_tile_for_full_write(coord) else {
+            let Some(layer) = self.ensure_tile_for_full_write(device, queue, encoder, coord) else {
                 continue;
             };
             debug_assert_eq!(tile.bytes().len(), TILE_BYTES);
             queue.write_texture(
                 wgpu::ImageCopyTexture {
-                    texture: self.pool.texture(),
+                    texture: self.store.pool().texture(),
                     mip_level: 0,
                     origin: wgpu::Origin3d {
                         x: 0,
@@ -436,16 +472,27 @@ impl CanvasRenderer {
                     depth_or_array_layers: 1,
                 },
             );
+            self.mark_dirty(coord);
         }
     }
 
-    /// Write the camera and build the draw list for this frame.
+    /// Write the camera, restore the tiles the viewport needs, and build the draw list.
     ///
-    /// Culls to tiles that intersect the page: out-of-page tiles are retained storage, not
-    /// visible content. The shader clamps too, so a stale instance can only ever draw
-    /// nothing — belt and braces, because getting this wrong would silently show pixels a
-    /// crop was supposed to hide.
-    pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, xform: PageToNdc) {
+    /// `visible` is the page-space bounding box of what the viewport covers. Culling to it is
+    /// no longer merely an optimisation: with residency bounded and spilling in place, asking
+    /// for every tile in the document would restore the whole document from the CPU every
+    /// frame. So the *visible* set is the working set.
+    ///
+    /// Returns whether the visible set was larger than the pool could hold, which the caller
+    /// reports rather than silently drawing a partial canvas.
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        xform: PageToNdc,
+        visible: PageRect,
+    ) -> bool {
         let (ex, ey) = self.page.end();
         let paper = Canvas::paper_color();
         queue.write_buffer(
@@ -460,23 +507,30 @@ impl CanvasRenderer {
             }),
         );
 
-        let mut list: Vec<TileInstance> = self
-            .map
-            .iter()
-            .filter(|(coord, _)| tile_intersects(*coord, self.page))
-            .map(|(coord, slot)| TileInstance {
-                coord: [coord.0, coord.1],
-                layer: slot.layer(),
-                _pad: 0,
-            })
+        // Tiles that exist, lie inside the page, and are on screen. Sorted so the frame's
+        // residency requests -- and therefore its eviction order -- are deterministic.
+        let mut wanted: Vec<TileCoord> = self
+            .tiles()
+            .filter(|c| tile_intersects(*c, self.page) && tile_intersects(*c, visible))
             .collect();
-        // Deterministic order so a GPU capture is comparable between frames; the tiles are
-        // disjoint and opaque, so order cannot affect the image.
-        list.sort_unstable_by_key(|i| (i.coord[1], i.coord[0]));
+        wanted.sort_unstable_by_key(|c| (c.1, c.0));
+
+        let mut under_pressure = false;
+        let mut list = Vec::with_capacity(wanted.len());
+        for coord in wanted {
+            match self.make_resident(device, queue, encoder, coord) {
+                Some(layer) => list.push(TileInstance {
+                    coord: [coord.0, coord.1],
+                    layer,
+                    _pad: 0,
+                }),
+                None => under_pressure = true,
+            }
+        }
 
         self.instance_count = list.len() as u32;
         if list.is_empty() {
-            return;
+            return under_pressure;
         }
         if list.len() > self.instance_capacity {
             self.instance_capacity = list.len().next_power_of_two();
@@ -489,6 +543,7 @@ impl CanvasRenderer {
             });
         }
         queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&list));
+        under_pressure
     }
 
     /// Record the canvas draw: the sheet, then every visible tile in one instanced call.
@@ -627,8 +682,10 @@ mod tests {
             }
         }
 
-        let mut canvas = CanvasRenderer::new(&device, SURFACE, &cpu);
-        canvas.upload_dirty(&queue, &mut cpu);
+        let mut canvas = CanvasRenderer::new(&device, SURFACE, &cpu, 128 * 1024 * 1024);
+        let mut enc = device.create_command_encoder(&Default::default());
+        canvas.upload_dirty(&device, &queue, &mut enc, &mut cpu);
+        queue.submit(std::iter::once(enc.finish()));
         assert_eq!(
             canvas.residency().0,
             1,
@@ -637,7 +694,20 @@ mod tests {
 
         let mut view = crate::view::View::new();
         view.fit(VIEW_W, VIEW_H, &cpu);
-        canvas.prepare(&device, &queue, view.page_to_ndc(VIEW_W, VIEW_H));
+        let mut enc = device.create_command_encoder(&Default::default());
+        // The whole page is visible in this test, so culling must not remove anything.
+        let visible = view.visible_rect(VIEW_W, VIEW_H);
+        assert!(
+            !canvas.prepare(
+                &device,
+                &queue,
+                &mut enc,
+                view.page_to_ndc(VIEW_W, VIEW_H),
+                visible
+            ),
+            "the test budget should be ample"
+        );
+        queue.submit(std::iter::once(enc.finish()));
 
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("draw-test-target"),

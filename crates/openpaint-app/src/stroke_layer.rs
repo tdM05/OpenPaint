@@ -820,6 +820,7 @@ impl StrokeLayer {
     /// Returns the canvas tiles that were written, which is what history records.
     pub fn bake(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         canvas: &mut CanvasRenderer,
@@ -835,10 +836,12 @@ impl StrokeLayer {
 
         let mut written = Vec::with_capacity(records.len());
         for (index, coord) in records.into_iter().enumerate() {
-            // A tile the stroke reached may not exist on the canvas yet.
-            let Some(_) = canvas.ensure_tile(encoder, coord) else {
+            // A tile the stroke reached may not exist on the canvas yet, and one that does
+            // may have spilled to the CPU since it was last drawn.
+            if canvas.ensure_tile(device, queue, encoder, coord).is_err() {
+                self.exhausted = true;
                 continue;
-            };
+            }
             let Some(target) = canvas.tile_target(coord) else {
                 continue;
             };
@@ -865,6 +868,7 @@ impl StrokeLayer {
             pass.set_bind_group(2, &self.xform_group, &[]);
             pass.draw(0..6, 0..1);
             drop(pass);
+            canvas.mark_dirty(coord);
             written.push(coord);
         }
 
@@ -965,7 +969,7 @@ mod tests {
         let cpu = Canvas::new(SIZE, SIZE);
         let page = cpu.rect();
         // The preview pipeline's format is irrelevant here; it is never drawn.
-        let mut canvas = CanvasRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, &cpu);
+        let mut canvas = crate::test_gpu::test_canvas(&device, &cpu);
         let mut layer =
             StrokeLayer::new(&device, CANVAS_FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
 
@@ -990,7 +994,7 @@ mod tests {
                 start += len;
             }
         }
-        layer.bake(&queue, &mut encoder, &mut canvas);
+        layer.bake(&device, &queue, &mut encoder, &mut canvas);
         queue.submit(std::iter::once(encoder.finish()));
 
         readback_page(&device, &queue, &canvas)
@@ -1161,8 +1165,7 @@ mod tests {
 
         let cpu_canvas = Canvas::new(W, H);
         let page = cpu_canvas.rect();
-        let mut canvas =
-            CanvasRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, &cpu_canvas);
+        let mut canvas = crate::test_gpu::test_canvas(&device, &cpu_canvas);
         let mut layer =
             StrokeLayer::new(&device, CANVAS_FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
 
@@ -1176,7 +1179,7 @@ mod tests {
         for index in 0..tiles {
             layer.stamp_range(&mut encoder, index, 0, dabs.len());
         }
-        layer.bake(&queue, &mut encoder, &mut canvas);
+        layer.bake(&device, &queue, &mut encoder, &mut canvas);
         queue.submit(std::iter::once(encoder.finish()));
 
         let gpu = readback_page(&device, &queue, &canvas);

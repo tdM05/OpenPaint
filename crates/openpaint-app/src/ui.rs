@@ -69,6 +69,10 @@ pub struct Status<'a> {
     pub crop_rect: Option<(i32, i32, u32, u32)>,
     /// Resident canvas tiles and pool capacity.
     pub residency: (u32, u32),
+    /// Tiles currently held on the CPU because they did not fit on the GPU.
+    pub spilled: usize,
+    /// Readbacks and re-uploads so far, for spotting a thrashing budget.
+    pub traffic: (u64, u64),
 }
 
 /// What the panel wants the app to do, collected during the frame.
@@ -277,10 +281,18 @@ impl Ui {
                     ui.heading("Canvas memory");
                     let (used, capacity) = status.residency;
                     ui.label(format!(
-                        "{used} / {capacity} tiles ({:.0} MiB of {:.0} MiB)",
+                        "GPU {used} / {capacity} tiles ({:.0} of {:.0} MiB)",
                         used as f32 * 0.5,
                         capacity as f32 * 0.5
                     ));
+                    if status.spilled > 0 {
+                        let (out, back) = status.traffic;
+                        ui.label(format!(
+                            "CPU {} tiles ({:.0} MiB), {out} out / {back} back",
+                            status.spilled,
+                            status.spilled as f32 * 0.5
+                        ));
+                    }
                     if ui.button("Trim to canvas").clicked() {
                         trim = true;
                     }

@@ -302,6 +302,12 @@ impl TileMap {
     }
 
     /// Take the slot for `coord` out of the map, handing ownership to the caller.
+    ///
+    /// Test-only: the one production user of this map drains it wholesale at stroke end, and
+    /// the store that needs per-tile removal keys by layer as well and owns that itself. Kept
+    /// because it is the counterpart to `insert`, and the ownership handoff it demonstrates is
+    /// what stops a removed tile leaking its pool layer.
+    #[cfg(test)]
     #[must_use = "the slot must be returned to the pool or handed to another owner"]
     pub fn take(&mut self, coord: TileCoord) -> Option<Slot> {
         self.slots.remove(&coord)

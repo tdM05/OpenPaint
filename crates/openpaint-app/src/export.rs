@@ -364,8 +364,10 @@ mod tests {
             }
         }
 
-        let mut canvas = CanvasRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, &cpu);
-        canvas.upload_dirty(&queue, &mut cpu);
+        let mut canvas = crate::test_gpu::test_canvas(&device, &cpu);
+        let mut enc = device.create_command_encoder(&Default::default());
+        canvas.upload_dirty(&device, &queue, &mut enc, &mut cpu);
+        queue.submit(std::iter::once(enc.finish()));
 
         let path = std::env::temp_dir().join("openpaint-export-tiles-test.png");
         export_tiles_png(&device, &queue, &canvas, &path).expect("export failed");
@@ -406,7 +408,7 @@ mod tests {
         };
 
         let cpu = Canvas::new(300, 200);
-        let canvas = CanvasRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, &cpu);
+        let canvas = crate::test_gpu::test_canvas(&device, &cpu);
         assert_eq!(canvas.tiles().count(), 0, "nothing should be resident yet");
 
         let path = std::env::temp_dir().join("openpaint-export-blank-test.png");

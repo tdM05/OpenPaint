@@ -25,7 +25,7 @@
 //! shaders, and both directions of this transform. Building it once is cheaper than
 //! building it twice.
 
-use openpaint_core::Canvas;
+use openpaint_core::{Canvas, PageRect};
 
 /// Fraction of the visible area the canvas is fitted into, so the sheet has a
 /// little breathing room rather than touching the window edge.
@@ -321,6 +321,39 @@ impl View {
         let (x, y) = self.canvas_to_screen(cx, cy, surface_w, surface_h);
         // Pixels -> NDC: x maps 0..sw to -1..1, y maps 0..sh to 1..-1.
         [x / sw * 2.0 - 1.0, 1.0 - y / sh * 2.0]
+    }
+
+    /// The page-space bounding box of everything the viewport can show.
+    ///
+    /// Conservative on purpose: under rotation the visible region is a rotated rectangle, and
+    /// this returns its axis-aligned bound. A tile just outside the true region costs one
+    /// wasted instance, whereas missing one leaves a hole on screen — so erring outward is the
+    /// only safe direction.
+    ///
+    /// Residency depends on this: with a bounded tile pool and spilling in place, the visible
+    /// set *is* the working set, so this is what decides which tiles are kept on the GPU.
+    #[must_use]
+    pub fn visible_rect(&self, surface_w: u32, surface_h: u32) -> PageRect {
+        let (x, y, w, h) = self.content_area(surface_w, surface_h);
+        let corners = [
+            (f64::from(x), f64::from(y)),
+            (f64::from(x + w), f64::from(y)),
+            (f64::from(x), f64::from(y + h)),
+            (f64::from(x + w), f64::from(y + h)),
+        ];
+        let mut min = (f32::MAX, f32::MAX);
+        let mut max = (f32::MIN, f32::MIN);
+        for c in corners {
+            let (px, py) = self.screen_to_canvas_unclipped(c, surface_w, surface_h);
+            min = (min.0.min(px), min.1.min(py));
+            max = (max.0.max(px), max.1.max(py));
+        }
+        // One pixel of slack, so a boundary landing exactly on a tile edge still includes it.
+        let x0 = min.0.floor() as i32 - 1;
+        let y0 = min.1.floor() as i32 - 1;
+        let x1 = max.0.ceil() as i32 + 1;
+        let y1 = max.1.ceil() as i32 + 1;
+        PageRect::new(x0, y0, (x1 - x0).max(1) as u32, (y1 - y0).max(1) as u32)
     }
 
     /// Map a window position (physical pixels) to canvas pixels.

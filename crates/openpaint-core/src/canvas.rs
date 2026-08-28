@@ -221,6 +221,16 @@ impl Canvas {
         self.tiles.get(&coord)
     }
 
+    /// How many tiles are waiting to be uploaded.
+    ///
+    /// Lets the renderer skip the upload path without taking the set, which matters because
+    /// taking it clears it: a caller that took it and then decided not to upload would lose
+    /// the tiles silently.
+    #[must_use]
+    pub fn dirty_count(&self) -> usize {
+        self.dirty.len()
+    }
+
     /// Take and clear the set of dirty tile coords since the last call.
     pub fn take_dirty(&mut self) -> HashSet<TileCoord> {
         std::mem::take(&mut self.dirty)

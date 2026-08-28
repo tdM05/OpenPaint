@@ -29,7 +29,7 @@ use crate::stroke_exec::StrokeExec;
 use crate::stroke_layer::StrokeLayer;
 use crate::tile_pool::TilePool;
 use crate::view::PageToNdc;
-use openpaint_core::PageResize;
+use openpaint_core::{PageRect, PageResize};
 
 /// What an undo or redo did, and therefore what the caller must reconcile.
 ///
@@ -75,6 +75,8 @@ pub struct Renderer {
     /// Set when a stroke could not be recorded for undo because the snapshot pool was
     /// full even after evicting everything.
     unrecordable: bool,
+    /// Set when the last frame's visible tiles did not all fit in the pool.
+    pressured: bool,
     window: Arc<Window>,
 }
 
@@ -141,7 +143,10 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let canvas_renderer = CanvasRenderer::new(&device, format, canvas);
+        // Residency is sized from what the adapter looks like, because wgpu offers no way
+        // to ask how much graphics memory there actually is. See `tile_store::budget_for`.
+        let budget = crate::tile_store::budget_for(info.device_type);
+        let canvas_renderer = CanvasRenderer::new(&device, format, canvas, budget);
         let stroke_layer = StrokeLayer::new(&device, CANVAS_FORMAT, format);
         let history = History::new(&device);
 
@@ -156,6 +161,7 @@ impl Renderer {
             recording: Vec::new(),
             recording_paint: ([0.0; 4], 1.0),
             unrecordable: false,
+            pressured: false,
             window,
         })
     }
@@ -195,7 +201,13 @@ impl Renderer {
     /// the frame begins, which keeps the overlay callback free to touch the rest
     /// of the app state.
     pub fn upload_canvas(&mut self, canvas: &mut Canvas) {
-        self.canvas_renderer.upload_dirty(&self.queue, canvas);
+        if canvas.dirty_count() == 0 {
+            return;
+        }
+        let mut encoder = self.new_stroke_encoder();
+        self.canvas_renderer
+            .upload_dirty(&self.device, &self.queue, &mut encoder, canvas);
+        self.queue.submit(std::iter::once(encoder.finish()));
     }
 
     /// Execute the editor's pending stroke commands on the GPU.
@@ -312,6 +324,21 @@ impl Renderer {
         self.stroke_layer.exhausted()
     }
 
+    /// Whether the last frame could not make every visible tile resident.
+    #[must_use]
+    pub fn pressured(&self) -> bool {
+        self.pressured
+    }
+
+    /// Tiles held on the CPU, and (readbacks, re-uploads) so far.
+    #[must_use]
+    pub fn spill_status(&self) -> (usize, (u64, u64)) {
+        (
+            self.canvas_renderer.spilled_count(),
+            self.canvas_renderer.traffic(),
+        )
+    }
+
     /// Undo the most recent operation.
     ///
     /// Returns what the caller must reconcile: a geometry change has to be mirrored
@@ -359,7 +386,8 @@ impl Renderer {
                 // Put the discarded tiles back where they were.
                 let mut encoder = self.new_stroke_encoder();
                 for (coord, snapshot) in tiles {
-                    let Some(dst) = self.canvas_renderer.alloc_bare() else {
+                    let Some(dst) = self.canvas_renderer.alloc_bare(&self.device, &self.queue)
+                    else {
                         continue;
                     };
                     TilePool::copy_layer_from(
@@ -412,8 +440,12 @@ impl Renderer {
                     self.stroke_layer
                         .stamp_range(&mut encoder, index, 0, dabs.len());
                 }
-                self.stroke_layer
-                    .bake(&self.queue, &mut encoder, &mut self.canvas_renderer);
+                self.stroke_layer.bake(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    &mut self.canvas_renderer,
+                );
                 self.queue.submit(std::iter::once(encoder.finish()));
                 HistoryChange::Pixels
             }
@@ -449,11 +481,19 @@ impl Renderer {
     pub fn render(
         &mut self,
         xform: PageToNdc,
+        visible: PageRect,
         overlay: impl FnOnce(Overlay<'_>),
     ) -> Result<(), wgpu::SurfaceError> {
         let page = self.canvas_renderer.page();
-        self.canvas_renderer
-            .prepare(&self.device, &self.queue, xform);
+
+        // Restores and fresh-tile clears are recorded here and submitted before the frame, so
+        // the pass that samples them runs afterwards.
+        let mut prep = self.new_stroke_encoder();
+        self.canvas_renderer.begin_frame();
+        self.pressured =
+            self.canvas_renderer
+                .prepare(&self.device, &self.queue, &mut prep, xform, visible);
+        self.queue.submit(std::iter::once(prep.finish()));
         self.stroke_layer.set_frame(&self.queue, xform, page);
         if self.stroke_layer.has_paint() {
             self.stroke_layer
