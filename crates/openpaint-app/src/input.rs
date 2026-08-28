@@ -83,13 +83,21 @@ pub trait InputBackend {
     /// Default: ignore window events (for purely polled backends).
     fn process_window_event(&mut self, _event: &WindowEvent, _out: &mut Vec<PenEvent>) {}
 
-    /// Drain any queued native input into `out`. Called once per frame before
-    /// rendering. Default: nothing to poll (for purely event-driven backends).
+    /// Drain any queued native input into `out`. Default: nothing to poll (for
+    /// purely event-driven backends).
+    ///
+    /// Called only from the **top of the event loop** (winit's `about_to_wait`),
+    /// never from inside a window or paint event. That is a hard requirement,
+    /// not a convenience: native tablet APIs can re-enter our event handlers
+    /// through a nested message pump, and draining them from inside such a
+    /// re-entered handler deadlocks. See the "Windows Ink reentrancy" note in
+    /// `main.rs` for the full mechanism.
     fn poll(&mut self, _out: &mut Vec<PenEvent>) {}
 
-    /// Whether this backend needs the app to redraw continuously so [`poll`]
-    /// runs every frame. Event-driven backends (mouse) return `false` and stay
-    /// idle until a window event; polled backends (octotablet) return `true`.
+    /// Whether this backend keeps input in its own queue and so needs the loop
+    /// to keep waking up to call [`poll`]. Event-driven backends (mouse) return
+    /// `false` and stay idle until a window event; polled backends (octotablet)
+    /// return `true`.
     ///
     /// [`poll`]: InputBackend::poll
     fn wants_continuous_poll(&self) -> bool {
