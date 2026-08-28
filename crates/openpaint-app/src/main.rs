@@ -35,12 +35,15 @@
 
 mod canvas_renderer;
 mod editor;
+mod history;
 mod input;
 mod input_mouse;
 #[cfg(target_os = "windows")]
 mod input_pen;
 mod renderer;
 mod stroke_layer;
+#[cfg(test)]
+mod test_gpu;
 mod ui;
 mod view;
 
@@ -118,6 +121,8 @@ struct Nav {
     cursor: Option<(f64, f64)>,
     /// True while space is held, which arms pan-on-drag (Photoshop/CSP habit).
     space_held: bool,
+    /// Latest modifier state, for shortcuts like Ctrl+Z.
+    modifiers: winit::keyboard::ModifiersState,
     /// Where a pan drag last was, if one is in progress.
     panning_from: Option<(f64, f64)>,
 }
@@ -238,6 +243,58 @@ impl OpenPaint {
         self.pen_events.clear();
         self.input.poll(&mut self.pen_events);
         self.apply_pen_events();
+    }
+
+    /// Handle undo/redo shortcuts. Returns `true` if the event was consumed.
+    ///
+    /// Ctrl+Z undoes, Ctrl+Shift+Z and Ctrl+Y redo -- the bindings every art app
+    /// shares. Hardcoded for now, like navigation (OPEN_QUESTIONS Q16).
+    fn handle_history(&mut self, event: &WindowEvent) -> bool {
+        use winit::event::ElementState;
+        use winit::keyboard::Key;
+
+        match event {
+            WindowEvent::ModifiersChanged(mods) => {
+                self.nav.modifiers = mods.state();
+                false
+            }
+            WindowEvent::KeyboardInput { event: key, .. } => {
+                if key.state != ElementState::Pressed || !self.nav.modifiers.control_key() {
+                    return false;
+                }
+                let Key::Character(c) = &key.logical_key else {
+                    return false;
+                };
+                let redo = match c.as_str() {
+                    "z" | "Z" => self.nav.modifiers.shift_key(),
+                    "y" | "Y" => true,
+                    _ => return false,
+                };
+
+                // Refuse mid-stroke. The in-progress stroke is not in history yet
+                // and is still accumulating, so undoing here would revert the
+                // *previous* stroke and then bake the current one on top of the
+                // restored image -- a state the user never asked for and cannot
+                // reason about.
+                if self.editor.is_drawing() {
+                    return true;
+                }
+
+                let Some(renderer) = self.renderer.as_mut() else {
+                    return true;
+                };
+                let changed = if redo {
+                    renderer.redo()
+                } else {
+                    renderer.undo()
+                };
+                if changed {
+                    self.request_redraw();
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Handle canvas navigation: pan, zoom, rotate, fit. Returns `true` if the
@@ -381,6 +438,7 @@ impl OpenPaint {
 
         let mut ui_wants_repaint = false;
         let mut ui_inset_left = None;
+        let history_status = renderer.history_status();
         let window = renderer.window().clone();
         // Borrowed, not copied: a copy would mean any future UI control that edits
         // the view silently writes to a dead value. Disjoint field borrows make
@@ -388,7 +446,8 @@ impl OpenPaint {
         let view = &self.view;
         let result = renderer.render(placement, |gpu| {
             if let Some(ui) = ui {
-                ui_wants_repaint = ui.render(&window, gpu, editor.brush_mut(), view);
+                ui_wants_repaint =
+                    ui.render(&window, gpu, editor.brush_mut(), view, history_status);
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
@@ -460,6 +519,11 @@ impl OpenPaint {
             if consumed {
                 return;
             }
+        }
+
+        // Undo/redo before navigation, so Ctrl+Z is never eaten as a plain 'z'.
+        if self.handle_history(&event) {
+            return;
         }
 
         // Canvas navigation. Before the input backend, so a pan drag is not also

@@ -24,8 +24,12 @@ use winit::window::Window;
 
 use crate::canvas_renderer::{CanvasRenderer, CANVAS_FORMAT};
 use crate::editor::StrokeOp;
+use crate::history::{self, Entry, History};
 use crate::stroke_layer::StrokeLayer;
 use crate::view::Placement;
+
+/// Bytes per canvas texel (`Rgba16Float`), for history's memory accounting.
+const CANVAS_BYTES_PER_TEXEL: usize = 8;
 
 /// Everything an overlay needs to draw itself into the current frame.
 pub struct Overlay<'a> {
@@ -46,6 +50,14 @@ pub struct Renderer {
     canvas_renderer: CanvasRenderer,
     /// GPU dab rasterization and the in-progress stroke.
     stroke_layer: StrokeLayer,
+    /// Undo/redo. GPU-side because the GPU owns the pixels (see `crate::history`).
+    history: History,
+    /// Dabs of the stroke being recorded, accumulated across frames so redo can
+    /// replay it. A stroke spans many frames, and each frame's dabs are cleared
+    /// once executed, so history has to keep its own copy.
+    recording: Vec<openpaint_core::Dab>,
+    /// Paint of the stroke being recorded, captured at Begin.
+    recording_paint: ([f32; 4], f32),
     window: Arc<Window>,
 }
 
@@ -128,6 +140,9 @@ impl Renderer {
             config,
             canvas_renderer,
             stroke_layer,
+            history: History::new(CANVAS_BYTES_PER_TEXEL),
+            recording: Vec::new(),
+            recording_paint: ([0.0; 4], 1.0),
             window,
         })
     }
@@ -194,6 +209,8 @@ impl Renderer {
                     color_linear_premul,
                     opacity,
                 } => {
+                    self.recording.clear();
+                    self.recording_paint = (color_linear_premul, opacity);
                     // Paint is a uniform written from the queue, so it has the same
                     // ordering hazard: a second stroke in the same frame would
                     // otherwise overwrite the first one's colour before either drew.
@@ -205,10 +222,32 @@ impl Renderer {
                 }
                 StrokeOp::Dabs { start, len } => {
                     if start + len <= dabs.len() {
+                        self.recording.extend_from_slice(&dabs[start..start + len]);
                         self.stroke_layer.stamp_range(&mut encoder, start, len);
                     }
                 }
-                StrokeOp::End => {
+                StrokeOp::End { bounds } => {
+                    // Snapshot *before* baking: this is the pre-stroke image undo
+                    // restores. A GPU-to-GPU copy of just the touched rectangle, so
+                    // nothing comes back to the CPU on the interactive path.
+                    if let Some(rect) = bounds {
+                        if !rect.is_empty() && !self.recording.is_empty() {
+                            let before = history::snapshot_region(
+                                &self.device,
+                                &mut encoder,
+                                self.canvas_renderer.texture(),
+                                rect,
+                            );
+                            let (color_linear_premul, opacity) = self.recording_paint;
+                            self.history.push(Entry {
+                                rect,
+                                before,
+                                dabs: std::mem::take(&mut self.recording),
+                                color_linear_premul,
+                                opacity,
+                            });
+                        }
+                    }
                     self.stroke_layer
                         .bake(&mut encoder, self.canvas_renderer.target_view());
                 }
@@ -216,6 +255,62 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Undo and redo depths, and snapshot bytes held, for display.
+    #[must_use]
+    pub fn history_status(&self) -> (usize, usize, usize) {
+        (
+            self.history.undo_depth(),
+            self.history.redo_depth(),
+            self.history.bytes_held(),
+        )
+    }
+
+    /// Undo the most recent stroke by restoring its before-image.
+    ///
+    /// Returns `true` if anything changed, so the caller knows to request a frame.
+    pub fn undo(&mut self) -> bool {
+        let Some(entry) = self.history.pop_undo() else {
+            return false;
+        };
+        let mut encoder = self.new_stroke_encoder();
+        history::restore_region(
+            &mut encoder,
+            &entry.before,
+            self.canvas_renderer.texture(),
+            entry.rect,
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+        // The snapshot is still the *before* image, which is exactly what a later
+        // undo of the redone stroke needs -- so it carries over untouched.
+        self.history.finish_undo(entry);
+        true
+    }
+
+    /// Redo by replaying the stroke's dabs, rather than storing an after-image.
+    pub fn redo(&mut self) -> bool {
+        let Some(entry) = self.history.pop_redo() else {
+            return false;
+        };
+
+        // Paint is a queue write, so it must be ordered before the draws that use
+        // it -- set it, then record in a fresh submission.
+        self.stroke_layer
+            .set_paint(&self.queue, entry.color_linear_premul, entry.opacity);
+        self.stroke_layer
+            .upload_dabs(&self.device, &self.queue, &entry.dabs);
+
+        let mut encoder = self.new_stroke_encoder();
+        self.stroke_layer.begin_stroke(&mut encoder);
+        self.stroke_layer
+            .stamp_range(&mut encoder, 0, entry.dabs.len());
+        self.stroke_layer
+            .bake(&mut encoder, self.canvas_renderer.target_view());
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        self.history.finish_redo(entry);
+        true
     }
 
     fn new_stroke_encoder(&self) -> wgpu::CommandEncoder {

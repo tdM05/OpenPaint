@@ -30,6 +30,8 @@
 
 use openpaint_core::{Brush, Canvas, Dab, StrokeState};
 
+use crate::history::{BoundsBuilder, CanvasRect};
+
 /// Fixed test-bed canvas size for the Phase 0 slice. The real document/page
 /// model (growable and multi-page) arrives in Phase 2; see OPEN_QUESTIONS Q13.
 const CANVAS_W: u32 = 2048;
@@ -51,7 +53,11 @@ pub enum StrokeOp {
     /// Stamp dabs `[start, start + len)` of the accompanying dab buffer.
     Dabs { start: usize, len: usize },
     /// Commit the stroke into the canvas.
-    End,
+    ///
+    /// Carries the region the stroke touched so history can snapshot just that
+    /// rectangle rather than the whole canvas. `None` when the stroke landed
+    /// entirely off-canvas and there is nothing to record.
+    End { bounds: Option<CanvasRect> },
 }
 
 pub struct Editor {
@@ -63,6 +69,8 @@ pub struct Editor {
     dabs: Vec<Dab>,
     /// Stroke commands awaiting execution, indexing into `dabs`.
     ops: Vec<StrokeOp>,
+    /// Area the in-progress stroke has touched, for history's snapshot.
+    bounds: BoundsBuilder,
     drawing: bool,
 }
 
@@ -81,6 +89,7 @@ impl Editor {
             stroke: StrokeState::new(),
             dabs: Vec::new(),
             ops: Vec::new(),
+            bounds: BoundsBuilder::default(),
             drawing: false,
         }
     }
@@ -132,6 +141,7 @@ impl Editor {
             color_linear_premul: self.brush.color_linear_premul(),
             opacity: self.brush.opacity,
         });
+        self.bounds.clear();
         self.drawing = true;
         let from = self.dabs.len();
         self.brush
@@ -153,18 +163,26 @@ impl Editor {
     /// End the current stroke, committing it to the canvas.
     pub fn stroke_end(&mut self) {
         if self.drawing {
-            self.ops.push(StrokeOp::End);
+            let bounds = self
+                .bounds
+                .to_rect(self.canvas.width(), self.canvas.height());
+            self.ops.push(StrokeOp::End { bounds });
         }
         self.drawing = false;
+        self.bounds.clear();
         self.stroke = StrokeState::new();
     }
 
     /// Record that dabs from `from` onward were just emitted.
     fn record_dabs(&mut self, from: usize) {
         let len = self.dabs.len() - from;
-        if len > 0 {
-            self.ops.push(StrokeOp::Dabs { start: from, len });
+        if len == 0 {
+            return;
         }
+        for d in &self.dabs[from..] {
+            self.bounds.add_dab(d);
+        }
+        self.ops.push(StrokeOp::Dabs { start: from, len });
     }
 }
 
@@ -248,7 +266,7 @@ mod tests {
 
         let (ops, dabs) = e.pending_stroke();
         assert!(matches!(ops.first(), Some(StrokeOp::Begin { .. })));
-        assert!(matches!(ops.last(), Some(StrokeOp::End)));
+        assert!(matches!(ops.last(), Some(StrokeOp::End { .. })));
         assert_eq!(
             dab_count(ops),
             dabs.len(),
@@ -284,6 +302,38 @@ mod tests {
 
     /// Ending without a stroke in progress must not queue a stray commit, which
     /// would bake whatever the previous stroke left behind a second time.
+    /// History snapshots only the region a stroke touched, so `End` must carry it
+    /// and it must actually cover the dabs.
+    #[test]
+    fn end_reports_the_region_the_stroke_touched() {
+        let mut e = Editor::new();
+        e.brush_mut().radius = 10.0;
+        e.stroke_begin(200.0, 300.0, 1.0);
+        e.stroke_to(400.0, 300.0, 1.0);
+        e.stroke_end();
+
+        let (ops, _) = e.pending_stroke();
+        match ops.last() {
+            Some(StrokeOp::End { bounds: Some(r) }) => {
+                assert!(r.x <= 189, "left edge {} too far right", r.x);
+                assert!(r.x + r.w >= 411, "right edge {} too far left", r.x + r.w);
+                assert!(r.y <= 289 && r.y + r.h >= 311, "vertical bounds {r:?}");
+            }
+            other => panic!("expected End with bounds, got {other:?}"),
+        }
+    }
+
+    /// A stroke entirely off-canvas has nothing to snapshot, and must say so rather
+    /// than producing a rectangle the GPU copy would reject.
+    #[test]
+    fn a_fully_off_canvas_stroke_reports_no_region() {
+        let mut e = Editor::new();
+        e.stroke_begin(-900.0, -900.0, 1.0);
+        e.stroke_end();
+        let (ops, _) = e.pending_stroke();
+        assert!(matches!(ops.last(), Some(StrokeOp::End { bounds: None })));
+    }
+
     #[test]
     fn ending_without_a_stroke_queues_nothing() {
         let mut e = Editor::new();
@@ -304,7 +354,10 @@ mod tests {
             .iter()
             .filter(|o| matches!(o, StrokeOp::Begin { .. }))
             .count();
-        let ends = ops.iter().filter(|o| matches!(o, StrokeOp::End)).count();
+        let ends = ops
+            .iter()
+            .filter(|o| matches!(o, StrokeOp::End { .. }))
+            .count();
         assert_eq!(begins, 2, "each stroke needs its own accumulation reset");
         assert_eq!(ends, 2);
     }

@@ -93,12 +93,14 @@ impl Ui {
     /// fade, a drag in progress). The caller **must** honor it: painting is
     /// demand-driven, and egui is only interactive while frames keep coming.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         window: &Window,
         gpu: Overlay<'_>,
         brush: &mut Brush,
         view: &View,
+        history: (usize, usize, usize),
     ) -> bool {
         let Overlay {
             device,
@@ -190,6 +192,21 @@ impl Ui {
                         egui::RichText::new(
                             "Navigation is mouse/keyboard only for now: pen input \
                              bypasses the UI layer (Q14).",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.separator();
+                    ui.heading("History");
+                    let (undo_depth, redo_depth, bytes) = history;
+                    ui.label(format!(
+                        "Undo {undo_depth}   Redo {redo_depth}   ({:.1} MiB)",
+                        bytes as f32 / (1024.0 * 1024.0)
+                    ));
+                    ui.label(
+                        egui::RichText::new(
+                            "Ctrl+Z undoes, Ctrl+Shift+Z or Ctrl+Y redoes. Snapshots \
+                             cover only the area a stroke touched.",
                         )
                         .small()
                         .weak(),

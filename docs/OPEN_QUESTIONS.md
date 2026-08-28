@@ -244,6 +244,31 @@ egui at all given egui is explicitly throwaway (DECISIONS section 3) - it may be
 better to solve once, properly, when the real UI framework is chosen (Q4). Until
 then the mouse operates the UI and the pen draws.
 
+### Q17. History is stroke-shaped, and GPU-resident
+Undo/redo landed 2026-08-27 (`crates/openpaint-app/src/history.rs`). Design and its
+consequences, so the limits are known rather than discovered:
+
+- **Snapshots the region a stroke touched**, not the canvas, since most strokes
+  cover a small fraction. GPU-to-GPU copy, so nothing returns to the CPU on the
+  interactive path.
+- **Redo replays the dabs** instead of storing an after-image. Halves the memory and
+  costs a re-rasterization, which is now the cheap direction.
+- **64 MiB budget**, evicting oldest-first. A stroke bigger than the whole budget is
+  kept anyway: silently making one stroke unundoable is worse than briefly exceeding
+  the cap.
+
+**Known limits:**
+- Undo/redo is **refused mid-stroke**. The in-progress stroke isn't in history and is
+  still accumulating, so undoing would revert the *previous* stroke and then bake the
+  current one over the restored image — a state the user never asked for. Ideally a
+  mid-stroke Ctrl+Z would *cancel* the stroke; that needs stroke cancellation, which
+  does not exist yet (also noted in Q16).
+- History lives beside the GPU resources rather than with the document, which is not
+  where it belongs conceptually. Revisit when the document/page model lands: history
+  will need to be per-document, and probably per-page.
+- Only strokes are undoable, because only strokes exist. When layers arrive this
+  grows an operation type; the snapshot-plus-replay shape should still hold.
+
 ### Q15. Tracked Phase-0 shortcuts (audited 2026-08-27)
 An honest inventory, so none of these go quiet. Each says why it is deferred
 rather than pretending it isn't there.
@@ -287,9 +312,10 @@ without a GPU.
 
 6. **The CPU `Canvas` no longer holds painted pixels.** The GPU is authoritative
    (DECISIONS §4a). `Canvas` carries dimensions plus the tile machinery that the
-   eventual cache and readback will build on. Until readback exists there is **no
-   way to save, export, or undo** — all three need pixels back on the CPU, and all
-   three are Q13's dependents.
+   eventual cache and readback will build on.
+   **Undo no longer needs readback** — it snapshots the touched region GPU-to-GPU
+   and redoes by replaying dabs (`history.rs`). **Save and export still do**, and
+   remain blocked on Q13.
 
 7. **Verified by test, not by hand:** the GPU/CPU pixel comparison covers the paint
    math, but the *wiring* from real pen input through to the GPU can only be

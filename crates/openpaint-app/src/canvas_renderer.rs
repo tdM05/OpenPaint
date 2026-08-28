@@ -84,6 +84,7 @@ impl CanvasRenderer {
             // (crate::stroke_layer). COPY_DST is only for the initial paper fill.
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -281,6 +282,12 @@ impl CanvasRenderer {
     pub fn set_placement(&self, queue: &wgpu::Queue, placement: Placement) {
         let uniform = PlacementUniform::from(placement);
         queue.write_buffer(&self.placement_buf, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    /// The canvas texture itself, for history's region copies.
+    #[must_use]
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.texture
     }
 
     /// The canvas texture as a render target, for the stroke layer to bake into.
