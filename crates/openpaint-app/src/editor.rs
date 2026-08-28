@@ -32,8 +32,8 @@ use openpaint_core::{Brush, Dab, Document, Page, PageRect, StrokeState};
 
 /// Starting page size. A placeholder until New-document presets exist (§5a says
 /// "300 DPI A4" and friends are presets computing pixel dimensions).
-const PAGE_W: u32 = 2048;
-const PAGE_H: u32 = 2048;
+pub const PAGE_W: u32 = 2048;
+pub const PAGE_H: u32 = 2048;
 
 /// Default amount an Extend adds, in pixels.
 ///

@@ -76,6 +76,9 @@ use view::{View, ROTATE_STEP};
 /// handle is equally easy to hit whether you are at 10% or 800%.
 const CROP_GRAB_PX: f32 = 10.0;
 
+/// Extension for the native document format.
+const DOCUMENT_EXTENSION: &str = "openpaint";
+
 /// Multiplier per brush-size keypress.
 ///
 /// Multiplicative rather than a fixed increment, because size is perceived logarithmically: one
@@ -132,6 +135,32 @@ struct OpenPaint {
     /// "Windows Ink reentrancy" note - without this, a re-entered frame can
     /// deadlock on a lock its own interrupted outer call is holding.
     in_dispatch: bool,
+    /// Where the open document lives, or `None` if it has never been saved.
+    document_path: Option<std::path::PathBuf>,
+    /// Whether there are edits the file does not have. Drives the title marker and the guard on
+    /// anything that would throw them away.
+    dirty: bool,
+    /// A dialog waiting to be shown.
+    ///
+    /// **Not** shown from the event handler that asked for it. A modal dialog pumps the Windows
+    /// message queue, which dispatches our pending events straight back into us -- the exact
+    /// hazard described at the top of this file. So a request is parked here and serviced from
+    /// [`ApplicationHandler::about_to_wait`], the one place winit guarantees no foreign frame is
+    /// on the stack. Same rule as draining pen input, for the same reason.
+    pending_dialog: Option<Dialog>,
+}
+
+/// Something that needs a modal dialog, deferred to a safe point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dialog {
+    /// Save, asking for a path only if there is not one yet.
+    Save,
+    /// Always ask for a path.
+    SaveAs,
+    Open,
+    New,
+    /// The window wants to close and there are unsaved edits.
+    ConfirmQuit,
 }
 
 /// In-progress canvas navigation.
@@ -189,6 +218,9 @@ impl Default for OpenPaint {
             crop: None,
             status_message: None,
             in_dispatch: false,
+            document_path: None,
+            dirty: false,
+            pending_dialog: None,
         }
     }
 }
@@ -405,6 +437,10 @@ impl OpenPaint {
     /// live in the editor, so both halves must be applied for them to agree. Nothing done here
     /// may be recorded in history -- it *is* the undo, not a new edit.
     fn apply_history_change(&mut self, change: renderer::HistoryChange) {
+        // An undo moves the document away from what the file holds just as an edit does.
+        if change != renderer::HistoryChange::None {
+            self.mark_dirty();
+        }
         match change {
             renderer::HistoryChange::None => {}
             renderer::HistoryChange::Pixels => self.request_redraw(),
@@ -485,6 +521,7 @@ impl OpenPaint {
         if let Some(r) = self.renderer.as_mut() {
             r.resize_canvas(resize, true);
         }
+        self.mark_dirty();
 
         // Deliberately does NOT re-fit. Photoshop keeps your zoom through a canvas
         // resize, and having the camera jump is disorienting when working zoomed in --
@@ -498,6 +535,7 @@ impl OpenPaint {
     /// the largest thing a single click can throw away -- so it is recorded in history first and
     /// refused if there is no room (DECISIONS §5c).
     fn apply_page_action(&mut self, action: ui::PageAction) {
+        self.mark_dirty();
         match action {
             ui::PageAction::Select(index) => {
                 self.editor.stroke_end();
@@ -570,6 +608,7 @@ impl OpenPaint {
     /// destructive crop (DECISIONS §5c). If there is no room to record it, the delete is
     /// refused rather than done.
     fn apply_layer_action(&mut self, action: ui::LayerAction) {
+        self.mark_dirty();
         match action {
             ui::LayerAction::Select(index) => {
                 // Ends any stroke first: a stroke belongs to the layer it started on.
@@ -664,36 +703,157 @@ impl OpenPaint {
         true
     }
 
-    /// Where Ctrl+S writes and Ctrl+O reads, until there is a file dialog.
-    ///
-    /// A fixed name in the working directory, matching how PNG export already behaves. Choosing
-    /// a path needs a native dialog, and a modal dialog pumps the Windows message queue -- which
-    /// is the reentrancy hazard this whole shell is arranged around (see the module note). That
-    /// deserves its own change rather than being bolted onto the format.
-    fn document_path() -> std::path::PathBuf {
-        std::path::PathBuf::from("openpaint-document.openpaint")
+    /// Note that the document differs from its file.
+    fn mark_dirty(&mut self) {
+        if !self.dirty {
+            self.dirty = true;
+            self.update_title();
+        }
     }
 
-    /// Save the document.
-    fn save_document(&mut self) {
-        let path = Self::document_path();
+    /// Show the document's name and whether it has unsaved edits.
+    ///
+    /// In the title bar rather than the panel because it has to be true even when the panel is
+    /// scrolled away, and because it is the one place every OS already trains people to look.
+    fn update_title(&self) {
+        let name = self.document_path.as_ref().map_or_else(
+            || "Untitled".to_owned(),
+            |p| {
+                p.file_name()
+                    .map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into())
+            },
+        );
+        let marker = if self.dirty { "*" } else { "" };
+        if let Some(r) = self.renderer.as_ref() {
+            r.window().set_title(&format!("{marker}{name} - OpenPaint"));
+        }
+    }
+
+    /// Park a dialog request for `about_to_wait` to service. See [`Dialog`].
+    fn request_dialog(&mut self, dialog: Dialog) {
+        self.pending_dialog = Some(dialog);
+        // A polled backend wakes on its own; an event-driven one needs a nudge, or the request
+        // would sit here until the next unrelated event.
+        self.request_redraw();
+    }
+
+    /// Show whatever dialog was parked, and act on it.
+    ///
+    /// Only ever called from `about_to_wait`.
+    fn service_dialog(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(dialog) = self.pending_dialog.take() else {
+            return;
+        };
+        match dialog {
+            Dialog::Save => {
+                if self.document_path.is_some() {
+                    self.save_to_current_path();
+                } else {
+                    self.save_as();
+                }
+            }
+            Dialog::SaveAs => self.save_as(),
+            Dialog::Open => {
+                if self.confirm_discard("Open another document") {
+                    self.open_with_dialog();
+                }
+            }
+            Dialog::New => {
+                if self.confirm_discard("Start a new document") {
+                    self.new_document();
+                }
+            }
+            Dialog::ConfirmQuit => {
+                if self.confirm_discard("Quit") {
+                    event_loop.exit();
+                }
+            }
+        }
+    }
+
+    /// Ask before throwing away unsaved edits. Returns whether to go ahead.
+    ///
+    /// Offers to save rather than only warning: a dialog whose only options are "lose your work"
+    /// and "cancel" makes the user do the saving by hand, which is exactly when they forget.
+    fn confirm_discard(&mut self, what: &str) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        let answer = rfd::MessageDialog::new()
+            .set_title("Unsaved changes")
+            .set_description(format!(
+                "{what} without saving? The current document has changes that are not in a file."
+            ))
+            .set_buttons(rfd::MessageButtons::YesNoCancel)
+            .show();
+        match answer {
+            // Yes: save first, and only continue if that actually worked.
+            rfd::MessageDialogResult::Yes => {
+                if self.document_path.is_some() {
+                    self.save_to_current_path();
+                } else {
+                    self.save_as();
+                }
+                !self.dirty
+            }
+            rfd::MessageDialogResult::No => true,
+            _ => false,
+        }
+    }
+
+    /// Write to the path the document already has.
+    fn save_to_current_path(&mut self) {
+        let Some(path) = self.document_path.clone() else {
+            return;
+        };
         let document = self.editor.document();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        self.status_message = Some(match renderer.save_document(document, &path) {
-            Ok(tiles) => format!("Saved {tiles} tiles to {}", path.display()),
-            Err(e) => format!("Save failed: {e}"),
-        });
+        match renderer.save_document(document, &path) {
+            Ok(tiles) => {
+                self.dirty = false;
+                self.status_message = Some(format!("Saved {tiles} tiles to {}", path.display()));
+            }
+            Err(e) => self.status_message = Some(format!("Save failed: {e}")),
+        }
+        self.update_title();
         self.request_redraw();
     }
 
-    /// Open the document, replacing what is open.
-    ///
-    /// Everything in flight is ended first: a stroke belongs to a layer of the document being
-    /// replaced, and history to a stack that is about to stop existing.
-    fn open_document(&mut self) {
-        let path = Self::document_path();
+    /// Ask for a path, then save to it.
+    fn save_as(&mut self) {
+        let suggested = self
+            .document_path
+            .as_ref()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "untitled.openpaint".to_owned());
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("OpenPaint document", &[DOCUMENT_EXTENSION])
+            .set_file_name(suggested)
+            .save_file()
+        else {
+            return;
+        };
+        // The dialog does not always append it, and a document without the extension will not be
+        // found by the open dialog's filter later.
+        let path = if path.extension().is_some() {
+            path
+        } else {
+            path.with_extension(DOCUMENT_EXTENSION)
+        };
+        self.document_path = Some(path);
+        self.save_to_current_path();
+    }
+
+    /// Ask for a file, then open it.
+    fn open_with_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("OpenPaint document", &[DOCUMENT_EXTENSION])
+            .pick_file()
+        else {
+            return;
+        };
         let loaded = match openpaint_file::load(&path) {
             Ok(l) => l,
             Err(e) => {
@@ -714,11 +874,35 @@ impl OpenPaint {
         }
         // A fresh document deserves a fresh view; its page is very likely a different size.
         self.view.request_fit();
+        self.document_path = Some(path.clone());
+        self.dirty = false;
+        self.update_title();
         self.status_message = Some(format!(
             "Opened {} ({pages} page{})",
             path.display(),
             if pages == 1 { "" } else { "s" }
         ));
+        self.request_redraw();
+    }
+
+    /// Replace everything with an empty document.
+    fn new_document(&mut self) {
+        self.editor.stroke_end();
+        self.crop = None;
+        self.editor
+            .replace_document(openpaint_core::Document::new(openpaint_core::Page::new(
+                editor::PAGE_W,
+                editor::PAGE_H,
+            )));
+        let rect = self.editor.page_rect();
+        if let Some(r) = self.renderer.as_mut() {
+            r.load_document(rect, Vec::new());
+        }
+        self.view.request_fit();
+        self.document_path = None;
+        self.dirty = false;
+        self.update_title();
+        self.status_message = Some("New document".to_owned());
         self.request_redraw();
     }
 
@@ -731,6 +915,7 @@ impl OpenPaint {
             return;
         };
         let (released, refused) = r.trim_to_page();
+        self.mark_dirty();
         self.status_message = Some(match (released, refused) {
             (0, false) => "Nothing outside the page to trim".to_owned(),
             (0, true) => "No room to record the trim; nothing was discarded".to_owned(),
@@ -772,8 +957,8 @@ impl OpenPaint {
 
     /// Handle undo/redo shortcuts. Returns `true` if the event was consumed.
     ///
-    /// Ctrl+Z undoes, Ctrl+Shift+Z and Ctrl+Y redo; Ctrl+S saves, Ctrl+O opens, Ctrl+E exports
-    /// a PNG -- the bindings every art app shares. Hardcoded for now, like navigation
+    /// Ctrl+Z undoes, Ctrl+Shift+Z and Ctrl+Y redo; Ctrl+N, Ctrl+O, Ctrl+S and Ctrl+Shift+S are
+    /// new/open/save/save-as; Ctrl+E exports a PNG -- the bindings every art app shares. Hardcoded for now, like navigation
     /// (OPEN_QUESTIONS Q16).
     fn handle_history(&mut self, event: &WindowEvent) -> bool {
         use winit::event::ElementState;
@@ -792,13 +977,21 @@ impl OpenPaint {
                     return false;
                 };
                 match c.as_str() {
-                    // Ctrl+S is now save, as it should be; export moved to Ctrl+E.
+                    // Ctrl+S is save, as it should be; export moved to Ctrl+E.
                     "s" | "S" => {
-                        self.save_document();
+                        self.request_dialog(if self.nav.modifiers.shift_key() {
+                            Dialog::SaveAs
+                        } else {
+                            Dialog::Save
+                        });
                         return true;
                     }
                     "o" | "O" => {
-                        self.open_document();
+                        self.request_dialog(Dialog::Open);
+                        return true;
+                    }
+                    "n" | "N" => {
+                        self.request_dialog(Dialog::New);
                         return true;
                     }
                     "e" | "E" => {
@@ -1021,10 +1214,12 @@ impl OpenPaint {
         // Borrowed, not cloned: this runs every frame a stroke is active, so a
         // copy here would be an allocation per frame on the interactive path.
         // `renderer` and `editor` are disjoint fields, so both borrows coexist.
+        let mut edited = false;
         if editor.has_pending_stroke() {
             let active_layer = editor.active_layer_id();
             let (ops, dabs) = editor.pending_stroke();
             renderer.apply_stroke(ops, dabs, tile_store::LayerId(active_layer));
+            edited = true;
             editor.clear_pending_stroke();
 
             // Running out of tiles or out of snapshot room is a real, reachable state on a
@@ -1113,6 +1308,10 @@ impl OpenPaint {
             }
         });
 
+        if edited {
+            self.mark_dirty();
+        }
+
         // Keep the canvas centered in the area the panel leaves free. The first
         // fit necessarily ran before the UI existed, so learning the inset queues
         // another one -- which needs a frame to actually apply.
@@ -1175,7 +1374,12 @@ impl OpenPaint {
         // Window/lifecycle events the shell handles directly.
         match &event {
             WindowEvent::CloseRequested => {
-                event_loop.exit();
+                if self.dirty {
+                    // Ask, but not from here: the dialog would pump the message queue mid-event.
+                    self.request_dialog(Dialog::ConfirmQuit);
+                } else {
+                    event_loop.exit();
+                }
                 return;
             }
             WindowEvent::Resized(new_size) => {
@@ -1280,6 +1484,8 @@ impl ApplicationHandler for OpenPaint {
                 // else would paint the initial canvas.
                 renderer.window().request_redraw();
                 self.renderer = Some(renderer);
+                // The window exists now, so the title can finally say which document is open.
+                self.update_title();
             }
             Err(err) => {
                 eprintln!("failed to initialize GPU: {err}");
@@ -1300,6 +1506,15 @@ impl ApplicationHandler for OpenPaint {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The safe point for a modal dialog, for the same reason it is the safe point for
+        // draining input: winit only calls this from the top of its own loop, so no foreign
+        // frame -- and no lock of ours -- is on the stack while the dialog pumps messages.
+        if self.pending_dialog.is_some() && !self.in_dispatch {
+            self.in_dispatch = true;
+            self.service_dialog(event_loop);
+            self.in_dispatch = false;
+        }
+
         if !self.input.wants_continuous_poll() {
             // Event-driven backends (mouse) stay idle until a real window event,
             // keeping the app at 0% CPU when nothing is happening.

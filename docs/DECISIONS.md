@@ -716,10 +716,19 @@ document: 7 tiles, 3.5 MB raw, **90 KB on disk**.
 - **Loading goes to the CPU side of the tile store, not the GPU.** Residency pulls in what
   the viewport asks for, so opening a large document is fast and memory-bounded for free.
 
-⚠️ **No file dialog yet.** Ctrl+S and Ctrl+O use a fixed name in the working directory, as
-PNG export already does. A native dialog is modal and pumps the Windows message queue, which
-is the reentrancy hazard this whole shell is arranged around (see `main.rs`), so it deserves
-its own change rather than being bolted onto the format.
+✅ **File dialogs, added 2026-08-28.** Ctrl+N / Ctrl+O / Ctrl+S / Ctrl+Shift+S, with the
+document's name and a `*` for unsaved edits in the title bar, and a guard that *offers to save*
+before anything that would discard them — a dialog whose only choices are "lose your work" and
+"cancel" makes the user save by hand, which is exactly when they forget.
+
+**A dialog is never opened from the event handler that asked for it.** A modal dialog pumps the
+Windows message queue, which dispatches our pending events straight back into us — the Q10c
+hazard. So a request is parked and serviced from `about_to_wait`, the one place winit guarantees
+no foreign frame is on the stack. Exactly the same rule, for exactly the same reason, as
+draining pen input (see the note at the top of `main.rs`).
+
+`rfd` is the dependency. Its `xdg-portal` backend is on by default and `gtk3` is off, so Linux
+needs no GTK development packages — which matters for §6's "cross-platform by construction".
 
 - **Open and documented.** The schema is introspectable, which is a better guarantee than a
   zip full of conventions only our code knows.
