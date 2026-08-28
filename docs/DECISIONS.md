@@ -1037,6 +1037,30 @@ of the same shape.
    General rule: **an assertion must not be load-bearing.** If deleting it changes what
    the program does, it is not an assertion.
 
+7. **An early return that skips a step the function must always take.** Adding a
+   branch near the top of a long procedure reads as local, and is not: everything
+   below it silently stops happening. In `about_to_wait` a "keep waking while a
+   stabilized stroke converges" branch was added *above* `drain_input`, with a
+   `return`. Draining is the only route by which pen movement — and pen *release* —
+   reaches the app, so the first press left `Editor::drawing` set forever, because the
+   `Up` that clears it was still sitting in the backend's queue. One dab appeared and
+   painting never worked again, in that stroke or any later one.
+
+   Two things make this class nastier than it looks. The added code was correct in
+   isolation and its own test passed; and the damage was to a *different* subsystem
+   than the one being edited, so nothing about the change suggested where to look.
+
+   **The fix is structural, not a test.** `about_to_wait` cannot be unit-tested — it
+   needs a live `ActiveEventLoop` — so there is nothing to assert against. Instead the
+   mandatory work now comes first, unconditionally, and the "should we keep waking"
+   decision is reduced to booleans combined at a single exit. There is no longer a
+   place to put an early return that could do this, which is worth more than a test
+   that could.
+
+   General rule: in a procedure whose steps are obligations rather than options, **do
+   the obligations first and branch afterwards** — and if it has more than one
+   `return`, treat that as a smell to justify rather than a convenience.
+
 ### Verification hazards
 
 3. **Injected input cannot reach RealTimeStylus.** `SetForegroundWindow` is refused

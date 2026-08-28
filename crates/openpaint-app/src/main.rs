@@ -438,7 +438,9 @@ impl OpenPaint {
     /// filter was only ever advanced by arriving samples, so with no samples it stopped converging,
     /// and the next one arrived carrying every millisecond of the pause.
     fn tick_stabilizer(&mut self) -> bool {
-        if !self.editor.is_drawing() {
+        // Unsmoothed strokes need no ticking at all: the line is never behind the pen, so an idle
+        // backend can stay idle exactly as it did before this existed.
+        if !self.editor.is_drawing() || !self.stabilizer.is_active() {
             return false;
         }
         if let Some(s) = self.stabilizer.advance(input::now_ms()) {
@@ -1879,41 +1881,46 @@ impl ApplicationHandler for OpenPaint {
         }
         self.poll_file_dialog();
 
-        // A file dialog answers on another thread, so nothing else would wake this loop to
-        // notice. Keep checking while one is open, whatever the input backend wants.
-        if self.file_dialog.is_some() {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL_INTERVAL));
-            return;
-        }
-
-        // A stabilized stroke is still moving after the last sample: the line is catching up to
-        // the pen, which takes real time. So while one is in flight the loop has to keep ticking
-        // whatever the input backend wants, or the line freezes wherever it happened to be when
-        // the pen stopped. This is demand-driven painting still -- there genuinely is demand.
-        if self.tick_stabilizer() {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL_INTERVAL));
-            return;
-        }
-
-        if !self.input.wants_continuous_poll() {
-            // Event-driven backends (mouse) stay idle until a real window event,
-            // keeping the app at 0% CPU when nothing is happening.
-            return;
-        }
-
-        // winit calls `about_to_wait` only from the top of its own loop, never
-        // from a window procedure, so this is the one place it's safe to touch a
-        // polled backend. The guard is belt-and-braces.
+        // ---------------------------------------------------------------------------------------
+        // NOTHING ABOVE THIS LINE MAY `return`, AND NOTHING BELOW IT MAY EITHER UNTIL THE INPUT
+        // BACKEND HAS BEEN DRAINED.
+        //
+        // This is not style. Draining is the *only* route by which pen movement and, critically,
+        // pen *release* reach the app, and `about_to_wait` is the only place it is safe to do
+        // (see the module note). An early return here does not merely skip a frame: it strands
+        // `Editor::drawing` set forever, because the `Up` that would clear it is sitting in the
+        // backend's queue. Painting then stops permanently -- one dab on press and nothing ever
+        // again, including for every later stroke.
+        //
+        // That is not hypothetical. A "keep ticking while a stroke converges" branch was added
+        // above the drain, with a `return`, and did exactly this. Structure the function so the
+        // mistake is not available: drain first, unconditionally, then decide about waking.
+        // ---------------------------------------------------------------------------------------
         if !self.in_dispatch {
             self.in_dispatch = true;
             self.drain_input();
             self.in_dispatch = false;
         }
 
-        // Keep waking up to drain the backend. Note we deliberately do NOT
-        // request a redraw here: doing so would leave a `WM_PAINT` permanently
-        // pending, which is precisely what a nested pump would dispatch back
-        // into us. Painting is demand-driven from strokes and resizes instead.
+        // A stabilized stroke keeps moving after its last sample -- the line is still travelling
+        // toward the pen, and that takes real time. So a stroke in flight needs the loop to keep
+        // waking whatever the input backend wants, or the line stops wherever it had reached.
+        // Demand-driven painting is intact: there genuinely is demand.
+        let converging = self.tick_stabilizer();
+
+        // A file dialog answers on another thread, so nothing else would wake the loop to notice.
+        let awaiting_dialog = self.file_dialog.is_some();
+
+        if !converging && !awaiting_dialog && !self.input.wants_continuous_poll() {
+            // Event-driven backends (mouse) with nothing in flight stay idle until a real window
+            // event, keeping the app at 0% CPU when nothing is happening.
+            return;
+        }
+
+        // Keep waking up. Note we deliberately do NOT request a redraw here:
+        // doing so would leave a `WM_PAINT` permanently pending, which is
+        // precisely what a nested pump would dispatch back into us. Painting is
+        // demand-driven from strokes and resizes instead.
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL_INTERVAL));
     }
 }

@@ -110,6 +110,15 @@ impl Stabilizer {
         self.tau_ms = lag_ms.max(0.0);
     }
 
+    /// Whether smoothing is doing anything at all.
+    ///
+    /// Lets a caller skip keeping a frame loop alive for a stroke that is a pass-through: with no
+    /// smoothing the line is never behind the pen, so there is nothing for time to catch up.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.tau_ms > 0.0
+    }
+
     /// Start a stroke. The first point is never moved — a stroke has to begin under the pen.
     pub fn begin(&mut self, x: f32, y: f32, pressure: f32, t_ms: f64) -> Smoothed {
         let first = Smoothed { x, y, pressure };
