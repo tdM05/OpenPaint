@@ -253,7 +253,7 @@ impl Gpu {
 
         // Panel draws over the canvas, in the same frame.
         let surface_size = [self.config.width, self.config.height];
-        self.ui.render(
+        let ui_wants_repaint = self.ui.render(
             &self.window,
             &self.device,
             &self.queue,
@@ -262,6 +262,9 @@ impl Gpu {
             surface_size,
             &mut self.brush,
         );
+        if ui_wants_repaint {
+            self.window.request_redraw();
+        }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
@@ -272,11 +275,13 @@ impl Gpu {
     /// consumed it, in which case it must not be treated as canvas input.
     pub fn ui_handled_event(&mut self, event: &winit::event::WindowEvent) -> bool {
         let consumed = self.ui.on_window_event(&self.window, event);
-        // egui is animated (hover highlights, sliders), so keep painting while it
-        // wants to.
-        if consumed {
-            self.window.request_redraw();
-        }
+        // Always request a frame, not just when egui consumed the event. egui
+        // processes queued input during `render`, so with demand-driven painting
+        // it cannot react to anything unless a frame follows -- including
+        // deciding whether to consume the *next* event. Gating this on `consumed`
+        // deadlocks the panel: input arrives, no frame runs, nothing is ever
+        // consumed, so no frame is ever requested.
+        self.window.request_redraw();
         consumed
     }
 

@@ -79,8 +79,10 @@ impl Ui {
 
     /// Build the panel, render it over the frame, and apply any edits to `brush`.
     ///
-    /// Returns `true` if the brush changed, so the caller can react (nothing needs
-    /// to yet — brush edits affect subsequent strokes only).
+    /// Returns `true` if egui wants another frame soon (an animation, a hover
+    /// fade, a drag in progress). The caller **must** honor it: painting is
+    /// demand-driven, and egui is only interactive while frames keep coming.
+    #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -91,7 +93,7 @@ impl Ui {
         target: &wgpu::TextureView,
         surface_size: [u32; 2],
         brush: &mut Brush,
-    ) {
+    ) -> bool {
         let input = self.state.take_egui_input(window);
         let mut color_srgb = brush.color_srgb8();
 
@@ -196,5 +198,13 @@ impl Ui {
         for id in &output.textures_delta.free {
             self.renderer.free_texture(id);
         }
+
+        // egui asks for the next frame via `repaint_delay`; zero means "as soon as
+        // possible". Anything that animates or tracks a drag reports zero while it
+        // is active, and idles otherwise, so this does not spin.
+        output
+            .viewport_output
+            .get(&ViewportId::ROOT)
+            .is_some_and(|v| v.repaint_delay.is_zero())
     }
 }
