@@ -29,6 +29,10 @@ pub struct Gpu {
     canvas_renderer: CanvasRenderer,
     brush: Brush,
     stroke: StrokeState,
+    /// Dabs emitted by the brush this update, reused to avoid per-stroke
+    /// allocation. Lives between dab emission and rasterization -- see
+    /// `Gpu::flush_dabs`.
+    dabs: Vec<openpaint_core::Dab>,
     drawing: bool,
 
     window: Arc<Window>,
@@ -106,6 +110,7 @@ impl Gpu {
             canvas_renderer,
             brush: Brush::default(),
             stroke: StrokeState::new(),
+            dabs: Vec::new(),
             drawing: false,
             window,
         })
@@ -137,13 +142,26 @@ impl Gpu {
             .screen_to_canvas(px, py, self.config.width, self.config.height)
     }
 
+    /// Rasterize whatever the brush just emitted, then clear the buffer.
+    ///
+    /// This is the per-dab / per-pixel seam (see `openpaint_core::dab`): the
+    /// brush produced dabs without touching a pixel, and rasterization happens
+    /// here. When dab rasterization moves to the GPU, only this call changes --
+    /// and a per-stroke flow/opacity accumulation buffer will slot in right here
+    /// too, between emission and rasterization.
+    fn flush_dabs(&mut self) {
+        openpaint_core::raster::rasterize_dabs(&mut self.canvas, &self.dabs);
+        self.dabs.clear();
+        self.window.request_redraw();
+    }
+
     /// Begin a stroke at a pen sample (if it lands on the canvas).
     pub fn stroke_begin(&mut self, s: &PenSample) {
         if let Some((cx, cy)) = self.to_canvas(s.x, s.y) {
             self.brush
-                .stroke_begin(&mut self.canvas, &mut self.stroke, cx, cy, s.pressure);
+                .stroke_begin(&mut self.dabs, &mut self.stroke, cx, cy, s.pressure);
             self.drawing = true;
-            self.window.request_redraw();
+            self.flush_dabs();
         }
     }
 
@@ -154,8 +172,8 @@ impl Gpu {
         }
         if let Some((cx, cy)) = self.to_canvas(s.x, s.y) {
             self.brush
-                .stroke_to(&mut self.canvas, &mut self.stroke, cx, cy, s.pressure);
-            self.window.request_redraw();
+                .stroke_to(&mut self.dabs, &mut self.stroke, cx, cy, s.pressure);
+            self.flush_dabs();
         }
     }
 

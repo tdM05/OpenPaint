@@ -10,10 +10,13 @@
 pub mod brush;
 pub mod canvas;
 pub mod color;
+pub mod dab;
+pub mod raster;
 pub mod tile;
 
 pub use brush::{Brush, StrokeState};
 pub use canvas::Canvas;
+pub use dab::Dab;
 
 /// Crate version, surfaced so the app/UI can display it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

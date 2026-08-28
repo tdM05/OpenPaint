@@ -7,21 +7,30 @@
 //! means the path toward Photoshop/CSP-quality brushes is incremental tuning,
 //! not a rewrite.
 //!
-//! Phase 0 scope: constant color, linear-space coverage blend, pressure maps to
-//! dab radius. Still to come with the real engine (see docs Q7a and
-//! DECISIONS §4a): GPU dab rasterization, **flow/opacity accumulation**,
-//! textures, and a tuned falloff curve.
+//! # This module emits dabs; it does not touch pixels
 //!
-//! ⚠️ Dabs currently composite straight onto the canvas, one at a time. That is
-//! wrong for overlapping dabs within a single stroke: Photoshop's model is that
-//! *flow* accumulates per dab while *opacity* caps the stroke's total
-//! contribution, which requires a per-stroke accumulation buffer rather than
-//! direct compositing. Until that lands, a soft dab at low coverage darkens
-//! where dabs overlap instead of building up smoothly to a ceiling. This is the
-//! single biggest remaining gap between this and a real brush engine.
+//! Per DECISIONS §4a, the brush decides *where dabs go and what they look like*
+//! and nothing else. Turning dabs into pixels is [`crate::raster`] (reference)
+//! and later a GPU rasterizer. See [`crate::dab`] for why that boundary is drawn
+//! exactly here.
+//!
+//! The practical benefit is visible in the tests below: stroke behavior is now
+//! verified by asserting on the *dabs produced* — exact count, exact positions,
+//! exact spacing — with no canvas involved. Previously it could only be checked
+//! indirectly, by observing that some pixels somewhere had changed.
+//!
+//! Phase 0 scope: constant color, pressure maps to dab radius. Still to come
+//! (docs Q7a): **flow/opacity accumulation**, textures, a tuned falloff curve,
+//! and modulation of parameters by pressure/tilt/velocity through curves.
+//!
+//! ⚠️ Dabs are still composited one at a time by the rasterizer, which is wrong
+//! for overlapping dabs within a stroke: *flow* should accumulate per dab while
+//! *opacity* caps the stroke's total contribution. That needs a per-stroke
+//! accumulation buffer sitting between emission and rasterization — which is
+//! exactly the seam this split creates, and the next piece of work.
 
-use crate::canvas::Canvas;
-use crate::color::{opaque_srgb8_to_linear_premul, scale_premul};
+use crate::color::opaque_srgb8_to_linear_premul;
+use crate::dab::Dab;
 
 /// Brush parameters. Sizes are in canvas pixels.
 #[derive(Clone, Copy)]
@@ -94,67 +103,43 @@ impl Brush {
         (self.radius * pressure.clamp(0.0, 1.0)).max(0.5)
     }
 
-    /// Stamp one dab centered at `(cx, cy)` with the given radius.
-    fn stamp(&self, canvas: &mut Canvas, cx: f32, cy: f32, radius: f32) {
-        if radius <= 0.0 {
-            return;
-        }
-        let min_x = (cx - radius).floor() as i32;
-        let max_x = (cx + radius).ceil() as i32;
-        let min_y = (cy - radius).floor() as i32;
-        let max_y = (cy + radius).ceil() as i32;
-
-        // hardness=1 -> falloff starts at the very center (very soft);
-        // hardness=0 -> solid until ~1px from the edge (hard, still AA'd).
-        let inner = (radius * (1.0 - self.hardness)).max(0.0);
-
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let dx = x as f32 + 0.5 - cx;
-                let dy = y as f32 + 0.5 - cy;
-                let dist = (dx * dx + dy * dy).sqrt();
-                let coverage = if dist <= inner {
-                    1.0
-                } else if dist >= radius {
-                    0.0
-                } else {
-                    // Smooth ramp from inner..radius.
-                    1.0 - (dist - inner) / (radius - inner)
-                };
-                if coverage > 0.0 {
-                    // Premultiplied, so coverage scales all four channels.
-                    canvas.blend_pixel(x, y, scale_premul(self.color_linear_premul, coverage));
-                }
-            }
+    /// Build one dab at `(cx, cy)` with the given radius.
+    fn dab_at(&self, cx: f32, cy: f32, radius: f32) -> Dab {
+        Dab {
+            x: cx,
+            y: cy,
+            radius,
+            hardness: self.hardness,
+            color_linear_premul: self.color_linear_premul,
         }
     }
 
-    /// Begin a stroke: stamp the initial dab at the first sample.
+    /// Begin a stroke: emit the initial dab at the first sample.
     pub fn stroke_begin(
         &self,
-        canvas: &mut Canvas,
+        out: &mut Vec<Dab>,
         state: &mut StrokeState,
         x: f32,
         y: f32,
         pressure: f32,
     ) {
-        self.stamp(canvas, x, y, self.radius_for(pressure));
+        out.push(self.dab_at(x, y, self.radius_for(pressure)));
         state.last = Some((x, y));
         state.residual = 0.0;
     }
 
-    /// Continue a stroke to a new sample, stamping evenly spaced dabs along the
+    /// Continue a stroke to a new sample, emitting evenly spaced dabs along the
     /// segment from the previous sample so speed doesn't create gaps.
     pub fn stroke_to(
         &self,
-        canvas: &mut Canvas,
+        out: &mut Vec<Dab>,
         state: &mut StrokeState,
         x: f32,
         y: f32,
         pressure: f32,
     ) {
         let Some((px, py)) = state.last else {
-            self.stroke_begin(canvas, state, x, y, pressure);
+            self.stroke_begin(out, state, x, y, pressure);
             return;
         };
 
@@ -176,7 +161,7 @@ impl Brush {
         while traveled + step <= seg_len {
             traveled += step;
             let t = traveled;
-            self.stamp(canvas, px + ux * t, py + uy * t, radius);
+            out.push(self.dab_at(px + ux * t, py + uy * t, radius));
         }
         state.residual = seg_len - traveled;
         state.last = Some((x, y));
@@ -187,22 +172,128 @@ impl Brush {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_dab_paints_something() {
-        let mut c = Canvas::new(256, 256);
-        let b = Brush::default();
-        let mut s = StrokeState::new();
-        b.stroke_begin(&mut c, &mut s, 128.0, 128.0, 1.0);
-        assert!(c.tiles().count() >= 1);
+    /// Emit a straight horizontal stroke and return the dabs it produced.
+    fn stroke(brush: &Brush, from: f32, to: f32, pressure: f32) -> Vec<Dab> {
+        let mut dabs = Vec::new();
+        let mut state = StrokeState::new();
+        brush.stroke_begin(&mut dabs, &mut state, from, 0.0, pressure);
+        brush.stroke_to(&mut dabs, &mut state, to, 0.0, pressure);
+        dabs
     }
 
     #[test]
-    fn a_stroke_spans_multiple_tiles() {
-        let mut c = Canvas::new(1024, 1024);
+    fn beginning_a_stroke_emits_exactly_one_dab() {
+        let mut dabs = Vec::new();
+        let mut state = StrokeState::new();
+        Brush::default().stroke_begin(&mut dabs, &mut state, 5.0, 7.0, 1.0);
+        assert_eq!(dabs.len(), 1);
+        assert_eq!((dabs[0].x, dabs[0].y), (5.0, 7.0));
+    }
+
+    /// The core spacing contract, now directly checkable: radius 8 at spacing
+    /// 0.25 means a dab every 4px, so 400px of travel is 100 dabs plus the
+    /// initial one.
+    #[test]
+    fn dabs_are_spaced_at_a_quarter_of_the_diameter() {
         let b = Brush::default();
-        let mut s = StrokeState::new();
-        b.stroke_begin(&mut c, &mut s, 10.0, 10.0, 1.0);
-        b.stroke_to(&mut c, &mut s, 600.0, 10.0, 1.0);
-        assert!(c.tiles().count() >= 2);
+        let dabs = stroke(&b, 0.0, 400.0, 1.0);
+        assert_eq!(b.radius * 2.0 * b.spacing, 4.0);
+        assert_eq!(dabs.len(), 101);
+        for (i, d) in dabs.iter().enumerate() {
+            assert!(
+                (d.x - i as f32 * 4.0).abs() < 1e-3,
+                "dab {i} at {} not at {}",
+                d.x,
+                i as f32 * 4.0
+            );
+        }
+    }
+
+    /// Spacing must carry across segment boundaries, or slow strokes (many short
+    /// segments) would bunch dabs up at every input sample.
+    #[test]
+    fn spacing_is_continuous_across_segments() {
+        let b = Brush::default();
+        let mut dabs = Vec::new();
+        let mut state = StrokeState::new();
+        b.stroke_begin(&mut dabs, &mut state, 0.0, 0.0, 1.0);
+        // Ten 10px segments == one 100px segment, as far as spacing goes.
+        for i in 1..=10 {
+            b.stroke_to(&mut dabs, &mut state, i as f32 * 10.0, 0.0, 1.0);
+        }
+
+        let one_segment = stroke(&b, 0.0, 100.0, 1.0);
+        assert_eq!(dabs.len(), one_segment.len());
+        for (a, b) in dabs.iter().zip(&one_segment) {
+            assert!((a.x - b.x).abs() < 1e-3, "{} vs {}", a.x, b.x);
+        }
+    }
+
+    #[test]
+    fn pressure_scales_dab_radius() {
+        let b = Brush::default();
+        let full = stroke(&b, 0.0, 100.0, 1.0);
+        let light = stroke(&b, 0.0, 100.0, 0.5);
+        assert_eq!(full[0].radius, b.radius);
+        assert_eq!(light[0].radius, b.radius * 0.5);
+        // Lighter pressure means smaller dabs, hence tighter spacing, hence more
+        // of them over the same distance.
+        assert!(light.len() > full.len());
+    }
+
+    /// Zero pressure must still produce a drawable dab rather than a degenerate
+    /// one, or a stroke started before the pen is fully down would vanish.
+    #[test]
+    fn zero_pressure_still_yields_a_positive_radius() {
+        let dabs = stroke(&Brush::default(), 0.0, 10.0, 0.0);
+        assert!(dabs.iter().all(|d| d.radius > 0.0));
+    }
+
+    #[test]
+    fn a_zero_length_segment_emits_no_extra_dabs() {
+        let b = Brush::default();
+        let mut dabs = Vec::new();
+        let mut state = StrokeState::new();
+        b.stroke_begin(&mut dabs, &mut state, 10.0, 10.0, 1.0);
+        b.stroke_to(&mut dabs, &mut state, 10.0, 10.0, 1.0);
+        assert_eq!(dabs.len(), 1);
+    }
+
+    /// `stroke_to` without a preceding `stroke_begin` must not silently drop the
+    /// input; it should behave as the start of a stroke.
+    #[test]
+    fn stroke_to_without_begin_starts_the_stroke() {
+        let mut dabs = Vec::new();
+        let mut state = StrokeState::new();
+        Brush::default().stroke_to(&mut dabs, &mut state, 3.0, 4.0, 1.0);
+        assert_eq!(dabs.len(), 1);
+        assert_eq!((dabs[0].x, dabs[0].y), (3.0, 4.0));
+    }
+
+    #[test]
+    fn dabs_carry_the_brush_color_and_hardness() {
+        let mut b = Brush::default();
+        b.set_color_srgb8([255, 0, 0]);
+        let dabs = stroke(&b, 0.0, 20.0, 1.0);
+        for d in &dabs {
+            assert_eq!(d.hardness, b.hardness);
+            assert_eq!(d.color_linear_premul, b.color_linear_premul());
+        }
+    }
+
+    #[test]
+    fn diagonal_strokes_are_spaced_along_the_path() {
+        let b = Brush::default();
+        let mut dabs = Vec::new();
+        let mut state = StrokeState::new();
+        b.stroke_begin(&mut dabs, &mut state, 0.0, 0.0, 1.0);
+        // (30, 40) is 50 units away, so 50/4 = 12 further dabs.
+        b.stroke_to(&mut dabs, &mut state, 30.0, 40.0, 1.0);
+        assert_eq!(dabs.len(), 13);
+        // Consecutive dabs must be one spacing step apart along the diagonal.
+        for pair in dabs.windows(2) {
+            let d = ((pair[1].x - pair[0].x).powi(2) + (pair[1].y - pair[0].y).powi(2)).sqrt();
+            assert!((d - 4.0).abs() < 1e-3, "spacing {d} != 4.0");
+        }
     }
 }
