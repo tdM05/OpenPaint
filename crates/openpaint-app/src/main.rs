@@ -158,6 +158,20 @@ struct OpenPaint {
     pending_confirm: Option<Confirm>,
     /// An action to run once a save the user asked for has succeeded.
     after_save: Option<Dialog>,
+    /// A native file dialog running on its own thread.
+    file_dialog: Option<FileDialogTask>,
+}
+
+/// Which file dialog is in flight, and where its answer will arrive.
+struct FileDialogTask {
+    kind: FileDialogKind,
+    answer: std::sync::mpsc::Receiver<Option<std::path::PathBuf>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileDialogKind {
+    Save,
+    Open,
 }
 
 /// A pending "you have unsaved changes" question.
@@ -252,6 +266,7 @@ impl Default for OpenPaint {
             pending_dialog: None,
             pending_confirm: None,
             after_save: None,
+            file_dialog: None,
         }
     }
 }
@@ -779,18 +794,17 @@ impl OpenPaint {
             return;
         };
         match dialog {
+            // When a path is already known the save happens now, so anything waiting on it can
+            // run. When a dialog is needed, the wait continues in `poll_file_dialog`.
             Dialog::Save => {
                 if self.document_path.is_some() {
                     self.save_to_current_path();
+                    self.continue_after_save();
                 } else {
                     self.save_as();
                 }
-                self.continue_after_save();
             }
-            Dialog::SaveAs => {
-                self.save_as();
-                self.continue_after_save();
-            }
+            Dialog::SaveAs => self.save_as(),
             Dialog::Open { confirmed } => {
                 if confirmed || !self.dirty {
                     self.open_with_dialog();
@@ -875,50 +889,105 @@ impl OpenPaint {
         self.request_redraw();
     }
 
-    /// Ask for a path, then save to it.
+    /// Ask for a path on another thread, then save to it when the answer arrives.
+    ///
+    /// **On its own thread, deliberately.** Two problems it solves at once:
+    ///
+    /// 1. A Windows file dialog needs a single-threaded COM apartment, and our thread's
+    ///    apartment is whatever RealTimeStylus initialised it to. In the wrong apartment the
+    ///    dialog opens and then hangs forever on "Working on it..." while the shell tries to
+    ///    enumerate a folder -- which is exactly what it did. A fresh thread gets the apartment
+    ///    the dialog wants.
+    /// 2. A modal dialog runs its own message loop, dispatching our pending messages back into
+    ///    us. Keeping it off our thread means that cannot happen at all, rather than being
+    ///    guarded against -- and that hazard is this project's most expensive recurring bug
+    ///    (Q10c).
+    ///
+    /// The cost is that the answer arrives later, so the app keeps running rather than blocking.
+    /// That is an improvement too: the canvas stays live behind the dialog.
     fn save_as(&mut self) {
         let suggested = self
             .document_path
             .as_ref()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "untitled.openpaint".to_owned());
-        let Some(window) = self.renderer.as_ref().map(|r| r.window().clone()) else {
-            return;
-        };
-        // Owned by our window. Without a parent, Windows can place a modal dialog *behind* it:
-        // you hear it appear, cannot see it, and the app is blocked on something invisible.
-        let Some(path) = rfd::FileDialog::new()
-            .set_parent(window.as_ref())
-            .add_filter("OpenPaint document", &[DOCUMENT_EXTENSION])
-            .set_file_name(suggested)
-            .save_file()
-        else {
-            return;
-        };
-        // The dialog does not always append it, and a document without the extension will not be
-        // found by the open dialog's filter later.
-        let path = if path.extension().is_some() {
-            path
-        } else {
-            path.with_extension(DOCUMENT_EXTENSION)
-        };
-        self.document_path = Some(path);
-        self.save_to_current_path();
+        self.spawn_file_dialog(FileDialogKind::Save, move |dialog| {
+            dialog.set_file_name(suggested).save_file()
+        });
     }
 
-    /// Ask for a file, then open it.
+    /// Ask for a file on another thread, then open it when the answer arrives.
     fn open_with_dialog(&mut self) {
+        self.spawn_file_dialog(FileDialogKind::Open, rfd::FileDialog::pick_file);
+    }
+
+    /// Run a file dialog on a fresh thread and remember where its answer will land.
+    fn spawn_file_dialog(
+        &mut self,
+        kind: FileDialogKind,
+        show: impl FnOnce(rfd::FileDialog) -> Option<std::path::PathBuf> + Send + 'static,
+    ) {
+        if self.file_dialog.is_some() {
+            // One at a time. A second would be modal to nothing and confusing.
+            return;
+        }
         let Some(window) = self.renderer.as_ref().map(|r| r.window().clone()) else {
             return;
         };
-        let Some(path) = rfd::FileDialog::new()
-            .set_parent(window.as_ref())
-            .add_filter("OpenPaint document", &[DOCUMENT_EXTENSION])
-            .pick_file()
-        else {
+        let (tx, answer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Owned by our window, so it cannot end up behind it. The `Arc<Window>` moves in
+            // with it, which is also what keeps the handle valid for as long as the dialog is up.
+            let dialog = rfd::FileDialog::new()
+                .set_parent(window.as_ref())
+                .add_filter("OpenPaint document", &[DOCUMENT_EXTENSION]);
+            // The receiver is gone if the app closed meanwhile; nothing to do about that.
+            let _ = tx.send(show(dialog));
+        });
+        self.file_dialog = Some(FileDialogTask { kind, answer });
+        self.request_redraw();
+    }
+
+    /// Act on a file dialog that has finished, if one has.
+    fn poll_file_dialog(&mut self) {
+        let Some(task) = self.file_dialog.as_ref() else {
             return;
         };
-        let loaded = match openpaint_file::load(&path) {
+        let answer = match task.answer.try_recv() {
+            Ok(answer) => answer,
+            // Still up. `Disconnected` means the thread died without answering, which is a
+            // cancellation as far as we are concerned.
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        let kind = task.kind;
+        self.file_dialog = None;
+
+        match (kind, answer) {
+            (FileDialogKind::Save, Some(path)) => {
+                // The dialog does not always append it, and a document without the extension
+                // will not match the open dialog's filter later.
+                let path = if path.extension().is_some() {
+                    path
+                } else {
+                    path.with_extension(DOCUMENT_EXTENSION)
+                };
+                self.document_path = Some(path);
+                self.save_to_current_path();
+                self.continue_after_save();
+            }
+            (FileDialogKind::Open, Some(path)) => self.load_from(&path),
+            // Cancelled. Anything that was waiting on a save does not happen.
+            (_, None) => {
+                self.after_save = None;
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Replace the open document with the one in `path`.
+    fn load_from(&mut self, path: &std::path::Path) {
+        let loaded = match openpaint_file::load(path) {
             Ok(l) => l,
             Err(e) => {
                 self.status_message = Some(format!("Open failed: {e}"));
@@ -938,7 +1007,7 @@ impl OpenPaint {
         }
         // A fresh document deserves a fresh view; its page is very likely a different size.
         self.view.request_fit();
-        self.document_path = Some(path.clone());
+        self.document_path = Some(path.to_path_buf());
         self.dirty = false;
         self.update_title();
         self.status_message = Some(format!(
@@ -1558,8 +1627,10 @@ impl ApplicationHandler for OpenPaint {
         // their own backend exists. This is the one swap point — the engine is
         // untouched regardless of which backend wins.
         #[cfg(target_os = "windows")]
-        if let Some(pen) = input_pen::PenBackend::try_new(window.clone()) {
-            self.input = Box::new(pen);
+        if std::env::var("OPENPAINT_NO_PEN").is_err() {
+            if let Some(pen) = input_pen::PenBackend::try_new(window.clone()) {
+                self.input = Box::new(pen);
+            }
         }
 
         match Renderer::new(window.clone(), self.editor.page_rect()) {
@@ -1605,6 +1676,14 @@ impl ApplicationHandler for OpenPaint {
             self.in_dispatch = true;
             self.service_dialog(event_loop);
             self.in_dispatch = false;
+        }
+        self.poll_file_dialog();
+
+        // A file dialog answers on another thread, so nothing else would wake this loop to
+        // notice. Keep checking while one is open, whatever the input backend wants.
+        if self.file_dialog.is_some() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL_INTERVAL));
+            return;
         }
 
         if !self.input.wants_continuous_poll() {

@@ -251,8 +251,9 @@ impl Ui {
         let mut tool_action = None;
         let mut confirm_choice = None;
 
+        let mut panel_rect = egui::Rect::NOTHING;
         let output = self.ctx.run(input, |ctx| {
-            egui::SidePanel::left("brush-panel")
+            let panel = egui::SidePanel::left("brush-panel")
                 .exact_width(PANEL_WIDTH)
                 .show(ctx, |ui| {
                     ui.heading("Tool");
@@ -619,37 +620,38 @@ impl Ui {
                         }
                     }
                 });
-        });
+            panel_rect = panel.response.rect;
 
-        if let Some(what) = status.confirm {
-            egui::Window::new("Unsaved changes")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(&self.ctx, |ui| {
-                    ui.label(format!(
-                        "This document has changes that are not in a file. Save before you {what}?"
-                    ));
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        // Save first, and leftmost, because it is the answer that loses nothing.
-                        if ui.button("Save").clicked() {
-                            confirm_choice = Some(ConfirmChoice::SaveFirst);
-                        }
-                        if ui.button("Discard").clicked() {
-                            confirm_choice = Some(ConfirmChoice::Discard);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            confirm_choice = Some(ConfirmChoice::Cancel);
-                        }
+            if let Some(what) = status.confirm {
+                egui::Window::new("Unsaved changes")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(format!(
+                            "This document has changes that are not in a file. Save before you {what}?"
+                        ));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            // Save first, and leftmost, because it is the answer that loses nothing.
+                            if ui.button("Save").clicked() {
+                                confirm_choice = Some(ConfirmChoice::SaveFirst);
+                            }
+                            if ui.button("Discard").clicked() {
+                                confirm_choice = Some(ConfirmChoice::Discard);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                confirm_choice = Some(ConfirmChoice::Cancel);
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new("Enter saves, Escape cancels.")
+                                .small()
+                                .weak(),
+                        );
                     });
-                    ui.label(
-                        egui::RichText::new("Enter saves, Escape cancels.")
-                            .small()
-                            .weak(),
-                    );
-                });
-        }
+            }
+        });
 
         // Paint the crop outline over the canvas. Deliberately painted, not built from
         // widgets: egui never sees pen input (Q14), so widget handles would be
@@ -687,10 +689,15 @@ impl Ui {
         brush.set_color_srgb8(color_srgb);
         self.extend_amount = extend_amount;
 
-        // Record which pixels egui owns, in physical coordinates, for
-        // `blocks_point`. `used_rect` is in logical points.
+        // Record which pixels the *panel* owns, in physical coordinates, for `blocks_point` and
+        // for the canvas inset.
+        //
+        // Deliberately the panel's own rect, not `used_rect()`. `used_rect` is the union of
+        // everything egui drew, so a centred floating window -- the unsaved-changes prompt --
+        // made it span half the screen and shoved the canvas sideways. The inset means "how much
+        // of the left edge the panel covers", and only the panel can answer that.
         let scale = self.ctx.pixels_per_point();
-        let used = self.ctx.used_rect();
+        let used = panel_rect;
         self.occupied = egui::Rect::from_min_max(
             egui::pos2(used.min.x * scale, used.min.y * scale),
             egui::pos2(used.max.x * scale, used.max.y * scale),
