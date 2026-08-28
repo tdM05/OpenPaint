@@ -328,6 +328,66 @@ impl Renderer {
         });
     }
 
+    /// Save the document and every tile it holds to `path`.
+    ///
+    /// Stalls to read the resident tiles back, which is fine for an explicit save; the drawing
+    /// path never reads back. Undo history is deliberately not saved -- see `openpaint_file`.
+    pub fn save_document(
+        &mut self,
+        document: &openpaint_core::Document,
+        path: &std::path::Path,
+    ) -> Result<usize, openpaint_file::Error> {
+        // Page index per layer id, so a tile can be filed under the page its layer belongs to.
+        let mut page_of_layer = std::collections::HashMap::new();
+        for index in 0..document.page_count() {
+            if let Some(page) = document.page(index) {
+                for layer in page.layers() {
+                    page_of_layer.insert(layer.id(), index);
+                }
+            }
+        }
+
+        let tiles = self.canvas_renderer.snapshot_all(&self.device, &self.queue);
+        let count = tiles.len();
+        let refs = tiles.into_iter().filter_map(|(key, tile)| {
+            // A tile whose layer no longer exists belongs to nothing and is not saved. It can
+            // only be one a deleted layer left in history, which a save does not preserve
+            // anyway.
+            let page = *page_of_layer.get(&key.layer.0)?;
+            Some((
+                openpaint_file::TileRef {
+                    page,
+                    layer_id: key.layer.0,
+                    coord: key.coord,
+                },
+                tile,
+            ))
+        });
+        openpaint_file::save(path, document, refs)?;
+        Ok(count)
+    }
+
+    /// Adopt the tiles of a freshly loaded document, discarding whatever was here.
+    ///
+    /// The caller replaces the `Document` itself; this takes the pixels. History is cleared with
+    /// them, because an undo stack that outlived its document would restore tiles into layers
+    /// that no longer exist.
+    pub fn load_document(
+        &mut self,
+        page: PageRect,
+        loaded_tiles: Vec<(openpaint_file::TileRef, openpaint_core::tile::Tile)>,
+    ) {
+        self.history = History::new(&self.device);
+        self.stroke_layer.abandon();
+        self.recording.clear();
+        self.canvas_renderer.set_page(page);
+        self.canvas_renderer.load_tiles(
+            loaded_tiles
+                .into_iter()
+                .map(|(r, t)| (TileKey::new(LayerId(r.layer_id), r.coord), t)),
+        );
+    }
+
     /// Read the canvas back and write it as an sRGB PNG.
     ///
     /// Stalls on the GPU while the readback maps, which is acceptable for an

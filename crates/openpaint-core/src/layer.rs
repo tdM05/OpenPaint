@@ -86,6 +86,28 @@ pub struct Layer {
 }
 
 impl Layer {
+    /// Rebuild a layer exactly as it was, for loading a document.
+    ///
+    /// Takes the id rather than assigning one, because tiles are keyed by it: a load that
+    /// renumbered layers would separate every layer from its pixels. Deliberately the only way
+    /// to choose an id from outside this crate, so ordinary code cannot invent one.
+    #[must_use]
+    pub fn restored(
+        id: u32,
+        name: impl Into<String>,
+        opacity: f32,
+        blend: Blend,
+        visible: bool,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            opacity,
+            blend,
+            visible,
+        }
+    }
+
     /// Create a layer with a given id. Only [`crate::page::Page`] hands out ids, so that
     /// they stay unique within a page.
     #[must_use]

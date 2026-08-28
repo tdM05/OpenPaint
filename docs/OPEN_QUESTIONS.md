@@ -137,22 +137,33 @@ DECISIONS §4b. Open: how far on color *management* — sRGB-only v1? ICC profil
 Wide-gamut/display-P3? CMYK for print later? (16-bit float in memory means we
 have the headroom whenever we want it, so this stays deferrable.)
 
-### Q6. File format specifics ⏳ DELIBERATELY DEFERRED until the page model exists
-Container is "zip of tiles + JSON" in spirit. Open: exact tile encoding
-(raw/compressed? per-tile format?), metadata schema, versioning strategy,
-thumbnail/preview embedding, autosave/recovery model.
+### Q6. File format specifics — ✅ RESOLVED 2026-08-28
 
-**Why it is waiting (decided 2026-08-27):** defining it now would define it for a
-single fixed-size page. Pages and a growable canvas would then force a v2 plus a
-migration path — for files nobody has yet. So the format waits for the document
-model.
+Built: `.openpaint` is a **SQLite database**, not a zip. See DECISIONS §7 for the reasoning
+and the decisions inside the format. The deferral condition is met -- it waited for the page
+model *and* layers, which were the two things the format had to be able to describe, and
+defining it before either would have guaranteed a migration.
 
-**PNG export shipped instead** (`openpaint-app/src/export.rs`, Ctrl+S). It has no
-format to design, it removes the immediate problem that work could not be kept at
-all, and it builds the GPU→CPU readback the native format will need anyway. Note
-the conversion PNG forces us to get right and now has tests for: **unpremultiply,
-then encode linear→sRGB.** Skipping the encode is the classic washed-out-export
-bug, and the same missing-encode error had already bitten once in the renderer.
+Answers to what this question actually asked:
+- **Tile encoding**: raw premultiplied `f16` with a per-tile `codec` column; deflate chosen
+  per tile when it wins. Measured 3.5 MB of tiles down to 90 KB on a real document. A better
+  codec is additive later, not a migration.
+- **Metadata schema**: real tables (`document`, `page`, `layer`, `tile`), not a JSON blob --
+  self-describing and introspectable.
+- **Versioning**: `user_version`. Newer files are refused with an explanation rather than
+  misread; older ones migrate.
+- **Thumbnail/preview embedding**: not yet. It wants the page-management UI to exist first,
+  since that is what would display them.
+- **Autosave/recovery**: not yet, and now straightforward -- the transaction discipline is
+  the hard part and it is done.
+
+**Still open around the format:**
+- **A file dialog**, so Save As / Open can choose a path. Currently a fixed name in the
+  working directory. Blocked on nothing except care: a modal native dialog pumps the Windows
+  message queue, which is the Q10c reentrancy hazard, so it needs handling deliberately.
+- **Autosave and crash recovery**, which is what actually protects work between saves.
+- **PSD import** (DECISIONS §7 wants it early for adoption) and the webcomic exports
+  (CBZ / PDF / image sequence with strip slicing).
 
 ### Q10b. Wintab is NOT provided by octotablet (correction)
 Earlier notes implied octotablet would give Wintab "for free." That is WRONG:

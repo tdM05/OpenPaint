@@ -148,6 +148,16 @@ impl Editor {
         self.document.active().active_index()
     }
 
+    /// Replace the open document wholesale, for loading a file.
+    ///
+    /// Ends any stroke first: it belongs to a layer of the document being replaced.
+    pub fn replace_document(&mut self, document: Document) {
+        self.stroke_end();
+        self.dabs.clear();
+        self.ops.clear();
+        self.document = document;
+    }
+
     /// Mutable document access, for layer commands from the UI.
     pub fn document_mut(&mut self) -> &mut Document {
         &mut self.document

@@ -550,6 +550,64 @@ impl OpenPaint {
         self.request_redraw();
     }
 
+    /// Where Ctrl+S writes and Ctrl+O reads, until there is a file dialog.
+    ///
+    /// A fixed name in the working directory, matching how PNG export already behaves. Choosing
+    /// a path needs a native dialog, and a modal dialog pumps the Windows message queue -- which
+    /// is the reentrancy hazard this whole shell is arranged around (see the module note). That
+    /// deserves its own change rather than being bolted onto the format.
+    fn document_path() -> std::path::PathBuf {
+        std::path::PathBuf::from("openpaint-document.openpaint")
+    }
+
+    /// Save the document.
+    fn save_document(&mut self) {
+        let path = Self::document_path();
+        let document = self.editor.document();
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        self.status_message = Some(match renderer.save_document(document, &path) {
+            Ok(tiles) => format!("Saved {tiles} tiles to {}", path.display()),
+            Err(e) => format!("Save failed: {e}"),
+        });
+        self.request_redraw();
+    }
+
+    /// Open the document, replacing what is open.
+    ///
+    /// Everything in flight is ended first: a stroke belongs to a layer of the document being
+    /// replaced, and history to a stack that is about to stop existing.
+    fn open_document(&mut self) {
+        let path = Self::document_path();
+        let loaded = match openpaint_file::load(&path) {
+            Ok(l) => l,
+            Err(e) => {
+                self.status_message = Some(format!("Open failed: {e}"));
+                self.request_redraw();
+                return;
+            }
+        };
+        self.editor.stroke_end();
+        self.crop = None;
+
+        let tiles: Vec<_> = loaded.tiles.into_iter().collect();
+        let pages = loaded.document.page_count();
+        let rect = loaded.document.active().rect();
+        self.editor.replace_document(loaded.document);
+        if let Some(r) = self.renderer.as_mut() {
+            r.load_document(rect, tiles);
+        }
+        // A fresh document deserves a fresh view; its page is very likely a different size.
+        self.view.request_fit();
+        self.status_message = Some(format!(
+            "Opened {} ({pages} page{})",
+            path.display(),
+            if pages == 1 { "" } else { "s" }
+        ));
+        self.request_redraw();
+    }
+
     /// Discard the tiles outside the page, reclaiming their memory.
     ///
     /// The only action that destroys pixels, which is why it is explicit and separate from
@@ -600,8 +658,9 @@ impl OpenPaint {
 
     /// Handle undo/redo shortcuts. Returns `true` if the event was consumed.
     ///
-    /// Ctrl+Z undoes, Ctrl+Shift+Z and Ctrl+Y redo -- the bindings every art app
-    /// shares. Hardcoded for now, like navigation (OPEN_QUESTIONS Q16).
+    /// Ctrl+Z undoes, Ctrl+Shift+Z and Ctrl+Y redo; Ctrl+S saves, Ctrl+O opens, Ctrl+E exports
+    /// a PNG -- the bindings every art app shares. Hardcoded for now, like navigation
+    /// (OPEN_QUESTIONS Q16).
     fn handle_history(&mut self, event: &WindowEvent) -> bool {
         use winit::event::ElementState;
         use winit::keyboard::Key;
@@ -618,9 +677,21 @@ impl OpenPaint {
                 let Key::Character(c) = &key.logical_key else {
                     return false;
                 };
-                if matches!(c.as_str(), "s" | "S") {
-                    self.export_png();
-                    return true;
+                match c.as_str() {
+                    // Ctrl+S is now save, as it should be; export moved to Ctrl+E.
+                    "s" | "S" => {
+                        self.save_document();
+                        return true;
+                    }
+                    "o" | "O" => {
+                        self.open_document();
+                        return true;
+                    }
+                    "e" | "E" => {
+                        self.export_png();
+                        return true;
+                    }
+                    _ => {}
                 }
                 let redo = match c.as_str() {
                     "z" | "Z" => self.nav.modifiers.shift_key(),
@@ -652,11 +723,10 @@ impl OpenPaint {
         }
     }
 
-    /// Export the canvas to a PNG beside the executable's working directory.
+    /// Export the flattened canvas to a PNG in the working directory.
     ///
-    /// Ctrl+S is "export" rather than "save" for now, deliberately: there is no
-    /// native document format yet, and inventing one before the page model exists
-    /// would guarantee a migration (OPEN_QUESTIONS Q6).
+    /// Ctrl+E, not Ctrl+S: saving the *document* is what Ctrl+S means now that there is a
+    /// document format to save into.
     fn export_png(&mut self) {
         let Some(renderer) = self.renderer.as_ref() else {
             return;

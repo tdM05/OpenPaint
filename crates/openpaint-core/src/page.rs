@@ -179,6 +179,35 @@ impl Page {
         }
     }
 
+    /// Rebuild a page exactly as it was, for loading a document.
+    ///
+    /// `next_layer_id` is part of the saved state on purpose: ids must never be reused, and a
+    /// counter derived from the layer count would start handing out ids that dead layers once
+    /// had. It is clamped above every id present, so a hand-edited or truncated file cannot
+    /// produce a collision.
+    ///
+    /// Returns `None` with no layers, because a page must always have somewhere to paint.
+    #[must_use]
+    pub fn restored(
+        rect: PageRect,
+        dpi: f32,
+        layers: Vec<Layer>,
+        active: usize,
+        next_layer_id: u32,
+    ) -> Option<Self> {
+        if layers.is_empty() {
+            return None;
+        }
+        let highest = layers.iter().map(Layer::id).max().unwrap_or(0);
+        Some(Self {
+            rect,
+            active: active.min(layers.len() - 1),
+            next_layer_id: next_layer_id.max(highest + 1),
+            layers,
+            dpi: dpi.max(1.0),
+        })
+    }
+
     /// The page's rectangle in page coordinates.
     #[must_use]
     pub fn rect(&self) -> PageRect {
@@ -207,6 +236,16 @@ impl Page {
 
     pub fn set_dpi(&mut self, dpi: f32) {
         self.dpi = dpi.max(1.0);
+    }
+
+    /// The next id this page would hand out.
+    ///
+    /// Part of the saved state, because ids must never be reused: a counter rebuilt from the
+    /// layer count would start handing out ids that deleted layers once had, and tiles are keyed
+    /// by id.
+    #[must_use]
+    pub fn next_layer_id(&self) -> u32 {
+        self.next_layer_id
     }
 
     /// The stack, bottom layer first.

@@ -586,6 +586,136 @@ mod tests {
         );
     }
 
+    /// Paint, save, and load back through the real path: a stroke on the GPU, read out of the
+    /// tile store, written to a file, read in, and compared pixel for pixel.
+    ///
+    /// The format crate's own tests use synthetic tile bytes, which proves the container works but
+    /// says nothing about whether the *app* hands it the right tiles or puts them back in the
+    /// right place. That seam is where a save silently loses work, so it gets its own test.
+    #[test]
+    fn a_painted_document_survives_a_save_and_load() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+
+        let mut editor = Editor::new();
+        editor.brush_mut().radius = 30.0;
+        let page = editor.page_rect();
+        let mut layer = test_stroke_layer(&device);
+        let mut canvas = test_canvas(&device, page, &layer);
+        let mut history = History::new(&device);
+        let mut recording = Vec::new();
+        let mut recording_paint = ([0.0; 4], 1.0);
+
+        // Two layers with a stroke each, so the save has to keep them apart.
+        editor.stroke_begin(400.0, 400.0, 1.0);
+        editor.stroke_to(700.0, 450.0, 1.0);
+        editor.stroke_end();
+        let bottom_id = editor.active_layer_id();
+        run_frame_on(
+            &device,
+            &queue,
+            &mut canvas,
+            &mut layer,
+            &mut history,
+            &mut recording,
+            &mut recording_paint,
+            &mut editor,
+            bottom_id,
+        );
+
+        editor.document_mut().active_mut().add_layer();
+        editor.document_mut().active_mut().active_layer_mut().blend =
+            openpaint_core::Blend::Multiply;
+        editor
+            .document_mut()
+            .active_mut()
+            .active_layer_mut()
+            .opacity = 0.6;
+        let top_id = editor.active_layer_id();
+        assert_ne!(top_id, bottom_id);
+        editor.stroke_begin(1200.0, 1200.0, 1.0);
+        editor.stroke_to(1500.0, 1250.0, 1.0);
+        editor.stroke_end();
+        run_frame_on(
+            &device,
+            &queue,
+            &mut canvas,
+            &mut layer,
+            &mut history,
+            &mut recording,
+            &mut recording_paint,
+            &mut editor,
+            top_id,
+        );
+
+        // What is on the GPU right now, to compare against.
+        let before: std::collections::HashMap<_, _> = canvas
+            .snapshot_all(&device, &queue)
+            .into_iter()
+            .map(|(k, t)| (k, t.bytes().to_vec()))
+            .collect();
+        assert!(before.len() >= 2, "expected tiles on both layers");
+
+        let path = std::env::temp_dir().join(format!(
+            "openpaint-app-roundtrip-{}.openpaint",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        // Save exactly as the app does.
+        let mut page_of_layer = std::collections::HashMap::new();
+        for i in 0..editor.document().page_count() {
+            if let Some(p) = editor.document().page(i) {
+                for l in p.layers() {
+                    page_of_layer.insert(l.id(), i);
+                }
+            }
+        }
+        let refs = canvas
+            .snapshot_all(&device, &queue)
+            .into_iter()
+            .filter_map(|(key, tile)| {
+                let page = *page_of_layer.get(&key.layer.0)?;
+                Some((
+                    openpaint_file::TileRef {
+                        page,
+                        layer_id: key.layer.0,
+                        coord: key.coord,
+                    },
+                    tile,
+                ))
+            });
+        openpaint_file::save(&path, editor.document(), refs).expect("save");
+
+        let loaded = openpaint_file::load(&path).expect("load");
+        let _ = std::fs::remove_file(&path);
+
+        // Structure: the stack, its ids, and the properties that decide how it looks.
+        let a = editor.document().active();
+        let b = loaded.document.active();
+        assert_eq!(a.layer_count(), b.layer_count());
+        for (x, y) in a.layers().iter().zip(b.layers()) {
+            assert_eq!(x, y, "layer {:?} changed across the save", x.name);
+        }
+
+        // Pixels: every tile back, keyed to the same layer, byte for byte.
+        assert_eq!(loaded.tiles.len(), before.len(), "tile count changed");
+        for (key, bytes) in &before {
+            let r = openpaint_file::TileRef {
+                page: 0,
+                layer_id: key.layer.0,
+                coord: key.coord,
+            };
+            let got = loaded
+                .tiles
+                .get(&r)
+                .unwrap_or_else(|| panic!("{r:?} missing after load"));
+            assert_eq!(got.bytes(), bytes.as_slice(), "{r:?} came back different");
+        }
+    }
+
     /// Drain the editor's pending commands through the executor, as `redraw` does.
     #[allow(clippy::too_many_arguments)]
     fn run_frame(
@@ -598,11 +728,37 @@ mod tests {
         recording_paint: &mut ([f32; 4], f32),
         editor: &mut Editor,
     ) {
+        run_frame_on(
+            device,
+            queue,
+            canvas,
+            layer,
+            history,
+            recording,
+            recording_paint,
+            editor,
+            0,
+        );
+    }
+
+    /// As `run_frame`, but painting on a chosen layer id rather than assuming the first.
+    #[allow(clippy::too_many_arguments)]
+    fn run_frame_on(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        canvas: &mut CanvasRenderer,
+        layer: &mut StrokeLayer,
+        history: &mut History,
+        recording: &mut Vec<Dab>,
+        recording_paint: &mut ([f32; 4], f32),
+        editor: &mut Editor,
+        layer_id: u32,
+    ) {
         assert!(editor.has_pending_stroke(), "nothing queued to execute");
         {
             let (ops, dabs) = editor.pending_stroke();
             let mut exec = StrokeExec {
-                layer: L0,
+                layer: LayerId(layer_id),
                 device,
                 queue,
                 canvas,

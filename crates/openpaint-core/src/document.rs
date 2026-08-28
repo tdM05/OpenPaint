@@ -45,6 +45,23 @@ impl Document {
         }
     }
 
+    /// Rebuild a document exactly as it was, for loading.
+    ///
+    /// Returns `None` with no pages: every accessor here assumes an active page exists, and a
+    /// document with none would make each of them fallible for the sake of a state no valid
+    /// file contains.
+    #[must_use]
+    pub fn restored(pages: Vec<Page>, active: usize, mode: Mode) -> Option<Self> {
+        if pages.is_empty() {
+            return None;
+        }
+        Some(Self {
+            active: active.min(pages.len() - 1),
+            pages,
+            mode,
+        })
+    }
+
     #[must_use]
     pub fn mode(&self) -> Mode {
         self.mode
@@ -77,6 +94,10 @@ impl Document {
 
     pub fn active_mut(&mut self) -> &mut Page {
         &mut self.pages[self.active]
+    }
+
+    pub fn page_mut(&mut self, index: usize) -> Option<&mut Page> {
+        self.pages.get_mut(index)
     }
 
     #[must_use]

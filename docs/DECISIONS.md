@@ -625,10 +625,60 @@ Decision: **stay cross-platform-capable by construction, ship Windows first.**
 
 ---
 
-## 7. File format & interop (direction, details TBD)
+## 7. File format & interop
 
-- **Open, documented container**: conceptually a zip of tiles + JSON metadata
-  (same spirit as `.kra` / `.procreate`, which are zips).
+### The native format is a SQLite database, settled 2026-08-28
+
+Reverses this section's original sketch ("a zip of tiles + JSON"). The reason is the one
+thing a zip cannot do: **replace an entry in place.** Every save to a zip rewrites the whole
+archive, so one stroke in a three-hundred-page sketchbook -- the stated core use case (§5) --
+costs a full multi-hundred-megabyte rewrite, and autosave becomes impossible. Autosave is the
+feature that actually protects work, so that is disqualifying rather than merely slow.
+
+What SQLite gives, none of it free otherwise:
+- **Atomicity and crash safety** from transactions, instead of hand-rolled
+  write-temp-and-rename and its edge cases.
+- **Incremental saves** -- only the tiles that changed.
+- **A self-describing schema**, dumpable with any SQLite tool, plus `user_version` for a
+  well-worn migration story.
+- A container whose own file format carries an explicit long-term stability commitment --
+  a stronger longevity guarantee than a convention of ours layered over zip.
+
+CSP's `.clip` is also SQLite, as far as public reverse-engineering shows; Krita and Procreate
+use zips and both have the rewrite problem. Not decisive on its own, but a signal the choice
+survives real documents.
+
+**The cost, stated plainly:** it is the project's first deliberate C dependency (`rusqlite`
+with the bundled amalgamation -- one C file, cross-compiles to Windows without fuss). Tile
+compression is ours to choose rather than free from the zip; deflate via `flate2`'s Rust
+backend, so SQLite remains the only non-Rust dependency. Measured on a real two-layer
+document: 7 tiles, 3.5 MB raw, **90 KB on disk**.
+
+**Decisions inside the format:**
+- **Tiles are keyed by layer *id*, not stack position**, so reordering layers rewrites no
+  tile rows. Same reason the in-memory store keys by id, and it is what keeps saves cheap.
+- **Blend modes and mode are stored by name**, not integer. A file you can read with
+  `sqlite3` and understand is worth a string compare per layer, and a name cannot collide
+  with a code some older file already used. `Blend::code()` stays an integer because the
+  *shader* needs one -- a different concern with a different lifetime.
+- **A per-tile `codec` column.** A better compressor can be introduced later without a
+  schema bump and without rewriting existing files.
+- **Tiles are stored premultiplied `f16`, verbatim.** No conversion on save, so no lossy
+  round trip through the format.
+- **Out-of-page tiles are saved.** That is what makes non-destructive crop (§5c) survive
+  being closed and reopened; without persistence the guarantee lasted only a session.
+- **Undo history is not saved.** A save is a fresh undo baseline -- which is precisely why
+  crop had to be non-destructive rather than "recoverable with Ctrl+Z".
+- **Loading goes to the CPU side of the tile store, not the GPU.** Residency pulls in what
+  the viewport asks for, so opening a large document is fast and memory-bounded for free.
+
+⚠️ **No file dialog yet.** Ctrl+S and Ctrl+O use a fixed name in the working directory, as
+PNG export already does. A native dialog is modal and pumps the Windows message queue, which
+is the reentrancy hazard this whole shell is arranged around (see `main.rs`), so it deserves
+its own change rather than being bolted onto the format.
+
+- **Open and documented.** The schema is introspectable, which is a better guarantee than a
+  zip full of conventions only our code knows.
 - **PSD import early** — huge for adoption. (Import prioritized; export later.)
 - **PNG import/export.**
 - Webcomic exports: **CBZ / PDF / image-sequence** (with webtoon strip slicing).

@@ -459,6 +459,117 @@ impl TileStore {
         self.staging.push(e.buffer);
     }
 
+    /// Put a tile straight into the CPU side, without touching the GPU.
+    ///
+    /// How a document is loaded. Uploading everything would try to put a whole sketchbook into
+    /// graphics memory at once; dropping it here instead means residency pulls in only what the
+    /// viewport asks for, so opening a large document is fast and bounded for free.
+    ///
+    /// Marked clean, because the CPU copy *is* the authority until something paints on it.
+    pub fn preload(&mut self, key: TileKey, tile: Tile) {
+        if let Some(old) = self.resident.remove(&key) {
+            self.pool.free(old.slot);
+        }
+        self.inflight.retain(|e| e.key != key);
+        self.spilled.insert(key, tile);
+    }
+
+    /// Forget everything. For loading a document over the top of the current one.
+    pub fn clear(&mut self) {
+        for (_, r) in std::mem::take(&mut self.resident) {
+            self.pool.free(r.slot);
+        }
+        self.spilled.clear();
+        // Let the readbacks land into a map nobody will read rather than cancelling them, which
+        // is not a thing wgpu offers.
+        self.inflight.clear();
+    }
+
+    /// Every tile, resident or spilled, as CPU bytes.
+    ///
+    /// For saving. Resident tiles are read back in **one** batched copy rather than one per tile:
+    /// a fully-inked page is a hundred-plus tiles, and a hundred separate map-and-wait round
+    /// trips would make saving feel broken. Spilled tiles are already here and cost nothing.
+    ///
+    /// Stalls on the GPU, which is fine for an explicit save -- the drawing path never does this.
+    pub fn snapshot_all(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Vec<(TileKey, Tile)> {
+        self.drain_inflight();
+        // Anything still in flight has to land, or its tile would be saved from a stale copy.
+        let pending: Vec<TileKey> = self.inflight.iter().map(|e| e.key).collect();
+        for key in pending {
+            self.resolve(device, key);
+        }
+
+        let mut out: Vec<(TileKey, Tile)> =
+            self.spilled.iter().map(|(k, t)| (*k, t.clone())).collect();
+
+        let resident: Vec<(TileKey, u32)> = self
+            .resident
+            .iter()
+            .map(|(k, r)| (*k, r.slot.layer()))
+            .collect();
+        if resident.is_empty() {
+            return out;
+        }
+
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tile-save-readback"),
+            size: (TILE_BYTES * resident.len()) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tile-save"),
+        });
+        for (i, (_, layer)) in resident.iter().enumerate() {
+            encoder.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture {
+                    texture: self.pool.texture(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: *layer,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyBuffer {
+                    buffer: &buffer,
+                    layout: wgpu::ImageDataLayout {
+                        // A tile is 512 KiB and a row 2048 bytes, both multiples of the 256-byte
+                        // copy alignment, so tiles pack end to end with no padding.
+                        offset: (TILE_BYTES * i) as u64,
+                        bytes_per_row: Some(TILE_SIZE as u32 * CANVAS_BYTES_PER_TEXEL),
+                        rows_per_image: Some(TILE_SIZE as u32),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: TILE_SIZE as u32,
+                    height: TILE_SIZE as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+
+        let view = buffer.slice(..).get_mapped_range();
+        for (i, (key, _)) in resident.iter().enumerate() {
+            let start = TILE_BYTES * i;
+            if let Some(tile) = Tile::from_bytes(&view[start..start + TILE_BYTES]) {
+                out.push((*key, tile));
+            } else {
+                debug_assert!(false, "a tile read back the wrong size");
+            }
+        }
+        out
+    }
+
     /// Upload tile bytes into a pool layer.
     fn upload(&self, queue: &wgpu::Queue, slot: &Slot, bytes: &[u8]) {
         debug_assert_eq!(bytes.len(), TILE_BYTES);

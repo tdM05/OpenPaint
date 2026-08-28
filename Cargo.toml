@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/openpaint-core",
+    "crates/openpaint-file",
     "crates/openpaint-app",
 ]
 

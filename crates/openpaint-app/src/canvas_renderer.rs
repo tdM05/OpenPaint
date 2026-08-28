@@ -461,6 +461,30 @@ impl CanvasRenderer {
         self.store.release(slot);
     }
 
+    /// Every tile the canvas holds, as CPU bytes. For saving.
+    pub fn snapshot_all(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Vec<(TileKey, openpaint_core::tile::Tile)> {
+        self.store.snapshot_all(device, queue)
+    }
+
+    /// Replace everything with the tiles of a loaded document.
+    ///
+    /// They go to the CPU side, not the GPU: residency pulls in what the viewport needs, so
+    /// opening a large document costs nothing until it is looked at.
+    pub fn load_tiles(
+        &mut self,
+        tiles: impl IntoIterator<Item = (TileKey, openpaint_core::tile::Tile)>,
+    ) {
+        self.store.clear();
+        for (key, tile) in tiles {
+            self.store.preload(key, tile);
+        }
+        self.instance_count = 0;
+    }
+
     /// Drop every tile belonging to a deleted layer.
     pub fn discard_layer(&mut self, layer: LayerId) {
         let doomed: Vec<TileCoord> = self.layer_tiles(layer).collect();

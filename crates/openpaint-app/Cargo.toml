@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 openpaint-core = { path = "../openpaint-core" }
+openpaint-file = { path = "../openpaint-file" }
 winit = "0.30"
 # GPU rendering. wgpu 22 is compatible with winit 0.30 and auto-selects a
 # backend at runtime (D3D12/Vulkan on Windows, Vulkan on Linux).
