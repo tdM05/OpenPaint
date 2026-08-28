@@ -129,8 +129,10 @@ Deferred by design. Start with egui debug panels; decide the polished CSP-like
 UI framework later (egui custom-drawn? another Rust UI? something else?).
 
 ### Q5. Color management depth
-Confirmed: composite in linear space. Open: how far on color management —
-sRGB-only v1? ICC profiles? Wide-gamut/display-P3 support? CMYK for print later?
+Composite in linear space, premultiplied, `Rgba16Float` in memory — settled, see
+DECISIONS §4b. Open: how far on color *management* — sRGB-only v1? ICC profiles?
+Wide-gamut/display-P3? CMYK for print later? (16-bit float in memory means we
+have the headroom whenever we want it, so this stays deferrable.)
 
 ### Q6. File format specifics
 Container is "zip of tiles + JSON" in spirit. Open: exact tile encoding
@@ -171,9 +173,15 @@ coalesced samples (and Wintab later, per Q10b). Worth re-checking whether newer
 octotablet releases stop holding the lock across COM calls; if so, upstream a
 note or a patch rather than carrying the constraint forever.
 
-### Q7. Brush engine: port libmypaint vs. build our own
-Depends on Q1 (license). If GPL-compatible, porting/wrapping libmypaint could
-save enormous time. If permissive license, likely build our own dab engine.
+### Q7. Brush engine: port libmypaint vs. build our own → ✅ BUILD OUR OWN (for the round brush)
+License is not the blocker (GPLv3, so libmypaint is usable). The blocker is fit:
+libmypaint's parameter model is built for painterly/wet behavior, not for
+reproducing Photoshop's soft round, which is the explicit Phase-1 quality target
+(Q7a). Porting it would mean fighting its model to get somewhere it isn't aimed.
+Our own dab engine is more direct and keeps the math unit-testable per
+DECISIONS §4a.
+**Still open:** revisit libmypaint later specifically for wet / smudge / blending
+brushes, where its model is genuinely strong and we'd be reinventing hard math.
 
 ### Q7a. Round-brush fidelity target = Photoshop/CSP soft round
 The default round brush should aim to feel/look like Photoshop's (and CSP's)

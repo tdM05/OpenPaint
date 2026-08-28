@@ -126,6 +126,57 @@ These, not features, are what separate a pro tool from a toy:
    composited on GPU; canvas stored as tiles (e.g. 256×256) so large multi-layer,
    multi-page docs don't blow up RAM or stall. Blend in **linear color space**.
 
+### 4a. Where the brush engine lives → core emits dabs, GPU rasterizes them
+
+Earlier drafts said both "the core is pure Rust with no OS calls" and
+"compositing happens on the GPU." Those conflict, because real quality requires
+rasterizing dabs on the GPU. Resolution:
+
+- **`openpaint-core` owns the dab *math*** — where each dab lands along the path,
+  its radius, and its pressure/tilt-derived parameters — plus tile storage, the
+  layer tree, the document model, and file I/O. Pure, portable, no GPU types.
+- **The renderer owns dab *rasterization* and compositing** — it consumes the dab
+  stream and stamps into tile textures on the GPU.
+
+Why this and not the alternatives: it's how the field works (Krita's brush
+engines emit dabs into tiled paint devices; Photoshop and CSP are stamp-based;
+Procreate rasterizes dabs on the GPU). Keeping dab *generation* pure makes it
+deterministic and unit-testable, which is the only credible way to chase
+Photoshop's falloff curve (Q7a) rather than eyeball it. The existing CPU
+`Canvas::blend_pixel` path is retained as the **reference implementation** that
+tests compare GPU output against.
+
+⚠️ **The hard part is accumulation, not rasterization.** Dabs within one stroke
+cannot simply be alpha-blended in a batch: Photoshop's model is that **flow**
+accumulates per dab while **opacity** clamps the stroke's total contribution. So a
+stroke needs its own accumulation buffer with max-alpha semantics, composited onto
+the layer once at stroke end. Getting this wrong is the single most common way
+brush clones feel wrong, and it's the reason dab order and stroke boundaries have
+to be first-class in the design.
+
+### 4b. Tile pixel format → linear, premultiplied, `Rgba16Float`
+
+- **Linear color space**, not sRGB. Already committed to above; this encodes it.
+- **Premultiplied alpha**, not straight.
+- **`Rgba16Float`** tile textures. sRGB conversion happens *only* at the final
+  display blit (the surface is already an `*Srgb` format, so it's free).
+
+Premultiplied is the one that matters most and the one that's cheap now and
+expensive later: it's what makes layer filtering, masks, and blend modes correct,
+and switching after the fact means auditing every blend site in the engine.
+
+**Current code contradicts all three axes** and must be migrated before the brush
+engine is written:
+- `openpaint-core/src/tile.rs` — hardcodes RGBA8 (`TILE_BYTES`, `pixel_mut`
+  returning `&mut [u8]`) and documents straight alpha.
+- `openpaint-core/src/canvas.rs` — `blend_pixel` blends in sRGB space with u8
+  rounding.
+- `openpaint-app/src/canvas_renderer.rs` — imports `TILE_BYTES` and creates an
+  `Rgba8Unorm` texture, so the format is an API-surface fact, not internal.
+
+On-disk storage format is a **separate, later** decision (Q6) — 16-bit in memory
+does not oblige 16-bit on disk.
+
 ---
 
 ## 5. Document model — the core differentiator
