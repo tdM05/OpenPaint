@@ -898,6 +898,146 @@ mod tests {
         }
     }
 
+    /// **The eraser is the same brush.** Every brush property must reach it identically, and not
+    /// because someone remembered to wire each one up twice.
+    ///
+    /// Pinned as an exact identity rather than a spot check. Paint a stroke onto a transparent
+    /// layer and it *adds* coverage; erase the same stroke from an opaque layer and it *removes*
+    /// the same coverage. So for every pixel:
+    ///
+    /// ```text
+    /// alpha(painted) + alpha(erased from opaque) == 1
+    /// ```
+    ///
+    /// That holds for any radius, hardness, flow, spacing, pressure or opacity, because all of
+    /// them act on the accumulated coverage and nothing else -- and it keeps holding for
+    /// properties that do not exist yet, which is the actual point. A future brush feature
+    /// honoured on the paint path but forgotten on the erase path breaks this test.
+    #[test]
+    fn every_brush_property_reaches_the_eraser() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        const SIDE: u32 = 300;
+
+        // radius, hardness, flow, opacity, spacing -- deliberately awkward values, including a
+        // flow and opacity below 1 so the ceiling and the build-up are both in play.
+        let settings = [
+            (30.0_f32, 1.0_f32, 1.0_f32, 1.0_f32, 0.25_f32),
+            (18.0, 0.0, 1.0, 1.0, 0.25),
+            (24.0, 0.5, 0.35, 0.6, 0.1),
+            (8.0, 0.75, 0.8, 0.45, 0.5),
+        ];
+
+        for (radius, hardness, flow, opacity, spacing) in settings {
+            let mut editor = Editor::new();
+            editor.resize_page(openpaint_core::PageRect::from_size(SIDE, SIDE));
+            let page = editor.page_rect();
+
+            let mut layer = test_stroke_layer(&device);
+            let mut canvas = test_canvas(&device, page, &layer);
+            let mut history = History::new(&device);
+            let mut recording = Vec::new();
+            let mut recording_paint = ([0.0; 4], 1.0, false);
+
+            let painted_id = editor.active_layer_id();
+            editor.document_mut().add_layer();
+            let erased_id = editor.active_layer_id();
+
+            // The layer the eraser works on starts fully opaque, so what it removes is visible as
+            // what is left.
+            {
+                let mut cpu = openpaint_core::Canvas::new(SIDE, SIDE);
+                for y in 0..SIDE as i32 {
+                    for x in 0..SIDE as i32 {
+                        cpu.replace_pixel(x, y, [1.0, 1.0, 1.0, 1.0]);
+                    }
+                }
+                let mut enc = device.create_command_encoder(&Default::default());
+                canvas.upload_dirty(&device, &queue, &mut enc, LayerId(erased_id), &mut cpu);
+                queue.submit(std::iter::once(enc.finish()));
+            }
+
+            // Identical settings on both tools, and identical geometry: the same calls, so the
+            // same dabs.
+            let apply = |b: &mut openpaint_core::Brush| {
+                b.radius = radius;
+                b.hardness = hardness;
+                b.flow = flow;
+                b.opacity = opacity;
+                b.spacing = spacing;
+            };
+
+            for (tool, target) in [
+                (crate::editor::Tool::Brush, painted_id),
+                (crate::editor::Tool::Eraser, erased_id),
+            ] {
+                editor.set_tool(tool);
+                apply(editor.brush_mut());
+                // Pressure varies along the stroke, so the pressure response is in play too.
+                editor.stroke_begin(60.0, 120.0, 0.4);
+                editor.stroke_to(150.0, 170.0, 0.9);
+                editor.stroke_to(240.0, 120.0, 0.6);
+                editor.stroke_end();
+                run_frame_on(
+                    &device,
+                    &queue,
+                    &mut canvas,
+                    &mut layer,
+                    &mut history,
+                    &mut recording,
+                    &mut recording_paint,
+                    &mut editor,
+                    target,
+                );
+            }
+
+            let painted = crate::test_gpu::readback_tile(
+                &device,
+                &queue,
+                &canvas,
+                LayerId(painted_id),
+                (0, 0),
+            )
+            .expect("the painted layer should be resident");
+            let erased = crate::test_gpu::readback_tile(
+                &device,
+                &queue,
+                &canvas,
+                LayerId(erased_id),
+                (0, 0),
+            )
+            .expect("the erased layer should be resident");
+
+            let mut touched = false;
+            for y in 0..SIDE as usize {
+                for x in 0..SIDE as usize {
+                    let i = y * openpaint_core::tile::TILE_SIZE + x;
+                    if x >= openpaint_core::tile::TILE_SIZE || y >= openpaint_core::tile::TILE_SIZE
+                    {
+                        continue;
+                    }
+                    let added = painted[i][3];
+                    let left = erased[i][3];
+                    if added > 0.02 {
+                        touched = true;
+                    }
+                    assert!(
+                        (added + left - 1.0).abs() < 0.02,
+                        "at ({x}, {y}) with radius {radius} hardness {hardness} flow {flow} \
+                         opacity {opacity} spacing {spacing}: brush added {added} but eraser \
+                         left {left}; they should sum to 1"
+                    );
+                }
+            }
+            assert!(
+                touched,
+                "the stroke painted nothing, so the test proved nothing"
+            );
+        }
+    }
+
     /// Drain the editor's pending commands through the executor, as `redraw` does.
     #[allow(clippy::too_many_arguments)]
     fn run_frame(

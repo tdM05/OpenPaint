@@ -148,19 +148,48 @@ struct OpenPaint {
     /// [`ApplicationHandler::about_to_wait`], the one place winit guarantees no foreign frame is
     /// on the stack. Same rule as draining pen input, for the same reason.
     pending_dialog: Option<Dialog>,
+    /// The unsaved-changes prompt, drawn in-app rather than as a native dialog.
+    ///
+    /// Native only where it is unavoidable -- a file picker cannot be reimplemented, a
+    /// three-button question can. Every native modal runs its own message loop, which is this
+    /// project's most expensive recurring bug (Q10c), so the fewer of them the better. Drawing it
+    /// ourselves also means it cannot end up behind the window, which is precisely how the first
+    /// version broke.
+    pending_confirm: Option<Confirm>,
+    /// An action to run once a save the user asked for has succeeded.
+    after_save: Option<Dialog>,
 }
 
-/// Something that needs a modal dialog, deferred to a safe point.
+/// A pending "you have unsaved changes" question.
+#[derive(Clone, Copy, Debug)]
+struct Confirm {
+    /// What to do if the user goes ahead.
+    then: Dialog,
+    /// What they are about to do, for the prompt.
+    what: &'static str,
+}
+
+/// Something that needs a native dialog, deferred to a safe point.
+///
+/// `confirmed` distinguishes "check for unsaved edits first" from "the user has already answered
+/// that question". The unsaved-changes prompt is drawn in-app, so answering it parks a second
+/// request rather than continuing inline -- a native file picker still must not be opened from a
+/// frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Dialog {
     /// Save, asking for a path only if there is not one yet.
     Save,
     /// Always ask for a path.
     SaveAs,
-    Open,
-    New,
-    /// The window wants to close and there are unsaved edits.
-    ConfirmQuit,
+    Open {
+        confirmed: bool,
+    },
+    New {
+        confirmed: bool,
+    },
+    Quit {
+        confirmed: bool,
+    },
 }
 
 /// In-progress canvas navigation.
@@ -221,6 +250,8 @@ impl Default for OpenPaint {
             document_path: None,
             dirty: false,
             pending_dialog: None,
+            pending_confirm: None,
+            after_save: None,
         }
     }
 }
@@ -237,7 +268,10 @@ impl OpenPaint {
                 // Don't paint underneath the UI. This check is needed for the pen
                 // specifically, because pen input never reaches egui and so egui's
                 // own pointer capture cannot exclude it (OPEN_QUESTIONS Q14).
-                if self.ui_blocks_point(sample) || self.nav.is_active() {
+                if self.ui_blocks_point(sample)
+                    || self.nav.is_active()
+                    || self.pending_confirm.is_some()
+                {
                     return;
                 }
                 // The crop tool consumes input entirely: no painting while it is up.
@@ -751,53 +785,73 @@ impl OpenPaint {
                 } else {
                     self.save_as();
                 }
+                self.continue_after_save();
             }
-            Dialog::SaveAs => self.save_as(),
-            Dialog::Open => {
-                if self.confirm_discard("Open another document") {
+            Dialog::SaveAs => {
+                self.save_as();
+                self.continue_after_save();
+            }
+            Dialog::Open { confirmed } => {
+                if confirmed || !self.dirty {
                     self.open_with_dialog();
+                } else {
+                    self.ask_confirm(Dialog::Open { confirmed: true }, "open another document");
                 }
             }
-            Dialog::New => {
-                if self.confirm_discard("Start a new document") {
+            Dialog::New { confirmed } => {
+                if confirmed || !self.dirty {
                     self.new_document();
+                } else {
+                    self.ask_confirm(Dialog::New { confirmed: true }, "start a new document");
                 }
             }
-            Dialog::ConfirmQuit => {
-                if self.confirm_discard("Quit") {
+            Dialog::Quit { confirmed } => {
+                if confirmed || !self.dirty {
                     event_loop.exit();
+                } else {
+                    self.ask_confirm(Dialog::Quit { confirmed: true }, "quit");
                 }
             }
         }
     }
 
-    /// Ask before throwing away unsaved edits. Returns whether to go ahead.
-    ///
-    /// Offers to save rather than only warning: a dialog whose only options are "lose your work"
-    /// and "cancel" makes the user do the saving by hand, which is exactly when they forget.
-    fn confirm_discard(&mut self, what: &str) -> bool {
-        if !self.dirty {
-            return true;
-        }
-        let answer = rfd::MessageDialog::new()
-            .set_title("Unsaved changes")
-            .set_description(format!(
-                "{what} without saving? The current document has changes that are not in a file."
-            ))
-            .set_buttons(rfd::MessageButtons::YesNoCancel)
-            .show();
-        match answer {
-            // Yes: save first, and only continue if that actually worked.
-            rfd::MessageDialogResult::Yes => {
-                if self.document_path.is_some() {
-                    self.save_to_current_path();
-                } else {
-                    self.save_as();
-                }
-                !self.dirty
+    /// Put the unsaved-changes question on screen.
+    fn ask_confirm(&mut self, then: Dialog, what: &'static str) {
+        self.pending_confirm = Some(Confirm { then, what });
+        self.request_redraw();
+    }
+
+    /// Act on the answer to the unsaved-changes question.
+    fn answer_confirm(&mut self, choice: ui::ConfirmChoice) {
+        let Some(confirm) = self.pending_confirm.take() else {
+            return;
+        };
+        match choice {
+            ui::ConfirmChoice::Cancel => {}
+            ui::ConfirmChoice::Discard => {
+                self.pending_dialog = Some(confirm.then);
             }
-            rfd::MessageDialogResult::No => true,
-            _ => false,
+            ui::ConfirmChoice::SaveFirst => {
+                // Saving may itself need a native path picker, so it goes through the deferred
+                // path like everything else, and the original action waits for it to succeed.
+                self.after_save = Some(confirm.then);
+                self.pending_dialog = Some(Dialog::Save);
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Run whatever was waiting on a save, but only if the save actually happened.
+    ///
+    /// A cancelled or failed save must not be treated as permission to discard the work.
+    fn continue_after_save(&mut self) {
+        let next = self.after_save.take();
+        if self.dirty {
+            return;
+        }
+        if let Some(next) = next {
+            self.pending_dialog = Some(next);
+            self.request_redraw();
         }
     }
 
@@ -828,7 +882,13 @@ impl OpenPaint {
             .as_ref()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "untitled.openpaint".to_owned());
+        let Some(window) = self.renderer.as_ref().map(|r| r.window().clone()) else {
+            return;
+        };
+        // Owned by our window. Without a parent, Windows can place a modal dialog *behind* it:
+        // you hear it appear, cannot see it, and the app is blocked on something invisible.
         let Some(path) = rfd::FileDialog::new()
+            .set_parent(window.as_ref())
             .add_filter("OpenPaint document", &[DOCUMENT_EXTENSION])
             .set_file_name(suggested)
             .save_file()
@@ -848,7 +908,11 @@ impl OpenPaint {
 
     /// Ask for a file, then open it.
     fn open_with_dialog(&mut self) {
+        let Some(window) = self.renderer.as_ref().map(|r| r.window().clone()) else {
+            return;
+        };
         let Some(path) = rfd::FileDialog::new()
+            .set_parent(window.as_ref())
             .add_filter("OpenPaint document", &[DOCUMENT_EXTENSION])
             .pick_file()
         else {
@@ -987,11 +1051,11 @@ impl OpenPaint {
                         return true;
                     }
                     "o" | "O" => {
-                        self.request_dialog(Dialog::Open);
+                        self.request_dialog(Dialog::Open { confirmed: false });
                         return true;
                     }
                     "n" | "N" => {
-                        self.request_dialog(Dialog::New);
+                        self.request_dialog(Dialog::New { confirmed: false });
                         return true;
                     }
                     "e" | "E" => {
@@ -1253,6 +1317,7 @@ impl OpenPaint {
         let mut trim_request = false;
         let mut layer_request = None;
         let mut tool_request = None;
+        let mut confirm_request = None;
         let mut page_request = None;
         let history_status = renderer.history_status();
         let residency = renderer.residency();
@@ -1268,6 +1333,7 @@ impl OpenPaint {
         let layers = editor.layers().to_vec();
         let active_index = editor.active_layer_index();
         let active_tool = editor.tool();
+        let confirm_prompt = self.pending_confirm.map(|c| c.what);
         let page_count = editor.document().page_count();
         let active_page = editor.document().active_index();
         let window = renderer.window().clone();
@@ -1295,6 +1361,7 @@ impl OpenPaint {
                         active_layer: active_index,
                         pages: (page_count, active_page),
                         tool: active_tool,
+                        confirm: confirm_prompt,
                     },
                 );
                 ui_wants_repaint = out.wants_repaint;
@@ -1304,6 +1371,7 @@ impl OpenPaint {
                 layer_request = out.layer;
                 page_request = out.page;
                 tool_request = out.tool;
+                confirm_request = out.confirm;
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
@@ -1331,6 +1399,9 @@ impl OpenPaint {
             self.status_message = Some(
                 "Too much of the canvas is visible at once to keep on the GPU; zoom in.".to_owned(),
             );
+        }
+        if let Some(choice) = confirm_request {
+            self.answer_confirm(choice);
         }
         if let Some(tool) = tool_request {
             self.editor.set_tool(tool);
@@ -1375,8 +1446,7 @@ impl OpenPaint {
         match &event {
             WindowEvent::CloseRequested => {
                 if self.dirty {
-                    // Ask, but not from here: the dialog would pump the message queue mid-event.
-                    self.request_dialog(Dialog::ConfirmQuit);
+                    self.request_dialog(Dialog::Quit { confirmed: false });
                 } else {
                     event_loop.exit();
                 }
@@ -1412,6 +1482,28 @@ impl OpenPaint {
             renderer.window().request_redraw();
             if consumed {
                 return;
+            }
+        }
+
+        // The unsaved-changes prompt claims Enter and Escape while it is up, and takes
+        // precedence over the crop tool: it is a question that has to be answered.
+        if self.pending_confirm.is_some() {
+            if let WindowEvent::KeyboardInput { event: key, .. } = &event {
+                use winit::event::ElementState;
+                use winit::keyboard::{Key, NamedKey};
+                if key.state == ElementState::Pressed {
+                    match key.logical_key {
+                        Key::Named(NamedKey::Enter) => {
+                            self.answer_confirm(ui::ConfirmChoice::SaveFirst);
+                            return;
+                        }
+                        Key::Named(NamedKey::Escape) => {
+                            self.answer_confirm(ui::ConfirmChoice::Cancel);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
 

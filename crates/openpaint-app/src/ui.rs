@@ -51,6 +51,17 @@ pub struct CropOverlay {
     pub handles: [[f32; 2]; 8],
 }
 
+/// What the user answered to "you have unsaved changes".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmChoice {
+    /// Save, then do the thing.
+    SaveFirst,
+    /// Do the thing and lose the changes.
+    Discard,
+    /// Do nothing.
+    Cancel,
+}
+
 /// A change the page panel wants made to the document.
 ///
 /// Returned rather than applied, for the same reason as [`LayerAction`]: pages own GPU tiles and
@@ -121,6 +132,8 @@ pub struct Status<'a> {
     pub pages: (usize, usize),
     /// The tool strokes currently use.
     pub tool: Tool,
+    /// Set while an unsaved-changes question is waiting, describing what is about to happen.
+    pub confirm: Option<&'static str>,
 }
 
 /// What the panel wants the app to do, collected during the frame.
@@ -141,6 +154,8 @@ pub struct Outcome {
     pub page: Option<PageAction>,
     /// Switch tool.
     pub tool: Option<Tool>,
+    /// The answer to the unsaved-changes question, if one was given.
+    pub confirm: Option<ConfirmChoice>,
 }
 
 pub struct Ui {
@@ -234,6 +249,7 @@ impl Ui {
         let mut layer_action = None;
         let mut page_action = None;
         let mut tool_action = None;
+        let mut confirm_choice = None;
 
         let output = self.ctx.run(input, |ctx| {
             egui::SidePanel::left("brush-panel")
@@ -605,6 +621,36 @@ impl Ui {
                 });
         });
 
+        if let Some(what) = status.confirm {
+            egui::Window::new("Unsaved changes")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&self.ctx, |ui| {
+                    ui.label(format!(
+                        "This document has changes that are not in a file. Save before you {what}?"
+                    ));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        // Save first, and leftmost, because it is the answer that loses nothing.
+                        if ui.button("Save").clicked() {
+                            confirm_choice = Some(ConfirmChoice::SaveFirst);
+                        }
+                        if ui.button("Discard").clicked() {
+                            confirm_choice = Some(ConfirmChoice::Discard);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            confirm_choice = Some(ConfirmChoice::Cancel);
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new("Enter saves, Escape cancels.")
+                            .small()
+                            .weak(),
+                    );
+                });
+        }
+
         // Paint the crop outline over the canvas. Deliberately painted, not built from
         // widgets: egui never sees pen input (Q14), so widget handles would be
         // mouse-only. Input is handled in the app's own path instead.
@@ -703,6 +749,7 @@ impl Ui {
             layer: layer_action,
             page: page_action,
             tool: tool_action,
+            confirm: confirm_choice,
         }
     }
 }

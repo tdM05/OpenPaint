@@ -727,6 +727,21 @@ hazard. So a request is parked and serviced from `about_to_wait`, the one place 
 no foreign frame is on the stack. Exactly the same rule, for exactly the same reason, as
 draining pen input (see the note at the top of `main.rs`).
 
+**Native only where it is unavoidable.** The first version used a native message box for the
+unsaved-changes question and it broke on contact: with no parent window, Windows placed the modal
+*behind* the app — audible, invisible, and blocking, so the app looked frozen. Two changes came
+out of that:
+- File pickers are parented to our window (`set_parent`). A modal with no owner has no z-order
+  relationship to the window it is blocking.
+- **The unsaved-changes question is drawn in-app, in egui.** A file browser cannot be
+  reimplemented; a three-button question can. Every native modal runs its own message loop, which
+  is this project's most expensive recurring bug, so the fewer the better — and one we draw
+  ourselves cannot end up behind the window at all. It also blocks painting while it is up, and
+  answers to Enter and Escape.
+
+The prompt **offers to save**, and only proceeds if the save actually succeeded: a cancelled or
+failed save is not permission to discard the work.
+
 `rfd` is the dependency. Its `xdg-portal` backend is on by default and `gtk3` is off, so Linux
 needs no GTK development packages — which matters for §6's "cross-platform by construction".
 

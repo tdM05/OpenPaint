@@ -158,9 +158,9 @@ Answers to what this question actually asked:
   the hard part and it is done.
 
 **Still open around the format:**
-- **A file dialog**, so Save As / Open can choose a path. Currently a fixed name in the
-  working directory. Blocked on nothing except care: a modal native dialog pumps the Windows
-  message queue, which is the Q10c reentrancy hazard, so it needs handling deliberately.
+- ✅ **A file dialog** — done. See DECISIONS §7; native pickers are parented to the window and
+  serviced from `about_to_wait`, and the unsaved-changes question is drawn in-app rather than
+  as a native modal, after the native one shipped broken (invisible behind the window).
 - **Autosave and crash recovery**, which is what actually protects work between saves.
 - **PSD import** (DECISIONS §7 wants it early for adoption) and the webcomic exports
   (CBZ / PDF / image sequence with strip slicing).
