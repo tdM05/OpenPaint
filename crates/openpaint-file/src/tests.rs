@@ -76,7 +76,7 @@ fn patterned(seed: u32) -> Tile {
 fn a_document_round_trips_exactly() {
     let f = TempFile::new("structure");
     let doc = sample();
-    save(f.path(), &doc, []).expect("save");
+    save(f.path(), &doc, [], &[]).expect("save");
     let back = load(f.path()).expect("load");
 
     assert_eq!(back.document.page_count(), doc.page_count());
@@ -111,7 +111,7 @@ fn layer_ids_survive_and_the_counter_stays_ahead() {
         .expect("page")
         .remove_layer(1)
         .expect("removable");
-    save(f.path(), &doc, []).expect("save");
+    save(f.path(), &doc, [], &[]).expect("save");
     let mut back = load(f.path()).expect("load");
 
     let ids: Vec<u32> = doc
@@ -170,6 +170,7 @@ fn tiles_round_trip_bit_for_bit() {
         f.path(),
         &doc,
         refs.iter().copied().zip(originals.iter().cloned()),
+        &[],
     )
     .expect("save");
     let back = load(f.path()).expect("load");
@@ -199,7 +200,7 @@ fn tiles_outside_the_page_are_saved() {
         coord: (5, 5),
     };
 
-    save(f.path(), &doc, [(far, patterned(9))]).expect("save");
+    save(f.path(), &doc, [(far, patterned(9))], &[]).expect("save");
     let back = load(f.path()).expect("load");
     assert!(
         back.tiles.contains_key(&far),
@@ -259,11 +260,11 @@ fn saving_twice_replaces_rather_than_accumulates() {
         layer_id: 0,
         coord: (1, 1),
     };
-    save(f.path(), &doc, [(key, patterned(1))]).expect("first save");
+    save(f.path(), &doc, [(key, patterned(1))], &[]).expect("first save");
 
     // A smaller document over the top of a larger one: the extra page must not linger.
     let doc2 = Document::new(Page::new(200, 200));
-    save(f.path(), &doc2, [(key, patterned(2))]).expect("second save");
+    save(f.path(), &doc2, [(key, patterned(2))], &[]).expect("second save");
 
     let back = load(f.path()).expect("load");
     assert_eq!(back.document.page_count(), 1, "the old page survived");
@@ -280,7 +281,7 @@ fn saving_twice_replaces_rather_than_accumulates() {
 #[test]
 fn a_newer_file_is_refused() {
     let f = TempFile::new("newer");
-    save(f.path(), &sample(), []).expect("save");
+    save(f.path(), &sample(), [], &[]).expect("save");
     {
         let db = rusqlite::Connection::open(f.path()).expect("open");
         db.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
@@ -296,7 +297,7 @@ fn a_newer_file_is_refused() {
     }
     // And saving into it must refuse too, rather than writing our schema over theirs.
     assert!(matches!(
-        save(f.path(), &sample(), []),
+        save(f.path(), &sample(), [], &[]),
         Err(Error::TooNew { .. })
     ));
 }
@@ -369,7 +370,7 @@ fn a_version_one_file_migrates() {
     );
 
     // Saving migrates the file, keeps the tile, and leaves it at the current version.
-    save(f.path(), &back.document, []).expect("save over a v1 file");
+    save(f.path(), &back.document, [], &[]).expect("save over a v1 file");
     {
         let db = rusqlite::Connection::open(f.path()).expect("reopen");
         let version: i32 = db
@@ -430,7 +431,7 @@ fn a_foreign_file_is_rejected() {
 #[test]
 fn an_unknown_blend_mode_is_reported() {
     let f = TempFile::new("blend");
-    save(f.path(), &sample(), []).expect("save");
+    save(f.path(), &sample(), [], &[]).expect("save");
     {
         let db = rusqlite::Connection::open(f.path()).expect("open");
         db.execute("UPDATE layer SET blend = 'hard-light' WHERE idx = 1", [])
@@ -466,7 +467,7 @@ fn two_pages_keep_their_tiles_apart() {
         layer_id: second_layer,
         coord: (0, 0),
     };
-    save(f.path(), &doc, [(a, patterned(1)), (b, patterned(2))]).expect("save");
+    save(f.path(), &doc, [(a, patterned(1)), (b, patterned(2))], &[]).expect("save");
 
     let back = load(f.path()).expect("load");
     assert_eq!(back.document.page_count(), 2);
@@ -492,7 +493,7 @@ fn pages_keep_their_own_geometry() {
     doc.active_mut().set_dpi(600.0);
     doc.set_active(0);
 
-    save(f.path(), &doc, []).expect("save");
+    save(f.path(), &doc, [], &[]).expect("save");
     let back = load(f.path()).expect("load");
     assert_eq!(
         back.document.page(0).expect("page").rect(),
@@ -518,4 +519,86 @@ fn every_blend_mode_has_a_stable_name() {
             "{name} did not round trip"
         );
     }
+}
+
+/// Metadata survives a round trip, because autosave's recovery depends on it.
+#[test]
+fn metadata_round_trips() {
+    let f = TempFile::new("meta");
+    save(
+        f.path(),
+        &sample(),
+        [],
+        &[
+            ("autosave.recovery", "1"),
+            ("autosave.original_path", r"C:\art\page one.openpaint"),
+        ],
+    )
+    .expect("save");
+
+    let back = load(f.path()).expect("load");
+    assert_eq!(
+        back.meta.get("autosave.recovery").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        back.meta.get("autosave.original_path").map(String::as_str),
+        Some(r"C:\art\page one.openpaint"),
+        "a path with spaces and backslashes has to survive verbatim"
+    );
+
+    // And the cheap reader agrees with the full load, since autosave uses it at startup instead of
+    // paying for every tile.
+    let only_meta = read_meta(f.path()).expect("read_meta");
+    assert_eq!(only_meta, back.meta);
+}
+
+/// A later save must replace metadata, not accumulate it.
+///
+/// Otherwise a document saved normally would keep the `autosave.recovery` marker it picked up from
+/// having once been a recovery copy, and every launch would offer to recover a file that is safe.
+#[test]
+fn metadata_is_replaced_not_merged() {
+    let f = TempFile::new("meta-replace");
+    save(f.path(), &sample(), [], &[("autosave.recovery", "1")]).expect("first save");
+    save(f.path(), &sample(), [], &[]).expect("second save");
+
+    let back = load(f.path()).expect("load");
+    assert!(
+        back.meta.is_empty(),
+        "stale metadata survived a save that specified none: {:?}",
+        back.meta
+    );
+}
+
+/// A file with no `meta` table at all reads as having no metadata.
+///
+/// This is the pre-v3 case, and the reason `load` tolerates the table's absence rather than
+/// branching on the schema version: absence reads as absence.
+#[test]
+fn a_file_without_the_meta_table_still_loads() {
+    let f = TempFile::new("meta-absent");
+    save(f.path(), &sample(), [], &[("gone", "soon")]).expect("save");
+    {
+        let db = rusqlite::Connection::open(f.path()).expect("reopen");
+        db.execute_batch("DROP TABLE meta").expect("drop meta");
+        // Pretend it was written by the version that had no such table.
+        db.pragma_update(None, "user_version", 2)
+            .expect("downgrade");
+    }
+
+    let back = load(f.path()).expect("a v2 file must still load");
+    assert!(back.meta.is_empty());
+    assert!(read_meta(f.path()).expect("read_meta").is_empty());
+
+    // And saving brings the table back rather than failing on its absence.
+    save(f.path(), &back.document, [], &[("back", "again")]).expect("save migrates");
+    assert_eq!(
+        load(f.path())
+            .expect("load")
+            .meta
+            .get("back")
+            .map(String::as_str),
+        Some("again")
+    );
 }

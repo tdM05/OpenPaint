@@ -401,6 +401,7 @@ impl Renderer {
         &mut self,
         document: &openpaint_core::Document,
         path: &std::path::Path,
+        meta: &[(&str, &str)],
     ) -> Result<usize, openpaint_file::Error> {
         // Page index per layer id, so a tile can be filed under the page its layer belongs to.
         let mut page_of_layer = std::collections::HashMap::new();
@@ -428,7 +429,7 @@ impl Renderer {
                 tile,
             ))
         });
-        openpaint_file::save(path, document, refs)?;
+        openpaint_file::save(path, document, refs, meta)?;
         Ok(count)
     }
 

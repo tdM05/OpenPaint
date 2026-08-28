@@ -154,14 +154,20 @@ Answers to what this question actually asked:
   misread; older ones migrate.
 - **Thumbnail/preview embedding**: not yet. It wants the page-management UI to exist first,
   since that is what would display them.
-- **Autosave/recovery**: not yet, and now straightforward -- the transaction discipline is
-  the hard part and it is done.
+- ~~**Autosave/recovery**~~ **DONE** 2026-08-28 (`autosave.rs`, DECISIONS §7a). A recovery copy is
+  an ordinary `.openpaint` file in the OS data directory, written every 60 s while there are
+  unsaved changes and removed the instant there are not -- so one surviving to the next launch
+  *is* the crash signal. Format v3 added a `meta` table so the copy remembers which document it
+  belongs to. Still open: **incremental saving**, if the panel's autosave timing says the 60 s
+  interval is expensive on a large document (tiles are individually keyed rows, so only the
+  changed ones need writing); and **two instances at once**, where the second offers to recover
+  the first's live document -- harmless duplication, and a proper fix needs an OS file lock.
 
 **Still open around the format:**
 - ✅ **A file dialog** — done. See DECISIONS §7; native pickers are parented to the window and
   serviced from `about_to_wait`, and the unsaved-changes question is drawn in-app rather than
   as a native modal, after the native one shipped broken (invisible behind the window).
-- **Autosave and crash recovery**, which is what actually protects work between saves.
+- ✅ **Autosave and crash recovery** — done, see above and DECISIONS §7a.
 - **PSD import** (DECISIONS §7 wants it early for adoption) and the webcomic exports
   (CBZ / PDF / image sequence with strip slicing).
 

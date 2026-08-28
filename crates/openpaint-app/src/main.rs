@@ -33,6 +33,7 @@
 //!   2. **Guard our handlers against reentrancy** (`in_dispatch`), so a nested
 //!      pump can never re-enter our GPU or input work part-way through.
 
+mod autosave;
 mod canvas_renderer;
 mod crop;
 mod editor;
@@ -168,6 +169,10 @@ struct OpenPaint {
     pending_sample_ms: Option<f64>,
     /// Rolling latency and frame-time measurements.
     perf: perf::Perf,
+    /// Periodic recovery copies, and the abandoned one found at startup.
+    autosave: autosave::Autosave,
+    /// An abandoned recovery copy waiting for the user to accept or discard it.
+    recovery: Option<autosave::Recoverable>,
     /// Path smoothing, applied between the pen and the brush.
     ///
     /// Lives here rather than in [`Editor`] because it conditions *input*, and input is the
@@ -283,6 +288,8 @@ impl Default for OpenPaint {
             file_dialog: None,
             pending_sample_ms: None,
             perf: perf::Perf::default(),
+            autosave: autosave::Autosave::new(),
+            recovery: None,
             stabilizer: openpaint_core::Stabilizer::default(),
         }
     }
@@ -306,6 +313,7 @@ impl OpenPaint {
                 if self.ui_blocks_point(sample.x, sample.y)
                     || self.nav.is_active()
                     || self.pending_confirm.is_some()
+                    || self.recovery.is_some()
                 {
                     return;
                 }
@@ -914,6 +922,78 @@ impl OpenPaint {
         }
     }
 
+    /// Note that the document matches its file, and throw away the recovery copy.
+    ///
+    /// The two belong together: a recovery copy exists *only* while there is unsaved work, which is
+    /// what makes one surviving to the next launch mean "that process died" rather than merely
+    /// "that process ran". Every path that makes the document clean goes through here.
+    fn mark_clean(&mut self) {
+        self.dirty = false;
+        self.autosave.discard();
+        self.update_title();
+    }
+
+    /// Write a recovery copy if one is due.
+    ///
+    /// Skipped mid-stroke: a save reads every resident tile back off the GPU, which would both
+    /// hitch the one thing that must never hitch and capture a stroke halfway through.
+    fn maybe_autosave(&mut self) {
+        if !self.autosave.is_due(self.dirty, self.editor.is_drawing()) {
+            return;
+        }
+        let Some(path) = self.autosave.path().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+
+        // The document it belongs to, so recovery can hand back something that still knows where it
+        // lives instead of an untitled orphan.
+        let original = self
+            .document_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        let mut meta: Vec<(&str, &str)> = vec![(autosave::IS_RECOVERY, "1")];
+        if let Some(original) = original.as_deref() {
+            meta.push((autosave::ORIGINAL_PATH, original));
+        }
+
+        let started = Instant::now();
+        let document = self.editor.document();
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        match renderer.save_document(document, &path, &meta) {
+            Ok(tiles) => self.autosave.record(started.elapsed(), tiles),
+            Err(e) => {
+                // Not a status message: autosave is background work the user did not ask for, and
+                // interrupting them about it every minute would be worse than the failure. The
+                // panel shows that it has not run, which is the honest signal.
+                eprintln!("autosave failed: {e}");
+                self.autosave.postpone();
+            }
+        }
+    }
+
+    /// Load an abandoned recovery copy as the live document.
+    ///
+    /// It comes back **dirty and pointed at the original file**, not at the copy: the work in it was
+    /// never saved, so pretending otherwise would let the next Ctrl+S write into the recovery
+    /// directory and leave the artist's real file untouched.
+    fn recover(&mut self, recoverable: &autosave::Recoverable) {
+        let from = recoverable.path.clone();
+        self.load_from(&from);
+        self.document_path = recoverable.original.clone();
+        self.dirty = true;
+        self.update_title();
+        self.status_message = Some(match self.document_path.as_ref() {
+            Some(p) => format!("Recovered unsaved changes to {}", p.display()),
+            None => "Recovered an unsaved document -- save it somewhere".to_owned(),
+        });
+        // The work is live in this session now, and this session has its own copy to protect it,
+        // so the abandoned one has done its job.
+        let _ = std::fs::remove_file(&from);
+        self.request_redraw();
+    }
+
     /// Show the document's name and whether it has unsaved edits.
     ///
     /// In the title bar rather than the panel because it has to be true even when the panel is
@@ -1032,9 +1112,9 @@ impl OpenPaint {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        match renderer.save_document(document, &path) {
+        match renderer.save_document(document, &path, &[]) {
             Ok(tiles) => {
-                self.dirty = false;
+                self.mark_clean();
                 self.status_message = Some(format!("Saved {tiles} tiles to {}", path.display()));
             }
             Err(e) => self.status_message = Some(format!("Save failed: {e}")),
@@ -1162,8 +1242,7 @@ impl OpenPaint {
         // A fresh document deserves a fresh view; its page is very likely a different size.
         self.view.request_fit();
         self.document_path = Some(path.to_path_buf());
-        self.dirty = false;
-        self.update_title();
+        self.mark_clean();
         self.status_message = Some(format!(
             "Opened {} ({pages} page{})",
             path.display(),
@@ -1187,8 +1266,7 @@ impl OpenPaint {
         }
         self.view.request_fit();
         self.document_path = None;
-        self.dirty = false;
-        self.update_title();
+        self.mark_clean();
         self.status_message = Some("New document".to_owned());
         self.request_redraw();
     }
@@ -1519,6 +1597,20 @@ impl OpenPaint {
         });
         let brush_cursor = self.brush_cursor();
         let perf = self.perf.snapshot();
+        let recovery_prompt = self.recovery.as_ref().map(autosave::Recoverable::describe);
+        // Built here rather than in the panel so the panel stays a renderer of state. It reports
+        // the *cost* as well as the time, because that number is what decides whether the 60 s
+        // interval is affordable or whether saving has to become incremental.
+        let autosave_status = match self.autosave.last() {
+            Some((_, took, tiles)) => {
+                format!("Autosave: {tiles} tiles in {} ms", took.as_millis().max(1))
+            }
+            None if !self.autosave.available() => {
+                "Autosave: unavailable (no writable data directory)".to_owned()
+            }
+            None if self.dirty => "Autosave: due within a minute".to_owned(),
+            None => "Autosave: nothing unsaved".to_owned(),
+        };
 
         // Disjoint field borrows, so the overlay closure can touch the editor and
         // the UI while the renderer is mutably borrowed.
@@ -1572,6 +1664,7 @@ impl OpenPaint {
         let mut layer_request = None;
         let mut tool_request = None;
         let mut confirm_request = None;
+        let mut recovery_request = None;
         let mut page_request = None;
         let history_status = renderer.history_status();
         let residency = renderer.residency();
@@ -1622,6 +1715,8 @@ impl OpenPaint {
                         confirm: confirm_prompt,
                         brush_cursor,
                         perf,
+                        recovery: recovery_prompt.as_deref(),
+                        autosave: &autosave_status,
                     },
                 );
                 ui_wants_repaint = out.wants_repaint;
@@ -1632,6 +1727,7 @@ impl OpenPaint {
                 page_request = out.page;
                 tool_request = out.tool;
                 confirm_request = out.confirm;
+                recovery_request = out.recovery;
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
@@ -1673,6 +1769,20 @@ impl OpenPaint {
         }
         if let Some(choice) = confirm_request {
             self.answer_confirm(choice);
+        }
+        if let Some(choice) = recovery_request {
+            // Taken either way: an offer answered is an offer gone, and leaving it set would put
+            // the prompt straight back up on the next frame.
+            if let Some(found) = self.recovery.take() {
+                match choice {
+                    ui::RecoveryChoice::Recover => self.recover(&found),
+                    ui::RecoveryChoice::Discard => {
+                        let _ = std::fs::remove_file(&found.path);
+                        self.status_message = Some("Discarded the recovered work".to_owned());
+                    }
+                }
+            }
+            self.request_redraw();
         }
         if let Some(tool) = tool_request {
             self.editor.set_tool(tool);
@@ -1844,6 +1954,14 @@ impl ApplicationHandler for OpenPaint {
                     renderer.surface_format(),
                     &window,
                 ));
+                // A recovery copy that outlived its process means that process died with unsaved
+                // work in it. Offered rather than loaded: the artist may well have moved on, and
+                // silently replacing whatever they just opened would be worse than losing it.
+                self.recovery = self.autosave.find_recoverable();
+                if let Some(found) = self.recovery.as_ref() {
+                    println!("recovery available: {}", found.path.display());
+                }
+
                 // Ask for the first frame explicitly. Redraws are demand-driven
                 // (strokes, resizes, and UI activity request them), so nothing
                 // else would paint the initial canvas.
@@ -1868,6 +1986,12 @@ impl ApplicationHandler for OpenPaint {
         self.in_dispatch = true;
         self.dispatch_window_event(event_loop, event);
         self.in_dispatch = false;
+    }
+
+    /// Clean exit: drop the recovery copy, so the next launch does not offer work that was never
+    /// actually lost.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.autosave.discard();
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -1907,6 +2031,11 @@ impl ApplicationHandler for OpenPaint {
         // waking whatever the input backend wants, or the line stops wherever it had reached.
         // Demand-driven painting is intact: there genuinely is demand.
         let converging = self.tick_stabilizer();
+
+        // Deliberately after the drain, like everything else here: it is safe work, but there is
+        // no reason for it to sit above an obligation. It also reads tiles back off the GPU, so
+        // `about_to_wait` -- with no foreign frame on the stack -- is where it belongs.
+        self.maybe_autosave();
 
         // A file dialog answers on another thread, so nothing else would wake the loop to notice.
         let awaiting_dialog = self.file_dialog.is_some();

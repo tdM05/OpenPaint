@@ -690,7 +690,7 @@ mod tests {
                     tile,
                 ))
             });
-        openpaint_file::save(&path, editor.document(), refs).expect("save");
+        openpaint_file::save(&path, editor.document(), refs, &[]).expect("save");
 
         let loaded = openpaint_file::load(&path).expect("load");
         let _ = std::fs::remove_file(&path);

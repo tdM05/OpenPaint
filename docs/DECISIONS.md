@@ -894,6 +894,54 @@ needs no GTK development packages — which matters for §6's "cross-platform by
 
 ---
 
+### 7a. Autosave writes ordinary documents — landed 2026-08-28
+
+Explicit saving protects the work you remembered to save. This protects the hour
+you were absorbed in, and it is the reason §7 chose a database over a zip: a zip
+would have made every autosave a full multi-hundred-megabyte rewrite.
+
+**A recovery copy is a real `.openpaint` file**, written with the same `save` as
+everything else. No second format to keep in step, and no recovery path that rots
+because nothing else exercises it. Format **v3** adds a `meta` key/value table so
+the copy records which document it belongs to (`autosave.original_path`) and that
+it is a copy at all (`autosave.recovery`). Kept general deliberately — that will
+not be the last thing a document needs to carry which is neither structure nor
+pixels — and additive, so the migration is `CREATE TABLE IF NOT EXISTS`.
+
+**Copies live in the OS per-user data directory, not beside the document.** That
+folder may be read-only, on removable media that is gone, or inside a sync folder
+that would cheerfully propagate a half-written temporary to every other machine.
+It is also not ours to litter.
+
+**A crash is detected by a copy outliving its process.** A copy exists only while
+the document is dirty and is deleted the moment it is not — on save, load, new, and
+`exiting`. So a copy present at startup means that process did not get to clean up.
+`mark_clean` is the single place that transition happens, because the invariant only
+holds if every route through it is the same route.
+
+**Recovery is offered, never applied.** The artist may have moved on, and silently
+replacing what they just opened would be worse than the crash. Accepting loads it
+**dirty and pointed at the original file** — the work in it was never saved, so
+letting the next Ctrl+S write into the recovery directory would leave their real
+file untouched while looking like success.
+
+**Skipped mid-stroke.** A save reads every resident tile back off the GPU, which
+mid-stroke would both hitch the one thing that must never hitch and capture a stroke
+halfway through.
+
+**The interval is 60 s, and the panel reports what a save cost.** Shorter is
+strictly better for the artist; the only thing pushing back is the price. So the
+price is measured and displayed rather than guessed at, the same discipline as §4f —
+and if it turns out to be expensive on a large document, the answer is incremental
+saving (tiles are individually keyed rows) rather than a longer interval.
+
+**Known limitation, recorded rather than hidden:** two instances at once. Each
+writes its own uniquely named copy, but the second to start will offer the first's
+live document. Accepting duplicates work in progress; it destroys nothing. Telling
+"abandoned" from "in use" needs an OS file lock, which is not worth a dependency
+until multiple windows exist.
+
+
 ## 8. Phased roadmap
 
 - **Phase 0 — Vertical slice (prove the feel):** repo scaffold + winit/wgpu

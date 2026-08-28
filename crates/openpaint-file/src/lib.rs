@@ -54,7 +54,7 @@ use openpaint_core::{Blend, Document, Layer, Page, PageRect};
 /// the counter proved derivable from the layers themselves. Both were `NOT NULL`, so a version-1
 /// *writer* cannot fill a version-2 file -- hence the bump. Reading needs no branch at all: a
 /// version-2 reader simply stops asking for them, which works on both.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// How a tile's bytes are encoded in the file.
 ///
@@ -139,6 +139,8 @@ impl From<std::io::Error> for Error {
 pub struct Loaded {
     pub document: Document,
     pub tiles: HashMap<TileRef, Tile>,
+    /// Whatever was in the `meta` table. Empty for a file written before v3.
+    pub meta: HashMap<String, String>,
 }
 
 /// Text names for blend modes, not integers.
@@ -235,6 +237,19 @@ const STRUCTURE_SCHEMA: &str = "
         );
         ";
 
+/// Free-form document metadata.
+///
+/// Added at v3 for autosave, which has to remember which file a recovery copy belongs to, and kept
+/// general because that will not be the last thing a document needs to carry that is neither
+/// structure nor pixels. A key/value table costs nothing when empty, migrates by existing, and
+/// cannot collide with a future column.
+const META_SCHEMA: &str = "
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        ) WITHOUT ROWID;
+        ";
+
 /// The tile table, which no migration has needed to touch.
 const TILE_SCHEMA: &str = "
         CREATE TABLE tile (
@@ -252,6 +267,7 @@ const TILE_SCHEMA: &str = "
 fn create_schema(db: &rusqlite::Connection) -> Result<(), Error> {
     db.execute_batch(STRUCTURE_SCHEMA)?;
     db.execute_batch(TILE_SCHEMA)?;
+    db.execute_batch(META_SCHEMA)?;
     db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -271,6 +287,12 @@ fn migrate(db: &rusqlite::Connection, from: i32) -> Result<(), Error> {
         )?;
         db.execute_batch(STRUCTURE_SCHEMA)?;
     }
+    if from < 3 {
+        // v3 added `meta`. Nothing to move into it, so this is purely additive -- which is why it
+        // is `CREATE TABLE IF NOT EXISTS` rather than a drop-and-recreate like the structure
+        // tables: there is no old shape to discard.
+        db.execute_batch(META_SCHEMA)?;
+    }
     db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -284,6 +306,7 @@ pub fn save(
     path: &Path,
     document: &Document,
     tiles: impl IntoIterator<Item = (TileRef, Tile)>,
+    meta: &[(&str, &str)],
 ) -> Result<(), Error> {
     let mut db = rusqlite::Connection::open(path)?;
     // WAL so an interrupted write cannot corrupt the file, and NORMAL because the transaction
@@ -304,6 +327,13 @@ pub fn save(
     }
 
     let tx = db.transaction()?;
+    tx.execute("DELETE FROM meta", [])?;
+    for (key, value) in meta {
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, value],
+        )?;
+    }
     tx.execute("DELETE FROM layer", [])?;
     tx.execute("DELETE FROM page", [])?;
     tx.execute("DELETE FROM document", [])?;
@@ -373,6 +403,29 @@ pub fn save(
 }
 
 /// Read a document and its tiles from `path`.
+/// Read only the `meta` table, without touching the tiles.
+///
+/// Autosave calls this for every candidate recovery file at startup, and the pixels are the
+/// expensive part of a document by three orders of magnitude. An empty map is the honest answer for
+/// a file written before v3 had the table.
+pub fn read_meta(path: &Path) -> Result<HashMap<String, String>, Error> {
+    let db = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let mut out = HashMap::new();
+    if let Ok(mut stmt) = db.prepare("SELECT key, value FROM meta") {
+        if let Ok(rows) =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
+            for (key, value) in rows.flatten() {
+                out.insert(key, value);
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn load(path: &Path) -> Result<Loaded, Error> {
     let db = rusqlite::Connection::open_with_flags(
         path,
@@ -474,7 +527,25 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
         );
     }
 
-    Ok(Loaded { document, tiles })
+    // A missing `meta` table *is* the answer for a pre-v3 file, so a failed query here is not an
+    // error. Reading still needs no branch on the schema version, which is the property worth
+    // keeping: absence of a thing reads as absence, not as a version check.
+    let mut meta = HashMap::new();
+    if let Ok(mut stmt) = db.prepare("SELECT key, value FROM meta") {
+        if let Ok(rows) =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
+            for row in rows.flatten() {
+                meta.insert(row.0, row.1);
+            }
+        }
+    }
+
+    Ok(Loaded {
+        document,
+        tiles,
+        meta,
+    })
 }
 
 #[cfg(test)]

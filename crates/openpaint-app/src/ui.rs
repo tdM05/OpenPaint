@@ -62,6 +62,15 @@ pub enum ConfirmChoice {
     Cancel,
 }
 
+/// What the user answered to an offer of recovered work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryChoice {
+    /// Load it.
+    Recover,
+    /// Throw it away.
+    Discard,
+}
+
 /// A change the page panel wants made to the document.
 ///
 /// Returned rather than applied, for the same reason as [`LayerAction`]: pages own GPU tiles and
@@ -138,6 +147,10 @@ pub struct Status<'a> {
     pub brush_cursor: Option<BrushCursor>,
     /// Latency and frame-time readout.
     pub perf: crate::perf::PerfSnapshot,
+    /// Set while unsaved work from a previous run is waiting to be accepted or thrown away.
+    pub recovery: Option<&'a str>,
+    /// What autosave has to report: a line of text, ready to show.
+    pub autosave: &'a str,
 }
 
 /// Where to draw the brush outline, and how big.
@@ -171,6 +184,8 @@ pub struct Outcome {
     pub tool: Option<Tool>,
     /// The answer to the unsaved-changes question, if one was given.
     pub confirm: Option<ConfirmChoice>,
+    /// The answer to the offer of recovered work.
+    pub recovery: Option<RecoveryChoice>,
 }
 
 pub struct Ui {
@@ -265,6 +280,7 @@ impl Ui {
         let mut page_action = None;
         let mut tool_action = None;
         let mut confirm_choice = None;
+        let mut recovery_choice = None;
 
         let mut panel_rect = egui::Rect::NOTHING;
         let output = self.ctx.run(input, |ctx| {
@@ -618,6 +634,7 @@ impl Ui {
                                 .small()
                                 .weak(),
                             );
+                            ui.label(status.autosave);
                             ui.separator();
                             ui.heading("Export");
                             ui.label(
@@ -696,6 +713,40 @@ impl Ui {
                         });
                 });
             panel_rect = panel.response.rect;
+
+            // Recovered work gets its own window rather than being folded into the unsaved-changes
+            // prompt: the question is different (there is nothing to save yet) and so are the
+            // answers. If a third prompt ever appears, that is the point at which these should
+            // become one general one -- two is not yet worth the indirection.
+            if let Some(what) = status.recovery {
+                egui::Window::new("Recovered work")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label("OpenPaint closed with unsaved changes.");
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(what).strong());
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            // Recover first and leftmost: it is the answer that loses nothing, and
+                            // the one the artist almost always wants.
+                            if ui.button("Recover").clicked() {
+                                recovery_choice = Some(RecoveryChoice::Recover);
+                            }
+                            if ui.button("Discard").clicked() {
+                                recovery_choice = Some(RecoveryChoice::Discard);
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "Recovering opens it as unsaved work pointed at the original                                  file, so nothing is overwritten until you save.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    });
+            }
 
             if let Some(what) = status.confirm {
                 egui::Window::new("Unsaved changes")
@@ -861,6 +912,7 @@ impl Ui {
             page: page_action,
             tool: tool_action,
             confirm: confirm_choice,
+            recovery: recovery_choice,
         }
     }
 }
