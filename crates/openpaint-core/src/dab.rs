@@ -52,11 +52,19 @@ pub struct Dab {
     pub radius: f32,
     /// Edge softness in `0.0..=1.0`: 0 = hard edge, 1 = fully soft falloff.
     pub hardness: f32,
-    /// Color, linear and premultiplied (see [`crate::color`]).
+    /// How much paint this dab deposits, in `0.0..=1.0`.
     ///
-    /// Flow is folded in here rather than kept as a separate field: under
-    /// premultiplied alpha, scaling all four channels *is* scaling coverage, so a
-    /// separate flow term would be a second way to express the same thing.
+    /// Kept separate from `color_linear_premul` because the accumulation model
+    /// needs it separate: within one stroke, flow *accumulates* toward the
+    /// stroke's opacity ceiling (see [`crate::stroke`]). Folding it into the
+    /// color would make a single dab look right but make overlapping dabs wrong.
+    ///
+    /// Per-dab rather than per-stroke because pressure-to-flow is a standard
+    /// mapping in Photoshop and CSP. Opacity, by contrast, is a *stroke*-level
+    /// ceiling and so lives on the brush, not here.
+    pub flow: f32,
+    /// Color, linear and premultiplied (see [`crate::color`]). Normally opaque
+    /// (alpha 1.0); coverage and flow are applied when the dab is rasterized.
     pub color_linear_premul: [f32; 4],
 }
 
@@ -117,6 +125,7 @@ mod tests {
             y: 0.0,
             radius,
             hardness,
+            flow: 1.0,
             color_linear_premul: [0.0, 0.0, 0.0, 1.0],
         }
     }
@@ -175,6 +184,7 @@ mod tests {
             y: 200.25,
             radius: 8.0,
             hardness: 0.5,
+            flow: 1.0,
             color_linear_premul: [0.0, 0.0, 0.0, 1.0],
         };
         let (min_x, min_y, max_x, max_y) = d.pixel_bounds();

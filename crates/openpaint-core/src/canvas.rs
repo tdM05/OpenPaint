@@ -88,6 +88,31 @@ impl Canvas {
         self.dirty.insert(tile_coord);
     }
 
+    /// Overwrite one canvas pixel outright, allocating its tile if needed.
+    ///
+    /// Unlike [`Canvas::blend_pixel`] this does not composite. It exists for
+    /// [`crate::stroke`], which *recomputes* a pixel from its pre-stroke snapshot
+    /// every update rather than darkening it progressively — that recomputation is
+    /// what keeps a mid-stroke preview identical to the committed result.
+    pub fn replace_pixel(&mut self, x: i32, y: i32, linear_premul: [f32; 4]) {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return;
+        }
+        let tile_coord = (
+            x.div_euclid(TILE_SIZE as i32),
+            y.div_euclid(TILE_SIZE as i32),
+        );
+        let lx = x.rem_euclid(TILE_SIZE as i32) as usize;
+        let ly = y.rem_euclid(TILE_SIZE as i32) as usize;
+
+        let tile = self
+            .tiles
+            .entry(tile_coord)
+            .or_insert_with(|| Tile::filled(Self::paper_color()));
+        tile.set_texel(lx, ly, linear_premul);
+        self.dirty.insert(tile_coord);
+    }
+
     /// Iterate all currently allocated tiles (coord + tile).
     pub fn tiles(&self) -> impl Iterator<Item = (&TileCoord, &Tile)> {
         self.tiles.iter()

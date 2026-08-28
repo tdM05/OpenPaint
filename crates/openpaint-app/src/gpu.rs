@@ -33,6 +33,10 @@ pub struct Gpu {
     /// allocation. Lives between dab emission and rasterization -- see
     /// `Gpu::flush_dabs`.
     dabs: Vec<openpaint_core::Dab>,
+    /// Per-stroke paint accumulation and pre-stroke tile snapshot. This is what
+    /// makes flow build up toward the opacity ceiling instead of darkening on
+    /// every overlap; see `openpaint_core::stroke`.
+    painter: openpaint_core::StrokePainter,
     drawing: bool,
 
     window: Arc<Window>,
@@ -111,6 +115,7 @@ impl Gpu {
             brush: Brush::default(),
             stroke: StrokeState::new(),
             dabs: Vec::new(),
+            painter: openpaint_core::StrokePainter::new(),
             drawing: false,
             window,
         })
@@ -142,22 +147,31 @@ impl Gpu {
             .screen_to_canvas(px, py, self.config.width, self.config.height)
     }
 
-    /// Rasterize whatever the brush just emitted, then clear the buffer.
+    /// Accumulate whatever the brush just emitted and re-composite, then clear
+    /// the dab buffer.
     ///
     /// This is the per-dab / per-pixel seam (see `openpaint_core::dab`): the
-    /// brush produced dabs without touching a pixel, and rasterization happens
-    /// here. When dab rasterization moves to the GPU, only this call changes --
-    /// and a per-stroke flow/opacity accumulation buffer will slot in right here
-    /// too, between emission and rasterization.
+    /// brush produced dabs without touching a pixel. Paint accumulates per
+    /// stroke, so overlapping dabs build toward `brush.opacity` rather than
+    /// darkening each time. When dab rasterization moves to the GPU, this is the
+    /// only call site that changes.
     fn flush_dabs(&mut self) {
-        openpaint_core::raster::rasterize_dabs(&mut self.canvas, &self.dabs);
+        self.painter.add_dabs(&self.canvas, &self.dabs);
         self.dabs.clear();
+        self.painter.composite(
+            &mut self.canvas,
+            self.brush.color_linear_premul(),
+            self.brush.opacity,
+        );
         self.window.request_redraw();
     }
 
     /// Begin a stroke at a pen sample (if it lands on the canvas).
     pub fn stroke_begin(&mut self, s: &PenSample) {
         if let Some((cx, cy)) = self.to_canvas(s.x, s.y) {
+            // A fresh stroke resets accumulation, so its opacity ceiling is
+            // independent of the previous stroke's.
+            self.painter.begin();
             self.brush
                 .stroke_begin(&mut self.dabs, &mut self.stroke, cx, cy, s.pressure);
             self.drawing = true;

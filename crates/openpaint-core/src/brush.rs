@@ -19,15 +19,13 @@
 //! exact spacing — with no canvas involved. Previously it could only be checked
 //! indirectly, by observing that some pixels somewhere had changed.
 //!
-//! Phase 0 scope: constant color, pressure maps to dab radius. Still to come
-//! (docs Q7a): **flow/opacity accumulation**, textures, a tuned falloff curve,
-//! and modulation of parameters by pressure/tilt/velocity through curves.
+//! Flow and opacity are honored via [`crate::stroke`], which accumulates paint
+//! per stroke so overlapping dabs build toward the opacity ceiling instead of
+//! darkening on every overlap.
 //!
-//! ⚠️ Dabs are still composited one at a time by the rasterizer, which is wrong
-//! for overlapping dabs within a stroke: *flow* should accumulate per dab while
-//! *opacity* caps the stroke's total contribution. That needs a per-stroke
-//! accumulation buffer sitting between emission and rasterization — which is
-//! exactly the seam this split creates, and the next piece of work.
+//! Still to come (docs Q7a): GPU dab rasterization, textures, a tuned falloff
+//! curve, and modulation of parameters by pressure/tilt/velocity through curves.
+//! Only radius is pressure-driven so far.
 
 use crate::color::opaque_srgb8_to_linear_premul;
 use crate::dab::Dab;
@@ -41,6 +39,13 @@ pub struct Brush {
     pub hardness: f32,
     /// Dab spacing as a fraction of diameter (Photoshop default ≈ 0.25).
     pub spacing: f32,
+    /// How much paint each dab deposits, `0.0..=1.0`.
+    pub flow: f32,
+    /// Ceiling the whole stroke may reach, `0.0..=1.0`.
+    ///
+    /// Per *stroke*, not per dab and not per layer: overlapping dabs build toward
+    /// this and stop, but a second stroke builds on top. See [`crate::stroke`].
+    pub opacity: f32,
     /// Brush color, linear and premultiplied (see [`crate::color`]).
     ///
     /// Stored converted rather than as authored sRGB so the per-pixel inner loop
@@ -55,6 +60,8 @@ impl Default for Brush {
             radius: 8.0,
             hardness: 0.5,
             spacing: 0.25,
+            flow: 1.0,
+            opacity: 1.0,
             color_linear_premul: opaque_srgb8_to_linear_premul([20, 20, 24]),
         }
     }
@@ -110,6 +117,7 @@ impl Brush {
             y: cy,
             radius,
             hardness: self.hardness,
+            flow: self.flow,
             color_linear_premul: self.color_linear_premul,
         }
     }

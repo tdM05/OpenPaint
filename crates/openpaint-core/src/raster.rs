@@ -13,13 +13,13 @@ use crate::canvas::Canvas;
 use crate::color::scale_premul;
 use crate::dab::Dab;
 
-/// Rasterize one dab onto a canvas, compositing as it goes.
+/// Rasterize one dab onto a canvas, compositing it directly.
 ///
-/// Note this composites each dab directly, which is *not* the final model:
-/// overlapping dabs within one stroke should accumulate flow toward an
-/// opacity ceiling rather than darkening on every overlap. That needs a
-/// per-stroke accumulation buffer between dab emission and this function — the
-/// next piece of work, and the reason the boundary now exists.
+/// ⚠️ Direct compositing is **not** how strokes are painted — use
+/// [`crate::stroke::StrokePainter`] for that, or overlapping dabs will darken on
+/// every overlap instead of building toward the stroke's opacity ceiling. This
+/// remains useful for single isolated dabs and as the simplest expression of the
+/// coverage/blend math for tests to check against.
 pub fn rasterize_dab(canvas: &mut Canvas, dab: &Dab) {
     if dab.radius <= 0.0 || dab.color_linear_premul[3] <= 0.0 {
         return;
@@ -33,7 +33,8 @@ pub fn rasterize_dab(canvas: &mut Canvas, dab: &Dab) {
             let coverage = dab.coverage_at(x as f32 + 0.5, y as f32 + 0.5);
             if coverage > 0.0 {
                 // Premultiplied, so coverage scales all four channels.
-                canvas.blend_pixel(x, y, scale_premul(dab.color_linear_premul, coverage));
+                let amount = coverage * dab.flow.clamp(0.0, 1.0);
+                canvas.blend_pixel(x, y, scale_premul(dab.color_linear_premul, amount));
             }
         }
     }
@@ -60,6 +61,7 @@ mod tests {
             y,
             radius,
             hardness,
+            flow: 1.0,
             color_linear_premul: [0.0, 0.0, 0.0, 1.0],
         }
     }

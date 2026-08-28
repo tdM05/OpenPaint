@@ -188,13 +188,21 @@ Photoshop's falloff curve (Q7a) rather than eyeball it. The existing CPU
 `Canvas::blend_pixel` path is retained as the **reference implementation** that
 tests compare GPU output against.
 
-⚠️ **The hard part is accumulation, not rasterization.** Dabs within one stroke
-cannot simply be alpha-blended in a batch: Photoshop's model is that **flow**
-accumulates per dab while **opacity** clamps the stroke's total contribution. So a
-stroke needs its own accumulation buffer with max-alpha semantics, composited onto
-the layer once at stroke end. Getting this wrong is the single most common way
-brush clones feel wrong, and it's the reason dab order and stroke boundaries have
-to be first-class in the design.
+**Accumulation, not rasterization, is the hard part — DONE.** Dabs within one
+stroke cannot simply be alpha-blended in a batch: **flow** accumulates per dab
+while **opacity** caps the stroke's total contribution, per *stroke* rather than
+per layer (so a second stroke builds on top of the first). Implemented in
+`openpaint-core/src/stroke.rs`.
+
+The mechanism turned out to matter beyond the brush. Showing a stroke build up
+live requires keeping the **pre-stroke state of every tile the stroke touches** and
+re-compositing them as dabs land, because the result must be *recomputed* rather
+than progressively darkened. Recomputation is idempotent, which is what makes a
+mid-stroke preview and the committed result identical.
+
+That snapshot is exactly the copy-on-write tile snapshot undo needs (Q13). **A
+correct brush and undo share one mechanism**, which is why this landed before
+either layers or history.
 
 ### 4c. Brush modularity → composable per *dab*, fixed per *pixel*
 

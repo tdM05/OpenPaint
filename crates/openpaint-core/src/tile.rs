@@ -43,6 +43,11 @@ pub const TILE_BYTES: usize = TILE_VALUES * 2;
 pub type TileCoord = (i32, i32);
 
 /// A single tile of linear, premultiplied RGBA `f16` texels.
+///
+/// `Clone` because strokes snapshot the tiles they touch before painting, so the
+/// stroke can be re-composited as it builds up (see [`crate::stroke`]). That same
+/// snapshot is what undo needs (OPEN_QUESTIONS Q13).
+#[derive(Clone)]
 pub struct Tile {
     /// Row-major, `TILE_SIZE` wide, 4 values per texel.
     texels: Vec<f16>,
