@@ -191,10 +191,14 @@ impl Gpu {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         // Neutral gray backdrop framing the canvas sheet.
+                        // LINEAR values: the surface is an *Srgb format, so wgpu
+                        // encodes on write. These are sRGB 0.16/0.16/0.17 taken
+                        // through the transfer function -- passing the sRGB
+                        // numbers directly would render a washed-out mid-grey.
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.16,
-                            g: 0.16,
-                            b: 0.17,
+                            r: 0.021_9,
+                            g: 0.021_9,
+                            b: 0.024_7,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,

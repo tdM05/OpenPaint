@@ -6,7 +6,8 @@
 //! touch changed regions, preserving the point of the tile model. The texture
 //! is drawn as a single quad, fitted and centered in the window.
 
-use openpaint_core::tile::{TILE_BYTES, TILE_SIZE};
+use half::f16;
+use openpaint_core::tile::{TILE_BYTES, TILE_CHANNELS, TILE_SIZE};
 use openpaint_core::Canvas;
 use wgpu::util::DeviceExt;
 
@@ -37,9 +38,10 @@ impl CanvasRenderer {
         let canvas_w = canvas.width();
         let canvas_h = canvas.height();
 
-        // Canvas texture, non-sRGB storage; we sample and write straight bytes.
-        // (Phase 0 blends in sRGB space; linear-correct compositing comes with
-        // the real engine.)
+        // Canvas texture in linear premultiplied RGBA f16, matching the tile
+        // format exactly (openpaint_core::tile) so uploads are a straight byte
+        // copy. Linear is not optional: the surface is an *Srgb format, so wgpu
+        // encodes on write, and handing it sRGB values would double-encode them.
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("canvas-texture"),
             size: wgpu::Extent3d {
@@ -50,15 +52,14 @@ impl CanvasRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
 
         // Initialize the whole texture to the paper color so unpainted area
         // reads as a clean sheet.
-        let paper = canvas.paper_color();
-        let init = vec_paper(canvas_w, canvas_h, paper);
+        let init = vec_paper(canvas_w, canvas_h, Canvas::paper_color());
         queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &texture,
@@ -69,7 +70,7 @@ impl CanvasRenderer {
             &init,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(canvas_w * 4),
+                bytes_per_row: Some(canvas_w * texel_bytes()),
                 rows_per_image: Some(canvas_h),
             },
             wgpu::Extent3d {
@@ -212,7 +213,7 @@ impl CanvasRenderer {
             if ox < 0 || oy < 0 {
                 continue;
             }
-            debug_assert_eq!(tile.pixels().len(), TILE_BYTES);
+            debug_assert_eq!(tile.bytes().len(), TILE_BYTES);
             queue.write_texture(
                 wgpu::ImageCopyTexture {
                     texture: &self.texture,
@@ -224,10 +225,10 @@ impl CanvasRenderer {
                     },
                     aspect: wgpu::TextureAspect::All,
                 },
-                tile.pixels(),
+                tile.bytes(),
                 wgpu::ImageDataLayout {
                     offset: 0,
-                    bytes_per_row: Some(TILE_SIZE as u32 * 4),
+                    bytes_per_row: Some(TILE_SIZE as u32 * texel_bytes()),
                     rows_per_image: Some(TILE_SIZE as u32),
                 },
                 wgpu::Extent3d {
@@ -304,8 +305,17 @@ impl CanvasRenderer {
     }
 }
 
-/// Build an RGBA8 buffer of `w*h` filled with an opaque paper color.
-fn vec_paper(w: u32, h: u32, paper: [u8; 3]) -> Vec<u8> {
-    let rgba = [paper[0], paper[1], paper[2], 255];
-    rgba.repeat((w * h) as usize)
+/// Bytes per texel of the canvas texture (RGBA f16).
+fn texel_bytes() -> u32 {
+    (TILE_CHANNELS * std::mem::size_of::<f16>()) as u32
+}
+
+/// Build an RGBA f16 buffer of `w*h` filled with a linear premultiplied color.
+fn vec_paper(w: u32, h: u32, rgba_linear_premul: [f32; 4]) -> Vec<u8> {
+    let texel: Vec<f16> = rgba_linear_premul
+        .iter()
+        .map(|c| f16::from_f32(*c))
+        .collect();
+    let row: Vec<f16> = texel.repeat((w * h) as usize);
+    bytemuck::cast_slice(&row).to_vec()
 }

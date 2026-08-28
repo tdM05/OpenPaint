@@ -7,11 +7,21 @@
 //! means the path toward Photoshop/CSP-quality brushes is incremental tuning,
 //! not a rewrite.
 //!
-//! Phase 0 scope: constant color, sRGB-space coverage blend, pressure maps to
-//! dab radius. Flow/opacity accumulation, linear-space blending, textures, and
-//! tuned falloff curves come with the real engine (see docs Q7a).
+//! Phase 0 scope: constant color, linear-space coverage blend, pressure maps to
+//! dab radius. Still to come with the real engine (see docs Q7a and
+//! DECISIONS §4a): GPU dab rasterization, **flow/opacity accumulation**,
+//! textures, and a tuned falloff curve.
+//!
+//! ⚠️ Dabs currently composite straight onto the canvas, one at a time. That is
+//! wrong for overlapping dabs within a single stroke: Photoshop's model is that
+//! *flow* accumulates per dab while *opacity* caps the stroke's total
+//! contribution, which requires a per-stroke accumulation buffer rather than
+//! direct compositing. Until that lands, a soft dab at low coverage darkens
+//! where dabs overlap instead of building up smoothly to a ceiling. This is the
+//! single biggest remaining gap between this and a real brush engine.
 
 use crate::canvas::Canvas;
+use crate::color::{opaque_srgb8_to_linear_premul, scale_premul};
 
 /// Brush parameters. Sizes are in canvas pixels.
 #[derive(Clone, Copy)]
@@ -22,8 +32,12 @@ pub struct Brush {
     pub hardness: f32,
     /// Dab spacing as a fraction of diameter (Photoshop default ≈ 0.25).
     pub spacing: f32,
-    /// Brush color, straight RGB.
-    pub color: [u8; 3],
+    /// Brush color, linear and premultiplied (see [`crate::color`]).
+    ///
+    /// Stored converted rather than as authored sRGB so the per-pixel inner loop
+    /// never pays for a transfer function, and so there is exactly one place the
+    /// conversion can be got wrong: [`Brush::set_color_srgb8`].
+    color_linear_premul: [f32; 4],
 }
 
 impl Default for Brush {
@@ -32,7 +46,7 @@ impl Default for Brush {
             radius: 8.0,
             hardness: 0.5,
             spacing: 0.25,
-            color: [20, 20, 24],
+            color_linear_premul: opaque_srgb8_to_linear_premul([20, 20, 24]),
         }
     }
 }
@@ -62,6 +76,17 @@ impl Default for StrokeState {
 }
 
 impl Brush {
+    /// Set the brush color from an authored opaque sRGB value.
+    pub fn set_color_srgb8(&mut self, rgb: [u8; 3]) {
+        self.color_linear_premul = opaque_srgb8_to_linear_premul(rgb);
+    }
+
+    /// The brush color as linear premultiplied RGBA.
+    #[must_use]
+    pub fn color_linear_premul(&self) -> [f32; 4] {
+        self.color_linear_premul
+    }
+
     /// Effective dab radius for a given pressure in `0.0..=1.0`.
     fn radius_for(&self, pressure: f32) -> f32 {
         // Simple linear pressure→size for now. A configurable response curve
@@ -97,7 +122,8 @@ impl Brush {
                     1.0 - (dist - inner) / (radius - inner)
                 };
                 if coverage > 0.0 {
-                    canvas.blend_pixel(x, y, self.color, coverage);
+                    // Premultiplied, so coverage scales all four channels.
+                    canvas.blend_pixel(x, y, scale_premul(self.color_linear_premul, coverage));
                 }
             }
         }

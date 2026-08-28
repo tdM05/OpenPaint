@@ -9,6 +9,7 @@
 
 pub mod brush;
 pub mod canvas;
+pub mod color;
 pub mod tile;
 
 pub use brush::{Brush, StrokeState};

@@ -20,6 +20,9 @@ wgpu = "22"
 pollster = "0.3"
 # Safe casting of plain-old-data structs to bytes for GPU uploads.
 bytemuck = { version = "1", features = ["derive"] }
+# Half-precision floats, to build Rgba16Float upload buffers matching the tile
+# format in openpaint-core.
+half = { version = "2", features = ["bytemuck"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Native tablet/pen input (Windows Ink) behind our InputBackend trait. Windows-

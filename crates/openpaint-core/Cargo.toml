@@ -7,3 +7,8 @@ repository.workspace = true
 description = "OpenPaint engine core: document model, tiled canvas, brush engine, compositor. UI-agnostic."
 
 [dependencies]
+# Half-precision floats for tile texels. Matches the GPU's Rgba16Float exactly,
+# so tile bytes upload with no conversion (see src/tile.rs).
+half = { version = "2", features = ["bytemuck"] }
+# Zero-copy reinterpretation of tile texels as upload-ready bytes.
+bytemuck = "1"
