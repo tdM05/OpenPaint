@@ -293,6 +293,23 @@ it is not a regression from the single-texture version, which had no mips either
 Also still open: **undo snapshots do not spill.** They have their own 64 MiB pool and evict
 the oldest operation rather than writing it to the CPU.
 
+### Q18. Layers - landed 2026-08-28; the composite cache is still open
+Built: a layer stack per page (`openpaint_core::layer`), tiles keyed by `(layer, coord)`, and
+a GPU compositor that walks the stack in one pass (DECISIONS 4d/4e). Normal, Multiply and
+Screen; per-layer opacity and visibility; add, select, reorder, delete. Deleting a layer is
+undoable, because it destroys pixels and 5c applies to layers exactly as it does to crops.
+
+**Still open, in the order it will start to matter:**
+- **The composite cache.** Compositing runs in the display pass, so every visible tile of
+  *every* layer must be resident at once and per-frame cost scales with layer count. Roughly,
+  layers x visible tiles must fit the pool. DECISIONS 4e has the design; it changes only where
+  the compositor writes.
+- **More blend modes.** Three is the honest minimum for comics. Each is a line in two places
+  that has to stay in step, and the cross-check test is what keeps them equal.
+- **Layer groups / folders**, which CSP users rely on for organising a page.
+- **Clipping and masks** (alpha lock, clip-to-below), which is how flats get coloured.
+- **Reordering by drag** rather than Up/Down buttons -- a real-UI concern (Q4).
+
 ### Q14. Pen input cannot reach the UI layer - ARCHITECTURAL, blocks any real UI
 Surfaced 2026-08-27 when the egui debug panel landed: **only the mouse can operate
 it.** Pen input arrives through octotablet, which bypasses winit's event stream

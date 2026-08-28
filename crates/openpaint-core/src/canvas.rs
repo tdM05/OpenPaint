@@ -27,6 +27,13 @@
 //!
 //! Pixels are **linear and premultiplied** throughout — see [`crate::color`].
 //!
+//! # A canvas is one layer, and starts empty
+//!
+//! Fresh tiles are **transparent**, not paper. A layer holds only what was painted on it; the
+//! sheet is composited underneath the whole stack (`docs/DECISIONS.md` §4e). This is also what
+//! keeps this reference implementation comparable with the GPU: both produce a layer, so the
+//! tests can diff them directly.
+//!
 //! # This is the reference implementation, not the fast path
 //!
 //! Per `docs/DECISIONS.md` §4a, dab rasterization moves to the GPU: the core
@@ -41,7 +48,11 @@ use crate::color::{opaque_srgb8_to_linear_premul, over_premul};
 use crate::page::PageRect;
 use crate::tile::{Tile, TileCoord, TILE_SIZE};
 
-/// Default paper color for freshly allocated tiles, as authored (near-white sRGB).
+/// The sheet colour a page is drawn on, as authored (near-white sRGB).
+///
+/// **Not** a tile default. A canvas is one *layer*, and a layer is transparent where nothing
+/// has been painted; the paper sits underneath the whole stack and belongs to compositing.
+/// Filling fresh tiles with it would make every layer opaque and hide everything below.
 const PAPER_SRGB: [u8; 3] = [250, 249, 246];
 
 /// A tiled canvas: a rectangle in a signed coordinate space. Tiles are sparse, so
@@ -134,7 +145,7 @@ impl Canvas {
         let tile = self
             .tiles
             .entry(tile_coord)
-            .or_insert_with(|| Tile::filled(Self::paper_color()));
+            .or_insert_with(Tile::transparent);
 
         let dst = tile.texel(lx, ly);
         tile.set_texel(lx, ly, over_premul(src_linear_premul, dst));
@@ -162,7 +173,7 @@ impl Canvas {
         let tile = self
             .tiles
             .entry(tile_coord)
-            .or_insert_with(|| Tile::filled(Self::paper_color()));
+            .or_insert_with(Tile::transparent);
         tile.set_texel(lx, ly, linear_premul);
         self.dirty.insert(tile_coord);
     }
@@ -236,9 +247,10 @@ impl Canvas {
         std::mem::take(&mut self.dirty)
     }
 
-    /// The paper color unpainted canvas should read as, linear and premultiplied.
-    /// The renderer clears tile-free area to this so the whole canvas looks like
-    /// one sheet.
+    /// The sheet colour a page is drawn on, linear and premultiplied.
+    ///
+    /// A *compositing* constant: the bottom of the layer stack, drawn under everything. Tiles
+    /// never contain it, because a layer is transparent where unpainted.
     #[must_use]
     pub fn paper_color() -> [f32; 4] {
         opaque_srgb8_to_linear_premul(PAPER_SRGB)
@@ -285,13 +297,15 @@ mod tests {
         assert_eq!(c.take_dirty().len(), 0);
     }
 
+    /// A layer is empty where nothing was painted, which is what lets the layers above it
+    /// show through. Filling fresh tiles with paper would make every layer opaque.
     #[test]
-    fn fresh_tiles_start_at_paper_color() {
+    fn fresh_tiles_start_transparent() {
         let mut c = Canvas::new(512, 512);
         // Touch one pixel to force allocation, then inspect an untouched one.
         c.blend_pixel(0, 0, BLACK);
         let tile = c.tile((0, 0)).expect("tile allocated");
-        assert_eq!(tile.texel(200, 200), Canvas::paper_color().map(round_f16));
+        assert_eq!(tile.texel(200, 200), [0.0; 4]);
     }
 
     #[test]
@@ -302,27 +316,22 @@ mod tests {
         assert_eq!(tile.texel(4, 4), [0.0, 0.0, 0.0, 1.0]);
     }
 
-    /// Half coverage of black over paper must land halfway in *linear* space.
-    /// If someone reintroduces sRGB-space blending, this test fails.
+    /// Half coverage must land at half alpha, and premultiplied means the colour channels
+    /// scale with it. Blending twice must accumulate the way "over" does, not linearly -- if
+    /// someone reintroduces straight-alpha or sRGB-space blending, this fails.
     #[test]
-    fn half_coverage_blends_in_linear_space() {
+    fn coverage_accumulates_as_premultiplied_over() {
         let mut c = Canvas::new(512, 512);
         c.blend_pixel(4, 4, scale_premul(BLACK, 0.5));
-        let paper = Canvas::paper_color();
         let got = c.tile((0, 0)).expect("tile allocated").texel(4, 4);
-        let expected = paper[0] * 0.5;
-        assert!(
-            (got[0] - expected).abs() < 1e-3,
-            "got {}, expected {expected}",
-            got[0]
-        );
-        assert!((got[3] - 1.0).abs() < 1e-3);
-    }
+        assert!((got[3] - 0.5).abs() < 1e-3, "alpha {}", got[3]);
+        // Black premultiplied by any alpha is still zero in the colour channels.
+        assert!(got[0].abs() < 1e-3);
 
-    /// Quantize an f32 the way storing it in an f16 tile would, so expectations
-    /// don't fail on representation error.
-    fn round_f16(v: f32) -> f32 {
-        half::f16::from_f32(v).to_f32()
+        // A second half-coverage pass: 0.5 + 0.5 * (1 - 0.5) = 0.75, not 1.0.
+        c.blend_pixel(4, 4, scale_premul(BLACK, 0.5));
+        let got = c.tile((0, 0)).expect("tile").texel(4, 4);
+        assert!((got[3] - 0.75).abs() < 1e-2, "alpha {}", got[3]);
     }
 
     /// Extending down must leave every painted pixel exactly where it was.
@@ -464,7 +473,7 @@ mod tests {
         assert!(c.width() >= 1 && c.height() >= 1);
     }
 
-    /// Whether a pixel carries paint, i.e. differs from bare paper.
+    /// Whether a pixel carries paint, i.e. has any coverage at all.
     ///
     /// Takes *signed* coordinates, because a canvas extended upward or leftward has
     /// negative ones. `div_euclid`/`rem_euclid` are what make that work.
@@ -475,7 +484,6 @@ mod tests {
         };
         let lx = x.rem_euclid(tile) as usize;
         let ly = y.rem_euclid(tile) as usize;
-        let paper = Canvas::paper_color()[0];
-        t.texel(lx, ly)[0] < paper - 0.05
+        t.texel(lx, ly)[3] > 0.05
     }
 }

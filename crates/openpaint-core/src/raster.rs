@@ -95,8 +95,8 @@ mod tests {
         assert_eq!(c.tiles().count(), 0);
     }
 
-    /// A hard dab's center must land at the dab color exactly, with no paper
-    /// bleeding through. Catches coverage or premultiplication mistakes.
+    /// A hard dab's centre must land at the dab colour exactly, at full coverage. Catches
+    /// coverage and premultiplication mistakes.
     #[test]
     fn a_hard_dab_center_is_fully_opaque_paint() {
         let mut c = Canvas::new(256, 256);
@@ -105,16 +105,15 @@ mod tests {
         assert_eq!(tile.texel(100, 100), [0.0, 0.0, 0.0, 1.0]);
     }
 
-    /// Pixels outside the radius must be untouched — the dab must not leak past
-    /// its own bounds.
+    /// Pixels outside the radius must be untouched -- the dab must not leak past its own
+    /// bounds. Untouched means *transparent* now that a canvas is one layer.
     #[test]
     fn a_dab_does_not_paint_outside_its_radius() {
         let mut c = Canvas::new(256, 256);
         rasterize_dab(&mut c, &black_dab(100.5, 100.5, 8.0, 0.0));
         let tile = c.tile((0, 0)).expect("tile allocated");
-        let paper = Canvas::paper_color().map(|v| half::f16::from_f32(v).to_f32());
         // 12px away, well beyond radius 8.
-        assert_eq!(tile.texel(112, 100), paper);
+        assert_eq!(tile.texel(112, 100), [0.0; 4]);
     }
 
     #[test]

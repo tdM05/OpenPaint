@@ -6,8 +6,10 @@
 //   1. `dab_*`     - stamp dabs into one tile of the accumulation pool.
 //   2. `bake_*`    - composite an accumulation tile into the matching canvas tile, once,
 //                    when the stroke ends.
-//   3. `preview_*` - composite the accumulation tiles onto the surface, mid-stroke, so
-//                    the canvas underneath stays untouched until the stroke commits.
+//
+// There is deliberately no preview pass here. Mid-stroke, the *compositor* reads this
+// accumulation and injects it into the active layer as it walks the stack (DECISIONS 4e), so
+// the preview and the committed result are the same arithmetic rather than two lookalikes.
 //
 // # Why accumulation blending is free
 //
@@ -165,6 +167,7 @@ fn dab_fs(in: DabOut) -> @location(0) vec4<f32> {
 struct PaintOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    // Flat because it is an index, not a quantity.
     @location(1) @interpolate(flat) layer: u32,
 };
 
@@ -177,32 +180,6 @@ fn bake_vs(@builtin(vertex_index) vid: u32) -> PaintOut {
     out.pos = vec4<f32>(q.x * 2.0 - 1.0, 1.0 - q.y * 2.0, 0.0, 1.0);
     out.uv = q;
     out.layer = tp.layer.x;
-    return out;
-}
-
-struct TileInst {
-    @location(0) coord: vec2<i32>,
-    @location(1) layer: u32,
-};
-
-/// Preview: one instanced quad per accumulation tile, following the on-screen canvas so
-/// the in-progress stroke pans, zooms, and rotates with it.
-@vertex
-fn preview_vs(@builtin(vertex_index) vid: u32, inst: TileInst) -> PaintOut {
-    let ts = xf.params.x;
-    let t0 = vec2<f32>(inst.coord) * ts;
-    let t1 = t0 + vec2<f32>(ts, ts);
-    // Same clamp as the canvas tiles, including `max(..., c0)`: without it a tile outside
-    // the page yields an inverted quad, which still rasterizes with culling off.
-    let c0 = max(t0, xf.page.xy);
-    let c1 = max(min(t1, xf.page.zw), c0);
-    let p = mix(c0, c1, quad(vid));
-
-    let h = vec3<f32>(p, 1.0);
-    var out: PaintOut;
-    out.pos = vec4<f32>(dot(xf.x_row.xyz, h), dot(xf.y_row.xyz, h), 0.0, 1.0);
-    out.uv = (p - t0) / ts;
-    out.layer = inst.layer;
     return out;
 }
 

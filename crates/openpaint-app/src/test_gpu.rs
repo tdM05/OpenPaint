@@ -8,9 +8,16 @@
 //! without a usable GPU would say nothing about the code.
 
 use openpaint_core::tile::{TILE_BYTES, TILE_SIZE};
-use openpaint_core::Canvas;
 
-use crate::canvas_renderer::CanvasRenderer;
+use crate::canvas_renderer::{CanvasRenderer, CANVAS_FORMAT};
+use crate::stroke_layer::StrokeLayer;
+use crate::tile_store::LayerId;
+
+/// The layer every single-layer test paints on.
+pub const L0: LayerId = LayerId(0);
+
+/// Surface format the GPU tests render to. sRGB, like the real one.
+pub const SURFACE: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// Side length used by the GPU tests. 128 keeps them quick, and it is deliberately
 /// **smaller than one tile**, so a page that does not fill its tiles is the default case
@@ -45,32 +52,36 @@ pub fn try_device() -> Option<(wgpu::Device, wgpu::Queue)> {
 ///
 /// Tests that mean to exercise eviction build a [`crate::tile_store::TileStore`] with a
 /// deliberately tiny budget instead.
-pub fn test_canvas(device: &wgpu::Device, cpu: &Canvas) -> CanvasRenderer {
-    CanvasRenderer::new(
-        device,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        cpu,
-        128 * 1024 * 1024,
-    )
+pub fn test_canvas(
+    device: &wgpu::Device,
+    page: openpaint_core::PageRect,
+    stroke: &StrokeLayer,
+) -> CanvasRenderer {
+    CanvasRenderer::new(device, SURFACE, page, 128 * 1024 * 1024, stroke)
 }
 
-/// Read the page region of a tiled canvas back as linear f32 RGBA, row-major.
+/// A stroke layer for tests. Separate because the compositor needs it at construction.
+pub fn test_stroke_layer(device: &wgpu::Device) -> StrokeLayer {
+    StrokeLayer::new(device, CANVAS_FORMAT)
+}
+
+/// Read one layer's page region back as linear f32 RGBA, row-major.
 ///
-/// Area with no resident tile reads as paper, matching what the sheet quad draws — so a
-/// comparison against the CPU reference (which allocates tiles the same way) lines up
-/// without either side having to know which tiles happen to exist.
+/// Area with no tile reads as **transparent**, matching what a layer actually holds. This is a
+/// layer, not a composited page: the paper belongs to the compositor, so a comparison against
+/// the CPU reference (which now also produces a transparent layer) lines up directly.
 pub fn readback_page(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     canvas: &CanvasRenderer,
+    layer: LayerId,
 ) -> Vec<[f32; 4]> {
     let page = canvas.page();
     let (w, h) = (page.w as usize, page.h as usize);
-    let paper = Canvas::paper_color().map(|c| half::f16::from_f32(c).to_f32());
-    let mut out = vec![paper; w * h];
+    let mut out = vec![[0.0f32; 4]; w * h];
 
     let coords: Vec<openpaint_core::tile::TileCoord> = canvas
-        .tiles()
+        .layer_tiles(layer)
         .filter(|c| crate::canvas_renderer::tile_intersects(*c, page))
         .collect();
     if coords.is_empty() {
@@ -92,7 +103,7 @@ pub fn readback_page(
         // comparison against the CPU reference would fail for a reason that looks like a
         // rasterization bug.
         let slot = canvas
-            .slot(*coord)
+            .slot(layer, *coord)
             .unwrap_or_else(|| panic!("tile {coord:?} is not resident; raise the test budget"));
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
@@ -159,9 +170,10 @@ pub fn readback_tile(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     canvas: &CanvasRenderer,
+    layer: LayerId,
     coord: openpaint_core::tile::TileCoord,
 ) -> Option<Vec<[f32; 4]>> {
-    let slot = canvas.slot(coord)?;
+    let slot = canvas.slot(layer, coord)?;
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("tile-readback"),
         size: TILE_BYTES as u64,
@@ -235,8 +247,10 @@ pub fn mean_difference(a: &[[f32; 4]], b: &[[f32; 4]]) -> f32 {
     (total / (a.len() * 4) as f64) as f32
 }
 
-/// Whether any pixel differs meaningfully from paper, i.e. paint actually landed.
+/// Whether any pixel carries coverage, i.e. paint actually landed.
+///
+/// Alpha, not colour: a layer starts transparent, so alpha is exactly how much paint is there.
+/// Comparing against paper would only work on a composited page.
 pub fn any_paint(pixels: &[[f32; 4]]) -> bool {
-    let paper = Canvas::paper_color();
-    pixels.iter().any(|p| (p[0] - paper[0]).abs() > 0.05)
+    pixels.iter().any(|p| p[3] > 0.05)
 }

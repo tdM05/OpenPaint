@@ -242,7 +242,7 @@ impl OpenPaint {
         let renderer = self.renderer.as_ref()?;
         let (w, h) = renderer.size_px();
         self.view
-            .screen_to_canvas(sample.x, sample.y, w, h, self.editor.canvas())
+            .screen_to_canvas(sample.x, sample.y, w, h, self.editor.page_rect())
     }
 
     fn ui_blocks_point(&self, sample: &PenSample) -> bool {
@@ -388,17 +388,28 @@ impl OpenPaint {
         })
     }
 
-    /// Mirror a geometry change from undo/redo onto the page.
+    /// Mirror a document change from undo/redo onto the page.
     ///
-    /// The renderer has already resized its textures; the page's dimensions live in
-    /// the editor, so both halves must be applied for them to agree. Resizing the page
-    /// here must **not** be recorded in history -- it *is* the undo, not a new edit.
+    /// The renderer has already moved its own state; the page's rectangle and its layer stack
+    /// live in the editor, so both halves must be applied for them to agree. Nothing done here
+    /// may be recorded in history -- it *is* the undo, not a new edit.
     fn apply_history_change(&mut self, change: renderer::HistoryChange) {
         match change {
             renderer::HistoryChange::None => {}
             renderer::HistoryChange::Pixels => self.request_redraw(),
             renderer::HistoryChange::Geometry { rect } => {
                 self.editor.resize_page(rect);
+                self.request_redraw();
+            }
+            renderer::HistoryChange::LayerRestored { index, layer } => {
+                self.editor
+                    .document_mut()
+                    .active_mut()
+                    .restore_layer(index, layer);
+                self.request_redraw();
+            }
+            renderer::HistoryChange::LayerDeleted { index } => {
+                self.editor.document_mut().active_mut().remove_layer(index);
                 self.request_redraw();
             }
         }
@@ -457,6 +468,85 @@ impl OpenPaint {
         // Deliberately does NOT re-fit. Photoshop keeps your zoom through a canvas
         // resize, and having the camera jump is disorienting when working zoomed in --
         // press 0 to fit.
+        self.request_redraw();
+    }
+
+    /// Apply a layer change from the panel.
+    ///
+    /// Deletion is the only one that touches pixels, and it is recorded in history first: a
+    /// layer holds work, so destroying one with no way back is the same mistake as a
+    /// destructive crop (DECISIONS §5c). If there is no room to record it, the delete is
+    /// refused rather than done.
+    fn apply_layer_action(&mut self, action: ui::LayerAction) {
+        match action {
+            ui::LayerAction::Select(index) => {
+                // Ends any stroke first: a stroke belongs to the layer it started on.
+                self.editor.stroke_end();
+                self.editor.document_mut().active_mut().set_active(index);
+            }
+            ui::LayerAction::Add => {
+                self.editor.stroke_end();
+                let index = self.editor.document_mut().active_mut().add_layer();
+                self.status_message = Some(format!("Added layer {}", index + 1));
+            }
+            ui::LayerAction::Delete(index) => self.delete_layer(index),
+            ui::LayerAction::Move { from, to } => {
+                self.editor.document_mut().active_mut().move_layer(from, to);
+            }
+            ui::LayerAction::SetVisible { index, visible } => {
+                if let Some(l) = self.editor.document_mut().active_mut().layer_mut(index) {
+                    l.visible = visible;
+                }
+            }
+            ui::LayerAction::SetOpacity { index, opacity } => {
+                if let Some(l) = self.editor.document_mut().active_mut().layer_mut(index) {
+                    l.opacity = opacity;
+                }
+            }
+            ui::LayerAction::SetBlend { index, blend } => {
+                if let Some(l) = self.editor.document_mut().active_mut().layer_mut(index) {
+                    l.blend = blend;
+                }
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Delete a layer, undoably.
+    fn delete_layer(&mut self, index: usize) {
+        self.editor.stroke_end();
+        let Some(layer) = self.editor.document().active().layer(index).cloned() else {
+            return;
+        };
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let Some(tiles) = renderer.adopt_layer(tile_store::LayerId(layer.id())) else {
+            self.status_message =
+                Some("No room to record the deletion, so the layer was kept".to_owned());
+            self.request_redraw();
+            return;
+        };
+        if self
+            .editor
+            .document_mut()
+            .active_mut()
+            .remove_layer(index)
+            .is_none()
+        {
+            // The last layer cannot go; put its tiles straight back.
+            self.status_message = Some("A page needs at least one layer".to_owned());
+            self.apply_history_change(renderer::HistoryChange::LayerRestored {
+                index,
+                layer: layer.clone(),
+            });
+            return;
+        }
+        let name = layer.name.clone();
+        if let Some(r) = self.renderer.as_mut() {
+            r.record_layer_deletion(index, layer, tiles);
+        }
+        self.status_message = Some(format!("Deleted {name} (Ctrl+Z to bring it back)"));
         self.request_redraw();
     }
 
@@ -572,7 +662,7 @@ impl OpenPaint {
             return;
         };
         let path = export::default_path();
-        self.status_message = Some(match renderer.export_png(&path) {
+        self.status_message = Some(match renderer.export_png(self.editor.layers(), &path) {
             Ok(()) => {
                 // Absolute, because a bare relative name leaves the user hunting
                 // for the file -- the working directory is not obvious when the app
@@ -727,8 +817,9 @@ impl OpenPaint {
         // copy here would be an allocation per frame on the interactive path.
         // `renderer` and `editor` are disjoint fields, so both borrows coexist.
         if editor.has_pending_stroke() {
+            let active_layer = editor.active_layer_id();
             let (ops, dabs) = editor.pending_stroke();
-            renderer.apply_stroke(ops, dabs);
+            renderer.apply_stroke(ops, dabs, tile_store::LayerId(active_layer));
             editor.clear_pending_stroke();
 
             // Running out of tiles or out of snapshot room is a real, reachable state on a
@@ -745,11 +836,10 @@ impl OpenPaint {
             }
         }
 
-        renderer.upload_canvas(editor.canvas_mut());
         let (w, h) = renderer.size_px();
         // Fitting needs both the surface size and the UI inset, so it is deferred
         // to here rather than done at construction.
-        self.view.apply_pending_fit(w, h, editor.canvas());
+        self.view.apply_pending_fit(w, h, editor.page_rect());
         let xform = self.view.page_to_ndc(w, h);
         // What the viewport covers, in page coordinates. Residency is bounded, so the
         // *visible* set is the working set: without this the renderer would try to restore
@@ -761,6 +851,7 @@ impl OpenPaint {
         let mut extend_request = None;
         let mut crop_request = None;
         let mut trim_request = false;
+        let mut layer_request = None;
         let history_status = renderer.history_status();
         let residency = renderer.residency();
         let (spilled, traffic) = renderer.spill_status();
@@ -769,12 +860,17 @@ impl OpenPaint {
             let page = editor.document().active();
             (page.width(), page.height())
         };
+        // Cloned, not borrowed: `editor` is handed to the overlay closure mutably, and the
+        // stack is a handful of small structs so the copy is immaterial next to the borrow
+        // gymnastics avoiding it would need.
+        let layers = editor.layers().to_vec();
+        let active_index = editor.active_layer_index();
         let window = renderer.window().clone();
         // Borrowed, not copied: a copy would mean any future UI control that edits
         // the view silently writes to a dead value. Disjoint field borrows make
         // this fine alongside the mutable borrows of `renderer` and `editor`.
         let view = &self.view;
-        let result = renderer.render(xform, visible, |gpu| {
+        let result = renderer.render(xform, visible, &layers, active_index, |gpu| {
             if let Some(ui) = ui {
                 let out = ui.render(
                     &window,
@@ -790,12 +886,15 @@ impl OpenPaint {
                         residency,
                         spilled,
                         traffic,
+                        layers: &layers,
+                        active_layer: active_index,
                     },
                 );
                 ui_wants_repaint = out.wants_repaint;
                 extend_request = out.extend;
                 crop_request = out.crop;
                 trim_request = out.trim;
+                layer_request = out.layer;
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
@@ -819,6 +918,9 @@ impl OpenPaint {
             self.status_message = Some(
                 "Too much of the canvas is visible at once to keep on the GPU; zoom in.".to_owned(),
             );
+        }
+        if let Some(action) = layer_request {
+            self.apply_layer_action(action);
         }
         if trim_request {
             self.trim_to_page();
@@ -943,7 +1045,7 @@ impl ApplicationHandler for OpenPaint {
             self.input = Box::new(pen);
         }
 
-        match Renderer::new(window.clone(), self.editor.canvas()) {
+        match Renderer::new(window.clone(), self.editor.page_rect()) {
             Ok(renderer) => {
                 println!("{} - {}", openpaint_core::hello(), openpaint_core::VERSION);
                 println!("input backend: {}", self.input.name());

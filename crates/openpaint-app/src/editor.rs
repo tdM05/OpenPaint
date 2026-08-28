@@ -28,7 +28,7 @@
 //! `openpaint_core::raster` remain the CPU *reference* implementations, and
 //! `tests/gpu_matches_cpu.rs` is what keeps the GPU honest against them.
 
-use openpaint_core::{Brush, Canvas, Dab, Document, Mode, Page, PageRect, StrokeState};
+use openpaint_core::{Brush, Dab, Document, Mode, Page, PageRect, StrokeState};
 
 /// Starting page size. A placeholder until New-document presets exist (§5a says
 /// "300 DPI A4" and friends are presets computing pixel dimensions).
@@ -122,15 +122,35 @@ impl Editor {
         }
     }
 
-    /// The canvas of the page being edited.
+    /// The rectangle of the page being edited.
+    ///
+    /// The page owns its geometry; layers have none of their own (`openpaint_core::page`).
     #[must_use]
-    pub fn canvas(&self) -> &Canvas {
-        self.document.active().canvas()
+    pub fn page_rect(&self) -> PageRect {
+        self.document.active().rect()
     }
 
-    /// Mutable canvas access, for the renderer to drain dirty tiles.
-    pub fn canvas_mut(&mut self) -> &mut Canvas {
-        self.document.active_mut().canvas_mut()
+    /// The id of the layer being painted, which is what the renderer keys tiles by.
+    #[must_use]
+    pub fn active_layer_id(&self) -> u32 {
+        self.document.active().active_layer().id()
+    }
+
+    /// The stack of the page being edited, bottom layer first.
+    #[must_use]
+    pub fn layers(&self) -> &[openpaint_core::Layer] {
+        self.document.active().layers()
+    }
+
+    /// Index of the layer being painted.
+    #[must_use]
+    pub fn active_layer_index(&self) -> usize {
+        self.document.active().active_index()
+    }
+
+    /// Mutable document access, for layer commands from the UI.
+    pub fn document_mut(&mut self) -> &mut Document {
+        &mut self.document
     }
 
     #[must_use]
@@ -243,7 +263,7 @@ mod tests {
         let e = Editor::new();
         assert!(!e.is_drawing());
         assert!(!e.has_pending_stroke());
-        assert_eq!(e.canvas().tiles().count(), 0);
+        assert_eq!(e.layers().len(), 1);
     }
 
     #[test]

@@ -30,9 +30,10 @@ use std::path::{Path, PathBuf};
 
 use openpaint_core::color::linear_to_srgb8;
 use openpaint_core::tile::{TileCoord, TILE_BYTES, TILE_SIZE};
-use openpaint_core::Canvas;
+use openpaint_core::{Blend, Canvas, Layer};
 
 use crate::canvas_renderer::{tile_intersects, CanvasRenderer};
+use crate::tile_store::LayerId;
 
 /// Bytes per canvas texel (`Rgba16Float`).
 const BYTES_PER_TEXEL: u32 = 8;
@@ -90,15 +91,22 @@ pub fn default_path() -> PathBuf {
 /// real workflow rather than a theoretical one.
 const MAX_EXPORT_PIXELS: u64 = 512 * 1024 * 1024;
 
-/// Assemble the page from its GPU tiles and write it as an sRGB PNG.
+/// Flatten the layer stack and write it as an sRGB PNG.
 ///
-/// Unpainted area has no tile at all, so it is filled with paper first and only the
-/// resident tiles are read back — an export costs what was drawn, not what the page
-/// measures.
+/// Composites on the **CPU**, through `openpaint_core::layer::Blend` — the same functions the
+/// shader mirrors. Two reasons, and neither is convenience:
+///
+/// 1. Export already stalls on a readback, so there is nothing to gain from doing it on the
+///    GPU, and doing it here needs no render target at all — which matters, because a
+///    page-sized target is exactly the ceiling the tiled canvas removed.
+/// 2. It makes the two compositing implementations comparable. A test that composites the same
+///    stack through both and diffs the pixels is what stops the shader and the reference
+///    drifting apart, the same way the dab tests pin the falloff curve.
 pub fn export_tiles_png(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     canvas: &CanvasRenderer,
+    layers: &[Layer],
     path: &Path,
 ) -> Result<(), ExportError> {
     let page = canvas.page();
@@ -107,116 +115,153 @@ pub fn export_tiles_png(
         return Err(ExportError::TooLarge { w, h });
     }
 
-    let paper = to_srgb8(&f16x4(Canvas::paper_color()));
+    let flat = flatten(device, queue, canvas, layers);
     let mut out = Vec::with_capacity((w as usize) * (h as usize) * 4);
-    for _ in 0..(w as usize) * (h as usize) {
-        out.extend_from_slice(&paper);
-    }
-
-    let coords: Vec<TileCoord> = canvas
-        .tiles()
-        .filter(|c| tile_intersects(*c, page))
-        .collect();
-    if !coords.is_empty() {
-        let tiles = read_tiles(device, queue, canvas, &coords);
-        for (coord, texels) in coords
-            .iter()
-            .zip(tiles.as_chunks::<{ TILE_SIZE * TILE_SIZE }>().0)
-        {
-            blit_tile(&mut out, w, h, page.x, page.y, *coord, texels);
+    let paper = Canvas::paper_color();
+    for y in 0..h {
+        for x in 0..w {
+            let px = page.x + x as i32;
+            let py = page.y + y as i32;
+            let texel = flat
+                .get(&crate::canvas_renderer::tile_of(px, py))
+                .map_or(paper, |tile| tile[local_index(px, py)]);
+            out.extend_from_slice(&to_srgb8(&f16x4(texel)));
         }
     }
-
     write_png(path, w, h, &out)
 }
 
-/// Read whole tiles back into one buffer, in the order given.
+/// Index of a page pixel within its tile.
+fn local_index(px: i32, py: i32) -> usize {
+    let t = TILE_SIZE as i32;
+    let lx = px.rem_euclid(t) as usize;
+    let ly = py.rem_euclid(t) as usize;
+    ly * TILE_SIZE + lx
+}
+
+/// Composite the stack, tile by tile, into linear premultiplied f32 texels.
 ///
-/// One mapped buffer for the lot rather than one per tile: a tile row is
-/// `256 * 8 = 2048` bytes and a whole tile is 512 KiB, both already multiples of the
-/// 256-byte copy alignment, so tiles pack end to end with no padding to skip.
-fn read_tiles(
+/// Keyed by tile so a sparse canvas costs only what was drawn, and so nothing page-sized is
+/// ever allocated on the GPU side.
+fn flatten(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     canvas: &CanvasRenderer,
-    coords: &[TileCoord],
-) -> Vec<[half::f16; 4]> {
+    layers: &[Layer],
+) -> std::collections::HashMap<TileCoord, Vec<[f32; 4]>> {
+    let page = canvas.page();
+    let mut out = std::collections::HashMap::new();
+    let paper = Canvas::paper_color();
+
+    let coords: Vec<TileCoord> = canvas
+        .occupied_tiles()
+        .into_iter()
+        .filter(|c| tile_intersects(*c, page))
+        .collect();
+
+    for coord in coords {
+        let mut flat = vec![paper; TILE_SIZE * TILE_SIZE];
+        for layer in layers {
+            let opacity = layer.effective_opacity();
+            if opacity <= 0.0 {
+                continue;
+            }
+            let Some(src) = read_tile(device, queue, canvas, LayerId(layer.id()), coord) else {
+                continue;
+            };
+            for (dst, s) in flat.iter_mut().zip(src) {
+                // Layer opacity scales a premultiplied texel wholesale.
+                let scaled = [
+                    s[0] * opacity,
+                    s[1] * opacity,
+                    s[2] * opacity,
+                    s[3] * opacity,
+                ];
+                *dst = blend_over(scaled, *dst, layer.blend);
+            }
+        }
+        out.insert(coord, flat);
+    }
+    out
+}
+
+/// Composite premultiplied `src` over premultiplied `dst`, the PDF/CSS way.
+///
+/// Mirrors `blend_over` in canvas.wgsl. Blend functions are defined on straight colour, so this
+/// un-premultiplies, blends, and recombines.
+pub(crate) fn blend_over(src: [f32; 4], dst: [f32; 4], mode: Blend) -> [f32; 4] {
+    let (sa, da) = (src[3], dst[3]);
+    if sa <= 0.0 {
+        return dst;
+    }
+    let mut out = [0.0f32; 4];
+    for c in 0..3 {
+        let cs = src[c] / sa;
+        let cb = if da > 0.0 { dst[c] / da } else { 0.0 };
+        let b = mode.apply(cs, cb);
+        out[c] = sa * (1.0 - da) * cs + sa * da * b + (1.0 - sa) * da * cb;
+    }
+    out[3] = sa + da * (1.0 - sa);
+    out
+}
+
+/// Read one layer's tile back as linear premultiplied f32, or `None` if it has none there.
+fn read_tile(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    canvas: &CanvasRenderer,
+    layer: LayerId,
+    coord: TileCoord,
+) -> Option<Vec<[f32; 4]>> {
+    let slot = canvas.slot(layer, coord)?;
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("export-readback"),
-        size: (TILE_BYTES * coords.len()) as u64,
+        size: TILE_BYTES as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("export-encoder"),
     });
-    for (i, coord) in coords.iter().enumerate() {
-        let Some(slot) = canvas.slot(*coord) else {
-            continue;
-        };
-        encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
-                texture: canvas.pool().texture(),
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: slot.layer(),
-                },
-                aspect: wgpu::TextureAspect::All,
+    encoder.copy_texture_to_buffer(
+        wgpu::ImageCopyTexture {
+            texture: canvas.pool().texture(),
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: 0,
+                y: 0,
+                z: slot.layer(),
             },
-            wgpu::ImageCopyBuffer {
-                buffer: &buffer,
-                layout: wgpu::ImageDataLayout {
-                    offset: (TILE_BYTES * i) as u64,
-                    bytes_per_row: Some(TILE_SIZE as u32 * BYTES_PER_TEXEL),
-                    rows_per_image: Some(TILE_SIZE as u32),
-                },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::ImageCopyBuffer {
+            buffer: &buffer,
+            layout: wgpu::ImageDataLayout {
+                offset: 0,
+                // A tile row is 256 x 8 = 2048 bytes, already a multiple of the 256-byte copy
+                // alignment, so there is no padding to skip.
+                bytes_per_row: Some(TILE_SIZE as u32 * BYTES_PER_TEXEL),
+                rows_per_image: Some(TILE_SIZE as u32),
             },
-            wgpu::Extent3d {
-                width: TILE_SIZE as u32,
-                height: TILE_SIZE as u32,
-                depth_or_array_layers: 1,
-            },
-        );
-    }
+        },
+        wgpu::Extent3d {
+            width: TILE_SIZE as u32,
+            height: TILE_SIZE as u32,
+            depth_or_array_layers: 1,
+        },
+    );
     queue.submit(std::iter::once(encoder.finish()));
-
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     device.poll(wgpu::Maintain::Wait);
-    let mapped = buffer.slice(..).get_mapped_range();
-    bytemuck::cast_slice::<u8, half::f16>(&mapped)
-        .as_chunks::<4>()
-        .0
-        .to_vec()
-}
-
-/// Copy one tile's in-page part into the output image.
-fn blit_tile(
-    out: &mut [u8],
-    w: u32,
-    h: u32,
-    page_x: i32,
-    page_y: i32,
-    coord: TileCoord,
-    texels: &[[half::f16; 4]],
-) {
-    let t = TILE_SIZE as i32;
-    for ly in 0..TILE_SIZE {
-        let py = coord.1 * t + ly as i32 - page_y;
-        if py < 0 || py >= h as i32 {
-            continue;
-        }
-        for lx in 0..TILE_SIZE {
-            let px = coord.0 * t + lx as i32 - page_x;
-            if px < 0 || px >= w as i32 {
-                continue;
-            }
-            let i = (py as usize * w as usize + px as usize) * 4;
-            out[i..i + 4].copy_from_slice(&to_srgb8(&texels[ly * TILE_SIZE + lx]));
-        }
-    }
+    let view = buffer.slice(..).get_mapped_range();
+    Some(
+        bytemuck::cast_slice::<u8, half::f16>(&view)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| [c[0].to_f32(), c[1].to_f32(), c[2].to_f32(), c[3].to_f32()])
+            .collect(),
+    )
 }
 
 /// A linear premultiplied colour as f16 texel channels.
@@ -227,6 +272,12 @@ fn f16x4(rgba: [f32; 4]) -> [half::f16; 4] {
         half::f16::from_f32(rgba[2]),
         half::f16::from_f32(rgba[3]),
     ]
+}
+
+/// The sRGB encode, for the test that compares the GPU compositor against this one.
+#[cfg(test)]
+pub(crate) fn to_srgb8_for_test(rgba: [f32; 4]) -> [u8; 4] {
+    to_srgb8(&f16x4(rgba))
 }
 
 /// Convert one linear premultiplied texel to straight-alpha sRGB bytes.
@@ -364,13 +415,15 @@ mod tests {
             }
         }
 
-        let mut canvas = crate::test_gpu::test_canvas(&device, &cpu);
+        let stroke = crate::test_gpu::test_stroke_layer(&device);
+        let mut canvas = crate::test_gpu::test_canvas(&device, page, &stroke);
         let mut enc = device.create_command_encoder(&Default::default());
-        canvas.upload_dirty(&device, &queue, &mut enc, &mut cpu);
+        canvas.upload_dirty(&device, &queue, &mut enc, crate::test_gpu::L0, &mut cpu);
         queue.submit(std::iter::once(enc.finish()));
+        let doc = openpaint_core::Page::new(page.w, page.h);
 
         let path = std::env::temp_dir().join("openpaint-export-tiles-test.png");
-        export_tiles_png(&device, &queue, &canvas, &path).expect("export failed");
+        export_tiles_png(&device, &queue, &canvas, doc.layers(), &path).expect("export failed");
 
         let file = io::BufReader::new(std::fs::File::open(&path).expect("open png"));
         let decoder = png::Decoder::new(file);
@@ -407,12 +460,17 @@ mod tests {
             return;
         };
 
-        let cpu = Canvas::new(300, 200);
-        let canvas = crate::test_gpu::test_canvas(&device, &cpu);
-        assert_eq!(canvas.tiles().count(), 0, "nothing should be resident yet");
+        let doc = openpaint_core::Page::new(300, 200);
+        let stroke = crate::test_gpu::test_stroke_layer(&device);
+        let canvas = crate::test_gpu::test_canvas(&device, doc.rect(), &stroke);
+        assert_eq!(
+            canvas.occupied_tiles().len(),
+            0,
+            "nothing should be resident yet"
+        );
 
         let path = std::env::temp_dir().join("openpaint-export-blank-test.png");
-        export_tiles_png(&device, &queue, &canvas, &path).expect("export failed");
+        export_tiles_png(&device, &queue, &canvas, doc.layers(), &path).expect("export failed");
 
         let file = io::BufReader::new(std::fs::File::open(&path).expect("open png"));
         let mut reader = png::Decoder::new(file).read_info().expect("png header");

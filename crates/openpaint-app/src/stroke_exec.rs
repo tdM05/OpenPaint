@@ -24,13 +24,17 @@ use crate::canvas_renderer::CanvasRenderer;
 use crate::editor::StrokeOp;
 use crate::history::{History, Op};
 use crate::stroke_layer::StrokeLayer;
+use crate::tile_store::LayerId;
 
 /// Everything executing a stroke needs, borrowed for the duration.
 pub struct StrokeExec<'a> {
+    /// The layer being painted. Recorded with the stroke, so undo puts the pixels back where
+    /// they came from even if the selection has moved on since.
+    pub layer: LayerId,
     pub device: &'a wgpu::Device,
     pub queue: &'a wgpu::Queue,
     pub canvas: &'a mut CanvasRenderer,
-    pub layer: &'a mut StrokeLayer,
+    pub stroke: &'a mut StrokeLayer,
     pub history: &'a mut History,
     /// Dabs of the stroke being recorded, accumulated across frames so redo can replay it.
     pub recording: &'a mut Vec<Dab>,
@@ -49,12 +53,12 @@ impl StrokeExec<'_> {
         // Upload every dab once, up front. Per-batch uploads would be clobbered: all of a
         // submission's buffer writes are applied before any of its command buffers execute.
         // See StrokeLayer::upload_dabs.
-        self.layer.upload_dabs(self.device, self.queue, dabs);
+        self.stroke.upload_dabs(self.device, self.queue, dabs);
         // Dab clipping reads the page from the stroke layer's uniform, and stamping happens
         // before the frame is drawn -- so the page has to be current *here*, not at render
         // time.
         let page = self.canvas.page();
-        self.layer.set_page(self.queue, page);
+        self.stroke.set_page(self.queue, page);
 
         let mut unrecordable = false;
         for segment in segments(ops) {
@@ -78,9 +82,9 @@ impl StrokeExec<'_> {
         {
             self.recording.clear();
             *self.recording_paint = (*color_linear_premul, *opacity);
-            self.layer
+            self.stroke
                 .set_paint(self.queue, *color_linear_premul, *opacity);
-            self.layer.begin_stroke();
+            self.stroke.begin_stroke();
         }
 
         // The union of this segment's dabs decides which accumulation tiles are needed, so
@@ -98,11 +102,11 @@ impl StrokeExec<'_> {
             let span = &dabs[first..last.0 + last.1];
             self.recording.extend_from_slice(span);
             let tiles = self
-                .layer
+                .stroke
                 .prepare_tiles(self.queue, &mut encoder, span, page);
             for index in 0..tiles {
                 for &(start, len) in &ranges {
-                    self.layer.stamp_range(&mut encoder, index, start, len);
+                    self.stroke.stamp_range(&mut encoder, index, start, len);
                 }
             }
         }
@@ -118,24 +122,27 @@ impl StrokeExec<'_> {
 
     /// Snapshot what the stroke is about to overwrite, then bake it.
     fn commit(&mut self, encoder: &mut wgpu::CommandEncoder, page: PageRect) -> bool {
-        let tiles = self.layer.tiles_to_bake(page);
+        let tiles = self.stroke.tiles_to_bake(page);
         if tiles.is_empty() || self.recording.is_empty() {
-            self.layer
-                .bake(self.device, self.queue, encoder, self.canvas);
+            self.stroke
+                .bake(self.device, self.queue, encoder, self.canvas, self.layer);
             return false;
         }
 
         // Snapshot *before* baking: this is the pre-stroke image undo restores. A
         // GPU-to-GPU copy per tile, so nothing comes back to the CPU on the interactive
         // path.
-        let before = self.history.snapshot_tiles(encoder, self.canvas, &tiles);
-        self.layer
-            .bake(self.device, self.queue, encoder, self.canvas);
+        let before = self
+            .history
+            .snapshot_tiles(encoder, self.canvas, self.layer, &tiles);
+        self.stroke
+            .bake(self.device, self.queue, encoder, self.canvas, self.layer);
 
         match before {
             Some(before) => {
                 let (color_linear_premul, opacity) = *self.recording_paint;
                 self.history.push(Op::Stroke {
+                    layer: self.layer,
                     before,
                     dabs: std::mem::take(self.recording),
                     color_linear_premul,
@@ -176,9 +183,10 @@ mod tests {
     use super::*;
     use openpaint_core::Canvas;
 
-    use crate::canvas_renderer::CANVAS_FORMAT;
     use crate::editor::Editor;
-    use crate::test_gpu::{any_paint, readback_page, try_device};
+    use crate::test_gpu::{
+        any_paint, readback_page, test_canvas, test_stroke_layer, try_device, L0,
+    };
 
     fn begin() -> StrokeOp {
         StrokeOp::Begin {
@@ -237,12 +245,11 @@ mod tests {
 
         let mut editor = Editor::new();
         editor.brush_mut().radius = 12.0;
-        let page = editor.canvas().rect();
+        let page = editor.page_rect();
 
-        let cpu = Canvas::new(page.w, page.h);
-        let mut canvas = crate::test_gpu::test_canvas(&device, &cpu);
-        let mut layer =
-            StrokeLayer::new(&device, CANVAS_FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let mut layer = test_stroke_layer(&device);
+
+        let mut canvas = test_canvas(&device, page, &layer);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
         let mut recording_paint = ([0.0; 4], 1.0);
@@ -277,10 +284,10 @@ mod tests {
         );
 
         assert!(
-            canvas.tiles().count() > 0,
+            canvas.layer_tiles(L0).count() > 0,
             "the bake allocated no canvas tiles"
         );
-        let pixels = readback_page(&device, &queue, &canvas);
+        let pixels = readback_page(&device, &queue, &canvas, L0);
         assert!(any_paint(&pixels), "the stroke did not reach the canvas");
         assert_eq!(history.undo_depth(), 1, "the stroke was not recorded");
     }
@@ -296,11 +303,9 @@ mod tests {
 
         let mut editor = Editor::new();
         editor.brush_mut().radius = 20.0;
-        let page = editor.canvas().rect();
-        let cpu = Canvas::new(page.w, page.h);
-        let mut canvas = crate::test_gpu::test_canvas(&device, &cpu);
-        let mut layer =
-            StrokeLayer::new(&device, CANVAS_FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let page = editor.page_rect();
+        let mut layer = test_stroke_layer(&device);
+        let mut canvas = test_canvas(&device, page, &layer);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
         let mut recording_paint = ([0.0; 4], 1.0);
@@ -318,7 +323,7 @@ mod tests {
             &mut editor,
         );
 
-        let pixels = readback_page(&device, &queue, &canvas);
+        let pixels = readback_page(&device, &queue, &canvas, L0);
         assert!(any_paint(&pixels), "a single-frame tap painted nothing");
     }
 
@@ -333,11 +338,9 @@ mod tests {
 
         let mut editor = Editor::new();
         editor.brush_mut().radius = 15.0;
-        let page = editor.canvas().rect();
-        let cpu = Canvas::new(page.w, page.h);
-        let mut canvas = crate::test_gpu::test_canvas(&device, &cpu);
-        let mut layer =
-            StrokeLayer::new(&device, CANVAS_FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let page = editor.page_rect();
+        let mut layer = test_stroke_layer(&device);
+        let mut canvas = test_canvas(&device, page, &layer);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
         let mut recording_paint = ([0.0; 4], 1.0);
@@ -358,7 +361,7 @@ mod tests {
             &mut editor,
         );
 
-        let pixels = readback_page(&device, &queue, &canvas);
+        let pixels = readback_page(&device, &queue, &canvas, L0);
         let at = |x: u32, y: u32| pixels[(y * page.w + x) as usize];
         let paper = Canvas::paper_color()[0];
         assert!(
@@ -388,18 +391,16 @@ mod tests {
 
         let mut editor = Editor::new();
         editor.brush_mut().radius = 30.0;
-        let page = editor.canvas().rect();
-        let cpu = Canvas::new(page.w, page.h);
-
+        let page = editor.page_rect();
         // Room for four tiles, so a stroke across several forces eviction of its own tiles.
+        let mut layer = test_stroke_layer(&device);
         let mut canvas = CanvasRenderer::new(
             &device,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-            &cpu,
+            crate::test_gpu::SURFACE,
+            page,
             4 * openpaint_core::tile::TILE_BYTES as u64,
+            &layer,
         );
-        let mut layer =
-            StrokeLayer::new(&device, CANVAS_FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
         let mut history = History::new(&device);
         let mut recording = Vec::new();
         let mut recording_paint = ([0.0; 4], 1.0);
@@ -419,7 +420,7 @@ mod tests {
             &mut editor,
         );
         assert!(
-            canvas.slot((0, 0)).is_some(),
+            canvas.slot(L0, (0, 0)).is_some(),
             "tile (0,0) should be resident"
         );
 
@@ -444,7 +445,7 @@ mod tests {
             );
         }
         assert!(
-            canvas.slot((0, 0)).is_none(),
+            canvas.slot(L0, (0, 0)).is_none(),
             "tile (0,0) should have been evicted by now"
         );
         assert!(canvas.traffic().0 > 0, "nothing was ever read back");
@@ -454,7 +455,7 @@ mod tests {
         let mut enc = device.create_command_encoder(&Default::default());
         assert!(
             canvas
-                .make_resident(&device, &queue, &mut enc, (0, 0))
+                .make_resident(&device, &queue, &mut enc, L0, (0, 0))
                 .is_some(),
             "the spilled tile could not be restored"
         );
@@ -462,12 +463,11 @@ mod tests {
 
         // Just this tile: most of the canvas is spilled on purpose, so a whole-page readback
         // would (correctly) refuse.
-        let tile = crate::test_gpu::readback_tile(&device, &queue, &canvas, (0, 0))
+        let tile = crate::test_gpu::readback_tile(&device, &queue, &canvas, L0, (0, 0))
             .expect("resident after the restore");
-        let paper = Canvas::paper_color()[0];
         let texel = tile[125 * openpaint_core::tile::TILE_SIZE + 125];
         assert!(
-            texel[0] < paper - 0.05,
+            texel[3] > 0.05,
             "the stroke did not survive the round trip: {texel:?}"
         );
     }
@@ -488,10 +488,11 @@ mod tests {
         {
             let (ops, dabs) = editor.pending_stroke();
             let mut exec = StrokeExec {
+                layer: L0,
                 device,
                 queue,
                 canvas,
-                layer,
+                stroke: layer,
                 history,
                 recording,
                 recording_paint,

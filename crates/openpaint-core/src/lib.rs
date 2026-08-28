@@ -12,6 +12,7 @@ pub mod canvas;
 pub mod color;
 pub mod dab;
 pub mod document;
+pub mod layer;
 pub mod page;
 pub mod raster;
 pub mod stroke;
@@ -21,6 +22,7 @@ pub use brush::{Brush, StrokeState};
 pub use canvas::Canvas;
 pub use dab::Dab;
 pub use document::{Document, Mode};
+pub use layer::{Blend, Layer};
 pub use page::{Page, PageRect, PageResize, Side};
 pub use stroke::StrokePainter;
 

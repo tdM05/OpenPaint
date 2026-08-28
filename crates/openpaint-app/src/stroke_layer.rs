@@ -13,9 +13,14 @@
 //!
 //! # The stroke is a separate layer until it ends
 //!
-//! Dabs accumulate into a single-channel buffer, and the canvas is **not touched** while
-//! the stroke is in progress. Mid-stroke the preview is drawn as a second pass over the
-//! canvas; on stroke end the accumulated paint is baked into the canvas once.
+//! Dabs accumulate into a single-channel buffer, and the canvas is **not touched** while the
+//! stroke is in progress. On stroke end the accumulated paint is baked into the active layer
+//! once.
+//!
+//! Mid-stroke, the *compositor* reads this buffer and injects it into the active layer as it
+//! walks the stack (DECISIONS §4e), so there is no preview pass here. That is why the preview
+//! and the committed result cannot disagree: they are the same arithmetic, run on the same
+//! accumulation, in the same shader.
 //!
 //! That structure is what makes the flow/opacity model work without a snapshot: *flow*
 //! accumulates per dab while *opacity* caps the stroke total, so the stroke has to stay
@@ -40,6 +45,7 @@ use openpaint_core::{Dab, PageRect};
 
 use crate::canvas_renderer::{tile_intersects, tile_of, CanvasRenderer};
 use crate::tile_pool::{layers_for_budget, TileMap, TilePool};
+use crate::tile_store::LayerId;
 use crate::view::PageToNdc;
 
 /// Accumulation format. `R16Float` rather than `R8Unorm` because a stroke at low flow
@@ -134,15 +140,6 @@ struct XformUniform {
     params: [f32; 4],
 }
 
-/// Matching `TileInst` in stroke.wgsl.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct TileInstance {
-    coord: [i32; 2],
-    layer: u32,
-    _pad: u32,
-}
-
 pub struct StrokeLayer {
     pool: TilePool,
     /// Accumulation tiles for the stroke in progress.
@@ -151,7 +148,6 @@ pub struct StrokeLayer {
     stamp_records: Vec<TileCoord>,
     dab_pipeline: wgpu::RenderPipeline,
     bake_pipeline: wgpu::RenderPipeline,
-    preview_pipeline: wgpu::RenderPipeline,
     paint_group: wgpu::BindGroup,
     /// Bound at group 0 during the dab pass, where the accumulation array is the render
     /// target and must not also be sampled.
@@ -164,10 +160,8 @@ pub struct StrokeLayer {
     /// Dab instances, grown on demand and reused between updates.
     instances: wgpu::Buffer,
     instance_capacity: usize,
-    /// Preview instances, one per accumulation tile.
-    tile_instances: wgpu::Buffer,
-    tile_instance_capacity: usize,
-    preview_count: u32,
+    /// Paint captured at stroke start, which the compositor needs to show the preview.
+    paint: ([f32; 4], f32),
     /// The camera and page last published, so the page can be refreshed without the
     /// caller having to supply a camera it does not have.
     frame: (PageToNdc, PageRect),
@@ -179,11 +173,7 @@ pub struct StrokeLayer {
 }
 
 impl StrokeLayer {
-    pub fn new(
-        device: &wgpu::Device,
-        canvas_format: wgpu::TextureFormat,
-        surface_format: wgpu::TextureFormat,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, canvas_format: wgpu::TextureFormat) -> Self {
         let capacity = layers_for_budget(device, ACCUM_BYTES_PER_TEXEL, ACCUM_BUDGET_BYTES);
         let pool = TilePool::new(
             device,
@@ -432,43 +422,12 @@ impl StrokeLayer {
             })
         };
 
-        let tile_instance_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<TileInstance>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Sint32x2,
-                },
-                wgpu::VertexAttribute {
-                    offset: 8,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Uint32,
-                },
-            ],
-        };
-
         let bake_pipeline = composite("bake-pipeline", "bake_vs", canvas_format, &[]);
-        let preview_pipeline = composite(
-            "preview-pipeline",
-            "preview_vs",
-            surface_format,
-            std::slice::from_ref(&tile_instance_layout),
-        );
 
         let instance_capacity = 256;
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dab-instances"),
             size: (instance_capacity * std::mem::size_of::<DabInstance>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let tile_instance_capacity = 64;
-        let tile_instances = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("stroke-tile-instances"),
-            size: (tile_instance_capacity * std::mem::size_of::<TileInstance>())
-                as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -479,7 +438,6 @@ impl StrokeLayer {
             stamp_records: Vec::new(),
             dab_pipeline,
             bake_pipeline,
-            preview_pipeline,
             paint_group,
             empty_group,
             tile_group,
@@ -489,9 +447,7 @@ impl StrokeLayer {
             xform_buf,
             instances,
             instance_capacity,
-            tile_instances,
-            tile_instance_capacity,
-            preview_count: 0,
+            paint: ([0.0; 4], 1.0),
             frame: (
                 PageToNdc {
                     x_row: [0.0; 3],
@@ -502,6 +458,24 @@ impl StrokeLayer {
             dirty: false,
             exhausted: false,
         }
+    }
+
+    /// The accumulation texture, so the compositor can read the in-progress stroke.
+    #[must_use]
+    pub fn accum_texture(&self) -> &wgpu::Texture {
+        self.pool.texture()
+    }
+
+    /// Which accumulation layer holds the stroke for a tile, if any.
+    #[must_use]
+    pub fn accum_slot(&self, coord: TileCoord) -> Option<u32> {
+        self.map.slot(coord).map(crate::tile_pool::Slot::layer)
+    }
+
+    /// The colour and opacity ceiling of the stroke in progress.
+    #[must_use]
+    pub fn paint(&self) -> ([f32; 4], f32) {
+        self.paint
     }
 
     /// Whether the layer holds any paint that still needs showing or baking.
@@ -603,7 +577,8 @@ impl StrokeLayer {
     }
 
     /// Update the stroke colour and opacity used when compositing.
-    pub fn set_paint(&self, queue: &wgpu::Queue, color_linear_premul: [f32; 4], opacity: f32) {
+    pub fn set_paint(&mut self, queue: &wgpu::Queue, color_linear_premul: [f32; 4], opacity: f32) {
+        self.paint = (color_linear_premul, opacity.clamp(0.0, 1.0));
         queue.write_buffer(
             &self.paint_buf,
             0,
@@ -747,52 +722,6 @@ impl StrokeLayer {
         self.dirty = true;
     }
 
-    /// Build the preview draw list from the stroke's accumulation tiles.
-    pub fn prepare_preview(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, page: PageRect) {
-        let mut list: Vec<TileInstance> = self
-            .map
-            .iter()
-            .filter(|(coord, _)| tile_intersects(*coord, page))
-            .map(|(coord, slot)| TileInstance {
-                coord: [coord.0, coord.1],
-                layer: slot.layer(),
-                _pad: 0,
-            })
-            .collect();
-        list.sort_unstable_by_key(|i| (i.coord[1], i.coord[0]));
-
-        self.preview_count = list.len() as u32;
-        if list.is_empty() {
-            return;
-        }
-        if list.len() > self.tile_instance_capacity {
-            self.tile_instance_capacity = list.len().next_power_of_two();
-            self.tile_instances = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("stroke-tile-instances"),
-                size: (self.tile_instance_capacity * std::mem::size_of::<TileInstance>())
-                    as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-        queue.write_buffer(&self.tile_instances, 0, bytemuck::cast_slice(&list));
-    }
-
-    /// Composite the stroke onto the surface, following the canvas.
-    ///
-    /// Used mid-stroke so the canvas underneath stays untouched.
-    pub fn draw_preview<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        if self.preview_count == 0 {
-            return;
-        }
-        pass.set_pipeline(&self.preview_pipeline);
-        pass.set_bind_group(0, &self.paint_group, &[]);
-        pass.set_bind_group(1, &self.tile_group, &[0]);
-        pass.set_bind_group(2, &self.xform_group, &[]);
-        pass.set_vertex_buffer(0, self.tile_instances.slice(..));
-        pass.draw(0..6, 0..self.preview_count);
-    }
-
     /// The canvas tiles a bake would write, in the order it will write them.
     ///
     /// Separate from [`StrokeLayer::bake`] because history has to snapshot those tiles
@@ -824,6 +753,7 @@ impl StrokeLayer {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         canvas: &mut CanvasRenderer,
+        layer: LayerId,
     ) -> Vec<TileCoord> {
         if !self.dirty {
             return Vec::new();
@@ -838,11 +768,14 @@ impl StrokeLayer {
         for (index, coord) in records.into_iter().enumerate() {
             // A tile the stroke reached may not exist on the canvas yet, and one that does
             // may have spilled to the CPU since it was last drawn.
-            if canvas.ensure_tile(device, queue, encoder, coord).is_err() {
+            if canvas
+                .ensure_tile(device, queue, encoder, layer, coord)
+                .is_err()
+            {
                 self.exhausted = true;
                 continue;
             }
-            let Some(target) = canvas.tile_target(coord) else {
+            let Some(target) = canvas.tile_target(layer, coord) else {
                 continue;
             };
             let mut pass = encoder
@@ -868,12 +801,11 @@ impl StrokeLayer {
             pass.set_bind_group(2, &self.xform_group, &[]);
             pass.draw(0..6, 0..1);
             drop(pass);
-            canvas.mark_dirty(coord);
+            canvas.mark_dirty(layer, coord);
             written.push(coord);
         }
 
         self.dirty = false;
-        self.preview_count = 0;
         written
     }
 }
@@ -937,9 +869,9 @@ mod tests {
     use super::*;
     use openpaint_core::{Canvas, StrokePainter};
 
-    use crate::canvas_renderer::CANVAS_FORMAT;
     use crate::test_gpu::{
-        any_paint, max_difference, mean_difference, readback_page, try_device, SIZE,
+        any_paint, max_difference, mean_difference, readback_page, test_canvas, test_stroke_layer,
+        try_device, L0, SIZE,
     };
 
     const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
@@ -966,12 +898,9 @@ mod tests {
     fn gpu_render_batched(dabs: &[Dab], opacity: f32, batches: usize) -> Vec<[f32; 4]> {
         let (device, queue) = try_device().expect("checked by caller");
 
-        let cpu = Canvas::new(SIZE, SIZE);
-        let page = cpu.rect();
-        // The preview pipeline's format is irrelevant here; it is never drawn.
-        let mut canvas = crate::test_gpu::test_canvas(&device, &cpu);
-        let mut layer =
-            StrokeLayer::new(&device, CANVAS_FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let page = openpaint_core::PageRect::from_size(SIZE, SIZE);
+        let mut layer = test_stroke_layer(&device);
+        let mut canvas = test_canvas(&device, page, &layer);
 
         // Every uniform written once, before the single submission -- the ordering rule
         // this module exists to respect.
@@ -994,10 +923,10 @@ mod tests {
                 start += len;
             }
         }
-        layer.bake(&device, &queue, &mut encoder, &mut canvas);
+        layer.bake(&device, &queue, &mut encoder, &mut canvas, L0);
         queue.submit(std::iter::once(encoder.finish()));
 
-        readback_page(&device, &queue, &canvas)
+        readback_page(&device, &queue, &canvas, L0)
     }
 
     /// Rasterize the same dabs through the CPU reference implementation.
@@ -1008,13 +937,13 @@ mod tests {
         painter.add_dabs(&canvas, dabs);
         painter.composite(&mut canvas, BLACK, opacity);
 
-        let paper = Canvas::paper_color().map(|c| half::f16::from_f32(c).to_f32());
         (0..SIZE)
             .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
             .map(|(x, y)| match canvas.tile((0, 0)) {
                 // Tiles are 256 wide, so the whole 128x128 canvas is tile (0, 0).
                 Some(tile) => tile.texel(x as usize, y as usize),
-                None => paper,
+                // A layer is transparent where nothing was painted.
+                None => [0.0; 4],
             })
             .collect()
     }
@@ -1095,14 +1024,12 @@ mod tests {
         let mean = mean_difference(&gpu, &cpu);
         assert!(mean < 0.002, "mean difference {mean} is too large");
 
-        // And the ceiling must actually bind: black at opacity 0.5 over paper can never
-        // darken past halfway.
-        let paper = Canvas::paper_color()[0];
-        let darkest = gpu.iter().map(|p| p[0]).fold(f32::MAX, f32::min);
+        // And the ceiling must actually bind: a stroke at opacity 0.5 can never reach more
+        // than half coverage, however many dabs pile up.
+        let most = gpu.iter().map(|p| p[3]).fold(0.0f32, f32::max);
         assert!(
-            darkest > paper * (1.0 - opacity) - 0.02,
-            "GPU passed the opacity ceiling: darkest {darkest}, floor {}",
-            paper * (1.0 - opacity)
+            most <= opacity + 0.02,
+            "GPU passed the opacity ceiling: most {most}, ceiling {opacity}"
         );
     }
 
@@ -1163,11 +1090,9 @@ mod tests {
             .map(|i| dab(10.0 + i as f32 * 3.0, 150.0, 20.0, 0.5, 0.4))
             .collect();
 
-        let cpu_canvas = Canvas::new(W, H);
-        let page = cpu_canvas.rect();
-        let mut canvas = crate::test_gpu::test_canvas(&device, &cpu_canvas);
-        let mut layer =
-            StrokeLayer::new(&device, CANVAS_FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let page = openpaint_core::PageRect::from_size(W, H);
+        let mut layer = test_stroke_layer(&device);
+        let mut canvas = test_canvas(&device, page, &layer);
 
         layer.set_page(&queue, page);
         layer.set_paint(&queue, BLACK, 1.0);
@@ -1179,10 +1104,10 @@ mod tests {
         for index in 0..tiles {
             layer.stamp_range(&mut encoder, index, 0, dabs.len());
         }
-        layer.bake(&device, &queue, &mut encoder, &mut canvas);
+        layer.bake(&device, &queue, &mut encoder, &mut canvas, L0);
         queue.submit(std::iter::once(encoder.finish()));
 
-        let gpu = readback_page(&device, &queue, &canvas);
+        let gpu = readback_page(&device, &queue, &canvas, L0);
 
         let mut reference = Canvas::new(W, H);
         let mut painter = StrokePainter::new();
@@ -1190,7 +1115,6 @@ mod tests {
         painter.add_dabs(&reference, &dabs);
         painter.composite(&mut reference, BLACK, 1.0);
 
-        let paper = Canvas::paper_color().map(|c| half::f16::from_f32(c).to_f32());
         let cpu: Vec<[f32; 4]> = (0..H)
             .flat_map(|y| (0..W).map(move |x| (x, y)))
             .map(|(x, y)| {
@@ -1200,7 +1124,7 @@ mod tests {
                 );
                 match reference.tile(coord) {
                     Some(tile) => tile.texel((x as usize) % TILE_SIZE, (y as usize) % TILE_SIZE),
-                    None => paper,
+                    None => [0.0; 4],
                 }
             })
             .collect();

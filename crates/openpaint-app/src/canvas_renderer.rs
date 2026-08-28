@@ -1,33 +1,44 @@
-//! Draws the canvas from a bounded pool of GPU tiles.
+//! Draws the canvas: the layer stack, composited from a bounded pool of GPU tiles.
 //!
 //! # What replaced what
 //!
-//! This used to hold one texture the size of the whole page. That was recorded as a
-//! Phase-0 shortcut (OPEN_QUESTIONS Q13) and it imposed two ceilings the app had to
-//! apologise for: a page could be no bigger than `max_texture_dimension_2d` (8192), and
-//! no bigger than one allocation the driver would accept (~16 Mpx at `Rgba16Float`).
-//! Both are gone: a page's size no longer determines any allocation.
+//! This used to hold one texture the size of the whole page. That was recorded as a Phase-0
+//! shortcut (OPEN_QUESTIONS Q13) and it imposed two ceilings the app had to apologise for: a
+//! page could be no bigger than `max_texture_dimension_2d` (8192), and no bigger than one
+//! allocation the driver would accept (~16 Mpx at `Rgba16Float`). Both are gone: a page's size
+//! no longer determines any allocation.
 //!
 //! Three consequences worth stating, because they are the point:
 //!
 //! 1. **Memory scales with painted area, not page area.** A blank 800×20000 webtoon strip
-//!    costs nothing until it is drawn on.
+//!    costs nothing until it is drawn on, and [`crate::tile_store`] spills what does not fit.
 //! 2. **Storage is decoupled from the page rectangle**, which is what makes a crop
 //!    non-destructive (DECISIONS §5c): tiles outside the page are kept, just not drawn.
-//! 3. **Resizing is metadata.** No texture is recreated and no pixel is copied — the
-//!    previous implementation did a full reallocation and a whole-canvas blit per resize.
+//! 3. **Resizing is metadata.** No texture is recreated and no pixel is copied.
 //!
 //! # Page coordinates go all the way down
 //!
-//! There is no longer a page-origin-to-texture-origin offset anywhere, because a tile is
-//! addressed by its *page* tile coordinate. The signed-origin invariant (DECISIONS §5a) —
-//! a pixel keeps its coordinate forever — now holds unbroken from the core to the GPU,
-//! and the subtraction that used to sit at the boundary is deleted rather than moved.
+//! There is no page-origin-to-texture-origin offset anywhere, because a tile is addressed by
+//! its *page* tile coordinate. The signed-origin invariant (DECISIONS §5a) — a pixel keeps its
+//! coordinate forever — holds unbroken from the core to the GPU.
+//!
+//! # Compositing is one pass, and the preview is part of it
+//!
+//! Every layer's tiles live in the same array texture, so one fragment shader reads the whole
+//! stack (DECISIONS §4e). That is what lets blend modes be plain arithmetic instead of needing
+//! a destination read, and it is why the in-progress stroke is *injected into the active
+//! layer* rather than drawn on top: a mid-stroke preview runs the same code as the committed
+//! result, so the two cannot disagree.
+//!
+//! Consequently this needs the stroke layer's accumulation texture at construction time. That
+//! coupling is real and deliberate — the preview genuinely is part of compositing — and it is
+//! safe because neither pool's texture is ever replaced.
 
 use half::f16;
-use openpaint_core::tile::{TileCoord, TILE_BYTES, TILE_CHANNELS, TILE_SIZE};
-use openpaint_core::{Canvas, PageRect};
+use openpaint_core::tile::{TileCoord, TILE_CHANNELS, TILE_SIZE};
+use openpaint_core::{Canvas, Layer, PageRect};
 
+use crate::stroke_layer::StrokeLayer;
 use crate::tile_pool::{Slot, TilePool};
 use crate::tile_store::{Init, LayerId, Pressure, TileKey, TileStore};
 use crate::view::PageToNdc;
@@ -39,21 +50,29 @@ pub const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Bytes per canvas texel (RGBA f16).
 pub const CANVAS_BYTES_PER_TEXEL: u32 = (TILE_CHANNELS * std::mem::size_of::<f16>()) as u32;
 
-/// The layer being drawn and painted.
-///
-/// One layer for now. Named rather than hardcoded at every call site so that adding the
-/// stack is a change to who supplies it, not a hunt through the file.
-pub const ACTIVE_LAYER: LayerId = LayerId(0);
+/// Marks "this layer has no tile here", matching `ABSENT` in canvas.wgsl.
+const ABSENT: u32 = u32::MAX;
 
-/// Uniform matching `Xform` in canvas.wgsl.
+/// Uniform matching `Params` in canvas.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct XformUniform {
+struct ParamsUniform {
     x_row: [f32; 4],
     y_row: [f32; 4],
     page: [f32; 4],
     paper: [f32; 4],
-    params: [f32; 4],
+    stroke: [f32; 4],
+    counts: [u32; 4],
+    misc: [f32; 4],
+}
+
+/// Matching `LayerInfo` in canvas.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct LayerInfoRecord {
+    blend: u32,
+    opacity: f32,
+    _pad: [f32; 2],
 }
 
 /// Per-instance data matching `TileInst` in canvas.wgsl.
@@ -61,18 +80,29 @@ struct XformUniform {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct TileInstance {
     coord: [i32; 2],
-    layer: u32,
-    _pad: u32,
 }
 
 pub struct CanvasRenderer {
     store: TileStore,
     /// The page rectangle. Drawing and painting are bounded by it; storage is not.
     page: PageRect,
+    /// Rebuilt whenever a storage buffer is grown, which is why the pieces are kept.
     bind_group: wgpu::BindGroup,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    accum_view: wgpu::TextureView,
     sheet_pipeline: wgpu::RenderPipeline,
-    tile_pipeline: wgpu::RenderPipeline,
-    xform_buf: wgpu::Buffer,
+    composite_pipeline: wgpu::RenderPipeline,
+    params_buf: wgpu::Buffer,
+    /// One entry per (instance, layer): which pool layer holds that tile, or `ABSENT`.
+    slots_buf: wgpu::Buffer,
+    slots_capacity: usize,
+    /// One entry per layer: blend mode and opacity.
+    infos_buf: wgpu::Buffer,
+    infos_capacity: usize,
+    /// One entry per instance: which accumulation layer holds the in-progress stroke there.
+    stroke_buf: wgpu::Buffer,
+    stroke_capacity: usize,
     instances: wgpu::Buffer,
     instance_capacity: usize,
     /// Instances written by the last `prepare`, i.e. what `draw` will draw.
@@ -83,29 +113,57 @@ impl CanvasRenderer {
     pub fn new(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
-        canvas: &Canvas,
+        page: PageRect,
         budget_bytes: u64,
+        stroke: &StrokeLayer,
     ) -> Self {
         let store = TileStore::new(device, budget_bytes);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("canvas-sampler"),
-            // Nearest when magnifying, so zooming in shows real pixels rather than a
-            // blur -- what you want when inspecting brush edges. Linear when minifying,
-            // so a zoomed-out canvas doesn't alias into noise.
+            // Nearest when magnifying, so zooming in shows real pixels rather than a blur --
+            // what you want when inspecting brush edges. Linear when minifying, so a
+            // zoomed-out canvas doesn't alias into noise.
             //
-            // An array texture is what makes this safe: each tile is its own image with
-            // its own clamped edges, so a filtered sample near a tile border cannot pull
-            // in an unrelated tile the way it would from a 2D atlas.
+            // An array texture is what makes this safe: each tile is its own image with its own
+            // clamped edges, so a filtered sample near a tile border cannot pull in an
+            // unrelated tile the way it would from a 2D atlas.
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        // Its own view of the stroke layer's array, because a `TextureView` cannot be cloned
+        // and this one has to survive being rebound when a storage buffer grows.
+        let accum_view = stroke
+            .accum_texture()
+            .create_view(&wgpu::TextureViewDescriptor {
+                label: Some("canvas-accum-view"),
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
 
-        let xform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("canvas-xform"),
-            size: std::mem::size_of::<XformUniform>() as wgpu::BufferAddress,
+        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("canvas-params"),
+            size: std::mem::size_of::<ParamsUniform>() as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let slots_capacity = 1024;
+        let infos_capacity = 16;
+        let stroke_capacity = 256;
+        let instance_capacity = 256;
+        let slots_buf = storage_buffer(device, "canvas-slots", slots_capacity * 4);
+        let infos_buf = storage_buffer(
+            device,
+            "canvas-layer-infos",
+            infos_capacity * std::mem::size_of::<LayerInfoRecord>(),
+        );
+        let stroke_buf = storage_buffer(device, "canvas-stroke-slots", stroke_capacity * 4);
+        let instances = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("canvas-tile-instances"),
+            size: (instance_capacity * std::mem::size_of::<TileInstance>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -122,31 +180,30 @@ impl CanvasRenderer {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
+                texture_entry(1),
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                storage_entry(3),
+                storage_entry(4),
+                texture_entry(5),
+                storage_entry(6),
             ],
         });
 
         let bind_group = make_bind_group(
             device,
             &bind_group_layout,
-            &xform_buf,
+            &params_buf,
             store.pool(),
             &sampler,
+            &slots_buf,
+            &infos_buf,
+            &accum_view,
+            &stroke_buf,
         );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -190,33 +247,26 @@ impl CanvasRenderer {
             cache: None,
         });
 
-        let tile_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("canvas-tile-pipeline"),
+        let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("canvas-composite-pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "tile_vs",
+                entry_point: "composite_vs",
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<TileInstance>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: wgpu::VertexFormat::Sint32x2,
-                        },
-                        wgpu::VertexAttribute {
-                            offset: 8,
-                            shader_location: 1,
-                            format: wgpu::VertexFormat::Uint32,
-                        },
-                    ],
+                    attributes: &[wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Sint32x2,
+                    }],
                 }],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "tile_fs",
+                entry_point: "composite_fs",
                 targets: &[target(surface_format)],
                 compilation_options: Default::default(),
             }),
@@ -227,21 +277,22 @@ impl CanvasRenderer {
             cache: None,
         });
 
-        let instance_capacity = 128;
-        let instances = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("canvas-tile-instances"),
-            size: (instance_capacity * std::mem::size_of::<TileInstance>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         Self {
             store,
-            page: canvas.rect(),
+            page,
             bind_group,
+            bind_group_layout,
+            sampler,
+            accum_view,
             sheet_pipeline,
-            tile_pipeline,
-            xform_buf,
+            composite_pipeline,
+            params_buf,
+            slots_buf,
+            slots_capacity,
+            infos_buf,
+            infos_capacity,
+            stroke_buf,
+            stroke_capacity,
             instances,
             instance_capacity,
             instance_count: 0,
@@ -256,9 +307,9 @@ impl CanvasRenderer {
 
     /// Move the page rectangle.
     ///
-    /// The entire cost of a resize. Tiles are addressed in page coordinates, so nothing
-    /// is reallocated, copied, or rekeyed — and tiles that fall outside the new rectangle
-    /// are **kept**, which is what makes a crop non-destructive (DECISIONS §5c).
+    /// The entire cost of a resize. Tiles are addressed in page coordinates, so nothing is
+    /// reallocated, copied, or rekeyed — and tiles that fall outside the new rectangle are
+    /// **kept**, which is what makes a crop non-destructive (DECISIONS §5c).
     pub fn set_page(&mut self, page: PageRect) {
         self.page = page;
     }
@@ -291,132 +342,113 @@ impl CanvasRenderer {
         self.store.begin_frame();
     }
 
-    /// The pool layer holding `coord`, if it is resident.
+    /// The pool layer holding a tile, if it is resident.
     #[must_use]
-    pub fn slot(&self, coord: TileCoord) -> Option<&Slot> {
-        self.store.slot(TileKey::new(ACTIVE_LAYER, coord))
+    pub fn slot(&self, layer: LayerId, coord: TileCoord) -> Option<&Slot> {
+        self.store.slot(TileKey::new(layer, coord))
     }
 
-    /// Every tile the canvas holds, resident or spilled.
-    pub fn tiles(&self) -> impl Iterator<Item = TileCoord> + '_ {
+    /// Every tile a layer holds, resident or spilled.
+    pub fn layer_tiles(&self, layer: LayerId) -> impl Iterator<Item = TileCoord> + '_ {
         self.store
             .keys()
-            .filter(|k| k.layer == ACTIVE_LAYER)
+            .filter(move |k| k.layer == layer)
             .map(|k| k.coord)
     }
 
-    /// Make sure `coord` is on the GPU, restoring it from the CPU if it had spilled.
+    /// Every tile coordinate any layer holds, deduplicated and in a stable order.
+    #[must_use]
+    pub fn occupied_tiles(&self) -> Vec<TileCoord> {
+        let mut all: Vec<TileCoord> = self.store.keys().map(|k| k.coord).collect();
+        all.sort_unstable_by_key(|c| (c.1, c.0));
+        all.dedup();
+        all
+    }
+
+    /// Make sure a tile is on the GPU, restoring it from the CPU if it had spilled.
     ///
-    /// Returns `None` when it is not a tile this canvas has, so callers that only want
-    /// existing pixels do not accidentally create empty ones.
+    /// Returns `None` when that layer has no such tile, so callers that only want existing
+    /// pixels do not accidentally create empty ones.
     pub fn make_resident(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        layer: LayerId,
         coord: TileCoord,
     ) -> Option<u32> {
-        let key = TileKey::new(ACTIVE_LAYER, coord);
+        let key = TileKey::new(layer, coord);
         if !self.store.contains(key) {
             return None;
         }
+        // The init value is unreachable: the tile exists, so this is a restore.
         self.store
-            .ensure(
-                device,
-                queue,
-                encoder,
-                key,
-                // Unreachable: the tile exists, so this is a restore, not a creation.
-                Init::Clear(paper_clear_color(Canvas::paper_color())),
-            )
+            .ensure(device, queue, encoder, key, Init::Untouched)
             .ok()
     }
 
     /// Note that a tile's pixels changed, so residency owes it a readback if it spills.
-    pub fn mark_dirty(&mut self, coord: TileCoord) {
-        self.store.mark_dirty(TileKey::new(ACTIVE_LAYER, coord));
+    pub fn mark_dirty(&mut self, layer: LayerId, coord: TileCoord) {
+        self.store.mark_dirty(TileKey::new(layer, coord));
     }
 
-    /// Make sure `coord` has a tile, clearing a fresh one to paper.
+    /// Make sure a tile exists, creating it **transparent** if it did not.
     ///
-    /// Fresh tiles are cleared to paper rather than transparent so a partially-covered tile
-    /// shows sheet, not a hole, in the parts the brush has not reached. That changes when
-    /// layers land: a *layer* is transparent where unpainted, and the paper moves to the
-    /// bottom of the compositor.
+    /// Transparent, not paper: a layer is empty where unpainted, and the paper belongs at the
+    /// bottom of the compositor. Filling layer tiles with paper would make every layer opaque
+    /// and hide everything beneath it.
     pub fn ensure_tile(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        layer: LayerId,
         coord: TileCoord,
     ) -> Result<u32, Pressure> {
         self.store.ensure(
             device,
             queue,
             encoder,
-            TileKey::new(ACTIVE_LAYER, coord),
-            Init::Clear(paper_clear_color(Canvas::paper_color())),
+            TileKey::new(layer, coord),
+            Init::Clear(wgpu::Color::TRANSPARENT),
         )
     }
 
-    /// Make sure `coord` has a tile, **without** clearing it to paper, for a caller that is
-    /// about to overwrite every texel.
-    ///
-    /// The clear is skipped rather than merely wasted. Clearing goes through the encoder while
-    /// a full upload goes through `Queue::write_texture`, and every queue write in a
-    /// submission is applied *before* any of its commands run -- so a paper clear here would
-    /// be reordered *after* the upload and wipe it. The export test is what caught that.
-    fn ensure_tile_for_full_write(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        coord: TileCoord,
-    ) -> Option<u32> {
-        self.store
-            .ensure(
-                device,
-                queue,
-                encoder,
-                TileKey::new(ACTIVE_LAYER, coord),
-                Init::Untouched,
-            )
-            .ok()
-    }
-
-    /// The tile at `coord` as a render target, for a stroke to bake into.
+    /// A tile as a render target, for a stroke to bake into.
     #[must_use]
-    pub fn tile_target(&self, coord: TileCoord) -> Option<&wgpu::TextureView> {
+    pub fn tile_target(&self, layer: LayerId, coord: TileCoord) -> Option<&wgpu::TextureView> {
         self.store
-            .slot(TileKey::new(ACTIVE_LAYER, coord))
+            .slot(TileKey::new(layer, coord))
             .map(|s| self.store.pool().layer_view(s))
     }
 
-    /// Drop every tile that lies entirely outside the page, handing the caller their
-    /// coordinates so it can record them.
-    ///
-    /// The only operation that discards pixels — see [`CanvasRenderer::take_tile`].
-    pub fn tiles_outside_page(&self) -> Vec<TileCoord> {
+    /// Every tile of every layer that lies entirely outside the page.
+    #[must_use]
+    pub fn tiles_outside_page(&self) -> Vec<TileKey> {
         let page = self.page;
-        self.tiles()
-            .filter(|c| !tile_intersects(*c, page))
-            .collect()
+        let mut out: Vec<TileKey> = self
+            .store
+            .keys()
+            .filter(|k| !tile_intersects(k.coord, page))
+            .collect();
+        out.sort_unstable();
+        out
     }
 
-    /// Take a tile out of the canvas, giving up ownership of its layer.
+    /// Take a tile out of the canvas, giving up ownership of its pool layer.
     ///
-    /// Used by undo (a tile the stroke created must go away again) and by Trim. The layer
-    /// is *not* freed here: the caller decides whether to return it to the pool or keep it
-    /// alive as a snapshot, and the move-only slot is what makes that choice explicit.
+    /// Used by undo (a tile the stroke created must go away again) and by Trim. The layer is
+    /// *not* freed here: the caller decides whether to return it or keep it alive as a
+    /// snapshot, and the move-only slot is what makes that choice explicit.
     #[must_use]
-    pub fn take_tile(&mut self, coord: TileCoord) -> Option<Slot> {
-        self.store.remove(TileKey::new(ACTIVE_LAYER, coord))
+    pub fn take_tile(&mut self, key: TileKey) -> Option<Slot> {
+        self.store.remove(key)
     }
 
     /// Put a tile back, e.g. when undoing a Trim. Returns any displaced slot.
     #[must_use = "the displaced slot must be returned to a pool"]
-    pub fn put_tile(&mut self, coord: TileCoord, slot: Slot) -> Option<Slot> {
-        self.store.insert(TileKey::new(ACTIVE_LAYER, coord), slot)
+    pub fn put_tile(&mut self, key: TileKey, slot: Slot) -> Option<Slot> {
+        self.store.insert(key, slot)
     }
 
     /// Allocate a bare tile without clearing it, for a caller that will overwrite it.
@@ -429,26 +461,49 @@ impl CanvasRenderer {
         self.store.release(slot);
     }
 
-    /// Upload the CPU reference canvas's dirty tiles.
+    /// Drop every tile belonging to a deleted layer.
+    pub fn discard_layer(&mut self, layer: LayerId) {
+        let doomed: Vec<TileCoord> = self.layer_tiles(layer).collect();
+        for coord in doomed {
+            if let Some(slot) = self.store.remove(TileKey::new(layer, coord)) {
+                self.store.release(slot);
+            }
+        }
+    }
+
+    /// Upload the CPU reference canvas's tiles into a layer.
     ///
-    /// The GPU is authoritative for painting (DECISIONS §4a), so in normal use there is
-    /// nothing here: `openpaint_core::Canvas` holds no pixels unless the CPU reference
-    /// path put them there. This is the seam that keeps that path usable.
+    /// The GPU is authoritative for painting (DECISIONS §4a), so in normal use nothing comes
+    /// through here: `openpaint_core::Canvas` holds no pixels unless the reference rasterizer
+    /// put them there. This is the seam that keeps that path usable, and what the export and
+    /// compositing tests build known canvases with -- which is also why it is test-only: the
+    /// shipping paint path never touches it, and an unused seam that compiles is worse than
+    /// one whose absence is visible.
+    #[cfg(test)]
     pub fn upload_dirty(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        layer: LayerId,
         canvas: &mut Canvas,
     ) {
         for coord in canvas.take_dirty() {
             let Some(tile) = canvas.tile(coord) else {
                 continue;
             };
-            let Some(layer) = self.ensure_tile_for_full_write(device, queue, encoder, coord) else {
+            // `Init::Untouched`, because every texel is about to be written and a clear would
+            // be reordered *after* the `write_texture` below and wipe it (DECISIONS §11a.2).
+            let Ok(pool_layer) = self.store.ensure(
+                device,
+                queue,
+                encoder,
+                TileKey::new(layer, coord),
+                Init::Untouched,
+            ) else {
                 continue;
             };
-            debug_assert_eq!(tile.bytes().len(), TILE_BYTES);
+            debug_assert_eq!(tile.bytes().len(), openpaint_core::tile::TILE_BYTES);
             queue.write_texture(
                 wgpu::ImageCopyTexture {
                     texture: self.store.pool().texture(),
@@ -456,7 +511,7 @@ impl CanvasRenderer {
                     origin: wgpu::Origin3d {
                         x: 0,
                         y: 0,
-                        z: layer,
+                        z: pool_layer,
                     },
                     aspect: wgpu::TextureAspect::All,
                 },
@@ -472,19 +527,20 @@ impl CanvasRenderer {
                     depth_or_array_layers: 1,
                 },
             );
-            self.mark_dirty(coord);
+            self.mark_dirty(layer, coord);
         }
     }
 
     /// Write the camera, restore the tiles the viewport needs, and build the draw list.
     ///
     /// `visible` is the page-space bounding box of what the viewport covers. Culling to it is
-    /// no longer merely an optimisation: with residency bounded and spilling in place, asking
-    /// for every tile in the document would restore the whole document from the CPU every
-    /// frame. So the *visible* set is the working set.
+    /// not merely an optimisation: with residency bounded and spilling in place, asking for
+    /// every tile in the document would restore the whole document from the CPU every frame.
+    /// So the *visible* set is the working set.
     ///
     /// Returns whether the visible set was larger than the pool could hold, which the caller
     /// reports rather than silently drawing a partial canvas.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -492,68 +548,156 @@ impl CanvasRenderer {
         encoder: &mut wgpu::CommandEncoder,
         xform: PageToNdc,
         visible: PageRect,
+        layers: &[Layer],
+        active: usize,
+        stroke: Option<&StrokeLayer>,
     ) -> bool {
         let (ex, ey) = self.page.end();
-        let paper = Canvas::paper_color();
+        let painting = stroke.is_some_and(StrokeLayer::has_paint);
+        let (stroke_color, stroke_opacity) = stroke.map_or(([0.0; 4], 0.0), StrokeLayer::paint);
+
         queue.write_buffer(
-            &self.xform_buf,
+            &self.params_buf,
             0,
-            bytemuck::bytes_of(&XformUniform {
+            bytemuck::bytes_of(&ParamsUniform {
                 x_row: [xform.x_row[0], xform.x_row[1], xform.x_row[2], 0.0],
                 y_row: [xform.y_row[0], xform.y_row[1], xform.y_row[2], 0.0],
                 page: [self.page.x as f32, self.page.y as f32, ex as f32, ey as f32],
-                paper,
-                params: [TILE_SIZE as f32, 0.0, 0.0, 0.0],
+                paper: Canvas::paper_color(),
+                stroke: [
+                    stroke_color[0],
+                    stroke_color[1],
+                    stroke_color[2],
+                    stroke_opacity,
+                ],
+                counts: [layers.len() as u32, active as u32, u32::from(painting), 0],
+                misc: [TILE_SIZE as f32, 0.0, 0.0, 0.0],
             }),
         );
 
-        // Tiles that exist, lie inside the page, and are on screen. Sorted so the frame's
-        // residency requests -- and therefore its eviction order -- are deterministic.
-        let mut wanted: Vec<TileCoord> = self
-            .tiles()
+        let infos: Vec<LayerInfoRecord> = layers
+            .iter()
+            .map(|l| LayerInfoRecord {
+                blend: l.blend.code(),
+                opacity: l.effective_opacity(),
+                _pad: [0.0; 2],
+            })
+            .collect();
+
+        // Tiles that exist somewhere in the stack, lie inside the page, and are on screen.
+        let wanted: Vec<TileCoord> = self
+            .occupied_tiles()
+            .into_iter()
             .filter(|c| tile_intersects(*c, self.page) && tile_intersects(*c, visible))
             .collect();
-        wanted.sort_unstable_by_key(|c| (c.1, c.0));
 
         let mut under_pressure = false;
-        let mut list = Vec::with_capacity(wanted.len());
-        for coord in wanted {
-            match self.make_resident(device, queue, encoder, coord) {
-                Some(layer) => list.push(TileInstance {
-                    coord: [coord.0, coord.1],
-                    layer,
-                    _pad: 0,
-                }),
-                None => under_pressure = true,
-            }
-        }
+        let mut instances = Vec::with_capacity(wanted.len());
+        let mut slots = Vec::with_capacity(wanted.len() * layers.len().max(1));
+        let mut stroke_slots = Vec::with_capacity(wanted.len());
 
-        self.instance_count = list.len() as u32;
-        if list.is_empty() {
-            return under_pressure;
-        }
-        if list.len() > self.instance_capacity {
-            self.instance_capacity = list.len().next_power_of_two();
-            self.instances = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("canvas-tile-instances"),
-                size: (self.instance_capacity * std::mem::size_of::<TileInstance>())
-                    as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
+        for coord in wanted {
+            for layer in layers {
+                let id = LayerId(layer.id());
+                match self.make_resident(device, queue, encoder, id, coord) {
+                    Some(pool_layer) => slots.push(pool_layer),
+                    None => {
+                        // Either that layer has nothing here, or residency could not fit it --
+                        // and only the second is worth reporting.
+                        if self.store.contains(TileKey::new(id, coord)) {
+                            under_pressure = true;
+                        }
+                        slots.push(ABSENT);
+                    }
+                }
+            }
+            stroke_slots.push(stroke.and_then(|s| s.accum_slot(coord)).unwrap_or(ABSENT));
+            instances.push(TileInstance {
+                coord: [coord.0, coord.1],
             });
         }
-        queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&list));
+
+        self.instance_count = instances.len() as u32;
+        self.write_storage(device, queue, &slots, &infos, &stroke_slots);
+        if !instances.is_empty() {
+            if instances.len() > self.instance_capacity {
+                self.instance_capacity = instances.len().next_power_of_two();
+                self.instances = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("canvas-tile-instances"),
+                    size: (self.instance_capacity * std::mem::size_of::<TileInstance>())
+                        as wgpu::BufferAddress,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&instances));
+        }
         under_pressure
     }
 
-    /// Record the canvas draw: the sheet, then every visible tile in one instanced call.
+    /// Upload the per-frame storage arrays, growing and rebinding when they no longer fit.
+    fn write_storage(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slots: &[u32],
+        infos: &[LayerInfoRecord],
+        stroke_slots: &[u32],
+    ) {
+        let mut rebind = false;
+        if slots.len() > self.slots_capacity {
+            self.slots_capacity = slots.len().next_power_of_two();
+            self.slots_buf = storage_buffer(device, "canvas-slots", self.slots_capacity * 4);
+            rebind = true;
+        }
+        if infos.len() > self.infos_capacity {
+            self.infos_capacity = infos.len().next_power_of_two();
+            self.infos_buf = storage_buffer(
+                device,
+                "canvas-layer-infos",
+                self.infos_capacity * std::mem::size_of::<LayerInfoRecord>(),
+            );
+            rebind = true;
+        }
+        if stroke_slots.len() > self.stroke_capacity {
+            self.stroke_capacity = stroke_slots.len().next_power_of_two();
+            self.stroke_buf =
+                storage_buffer(device, "canvas-stroke-slots", self.stroke_capacity * 4);
+            rebind = true;
+        }
+        if rebind {
+            self.bind_group = make_bind_group(
+                device,
+                &self.bind_group_layout,
+                &self.params_buf,
+                self.store.pool(),
+                &self.sampler,
+                &self.slots_buf,
+                &self.infos_buf,
+                &self.accum_view,
+                &self.stroke_buf,
+            );
+        }
+
+        if !slots.is_empty() {
+            queue.write_buffer(&self.slots_buf, 0, bytemuck::cast_slice(slots));
+        }
+        if !infos.is_empty() {
+            queue.write_buffer(&self.infos_buf, 0, bytemuck::cast_slice(infos));
+        }
+        if !stroke_slots.is_empty() {
+            queue.write_buffer(&self.stroke_buf, 0, bytemuck::cast_slice(stroke_slots));
+        }
+    }
+
+    /// Record the canvas draw: the sheet, then every visible tile composited in one call.
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         pass.set_pipeline(&self.sheet_pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.draw(0..6, 0..1);
 
         if self.instance_count > 0 {
-            pass.set_pipeline(&self.tile_pipeline);
+            pass.set_pipeline(&self.composite_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.instances.slice(..));
             pass.draw(0..6, 0..self.instance_count);
@@ -561,12 +705,52 @@ impl CanvasRenderer {
     }
 }
 
+fn storage_buffer(device: &wgpu::Device, label: &str, bytes: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: bytes.max(4) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn make_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-    xform: &wgpu::Buffer,
+    params: &wgpu::Buffer,
     pool: &TilePool,
     sampler: &wgpu::Sampler,
+    slots: &wgpu::Buffer,
+    infos: &wgpu::Buffer,
+    accum: &wgpu::TextureView,
+    stroke: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("canvas-bg"),
@@ -574,7 +758,7 @@ fn make_bind_group(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: xform.as_entire_binding(),
+                resource: params.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -583,6 +767,22 @@ fn make_bind_group(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: slots.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: infos.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(accum),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: stroke.as_entire_binding(),
             },
         ],
     })
@@ -604,116 +804,133 @@ pub fn tile_of(x: i32, y: i32) -> TileCoord {
     (x.div_euclid(t), y.div_euclid(t))
 }
 
-/// A linear premultiplied colour as a clear value.
-fn paper_clear_color(rgba: [f32; 4]) -> wgpu::Color {
-    wgpu::Color {
-        r: f64::from(rgba[0]),
-        g: f64::from(rgba[1]),
-        b: f64::from(rgba[2]),
-        a: f64::from(rgba[3]),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_tile_inside_the_page_intersects_it() {
-        let page = PageRect::from_size(1000, 1000);
-        assert!(tile_intersects((0, 0), page));
-        assert!(tile_intersects((3, 3), page));
-    }
+    /// The GPU tests render to an sRGB target, like the real surface, so a readback can be
+    /// compared against the same encode the PNG export uses.
+    const SURFACE: wgpu::TextureFormat = crate::test_gpu::SURFACE;
 
-    #[test]
-    fn a_tile_beyond_the_page_does_not() {
-        let page = PageRect::from_size(1000, 1000);
-        assert!(!tile_intersects((4, 0), page), "1024 is past 1000");
-        assert!(!tile_intersects((-1, 0), page));
-    }
-
-    /// A page cropped inward leaves tiles outside it. They must be excluded from drawing
-    /// while remaining in storage -- that separation is the whole of non-destructive crop.
-    #[test]
-    fn cropping_excludes_the_tiles_it_leaves_behind() {
-        let full = PageRect::from_size(1000, 1000);
-        let cropped = PageRect::from_size(300, 300);
-        assert!(tile_intersects((3, 3), full));
-        assert!(!tile_intersects((3, 3), cropped));
-    }
-
-    /// A page extended up or left has a negative origin, so tile coordinates go negative
-    /// too. `div_euclid` is what makes that work; plain division would round toward zero
-    /// and put -1..-255 in tile 0.
-    #[test]
-    fn negative_page_coordinates_map_to_negative_tiles() {
-        assert_eq!(tile_of(-1, -1), (-1, -1));
-        assert_eq!(tile_of(-256, -256), (-1, -1));
-        assert_eq!(tile_of(-257, 0), (-2, 0));
-        assert_eq!(tile_of(0, 0), (0, 0));
-
-        let page = PageRect::new(-400, -500, 900, 1200);
-        assert!(tile_intersects((-2, -2), page));
-        assert!(tile_intersects((-1, -1), page));
-    }
-
-    /// Draw the canvas into an offscreen target and check what lands on screen.
+    /// The compositor's arithmetic exists twice -- `composite_fs` in canvas.wgsl and
+    /// `openpaint_core::layer::Blend` plus `export::blend_over` on the CPU. Two copies of a
+    /// formula drift, exactly like the dab falloff curve. This composites the same stack
+    /// through both and diffs the pixels.
     ///
-    /// The other half of the paint path, and it had no coverage: every GPU test until now
-    /// stopped at "the tile holds the right pixels", which says nothing about whether the
-    /// tile is ever drawn. Uses a fitted `View`, so the affine, the instance buffer, the
-    /// page clip and the sheet are all exercised the way a frame exercises them.
+    /// Deliberately a **two-layer** stack with the mode's layer on top at full opacity. An
+    /// earlier version put the mode in the middle of three layers with partial opacity, which
+    /// looked like a stronger test but damped the mode's contribution down to the comparison
+    /// tolerance -- it passed with Multiply deliberately scaled by 0.9. Verified per §11a.4:
+    /// this version fails on that same injection.
+    ///
+    /// The layer still has **partial alpha**, because that is the term a naive premultiplied
+    /// implementation gets wrong; with an opaque layer nearly any formula agrees.
     #[test]
-    fn a_painted_tile_is_actually_drawn() {
+    fn the_gpu_compositor_matches_the_cpu_reference() {
         let Some((device, queue)) = crate::test_gpu::try_device() else {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        const SURFACE: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-        const VIEW_W: u32 = 256;
-        const VIEW_H: u32 = 256;
+        const W: u32 = 64;
+        const H: u32 = 64;
+        // Straight colours; premultiplication happens where the tiles are filled.
+        const UNDER: [f32; 4] = [0.75, 0.35, 0.15, 1.0];
+        const OVER: [f32; 4] = [0.20, 0.85, 0.45, 0.8];
 
-        // A small page, painted red in one corner through the CPU reference upload.
-        let mut cpu = Canvas::new(400, 400);
-        let red = [1.0, 0.0, 0.0, 1.0];
-        for y in 0..64 {
-            for x in 0..64 {
-                cpu.replace_pixel(x, y, red);
+        let mut results = Vec::new();
+        for mode in openpaint_core::Blend::ALL {
+            let mut doc = openpaint_core::Page::new(W, H);
+            doc.add_layer();
+            doc.layer_mut(1).expect("top").blend = mode;
+
+            let stroke = crate::test_gpu::test_stroke_layer(&device);
+            let mut canvas =
+                CanvasRenderer::new(&device, SURFACE, doc.rect(), 64 * 1024 * 1024, &stroke);
+
+            for (index, fill) in [UNDER, OVER].iter().enumerate() {
+                let mut cpu = Canvas::new(W, H);
+                let a = fill[3];
+                let premul = [fill[0] * a, fill[1] * a, fill[2] * a, a];
+                for y in 0..H as i32 {
+                    for x in 0..W as i32 {
+                        cpu.replace_pixel(x, y, premul);
+                    }
+                }
+                let id = LayerId(doc.layers()[index].id());
+                let mut enc = device.create_command_encoder(&Default::default());
+                canvas.upload_dirty(&device, &queue, &mut enc, id, &mut cpu);
+                queue.submit(std::iter::once(enc.finish()));
             }
-        }
 
-        let mut canvas = CanvasRenderer::new(&device, SURFACE, &cpu, 128 * 1024 * 1024);
-        let mut enc = device.create_command_encoder(&Default::default());
-        canvas.upload_dirty(&device, &queue, &mut enc, &mut cpu);
-        queue.submit(std::iter::once(enc.finish()));
-        assert_eq!(
-            canvas.residency().0,
-            1,
-            "expected exactly one tile resident"
-        );
-
-        let mut view = crate::view::View::new();
-        view.fit(VIEW_W, VIEW_H, &cpu);
-        let mut enc = device.create_command_encoder(&Default::default());
-        // The whole page is visible in this test, so culling must not remove anything.
-        let visible = view.visible_rect(VIEW_W, VIEW_H);
-        assert!(
-            !canvas.prepare(
+            let mut view = crate::view::View::new();
+            view.fit(W, H, doc.rect());
+            let mut enc = device.create_command_encoder(&Default::default());
+            canvas.prepare(
                 &device,
                 &queue,
                 &mut enc,
-                view.page_to_ndc(VIEW_W, VIEW_H),
-                visible
-            ),
-            "the test budget should be ample"
-        );
-        queue.submit(std::iter::once(enc.finish()));
+                view.page_to_ndc(W, H),
+                view.visible_rect(W, H),
+                doc.layers(),
+                0,
+                None,
+            );
+            queue.submit(std::iter::once(enc.finish()));
+            let gpu = draw_to_target(&device, &queue, &canvas, W, H);
 
+            // The same stack through the CPU reference.
+            let mut expected = Canvas::paper_color();
+            for (index, fill) in [UNDER, OVER].iter().enumerate() {
+                let layer = &doc.layers()[index];
+                let a = fill[3] * layer.effective_opacity();
+                let src = [fill[0] * a, fill[1] * a, fill[2] * a, a];
+                expected = crate::export::blend_over(src, expected, layer.blend);
+            }
+            let want = crate::export::to_srgb8_for_test(expected);
+
+            // The fills are uniform, so every pixel of the page should agree; sampling the
+            // centre avoids the page's own edges where the quad is clipped.
+            let mid = gpu[(H as usize / 2) * W as usize + W as usize / 2];
+            for c in 0..3 {
+                let diff = i32::from(mid[c]) - i32::from(want[c]);
+                assert!(
+                    diff.abs() <= 2,
+                    "{mode:?}: channel {c} differs by {diff}; gpu {mid:?} cpu {want:?}"
+                );
+            }
+            results.push((mode, mid));
+        }
+
+        // And the mode must actually reach the shader. Without this, a compositor that ignored
+        // the blend code entirely would agree with a CPU reference that also ignored it.
+        for (i, (mode_a, a)) in results.iter().enumerate() {
+            for (mode_b, b) in &results[i + 1..] {
+                let spread: i32 = (0..3)
+                    .map(|c| (i32::from(a[c]) - i32::from(b[c])).abs())
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    spread > 8,
+                    "{mode_a:?} and {mode_b:?} produced nearly the same pixel \
+                     ({a:?} vs {b:?}); is the blend mode reaching the shader?"
+                );
+            }
+        }
+    }
+
+    /// Draw the canvas into an offscreen sRGB target and read it back as bytes.
+    fn draw_to_target(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        canvas: &CanvasRenderer,
+        w: u32,
+        h: u32,
+    ) -> Vec<[u8; 4]> {
         let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("draw-test-target"),
+            label: Some("composite-test-target"),
             size: wgpu::Extent3d {
-                width: VIEW_W,
-                height: VIEW_H,
+                width: w,
+                height: h,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -723,17 +940,15 @@ mod tests {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
-
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("draw-test-pass"),
+                label: Some("composite-test-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target_view,
+                    view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // Blue backdrop, so "nothing was drawn" is unmistakable.
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLUE),
                         store: wgpu::StoreOp::Store,
                     },
@@ -745,27 +960,7 @@ mod tests {
             canvas.draw(&mut pass);
         }
         queue.submit(std::iter::once(encoder.finish()));
-
-        let pixels = read_rgba8(&device, &queue, &target, VIEW_W, VIEW_H);
-        let at = |x: u32, y: u32| pixels[(y * VIEW_W + x) as usize];
-
-        // The page is fitted and centred, so its own centre is the view's centre and must be
-        // paper -- not the backdrop.
-        // Paper is bright in every channel; the backdrop is pure blue.
-        let mid = at(VIEW_W / 2, VIEW_H / 2);
-        assert!(
-            mid[0] > 200 && mid[1] > 200,
-            "the paper sheet was not drawn; centre is {mid:?}"
-        );
-
-        // And the painted tile covers the page's top-left eighth, so a point just inside the
-        // page's top-left corner must be red.
-        let (px, py) = view.canvas_to_screen(20.0, 20.0, VIEW_W, VIEW_H);
-        let corner = at(px.round() as u32, py.round() as u32);
-        assert!(
-            corner[0] > 200 && corner[1] < 80 && corner[2] < 80,
-            "the painted tile was not drawn; got {corner:?} at ({px}, {py})"
-        );
+        read_rgba8(device, queue, &target, w, h)
     }
 
     /// Read an RGBA8 target back, skipping row padding.
@@ -818,5 +1013,118 @@ mod tests {
             out.extend_from_slice(mapped[start..end].as_chunks::<4>().0);
         }
         out
+    }
+
+    /// A painted layer must actually reach the screen. Every other GPU test stops at "the tile
+    /// holds the right pixels", which says nothing about whether the tile is ever drawn -- and
+    /// a version that painted nothing at all once passed all of them.
+    #[test]
+    fn a_painted_layer_is_actually_drawn() {
+        let Some((device, queue)) = crate::test_gpu::try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        const VIEW: u32 = 256;
+
+        let doc = openpaint_core::Page::new(400, 400);
+        // Red over the page's top-left corner only, so the sheet is visible elsewhere.
+        let mut cpu = Canvas::new(400, 400);
+        for y in 0..64 {
+            for x in 0..64 {
+                cpu.replace_pixel(x, y, [1.0, 0.0, 0.0, 1.0]);
+            }
+        }
+
+        let stroke = crate::test_gpu::test_stroke_layer(&device);
+        let mut canvas =
+            CanvasRenderer::new(&device, SURFACE, doc.rect(), 64 * 1024 * 1024, &stroke);
+        let mut enc = device.create_command_encoder(&Default::default());
+        canvas.upload_dirty(
+            &device,
+            &queue,
+            &mut enc,
+            LayerId(doc.layers()[0].id()),
+            &mut cpu,
+        );
+        queue.submit(std::iter::once(enc.finish()));
+        assert_eq!(
+            canvas.residency().0,
+            1,
+            "expected exactly one tile resident"
+        );
+
+        let mut view = crate::view::View::new();
+        view.fit(VIEW, VIEW, doc.rect());
+        let mut enc = device.create_command_encoder(&Default::default());
+        assert!(
+            !canvas.prepare(
+                &device,
+                &queue,
+                &mut enc,
+                view.page_to_ndc(VIEW, VIEW),
+                view.visible_rect(VIEW, VIEW),
+                doc.layers(),
+                0,
+                None,
+            ),
+            "the test budget should be ample"
+        );
+        queue.submit(std::iter::once(enc.finish()));
+
+        let pixels = draw_to_target(&device, &queue, &canvas, VIEW, VIEW);
+        let at = |x: u32, y: u32| pixels[(y * VIEW + x) as usize];
+
+        // Paper is bright in every channel; the backdrop is pure blue.
+        let mid = at(VIEW / 2, VIEW / 2);
+        assert!(
+            mid[0] > 200 && mid[1] > 200,
+            "the paper sheet was not drawn; centre is {mid:?}"
+        );
+
+        let (px, py) = view.canvas_to_screen(20.0, 20.0, VIEW, VIEW);
+        let corner = at(px.round() as u32, py.round() as u32);
+        assert!(
+            corner[0] > 200 && corner[1] < 80 && corner[2] < 80,
+            "the painted layer was not drawn; got {corner:?} at ({px}, {py})"
+        );
+    }
+
+    #[test]
+    fn a_tile_inside_the_page_intersects_it() {
+        let page = PageRect::from_size(1000, 1000);
+        assert!(tile_intersects((0, 0), page));
+        assert!(tile_intersects((3, 3), page));
+    }
+
+    #[test]
+    fn a_tile_beyond_the_page_does_not() {
+        let page = PageRect::from_size(1000, 1000);
+        assert!(!tile_intersects((4, 0), page), "1024 is past 1000");
+        assert!(!tile_intersects((-1, 0), page));
+    }
+
+    /// A page cropped inward leaves tiles outside it. They must be excluded from drawing while
+    /// remaining in storage -- that separation is the whole of non-destructive crop.
+    #[test]
+    fn cropping_excludes_the_tiles_it_leaves_behind() {
+        let full = PageRect::from_size(1000, 1000);
+        let cropped = PageRect::from_size(300, 300);
+        assert!(tile_intersects((3, 3), full));
+        assert!(!tile_intersects((3, 3), cropped));
+    }
+
+    /// A page extended up or left has a negative origin, so tile coordinates go negative too.
+    /// `div_euclid` is what makes that work; plain division would round toward zero and put
+    /// -1..-255 in tile 0.
+    #[test]
+    fn negative_page_coordinates_map_to_negative_tiles() {
+        assert_eq!(tile_of(-1, -1), (-1, -1));
+        assert_eq!(tile_of(-256, -256), (-1, -1));
+        assert_eq!(tile_of(-257, 0), (-2, 0));
+        assert_eq!(tile_of(0, 0), (0, 0));
+
+        let page = PageRect::new(-400, -500, 900, 1200);
+        assert!(tile_intersects((-2, -2), page));
+        assert!(tile_intersects((-1, -1), page));
     }
 }

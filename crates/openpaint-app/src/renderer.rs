@@ -19,7 +19,6 @@
 
 use std::sync::Arc;
 
-use openpaint_core::Canvas;
 use winit::window::Window;
 
 use crate::canvas_renderer::{CanvasRenderer, CANVAS_FORMAT};
@@ -27,15 +26,16 @@ use crate::editor::StrokeOp;
 use crate::history::{History, Op, TileBefore};
 use crate::stroke_exec::StrokeExec;
 use crate::stroke_layer::StrokeLayer;
-use crate::tile_pool::TilePool;
+use crate::tile_pool::{Slot, TilePool};
+use crate::tile_store::{LayerId, TileKey};
 use crate::view::PageToNdc;
-use openpaint_core::{PageRect, PageResize};
+use openpaint_core::{Layer, PageRect, PageResize};
 
 /// What an undo or redo did, and therefore what the caller must reconcile.
 ///
 /// Geometry changes cannot be handled entirely in here: the page's dimensions live in
 /// the editor while its pixels live on the GPU, so the shell has to apply both halves.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum HistoryChange {
     /// Nothing to undo or redo.
     None,
@@ -43,6 +43,10 @@ pub enum HistoryChange {
     Pixels,
     /// The page's rectangle changed; the editor's page must be moved to match.
     Geometry { rect: openpaint_core::PageRect },
+    /// A deleted layer came back, and the document must put it at `index` again.
+    LayerRestored { index: usize, layer: Layer },
+    /// A restored layer was deleted again.
+    LayerDeleted { index: usize },
 }
 
 /// Everything an overlay needs to draw itself into the current frame.
@@ -82,7 +86,7 @@ pub struct Renderer {
 
 impl Renderer {
     /// Create the GPU context for a window. Blocks on async setup via pollster.
-    pub fn new(window: Arc<Window>, canvas: &Canvas) -> Result<Self, String> {
+    pub fn new(window: Arc<Window>, page: PageRect) -> Result<Self, String> {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -146,8 +150,10 @@ impl Renderer {
         // Residency is sized from what the adapter looks like, because wgpu offers no way
         // to ask how much graphics memory there actually is. See `tile_store::budget_for`.
         let budget = crate::tile_store::budget_for(info.device_type);
-        let canvas_renderer = CanvasRenderer::new(&device, format, canvas, budget);
-        let stroke_layer = StrokeLayer::new(&device, CANVAS_FORMAT, format);
+        // The stroke layer first: the compositor reads its accumulation to show the preview,
+        // so it needs that texture at construction (see `canvas_renderer`).
+        let stroke_layer = StrokeLayer::new(&device, CANVAS_FORMAT);
+        let canvas_renderer = CanvasRenderer::new(&device, format, page, budget, &stroke_layer);
         let history = History::new(&device);
 
         Ok(Self {
@@ -195,21 +201,6 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Push the canvas's changed tiles to the GPU.
-    ///
-    /// Separate from [`Renderer::render`] so the mutable canvas borrow ends before
-    /// the frame begins, which keeps the overlay callback free to touch the rest
-    /// of the app state.
-    pub fn upload_canvas(&mut self, canvas: &mut Canvas) {
-        if canvas.dirty_count() == 0 {
-            return;
-        }
-        let mut encoder = self.new_stroke_encoder();
-        self.canvas_renderer
-            .upload_dirty(&self.device, &self.queue, &mut encoder, canvas);
-        self.queue.submit(std::iter::once(encoder.finish()));
-    }
-
     /// Execute the editor's pending stroke commands on the GPU.
     ///
     /// Submitted separately from [`Renderer::render`] and before it, so the canvas tiles are
@@ -218,12 +209,13 @@ impl Renderer {
     ///
     /// The work itself lives in [`crate::stroke_exec`], which needs no surface and is
     /// therefore testable — see the note there.
-    pub fn apply_stroke(&mut self, ops: &[StrokeOp], dabs: &[openpaint_core::Dab]) {
+    pub fn apply_stroke(&mut self, ops: &[StrokeOp], dabs: &[openpaint_core::Dab], layer: LayerId) {
         let mut exec = StrokeExec {
+            layer,
             device: &self.device,
             queue: &self.queue,
             canvas: &mut self.canvas_renderer,
-            layer: &mut self.stroke_layer,
+            stroke: &mut self.stroke_layer,
             history: &mut self.history,
             recording: &mut self.recording,
             recording_paint: &mut self.recording_paint,
@@ -267,20 +259,20 @@ impl Renderer {
         let mut encoder = self.new_stroke_encoder();
         let mut adopted = Vec::new();
         let mut refused = false;
-        for coord in outside {
+        for key in outside {
             match self
                 .history
-                .adopt_tile(&mut encoder, &self.canvas_renderer, coord)
+                .adopt_tile(&mut encoder, &self.canvas_renderer, key)
             {
-                Some(slot) => adopted.push((coord, slot)),
+                Some(slot) => adopted.push((key, slot)),
                 None => refused = true,
             }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
 
         let released = adopted.len();
-        for (coord, _) in &adopted {
-            if let Some(slot) = self.canvas_renderer.take_tile(*coord) {
+        for (key, _) in &adopted {
+            if let Some(slot) = self.canvas_renderer.take_tile(*key) {
                 self.canvas_renderer.release(slot);
             }
         }
@@ -290,12 +282,68 @@ impl Renderer {
         (released, refused)
     }
 
+    /// Move a layer's tiles into history and drop them, so the layer can be deleted undoably.
+    ///
+    /// Returns `None` if there was no room to record them all, in which case the caller must
+    /// **not** delete the layer: destroying pixels with no way back is the one thing this
+    /// project does not do (DECISIONS §5c).
+    pub fn adopt_layer(&mut self, layer: LayerId) -> Option<Vec<(TileKey, Slot)>> {
+        let coords: Vec<openpaint_core::tile::TileCoord> =
+            self.canvas_renderer.layer_tiles(layer).collect();
+        let mut encoder = self.new_stroke_encoder();
+        let mut adopted = Vec::with_capacity(coords.len());
+        for coord in coords {
+            let key = TileKey::new(layer, coord);
+            match self
+                .history
+                .adopt_tile(&mut encoder, &self.canvas_renderer, key)
+            {
+                Some(slot) => adopted.push((key, slot)),
+                None => {
+                    // Give back what this attempt took, so a refusal costs nothing.
+                    self.queue.submit(std::iter::once(encoder.finish()));
+                    for (_, slot) in adopted {
+                        self.history.release_slot(slot);
+                    }
+                    return None;
+                }
+            }
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.canvas_renderer.discard_layer(layer);
+        Some(adopted)
+    }
+
+    /// Record a completed layer deletion, whose tiles [`Renderer::adopt_layer`] already took.
+    pub fn record_layer_deletion(
+        &mut self,
+        index: usize,
+        layer: Layer,
+        tiles: Vec<(TileKey, Slot)>,
+    ) {
+        self.history.push(Op::DeleteLayer {
+            index,
+            layer,
+            tiles,
+        });
+    }
+
     /// Read the canvas back and write it as an sRGB PNG.
     ///
     /// Stalls on the GPU while the readback maps, which is acceptable for an
     /// explicit user action -- the drawing path never reads back.
-    pub fn export_png(&self, path: &std::path::Path) -> Result<(), crate::export::ExportError> {
-        crate::export::export_tiles_png(&self.device, &self.queue, &self.canvas_renderer, path)
+    pub fn export_png(
+        &self,
+        layers: &[Layer],
+        path: &std::path::Path,
+    ) -> Result<(), crate::export::ExportError> {
+        crate::export::export_tiles_png(
+            &self.device,
+            &self.queue,
+            &self.canvas_renderer,
+            layers,
+            path,
+        )
     }
 
     /// Undo and redo depths, and snapshot bytes held, for display.
@@ -349,14 +397,14 @@ impl Renderer {
             return HistoryChange::None;
         };
         let change = match &op {
-            Op::Stroke { before, .. } => {
+            Op::Stroke { layer, before, .. } => {
                 let mut encoder = self.new_stroke_encoder();
                 for (coord, was) in before {
                     match was {
                         TileBefore::Content(snapshot) => {
                             // The tile still exists unless a later op removed it, and LIFO
                             // guarantees no later op is still applied.
-                            if let Some(dst) = self.canvas_renderer.slot(*coord) {
+                            if let Some(dst) = self.canvas_renderer.slot(*layer, *coord) {
                                 TilePool::copy_layer_from(
                                     &mut encoder,
                                     self.history.pool(),
@@ -368,8 +416,10 @@ impl Renderer {
                         }
                         TileBefore::Absent => {
                             // The stroke created this tile, so undo removes it rather than
-                            // leaving a paper tile holding residency for nothing.
-                            if let Some(slot) = self.canvas_renderer.take_tile(*coord) {
+                            // leaving an empty tile holding residency for nothing.
+                            if let Some(slot) =
+                                self.canvas_renderer.take_tile(TileKey::new(*layer, *coord))
+                            {
                                 self.canvas_renderer.release(slot);
                             }
                         }
@@ -383,26 +433,19 @@ impl Renderer {
                 HistoryChange::Geometry { rect: resize.old }
             }
             Op::Trim { tiles } => {
-                // Put the discarded tiles back where they were.
-                let mut encoder = self.new_stroke_encoder();
-                for (coord, snapshot) in tiles {
-                    let Some(dst) = self.canvas_renderer.alloc_bare(&self.device, &self.queue)
-                    else {
-                        continue;
-                    };
-                    TilePool::copy_layer_from(
-                        &mut encoder,
-                        self.history.pool(),
-                        snapshot,
-                        self.canvas_renderer.pool(),
-                        &dst,
-                    );
-                    if let Some(displaced) = self.canvas_renderer.put_tile(*coord, dst) {
-                        self.canvas_renderer.release(displaced);
-                    }
-                }
-                self.queue.submit(std::iter::once(encoder.finish()));
+                self.restore_tiles(tiles);
                 HistoryChange::Pixels
+            }
+            Op::DeleteLayer {
+                index,
+                layer,
+                tiles,
+            } => {
+                self.restore_tiles(tiles);
+                HistoryChange::LayerRestored {
+                    index: *index,
+                    layer: layer.clone(),
+                }
             }
         };
         self.history.finish_undo(op);
@@ -416,6 +459,7 @@ impl Renderer {
         };
         let change = match &op {
             Op::Stroke {
+                layer,
                 dabs,
                 color_linear_premul,
                 opacity,
@@ -445,6 +489,7 @@ impl Renderer {
                     &self.queue,
                     &mut encoder,
                     &mut self.canvas_renderer,
+                    *layer,
                 );
                 self.queue.submit(std::iter::once(encoder.finish()));
                 HistoryChange::Pixels
@@ -454,16 +499,41 @@ impl Renderer {
                 HistoryChange::Geometry { rect: resize.new }
             }
             Op::Trim { tiles } => {
-                for (coord, _) in tiles {
-                    if let Some(slot) = self.canvas_renderer.take_tile(*coord) {
+                for (key, _) in tiles {
+                    if let Some(slot) = self.canvas_renderer.take_tile(*key) {
                         self.canvas_renderer.release(slot);
                     }
                 }
                 HistoryChange::Pixels
             }
+            Op::DeleteLayer { index, layer, .. } => {
+                self.canvas_renderer.discard_layer(LayerId(layer.id()));
+                HistoryChange::LayerDeleted { index: *index }
+            }
         };
         self.history.finish_redo(op);
         change
+    }
+
+    /// Copy snapshot tiles back into the canvas, allocating fresh pool layers for them.
+    fn restore_tiles(&mut self, tiles: &[(TileKey, Slot)]) {
+        let mut encoder = self.new_stroke_encoder();
+        for (key, snapshot) in tiles {
+            let Some(dst) = self.canvas_renderer.alloc_bare(&self.device, &self.queue) else {
+                continue;
+            };
+            TilePool::copy_layer_from(
+                &mut encoder,
+                self.history.pool(),
+                snapshot,
+                self.canvas_renderer.pool(),
+                &dst,
+            );
+            if let Some(displaced) = self.canvas_renderer.put_tile(*key, dst) {
+                self.canvas_renderer.release(displaced);
+            }
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
     }
 
     fn new_stroke_encoder(&self) -> wgpu::CommandEncoder {
@@ -478,10 +548,13 @@ impl Renderer {
     /// Takes an already-computed transform rather than the canvas: the renderer has no
     /// need for the document (the pixels are already in its tiles), and not borrowing it
     /// leaves the caller free to hand the overlay mutable access to editor state.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         xform: PageToNdc,
         visible: PageRect,
+        layers: &[Layer],
+        active: usize,
         overlay: impl FnOnce(Overlay<'_>),
     ) -> Result<(), wgpu::SurfaceError> {
         let page = self.canvas_renderer.page();
@@ -490,15 +563,18 @@ impl Renderer {
         // the pass that samples them runs afterwards.
         let mut prep = self.new_stroke_encoder();
         self.canvas_renderer.begin_frame();
-        self.pressured =
-            self.canvas_renderer
-                .prepare(&self.device, &self.queue, &mut prep, xform, visible);
+        self.pressured = self.canvas_renderer.prepare(
+            &self.device,
+            &self.queue,
+            &mut prep,
+            xform,
+            visible,
+            layers,
+            active,
+            Some(&self.stroke_layer),
+        );
         self.queue.submit(std::iter::once(prep.finish()));
         self.stroke_layer.set_frame(&self.queue, xform, page);
-        if self.stroke_layer.has_paint() {
-            self.stroke_layer
-                .prepare_preview(&self.device, &self.queue, page);
-        }
 
         let frame = self.surface.get_current_texture()?;
         let target = frame
@@ -536,13 +612,9 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            // One call: the compositor walks the layer stack and injects the in-progress
+            // stroke into the active layer as it goes, so there is no separate preview pass.
             self.canvas_renderer.draw(&mut pass);
-            // The in-progress stroke is not in the canvas texture yet, so it is
-            // composited on top for the preview. It uses the same placement, so it
-            // pans, zooms, and rotates with the canvas.
-            if self.stroke_layer.has_paint() {
-                self.stroke_layer.draw_preview(&mut pass);
-            }
         }
 
         overlay(Overlay {

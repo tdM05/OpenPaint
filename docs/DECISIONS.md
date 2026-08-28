@@ -252,6 +252,27 @@ One thing this changes about pixels: **a layer tile is transparent where unpaint
 paper.** The paper moves to the bottom of the compositor, where the sheet quad effectively is
 today.
 
+⚠️ **The cache itself is deferred; the compositor landed first.** Revised while building,
+2026-08-28. The compositor runs in the display pass, sampling every layer per screen pixel,
+with no cache tile in between. Reasons, in order:
+- The compositor is the risky part and the cache is a pure optimisation on top of it. Landing
+  the risky part alone, verifiable, was worth more than landing both at once.
+- Output is identical either way, so this is not a quality trade. Points 1 and 4 above —
+  blend modes as plain maths, and the preview being exactly the committed result — come from
+  the *compositor*, not the cache, and are already true.
+- Cache invalidation is the kind of thing to design against observed usage rather than
+  guessed usage.
+
+What is genuinely deferred with it is point 2: **residency does scale with layer count for
+now**, because every visible tile of every layer must be resident at once. Roughly, layers ×
+visible tiles must fit the pool, and exceeding it reports the same "zoom in" message spilling
+already uses. Point 3 goes too: per-frame cost scales with layer count, though sampling a few
+layers per pixel is cheap enough that this will not be what bites first.
+
+The cache becomes worth building when real layer counts make either of those bite. It does not
+change the layer model, the blend modes, the UI, or the shader's maths — only where the
+compositor writes.
+
 ### 4c. Brush modularity → composable per *dab*, fixed per *pixel*
 
 The question was whether to make brush features arbitrary plug-in components

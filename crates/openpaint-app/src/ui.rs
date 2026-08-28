@@ -22,7 +22,7 @@
 //! it.
 
 use egui::ViewportId;
-use openpaint_core::Brush;
+use openpaint_core::{Blend, Brush, Layer};
 use winit::window::Window;
 
 use crate::editor::DEFAULT_EXTEND;
@@ -50,6 +50,29 @@ pub struct CropOverlay {
     pub handles: [[f32; 2]; 8],
 }
 
+/// A change the layer panel wants made to the stack.
+///
+/// Returned rather than applied, like every other panel action: layer operations touch GPU
+/// tiles and history, neither of which the overlay closure can reach while the frame it is
+/// drawing into is still open.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LayerAction {
+    /// Paint on this layer from now on.
+    Select(usize),
+    /// Add an empty layer above the active one.
+    Add,
+    /// Delete this layer. Undoable, or it would not be offered at all.
+    Delete(usize),
+    /// Move a layer to a new index.
+    Move { from: usize, to: usize },
+    /// Show or hide a layer.
+    SetVisible { index: usize, visible: bool },
+    /// Set a layer's opacity.
+    SetOpacity { index: usize, opacity: f32 },
+    /// Set a layer's blend mode.
+    SetBlend { index: usize, blend: Blend },
+}
+
 /// What the crop tool should do next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CropAction {
@@ -73,6 +96,10 @@ pub struct Status<'a> {
     pub spilled: usize,
     /// Readbacks and re-uploads so far, for spotting a thrashing budget.
     pub traffic: (u64, u64),
+    /// The layer stack, bottom first, as the document holds it.
+    pub layers: &'a [Layer],
+    /// Index of the layer being painted.
+    pub active_layer: usize,
 }
 
 /// What the panel wants the app to do, collected during the frame.
@@ -87,6 +114,8 @@ pub struct Outcome {
     pub crop: Option<CropAction>,
     /// Discard the tiles outside the page, reclaiming their memory.
     pub trim: bool,
+    /// At most one layer change per frame, which is all a click can produce.
+    pub layer: Option<LayerAction>,
 }
 
 pub struct Ui {
@@ -177,6 +206,7 @@ impl Ui {
         let mut extend_amount = self.extend_amount;
         let mut crop_action = None;
         let mut trim = false;
+        let mut layer_action = None;
 
         let output = self.ctx.run(input, |ctx| {
             egui::SidePanel::left("brush-panel")
@@ -277,6 +307,97 @@ impl Ui {
                         .small()
                         .weak(),
                     );
+                    ui.separator();
+                    ui.heading("Layers");
+                    if ui.button("Add layer").clicked() {
+                        layer_action = Some(LayerAction::Add);
+                    }
+                    // Top-down, because that is how every drawing app shows a stack and how
+                    // artists talk about it -- the document stores it bottom-first.
+                    let count = status.layers.len();
+                    for (index, layer) in status.layers.iter().enumerate().rev() {
+                        let selected = index == status.active_layer;
+                        ui.push_id(layer.id(), |ui| {
+                            ui.horizontal(|ui| {
+                                let mut visible = layer.visible;
+                                if ui.checkbox(&mut visible, "").changed() {
+                                    layer_action =
+                                        Some(LayerAction::SetVisible { index, visible });
+                                }
+                                if ui.selectable_label(selected, &layer.name).clicked() {
+                                    layer_action = Some(LayerAction::Select(index));
+                                }
+                            });
+                            if selected {
+                                ui.horizontal(|ui| {
+                                    let mut opacity = layer.opacity;
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(&mut opacity, 0.0..=1.0)
+                                                .text("opacity"),
+                                        )
+                                        .changed()
+                                    {
+                                        layer_action =
+                                            Some(LayerAction::SetOpacity { index, opacity });
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_salt("blend")
+                                        .selected_text(layer.blend.label())
+                                        .show_ui(ui, |ui| {
+                                            for mode in Blend::ALL {
+                                                if ui
+                                                    .selectable_label(
+                                                        layer.blend == mode,
+                                                        mode.label(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    layer_action = Some(LayerAction::SetBlend {
+                                                        index,
+                                                        blend: mode,
+                                                    });
+                                                }
+                                            }
+                                        });
+                                    if ui
+                                        .add_enabled(index + 1 < count, egui::Button::new("Up"))
+                                        .clicked()
+                                    {
+                                        layer_action = Some(LayerAction::Move {
+                                            from: index,
+                                            to: index + 1,
+                                        });
+                                    }
+                                    if ui.add_enabled(index > 0, egui::Button::new("Down")).clicked()
+                                    {
+                                        layer_action = Some(LayerAction::Move {
+                                            from: index,
+                                            to: index - 1,
+                                        });
+                                    }
+                                    // The last layer cannot go: a page with nowhere to paint is
+                                    // a state every caller would have to special-case.
+                                    if ui
+                                        .add_enabled(count > 1, egui::Button::new("Delete"))
+                                        .clicked()
+                                    {
+                                        layer_action = Some(LayerAction::Delete(index));
+                                    }
+                                });
+                            }
+                        });
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Multiply darkens what is under it, Screen lightens. Deleting a \
+                             layer is undoable -- otherwise it would not be offered.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+
                     ui.separator();
                     ui.heading("Canvas memory");
                     let (used, capacity) = status.residency;
@@ -476,6 +597,7 @@ impl Ui {
             extend,
             crop: crop_action,
             trim,
+            layer: layer_action,
         }
     }
 }

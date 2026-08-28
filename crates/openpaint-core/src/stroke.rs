@@ -132,7 +132,7 @@ impl StrokePainter {
                     canvas
                         .tile(coord)
                         .cloned()
-                        .unwrap_or_else(|| Tile::filled(Canvas::paper_color()))
+                        .unwrap_or_else(Tile::transparent)
                 });
 
                 let accum = self
@@ -209,14 +209,16 @@ mod tests {
 
     /// How much paint ended up at `(x, y)`, as an effective alpha in `0.0..=1.0`.
     ///
-    /// Derived from the *color* channel, not alpha: the canvas is opaque paper, so
-    /// its alpha is always 1.0 regardless of how much paint landed. Compositing
-    /// black at effective alpha `k` over paper `p` leaves `p * (1 - k)`, so
-    /// `k = 1 - color / p`.
+    /// Read straight from *alpha*, because a layer starts transparent: coverage is exactly
+    /// what its alpha becomes.
+    ///
+    /// This used to derive it from the colour channel instead, because a canvas was
+    /// paper-filled and therefore always opaque -- alpha carried no information at all, and an
+    /// earlier version of this helper read it anyway and so measured nothing. Now that a canvas
+    /// is one transparent layer, alpha is the direct answer.
     fn paint_amount(canvas: &Canvas, x: usize, y: usize) -> f32 {
-        let paper = Canvas::paper_color()[0];
         match canvas.tile((0, 0)) {
-            Some(tile) => 1.0 - tile.texel(x, y)[0] / paper,
+            Some(tile) => tile.texel(x, y)[3],
             None => 0.0,
         }
     }

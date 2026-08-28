@@ -25,7 +25,7 @@
 //! shaders, and both directions of this transform. Building it once is cheaper than
 //! building it twice.
 
-use openpaint_core::{Canvas, PageRect};
+use openpaint_core::PageRect;
 
 /// Fraction of the visible area the canvas is fitted into, so the sheet has a
 /// little breathing room rather than touching the window edge.
@@ -160,26 +160,25 @@ impl View {
     }
 
     /// Apply a pending fit request, if any. Returns `true` if the view changed.
-    pub fn apply_pending_fit(&mut self, surface_w: u32, surface_h: u32, canvas: &Canvas) -> bool {
+    pub fn apply_pending_fit(&mut self, surface_w: u32, surface_h: u32, page: PageRect) -> bool {
         if !self.needs_fit {
             return false;
         }
         self.needs_fit = false;
-        self.fit(surface_w, surface_h, canvas);
+        self.fit(surface_w, surface_h, page);
         true
     }
 
     /// Fit the whole canvas in the visible area, upright and centered.
-    pub fn fit(&mut self, surface_w: u32, surface_h: u32, canvas: &Canvas) {
+    pub fn fit(&mut self, surface_w: u32, surface_h: u32, page: PageRect) {
         let (_, _, area_w, area_h) = self.content_area(surface_w, surface_h);
-        let cw = canvas.width().max(1) as f32;
-        let ch = canvas.height().max(1) as f32;
+        let cw = page.w.max(1) as f32;
+        let ch = page.h.max(1) as f32;
         self.scale = ((area_w / cw).min(area_h / ch) * FIT_MARGIN).clamp(MIN_SCALE, MAX_SCALE);
         self.rotation = 0.0;
-        // The page's centre in page coordinates, which is not `extent / 2` once the
-        // origin is negative.
-        let (ox, oy) = canvas.origin();
-        self.center = (ox as f32 + cw * 0.5, oy as f32 + ch * 0.5);
+        // The page's centre in page coordinates, which is not `extent / 2` once the origin is
+        // negative.
+        self.center = (page.x as f32 + cw * 0.5, page.y as f32 + ch * 0.5);
     }
 
     /// Set zoom to an exact scale, keeping the canvas point under `anchor` fixed.
@@ -367,12 +366,11 @@ impl View {
         py: f64,
         surface_w: u32,
         surface_h: u32,
-        canvas: &Canvas,
+        page: PageRect,
     ) -> Option<(f32, f32)> {
         let (cx, cy) = self.screen_to_canvas_unclipped((px, py), surface_w, surface_h);
-        let (ox, oy) = canvas.origin();
-        let (ex, ey) = canvas.end();
-        if cx < ox as f32 || cy < oy as f32 || cx > ex as f32 || cy > ey as f32 {
+        let (ex, ey) = page.end();
+        if cx < page.x as f32 || cy < page.y as f32 || cx > ex as f32 || cy > ey as f32 {
             return None;
         }
         Some((cx, cy))
@@ -407,13 +405,13 @@ mod tests {
     const SW: u32 = 800;
     const SH: u32 = 600;
 
-    fn canvas() -> Canvas {
-        Canvas::new(1000, 1000)
+    fn canvas() -> PageRect {
+        PageRect::from_size(1000, 1000)
     }
 
     fn fitted() -> View {
         let mut v = View::new();
-        v.fit(SW, SH, &canvas());
+        v.fit(SW, SH, canvas());
         v
     }
 
@@ -598,21 +596,18 @@ mod tests {
         let c = canvas();
         let v = fitted();
         // Top-left of the window is backdrop when the canvas is fitted with margin.
-        assert!(v.screen_to_canvas(1.0, 1.0, SW, SH, &c).is_none());
-        assert!(v.screen_to_canvas(400.0, 300.0, SW, SH, &c).is_some());
+        assert!(v.screen_to_canvas(1.0, 1.0, SW, SH, c).is_none());
+        assert!(v.screen_to_canvas(400.0, 300.0, SW, SH, c).is_some());
     }
 
     #[test]
     fn a_pending_fit_applies_once() {
         let c = canvas();
         let mut v = View::new();
-        assert!(v.apply_pending_fit(SW, SH, &c), "first fit should apply");
-        assert!(!v.apply_pending_fit(SW, SH, &c), "fit should not repeat");
+        assert!(v.apply_pending_fit(SW, SH, c), "first fit should apply");
+        assert!(!v.apply_pending_fit(SW, SH, c), "fit should not repeat");
         v.request_fit();
-        assert!(
-            v.apply_pending_fit(SW, SH, &c),
-            "requested fit should apply"
-        );
+        assert!(v.apply_pending_fit(SW, SH, c), "requested fit should apply");
     }
 
     #[test]
@@ -620,7 +615,7 @@ mod tests {
         let c = canvas();
         let mut v = View::new();
         let _ = v.set_inset_left(200.0);
-        v.fit(SW, SH, &c);
+        v.fit(SW, SH, c);
         // Center of the area right of the panel maps to the canvas center.
         let (cx, cy) = v.screen_to_canvas_unclipped((200.0 + 300.0, 300.0), SW, SH);
         assert!((cx - 500.0).abs() < 0.5, "x {cx}");
@@ -634,11 +629,11 @@ mod tests {
     fn learning_the_ui_inset_refits_while_auto_fitting() {
         let c = canvas();
         let mut v = View::new();
-        assert!(v.apply_pending_fit(SW, SH, &c));
+        assert!(v.apply_pending_fit(SW, SH, c));
 
         assert!(v.set_inset_left(280.0), "inset change should queue a fit");
         assert!(
-            v.apply_pending_fit(SW, SH, &c),
+            v.apply_pending_fit(SW, SH, c),
             "inset change did not trigger a re-fit"
         );
 
@@ -653,7 +648,7 @@ mod tests {
     fn manual_navigation_stops_auto_fitting() {
         let c = canvas();
         let mut v = View::new();
-        v.apply_pending_fit(SW, SH, &c);
+        v.apply_pending_fit(SW, SH, c);
 
         v.zoom_by_notches(4.0, (400.0, 300.0), SW, SH);
         let zoomed = v.scale();
@@ -661,7 +656,7 @@ mod tests {
         v.surface_resized();
         let _ = v.set_inset_left(280.0);
         assert!(
-            !v.apply_pending_fit(SW, SH, &c),
+            !v.apply_pending_fit(SW, SH, c),
             "auto-fit re-fitted after the user navigated"
         );
         assert!((v.scale() - zoomed).abs() < 1e-6, "zoom was reset");
@@ -673,22 +668,22 @@ mod tests {
     fn requesting_fit_resumes_auto_fitting() {
         let c = canvas();
         let mut v = View::new();
-        v.apply_pending_fit(SW, SH, &c);
+        v.apply_pending_fit(SW, SH, c);
         v.zoom_by_notches(4.0, (400.0, 300.0), SW, SH);
 
         v.request_fit();
-        assert!(v.apply_pending_fit(SW, SH, &c));
+        assert!(v.apply_pending_fit(SW, SH, c));
         v.surface_resized();
-        assert!(v.apply_pending_fit(SW, SH, &c), "auto-fit did not resume");
+        assert!(v.apply_pending_fit(SW, SH, c), "auto-fit did not resume");
     }
 
     #[test]
     fn degenerate_surface_sizes_do_not_panic() {
         let c = canvas();
         let mut v = View::new();
-        v.fit(0, 0, &c);
+        v.fit(0, 0, c);
         let _ = v.page_to_ndc(0, 0);
-        let _ = v.screen_to_canvas(0.0, 0.0, 0, 0, &c);
+        let _ = v.screen_to_canvas(0.0, 0.0, 0, 0, c);
     }
 
     /// After extending upward the page origin is negative, and the camera must treat
@@ -696,12 +691,12 @@ mod tests {
     /// drawable on.
     #[test]
     fn a_negative_origin_is_inside_the_page() {
-        let mut c = Canvas::new(1000, 1000);
-        c.resize(openpaint_core::PageRect::new(0, -500, 1000, 1500));
+        // A page extended downward: same origin, taller.
+        let c = openpaint_core::PageRect::new(0, -500, 1000, 1500);
         assert_eq!(c.origin(), (0, -500));
 
         let mut v = View::new();
-        v.fit(SW, SH, &c);
+        v.fit(SW, SH, c);
 
         // The centre of the visible area is the page's centre, which is now y = 250.
         let (cx, cy) =
@@ -712,7 +707,7 @@ mod tests {
         // A point in the newly added region maps and is accepted.
         let screen = v.canvas_to_screen(500.0, -250.0, SW, SH);
         let hit = v
-            .screen_to_canvas(f64::from(screen.0), f64::from(screen.1), SW, SH, &c)
+            .screen_to_canvas(f64::from(screen.0), f64::from(screen.1), SW, SH, c)
             .expect("negative-y page space should be paintable");
         assert!((hit.1 - -250.0).abs() < 0.5, "got {hit:?}");
     }
@@ -722,15 +717,16 @@ mod tests {
     /// coordinates do not change and the camera is untouched.
     #[test]
     fn extending_does_not_move_content_on_screen() {
-        let mut c = Canvas::new(1000, 1000);
         let mut v = View::new();
-        v.fit(SW, SH, &c);
+        v.fit(SW, SH, PageRect::from_size(1000, 1000));
 
         let p = (137.0_f32, 421.0_f32);
         let before = v.canvas_to_screen(p.0, p.1, SW, SH);
 
-        // Extend upward and leftward: the rectangle's origin moves, content does not.
-        c.resize(openpaint_core::PageRect::new(-400, -500, 1400, 1500));
+        // Extend upward and leftward: the rectangle's origin moves, content does not. The
+        // camera is deliberately *not* told about it, which is the point -- nothing has to
+        // compensate, because the point's coordinates did not change.
+        let _extended = PageRect::new(-400, -500, 1400, 1500);
         let after = v.canvas_to_screen(p.0, p.1, SW, SH);
 
         assert_eq!(

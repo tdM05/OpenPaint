@@ -43,14 +43,17 @@
 //! - [`Op::Resize`] keeps **nothing but the two rectangles**. This is the shape of
 //!   DECISIONS §5c: a resize destroys no pixels, so there is nothing to save. The previous
 //!   version snapshotted the whole pre-crop canvas, and deleting that is the point.
-//! - [`Op::Trim`] owns the tiles it discarded, because Trim is now the only operation that
-//!   destroys anything.
+//! - [`Op::Trim`] owns the tiles it discarded.
+//! - [`Op::DeleteLayer`] owns the whole layer: its properties, its position in the stack, and
+//!   every tile it held. Deleting a layer destroys pixels, so by the same argument as §5c it
+//!   cannot be offered at all unless it is undoable.
 
 use openpaint_core::tile::TileCoord;
-use openpaint_core::{Dab, PageResize};
+use openpaint_core::{Dab, Layer, PageResize};
 
 use crate::canvas_renderer::{CanvasRenderer, CANVAS_BYTES_PER_TEXEL, CANVAS_FORMAT};
 use crate::tile_pool::{layers_for_budget, Slot, TilePool};
+use crate::tile_store::{LayerId, TileKey};
 
 /// How much snapshot memory history may hold before evicting its oldest operations.
 ///
@@ -71,6 +74,9 @@ pub enum TileBefore {
 /// One undoable operation.
 pub enum Op {
     Stroke {
+        /// Which layer it was painted on. Undo has to put the pixels back where they came
+        /// from, and the active layer may well have changed since.
+        layer: LayerId,
         /// Every tile the stroke wrote, as it was beforehand.
         before: Vec<(TileCoord, TileBefore)>,
         /// Everything needed to reproduce the stroke for redo.
@@ -81,7 +87,14 @@ pub enum Op {
     /// Geometry only. Nothing is saved because nothing is destroyed (DECISIONS §5c).
     Resize { resize: PageResize },
     /// Tiles discarded by Trim, owned by the operation so undo can put them straight back.
-    Trim { tiles: Vec<(TileCoord, Slot)> },
+    Trim { tiles: Vec<(TileKey, Slot)> },
+    /// A deleted layer, kept whole so undo can put it back exactly where it was.
+    DeleteLayer {
+        /// Where it sat in the stack, so undo restores the order and not just the pixels.
+        index: usize,
+        layer: Layer,
+        tiles: Vec<(TileKey, Slot)>,
+    },
 }
 
 impl Op {
@@ -96,7 +109,9 @@ impl Op {
                 })
                 .collect(),
             Self::Resize { .. } => Vec::new(),
-            Self::Trim { tiles } => tiles.into_iter().map(|(_, slot)| slot).collect(),
+            Self::Trim { tiles } | Self::DeleteLayer { tiles, .. } => {
+                tiles.into_iter().map(|(_, slot)| slot).collect()
+            }
         }
     }
 }
@@ -160,11 +175,12 @@ impl History {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         canvas: &CanvasRenderer,
+        layer: LayerId,
         tiles: &[TileCoord],
     ) -> Option<Vec<(TileCoord, TileBefore)>> {
         let mut before = Vec::with_capacity(tiles.len());
         for coord in tiles {
-            let Some(src) = canvas.slot(*coord) else {
+            let Some(src) = canvas.slot(layer, *coord) else {
                 // Nothing there yet, so the stroke is creating it.
                 before.push((*coord, TileBefore::Absent));
                 continue;
@@ -193,12 +209,17 @@ impl History {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         canvas: &CanvasRenderer,
-        coord: TileCoord,
+        key: TileKey,
     ) -> Option<Slot> {
-        let src = canvas.slot(coord)?;
+        let src = canvas.slot(key.layer, key.coord)?;
         let dst = self.alloc_evicting()?;
         TilePool::copy_layer_from(encoder, canvas.pool(), src, &self.pool, &dst);
         Some(dst)
+    }
+
+    /// Hand a snapshot layer back, for a caller abandoning a partly-built operation.
+    pub fn release_slot(&mut self, slot: Slot) {
+        self.pool.free(slot);
     }
 
     /// Take a snapshot layer, evicting the oldest history if the pool is full.
@@ -278,6 +299,18 @@ mod tests {
         History::new(device)
     }
 
+    const L0: LayerId = LayerId(0);
+
+    fn stroke_op(before: Vec<(TileCoord, TileBefore)>) -> Op {
+        Op::Stroke {
+            layer: L0,
+            before,
+            dabs: Vec::new(),
+            color_linear_premul: [0.0; 4],
+            opacity: 1.0,
+        }
+    }
+
     fn resize() -> Op {
         Op::Resize {
             resize: PageResize {
@@ -352,12 +385,7 @@ mod tests {
         // Fill the pool one single-tile op at a time.
         for _ in 0..capacity {
             let slot = h.alloc_evicting().expect("within capacity");
-            h.push(Op::Stroke {
-                before: vec![((0, 0), TileBefore::Content(slot))],
-                dabs: Vec::new(),
-                color_linear_premul: [0.0; 4],
-                opacity: 1.0,
-            });
+            h.push(stroke_op(vec![((0, 0), TileBefore::Content(slot))]));
         }
         assert_eq!(h.undo_depth(), capacity as usize);
         assert_eq!(h.pool.used(), capacity);
@@ -385,12 +413,7 @@ mod tests {
 
         let one = |h: &mut History| {
             let slot = h.alloc_evicting().expect("capacity");
-            Op::Stroke {
-                before: vec![((0, 0), TileBefore::Content(slot))],
-                dabs: Vec::new(),
-                color_linear_premul: [0.0; 4],
-                opacity: 1.0,
-            }
+            stroke_op(vec![((0, 0), TileBefore::Content(slot))])
         };
 
         // Half the capacity on the undo stack, half moved over to redo.
