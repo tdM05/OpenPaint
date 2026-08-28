@@ -47,6 +47,8 @@
 //! - [`Op::DeleteLayer`] owns the whole layer: its properties, its position in the stack, and
 //!   every tile it held. Deleting a layer destroys pixels, so by the same argument as §5c it
 //!   cannot be offered at all unless it is undoable.
+//! - [`Op::DeletePage`] does the same for a page, which is a whole stack of layers at once and
+//!   therefore the largest thing a single click can destroy.
 
 use openpaint_core::tile::TileCoord;
 use openpaint_core::{Dab, Layer, PageResize};
@@ -88,6 +90,12 @@ pub enum Op {
     Resize { resize: PageResize },
     /// Tiles discarded by Trim, owned by the operation so undo can put them straight back.
     Trim { tiles: Vec<(TileKey, Slot)> },
+    /// A deleted page, kept whole -- its layers and every tile they held.
+    DeletePage {
+        index: usize,
+        page: openpaint_core::Page,
+        tiles: Vec<(TileKey, Slot)>,
+    },
     /// A deleted layer, kept whole so undo can put it back exactly where it was.
     DeleteLayer {
         /// Where it sat in the stack, so undo restores the order and not just the pixels.
@@ -109,9 +117,9 @@ impl Op {
                 })
                 .collect(),
             Self::Resize { .. } => Vec::new(),
-            Self::Trim { tiles } | Self::DeleteLayer { tiles, .. } => {
-                tiles.into_iter().map(|(_, slot)| slot).collect()
-            }
+            Self::Trim { tiles }
+            | Self::DeleteLayer { tiles, .. }
+            | Self::DeletePage { tiles, .. } => tiles.into_iter().map(|(_, slot)| slot).collect(),
         }
     }
 }

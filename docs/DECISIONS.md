@@ -587,6 +587,30 @@ lazy-load from an on-disk tile store so a 200-page sketchbook stays light.
      navigation. Possibly per-page notes/tags to find old studies. No special
      casing — just UX defaults.
 
+### Page management — landed 2026-08-28
+
+Select, add, delete (undoable), reorder, and the Pages/Continuous toggle. The model had been
+ready since §5a; this is the UI catching up, and it stayed cheap exactly because the model was
+already general.
+
+One latent bug fell out of building it, worth recording because it was invisible until pages
+existed: **layer ids were per page**, and `Page::new` always started at 0. The renderer keys
+tiles by layer id alone, so a second page's first layer would have shared tiles with the
+first's. Id allocation moved to `Document`, so ids are unique across the document and a page
+reorder still rewrites nothing.
+
+A related simplification: the layer-id counter is **no longer saved**. One past the highest
+live id is correct on load, because a save discards undo history — and history holding tiles
+keyed to *deleted* layers was the only thing that made reusing an id dangerous.
+
+Switching pages **re-fits the camera**, unlike a resize, which deliberately keeps the zoom. A
+different page is very likely a different size, so keeping the zoom would leave the artist
+looking at empty space; a resize of the page you are working on is the opposite case.
+
+Still missing, in rough order of how much they will be missed: **thumbnails** (the list is
+names for now), **drag to reorder** rather than Up/Down, **spread pairing** for print, and
+export of a whole document (CBZ/PDF, §7).
+
 ### Page management (the under-served area we intend to win)
 Reordering, spreads, templates, thumbnail-grid overview, lazy on-disk loading,
 and (for webcomics) panel/frame tooling + export to CBZ/PDF/image-sequence.

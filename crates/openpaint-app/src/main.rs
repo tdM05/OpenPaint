@@ -412,6 +412,16 @@ impl OpenPaint {
                 self.editor.document_mut().active_mut().remove_layer(index);
                 self.request_redraw();
             }
+            renderer::HistoryChange::PageRestored { index, page } => {
+                self.editor.document_mut().restore_page(index, page);
+                self.follow_active_page();
+                self.request_redraw();
+            }
+            renderer::HistoryChange::PageDeleted { index } => {
+                self.editor.document_mut().remove_page(index);
+                self.follow_active_page();
+                self.request_redraw();
+            }
         }
     }
 
@@ -471,6 +481,78 @@ impl OpenPaint {
         self.request_redraw();
     }
 
+    /// Apply a page change from the panel.
+    ///
+    /// Deletion is the only one that touches pixels, and it destroys a whole stack at once --
+    /// the largest thing a single click can throw away -- so it is recorded in history first and
+    /// refused if there is no room (DECISIONS §5c).
+    fn apply_page_action(&mut self, action: ui::PageAction) {
+        match action {
+            ui::PageAction::Select(index) => {
+                self.editor.stroke_end();
+                if self.editor.document_mut().set_active(index) {
+                    self.follow_active_page();
+                }
+            }
+            ui::PageAction::Add => {
+                self.editor.stroke_end();
+                let index = self.editor.document_mut().add_page_like_active();
+                self.follow_active_page();
+                self.status_message = Some(format!("Added page {}", index + 1));
+            }
+            ui::PageAction::Delete(index) => self.delete_page(index),
+            ui::PageAction::Move { from, to } => {
+                self.editor.document_mut().move_page(from, to);
+            }
+            ui::PageAction::SetMode(mode) => self.editor.document_mut().set_mode(mode),
+        }
+        self.request_redraw();
+    }
+
+    /// Point the renderer and the camera at whatever page is now active.
+    ///
+    /// Re-fits deliberately: a different page is very likely a different size, so keeping the
+    /// zoom would leave the artist looking at the middle of nowhere. Same reasoning as opening a
+    /// document, and unlike a *resize*, where keeping the zoom is what you want.
+    fn follow_active_page(&mut self) {
+        let rect = self.editor.page_rect();
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_page(rect);
+        }
+        self.view.request_fit();
+    }
+
+    /// Delete a page, undoably.
+    fn delete_page(&mut self, index: usize) {
+        self.editor.stroke_end();
+        let Some(page) = self.editor.document().page(index).cloned() else {
+            return;
+        };
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let Some(tiles) = renderer.adopt_page(&page) else {
+            self.status_message =
+                Some("No room to record the deletion, so the page was kept".to_owned());
+            self.request_redraw();
+            return;
+        };
+        if self.editor.document_mut().remove_page(index).is_none() {
+            self.status_message = Some("A document needs at least one page".to_owned());
+            self.apply_history_change(renderer::HistoryChange::PageRestored { index, page });
+            return;
+        }
+        if let Some(r) = self.renderer.as_mut() {
+            r.record_page_deletion(index, page, tiles);
+        }
+        self.follow_active_page();
+        self.status_message = Some(format!(
+            "Deleted page {} (Ctrl+Z to bring it back)",
+            index + 1
+        ));
+        self.request_redraw();
+    }
+
     /// Apply a layer change from the panel.
     ///
     /// Deletion is the only one that touches pixels, and it is recorded in history first: a
@@ -486,7 +568,7 @@ impl OpenPaint {
             }
             ui::LayerAction::Add => {
                 self.editor.stroke_end();
-                let index = self.editor.document_mut().active_mut().add_layer();
+                let index = self.editor.document_mut().add_layer();
                 self.status_message = Some(format!("Added layer {}", index + 1));
             }
             ui::LayerAction::Delete(index) => self.delete_layer(index),
@@ -922,6 +1004,7 @@ impl OpenPaint {
         let mut crop_request = None;
         let mut trim_request = false;
         let mut layer_request = None;
+        let mut page_request = None;
         let history_status = renderer.history_status();
         let residency = renderer.residency();
         let (spilled, traffic) = renderer.spill_status();
@@ -935,6 +1018,9 @@ impl OpenPaint {
         // gymnastics avoiding it would need.
         let layers = editor.layers().to_vec();
         let active_index = editor.active_layer_index();
+        let page_count = editor.document().page_count();
+        let active_page = editor.document().active_index();
+        let document_mode = editor.document().mode();
         let window = renderer.window().clone();
         // Borrowed, not copied: a copy would mean any future UI control that edits
         // the view silently writes to a dead value. Disjoint field borrows make
@@ -958,6 +1044,8 @@ impl OpenPaint {
                         traffic,
                         layers: &layers,
                         active_layer: active_index,
+                        pages: (page_count, active_page),
+                        mode: document_mode,
                     },
                 );
                 ui_wants_repaint = out.wants_repaint;
@@ -965,6 +1053,7 @@ impl OpenPaint {
                 crop_request = out.crop;
                 trim_request = out.trim;
                 layer_request = out.layer;
+                page_request = out.page;
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
@@ -988,6 +1077,9 @@ impl OpenPaint {
             self.status_message = Some(
                 "Too much of the canvas is visible at once to keep on the GPU; zoom in.".to_owned(),
             );
+        }
+        if let Some(action) = page_request {
+            self.apply_page_action(action);
         }
         if let Some(action) = layer_request {
             self.apply_layer_action(action);

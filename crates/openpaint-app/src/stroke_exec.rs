@@ -625,7 +625,7 @@ mod tests {
             bottom_id,
         );
 
-        editor.document_mut().active_mut().add_layer();
+        editor.document_mut().add_layer();
         editor.document_mut().active_mut().active_layer_mut().blend =
             openpaint_core::Blend::Multiply;
         editor

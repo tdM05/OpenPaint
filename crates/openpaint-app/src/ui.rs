@@ -22,7 +22,7 @@
 //! it.
 
 use egui::ViewportId;
-use openpaint_core::{Blend, Brush, Layer};
+use openpaint_core::{Blend, Brush, Layer, Mode};
 use winit::window::Window;
 
 use crate::editor::DEFAULT_EXTEND;
@@ -48,6 +48,24 @@ pub struct CropOverlay {
     pub corners: [[f32; 2]; 4],
     /// The eight edge and corner handles.
     pub handles: [[f32; 2]; 8],
+}
+
+/// A change the page panel wants made to the document.
+///
+/// Returned rather than applied, for the same reason as [`LayerAction`]: pages own GPU tiles and
+/// history, neither of which the overlay closure can reach mid-frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PageAction {
+    /// Work on this page from now on.
+    Select(usize),
+    /// Add an empty page after the active one, the same size.
+    Add,
+    /// Delete this page. Undoable, or it would not be offered.
+    Delete(usize),
+    /// Move a page to a new index.
+    Move { from: usize, to: usize },
+    /// Switch what the UI presents. Restricts nothing (DECISIONS §5a).
+    SetMode(Mode),
 }
 
 /// A change the layer panel wants made to the stack.
@@ -100,6 +118,10 @@ pub struct Status<'a> {
     pub layers: &'a [Layer],
     /// Index of the layer being painted.
     pub active_layer: usize,
+    /// How many pages the document has, and which is active.
+    pub pages: (usize, usize),
+    /// What the UI is currently presenting.
+    pub mode: Mode,
 }
 
 /// What the panel wants the app to do, collected during the frame.
@@ -116,6 +138,8 @@ pub struct Outcome {
     pub trim: bool,
     /// At most one layer change per frame, which is all a click can produce.
     pub layer: Option<LayerAction>,
+    /// At most one page change per frame.
+    pub page: Option<PageAction>,
 }
 
 pub struct Ui {
@@ -207,6 +231,7 @@ impl Ui {
         let mut crop_action = None;
         let mut trim = false;
         let mut layer_action = None;
+        let mut page_action = None;
 
         let output = self.ctx.run(input, |ctx| {
             egui::SidePanel::left("brush-panel")
@@ -307,6 +332,73 @@ impl Ui {
                         .small()
                         .weak(),
                     );
+                    ui.separator();
+                    ui.heading("Pages");
+                    let (page_count, active_page) = status.pages;
+                    ui.horizontal(|ui| {
+                        if ui.button("Add page").clicked() {
+                            page_action = Some(PageAction::Add);
+                        }
+                        // Mode hides affordances and sets defaults; it restricts nothing
+                        // (DECISIONS §5a), which is why it is a plain toggle rather than a
+                        // document type.
+                        let mut continuous = status.mode == Mode::Continuous;
+                        if ui.checkbox(&mut continuous, "webtoon").changed() {
+                            page_action = Some(PageAction::SetMode(if continuous {
+                                Mode::Continuous
+                            } else {
+                                Mode::Pages
+                            }));
+                        }
+                    });
+                    for index in 0..page_count {
+                        ui.horizontal(|ui| {
+                            let selected = index == active_page;
+                            if ui
+                                .selectable_label(selected, format!("Page {}", index + 1))
+                                .clicked()
+                            {
+                                page_action = Some(PageAction::Select(index));
+                            }
+                            if selected {
+                                if ui
+                                    .add_enabled(index > 0, egui::Button::new("Up"))
+                                    .clicked()
+                                {
+                                    page_action = Some(PageAction::Move {
+                                        from: index,
+                                        to: index - 1,
+                                    });
+                                }
+                                if ui
+                                    .add_enabled(index + 1 < page_count, egui::Button::new("Down"))
+                                    .clicked()
+                                {
+                                    page_action = Some(PageAction::Move {
+                                        from: index,
+                                        to: index + 1,
+                                    });
+                                }
+                                // The last page cannot go: a document must have somewhere to
+                                // draw.
+                                if ui
+                                    .add_enabled(page_count > 1, egui::Button::new("Delete"))
+                                    .clicked()
+                                {
+                                    page_action = Some(PageAction::Delete(index));
+                                }
+                            }
+                        });
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "A webtoon is one very tall page, a sketchbook is many -- one model \
+                             either way (DECISIONS §5a). Deleting a page is undoable.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+
                     ui.separator();
                     ui.heading("Layers");
                     if ui.button("Add layer").clicked() {
@@ -598,6 +690,7 @@ impl Ui {
             crop: crop_action,
             trim,
             layer: layer_action,
+            page: page_action,
         }
     }
 }

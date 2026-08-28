@@ -316,7 +316,11 @@ pub fn save(
                 r.h,
                 page.dpi(),
                 page.active_index() as i64,
-                i64::from(page.next_layer_id()),
+                // Kept for files written before layer ids became document-wide, which stored a
+                // per-page counter here. Ignored on read: one past the highest live id is
+                // correct without it, because a save discards the undo history that made
+                // reusing a dead id dangerous.
+                i64::from(page.highest_layer_id()) + 1,
             ],
         )?;
         for (li, layer) in page.layers().iter().enumerate() {
@@ -405,7 +409,7 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
     })?;
 
     for row in rows {
-        let (idx, rect, dpi, active_layer, next_layer_id) = row?;
+        let (idx, rect, dpi, active_layer, _legacy_next_layer_id) = row?;
         let layers: Vec<Layer> = layer_stmt
             .query_map([idx], |r| {
                 let blend_text: String = r.get(3)?;
@@ -430,7 +434,6 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
             dpi,
             layers,
             usize::try_from(active_layer).unwrap_or(0),
-            u32::try_from(next_layer_id).unwrap_or(0),
         )
         .ok_or_else(|| Error::Malformed(format!("page {idx} has no layers")))?;
         pages.push(page);

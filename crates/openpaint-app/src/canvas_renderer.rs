@@ -870,9 +870,13 @@ pub(crate) mod tests {
 
         let mut results = Vec::new();
         for mode in openpaint_core::Blend::ALL {
-            let mut doc = openpaint_core::Page::new(W, H);
-            doc.add_layer();
-            doc.layer_mut(1).expect("top").blend = mode;
+            let mut document = openpaint_core::Document::new(
+                openpaint_core::Page::new(W, H),
+                openpaint_core::Mode::Pages,
+            );
+            document.add_layer();
+            document.active_mut().layer_mut(1).expect("top").blend = mode;
+            let doc = document.active();
 
             let stroke = crate::test_gpu::test_stroke_layer(&device);
             let mut canvas =

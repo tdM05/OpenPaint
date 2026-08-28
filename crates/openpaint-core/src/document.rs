@@ -32,16 +32,25 @@ pub struct Document {
     pages: Vec<Page>,
     active: usize,
     mode: Mode,
+    /// Layer ids are unique across the whole document, and never reused within a session.
+    ///
+    /// Document-wide rather than per page, because the renderer keys tiles by layer id alone:
+    /// two pages each starting their layers at 0 would have their pixels collide. Kept
+    /// monotonic within a session because undo holds tiles keyed by the ids of *deleted*
+    /// layers, and handing one out again would let a restore land on the wrong layer.
+    next_layer_id: u32,
 }
 
 impl Document {
     /// A document with a single page.
     #[must_use]
     pub fn new(page: Page, mode: Mode) -> Self {
+        let next_layer_id = page.highest_layer_id() + 1;
         Self {
             pages: vec![page],
             active: 0,
             mode,
+            next_layer_id,
         }
     }
 
@@ -55,10 +64,15 @@ impl Document {
         if pages.is_empty() {
             return None;
         }
+        // Derived rather than stored. A save discards undo history, which is the only thing
+        // that made reusing a dead layer's id dangerous -- so one past the highest live id is
+        // exactly right on load, and needs nothing from the file to be correct.
+        let next_layer_id = pages.iter().map(Page::highest_layer_id).max().unwrap_or(0) + 1;
         Some(Self {
             active: active.min(pages.len() - 1),
             pages,
             mode,
+            next_layer_id,
         })
     }
 
@@ -118,9 +132,79 @@ impl Document {
 
     /// Append a page and make it active. Available in every mode (§5a).
     pub fn add_page(&mut self, page: Page) -> usize {
+        self.next_layer_id = self.next_layer_id.max(page.highest_layer_id() + 1);
         self.pages.push(page);
         self.active = self.pages.len() - 1;
         self.active
+    }
+
+    /// Add an empty page the same size as the active one, directly after it, and select it.
+    ///
+    /// After the active page rather than at the end, for the same reason a new layer goes above
+    /// the active one: the page you just made is nearly always meant to follow the one you were
+    /// working on.
+    pub fn add_page_like_active(&mut self) -> usize {
+        let rect = self.active().rect();
+        let dpi = self.active().dpi();
+        let id = self.take_layer_id();
+        let mut page = Page::with_layer_id(rect.w, rect.h, id);
+        page.set_dpi(dpi);
+        // Keep the new page's rectangle where the old one's was, so a webtoon strip extended
+        // upward does not put its next page somewhere else entirely.
+        page.resize(rect);
+        self.insert_page(self.active + 1, page)
+    }
+
+    /// Take the next layer id. The only place ids come from.
+    fn take_layer_id(&mut self) -> u32 {
+        let id = self.next_layer_id;
+        self.next_layer_id += 1;
+        id
+    }
+
+    /// Add a layer above the active one of the active page, and select it.
+    pub fn add_layer(&mut self) -> usize {
+        let id = self.take_layer_id();
+        // Named from the id, not the count: naming from the count reuses names as soon as a
+        // layer is deleted, and two layers called "Layer 2" is worse than a gap in the
+        // numbering.
+        let name = format!("Layer {}", id + 1);
+        let at = self.active().active_index();
+        self.active_mut().insert_layer_above(at, id, name)
+    }
+
+    /// Move a page to a new index, shifting the rest. Returns where it ended up.
+    pub fn move_page(&mut self, from: usize, to: usize) -> Option<usize> {
+        if from >= self.pages.len() {
+            return None;
+        }
+        let to = to.min(self.pages.len() - 1);
+        if from == to {
+            return Some(to);
+        }
+        let page = self.pages.remove(from);
+        self.pages.insert(to, page);
+        // Follow the page that moved, if it was the active one.
+        if self.active == from {
+            self.active = to;
+        } else if from < self.active && to >= self.active {
+            self.active -= 1;
+        } else if from > self.active && to <= self.active {
+            self.active += 1;
+        }
+        Some(to)
+    }
+
+    /// Put a removed page back at `index`, keeping its layer ids.
+    ///
+    /// For undoing a deletion, which is why it takes a whole [`Page`]: the ids have to be the
+    /// same or the tiles history is about to restore would belong to nothing.
+    pub fn restore_page(&mut self, index: usize, page: Page) -> usize {
+        self.next_layer_id = self.next_layer_id.max(page.highest_layer_id() + 1);
+        let at = index.min(self.pages.len());
+        self.pages.insert(at, page);
+        self.active = at;
+        at
     }
 
     /// Insert a page at `index`, making it active.
@@ -133,19 +217,21 @@ impl Document {
 
     /// Remove a page. Refuses to remove the last one — a document must always have
     /// somewhere to draw.
-    pub fn remove_page(&mut self, index: usize) -> bool {
+    pub fn remove_page(&mut self, index: usize) -> Option<Page> {
         if self.pages.len() <= 1 || index >= self.pages.len() {
-            return false;
+            return None;
         }
-        self.pages.remove(index);
+        let page = self.pages.remove(index);
         self.active = self.active.min(self.pages.len() - 1);
-        true
+        Some(page)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layer::Layer;
+    use crate::page::PageRect;
 
     fn doc() -> Document {
         Document::new(Page::new(800, 1000), Mode::Pages)
@@ -202,7 +288,7 @@ mod tests {
     #[test]
     fn the_last_page_cannot_be_removed() {
         let mut d = doc();
-        assert!(!d.remove_page(0));
+        assert!(d.remove_page(0).is_none());
         assert_eq!(d.page_count(), 1);
     }
 
@@ -213,7 +299,7 @@ mod tests {
         d.add_page(Page::new(2, 2));
         assert_eq!(d.active_index(), 2);
 
-        assert!(d.remove_page(2));
+        assert!(d.remove_page(2).is_some());
         assert_eq!(d.page_count(), 2);
         assert!(
             d.active_index() < d.page_count(),
@@ -235,5 +321,108 @@ mod tests {
         let moved = d.active_mut().extend(crate::page::Side::Bottom, 500);
         assert_eq!(moved, (0, 0));
         assert_eq!(d.active().height(), 1500);
+    }
+
+    /// The bug this ownership change fixed: layer ids must be unique across the **document**,
+    /// not the page. The renderer keys tiles by id alone, so two pages each starting their
+    /// layers at 0 would have their pixels land on top of each other.
+    #[test]
+    fn layer_ids_are_unique_across_pages() {
+        let mut d = Document::new(Page::new(100, 100), Mode::Pages);
+        d.add_layer();
+        d.add_page_like_active();
+        d.add_layer();
+        d.add_page_like_active();
+
+        let mut ids: Vec<u32> = (0..d.page_count())
+            .flat_map(|i| {
+                d.page(i)
+                    .expect("page")
+                    .layers()
+                    .iter()
+                    .map(Layer::id)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let total = ids.len();
+        assert!(total >= 5, "expected several layers, got {total}");
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "an id was shared between pages");
+    }
+
+    /// A new page follows the active one rather than going to the end, for the same reason a new
+    /// layer goes above the active one.
+    #[test]
+    fn a_new_page_follows_the_active_one() {
+        let mut d = Document::new(Page::new(100, 100), Mode::Pages);
+        d.add_page_like_active();
+        d.add_page_like_active();
+        assert_eq!(d.page_count(), 3);
+        assert!(d.set_active(0));
+        assert_eq!(d.add_page_like_active(), 1);
+        assert_eq!(d.active_index(), 1, "the new page should be selected");
+        assert_eq!(d.page_count(), 4);
+    }
+
+    /// A new page inherits the active one's size and DPI, so a sketchbook stays uniform and a
+    /// webtoon's next page matches the strip.
+    #[test]
+    fn a_new_page_matches_the_one_it_follows() {
+        let mut d = Document::new(Page::new(100, 100), Mode::Pages);
+        d.active_mut().set_dpi(300.0);
+        d.active_mut().resize(PageRect::new(-40, -70, 800, 1200));
+        d.add_page_like_active();
+        assert_eq!(d.active().rect(), PageRect::new(-40, -70, 800, 1200));
+        assert!((d.active().dpi() - 300.0).abs() < 1e-3);
+    }
+
+    /// Reordering has to carry the selection with the page that moved, or the artist keeps
+    /// drawing on a different page than the one they dragged.
+    #[test]
+    fn reordering_pages_follows_the_selection() {
+        let mut d = Document::new(Page::new(10, 10), Mode::Pages);
+        d.add_page_like_active();
+        d.add_page_like_active();
+        assert!(d.set_active(0));
+        let selected = d.active().active_layer().id();
+        assert_eq!(d.move_page(0, 2), Some(2));
+        assert_eq!(d.active_index(), 2, "selection did not follow");
+        assert_eq!(d.active().active_layer().id(), selected);
+
+        // Moving another page past the selection keeps it pointing at the same page.
+        d.move_page(0, 2);
+        assert_eq!(d.active().active_layer().id(), selected);
+    }
+
+    /// Deleting must hand the page back, or its tiles would be stranded with nothing to restore
+    /// them -- and page deletion has to be undoable for the same reason layer deletion does.
+    #[test]
+    fn removing_a_page_hands_it_back() {
+        let mut d = Document::new(Page::new(10, 10), Mode::Pages);
+        d.add_page_like_active();
+        let doomed = d.active().active_layer().id();
+        let page = d.remove_page(1).expect("removable");
+        assert_eq!(page.active_layer().id(), doomed);
+        assert_eq!(d.page_count(), 1);
+
+        // And putting it back keeps its ids, so its tiles still belong to it.
+        d.restore_page(1, page);
+        assert_eq!(d.page_count(), 2);
+        assert_eq!(d.page(1).expect("page").active_layer().id(), doomed);
+    }
+
+    /// Restoring a page must not let a later `add_layer` reuse one of its ids.
+    #[test]
+    fn restoring_a_page_keeps_the_counter_ahead() {
+        let mut d = Document::new(Page::new(10, 10), Mode::Pages);
+        d.add_page_like_active();
+        d.add_layer();
+        let page = d.remove_page(1).expect("removable");
+        let ids: Vec<u32> = page.layers().iter().map(Layer::id).collect();
+        d.restore_page(1, page);
+        d.add_layer();
+        let fresh = d.active().active_layer().id();
+        assert!(!ids.contains(&fresh), "id {fresh} collides with {ids:?}");
     }
 }

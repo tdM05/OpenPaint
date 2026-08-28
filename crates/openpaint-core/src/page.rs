@@ -152,6 +152,11 @@ impl PageResize {
     }
 }
 
+/// A page: its rectangle, its stack of layers, and its print metadata.
+///
+/// `Clone` because deleting a page has to be undoable: history keeps the whole page so it can be
+/// put back with its layer ids intact, and those ids are what its tiles are keyed by.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Page {
     rect: PageRect,
     /// Bottom-first, so index 0 is the layer furthest back. Compositing walks it in order,
@@ -160,9 +165,6 @@ pub struct Page {
     layers: Vec<Layer>,
     /// Index into `layers` of the layer being painted.
     active: usize,
-    /// Never reused, so a tile keyed by a dead layer's id can never be mistaken for a live
-    /// one's.
-    next_layer_id: u32,
     /// Dots per inch, for print and export. Metadata only -- see the module note.
     dpi: f32,
 }
@@ -170,39 +172,35 @@ pub struct Page {
 impl Page {
     #[must_use]
     pub fn new(width: u32, height: u32) -> Self {
+        Self::with_layer_id(width, height, 0)
+    }
+
+    /// A page whose sole layer has a given id.
+    ///
+    /// Layer ids are unique across the **document**, not the page (see
+    /// [`crate::document::Document`]), because tiles are keyed by id alone: two pages both
+    /// starting at 0 would have their pixels collide. So the document hands the id down.
+    #[must_use]
+    pub fn with_layer_id(width: u32, height: u32, layer_id: u32) -> Self {
         Self {
             rect: PageRect::from_size(width, height),
-            layers: vec![Layer::new(0, "Layer 1")],
+            layers: vec![Layer::new(layer_id, "Layer 1")],
             active: 0,
-            next_layer_id: 1,
             dpi: DEFAULT_DPI,
         }
     }
 
     /// Rebuild a page exactly as it was, for loading a document.
     ///
-    /// `next_layer_id` is part of the saved state on purpose: ids must never be reused, and a
-    /// counter derived from the layer count would start handing out ids that dead layers once
-    /// had. It is clamped above every id present, so a hand-edited or truncated file cannot
-    /// produce a collision.
-    ///
     /// Returns `None` with no layers, because a page must always have somewhere to paint.
     #[must_use]
-    pub fn restored(
-        rect: PageRect,
-        dpi: f32,
-        layers: Vec<Layer>,
-        active: usize,
-        next_layer_id: u32,
-    ) -> Option<Self> {
+    pub fn restored(rect: PageRect, dpi: f32, layers: Vec<Layer>, active: usize) -> Option<Self> {
         if layers.is_empty() {
             return None;
         }
-        let highest = layers.iter().map(Layer::id).max().unwrap_or(0);
         Some(Self {
             rect,
             active: active.min(layers.len() - 1),
-            next_layer_id: next_layer_id.max(highest + 1),
             layers,
             dpi: dpi.max(1.0),
         })
@@ -238,14 +236,10 @@ impl Page {
         self.dpi = dpi.max(1.0);
     }
 
-    /// The next id this page would hand out.
-    ///
-    /// Part of the saved state, because ids must never be reused: a counter rebuilt from the
-    /// layer count would start handing out ids that deleted layers once had, and tiles are keyed
-    /// by id.
+    /// The highest layer id on this page, so the document can keep its counter ahead.
     #[must_use]
-    pub fn next_layer_id(&self) -> u32 {
-        self.next_layer_id
+    pub fn highest_layer_id(&self) -> u32 {
+        self.layers.iter().map(Layer::id).max().unwrap_or(0)
     }
 
     /// The stack, bottom layer first.
@@ -298,22 +292,11 @@ impl Page {
     /// Returns its index. Inserting above the active layer rather than at the top is what
     /// every drawing app does, because the layer you just made is nearly always meant to sit
     /// on the one you were working on.
-    pub fn insert_layer_above(&mut self, above: usize, name: impl Into<String>) -> usize {
-        let id = self.next_layer_id;
-        self.next_layer_id += 1;
+    pub fn insert_layer_above(&mut self, above: usize, id: u32, name: impl Into<String>) -> usize {
         let at = (above + 1).min(self.layers.len());
         self.layers.insert(at, Layer::new(id, name));
         self.active = at;
         at
-    }
-
-    /// Add a layer above the active one, named for its position.
-    pub fn add_layer(&mut self) -> usize {
-        // Named from the id, not the count: naming from the count reuses names as soon as a
-        // layer is deleted, and two layers called "Layer 2" is worse than a gap in the
-        // numbering.
-        let name = format!("Layer {}", self.next_layer_id + 1);
-        self.insert_layer_above(self.active, name)
     }
 
     /// Remove a layer, returning its id so its tiles can be released.
@@ -336,9 +319,6 @@ impl Page {
     /// one: the id has to be the same, or the tiles history is about to restore would be keyed
     /// to a layer that no longer exists.
     pub fn restore_layer(&mut self, index: usize, layer: Layer) -> usize {
-        // Ids are never reused, so a restored layer can be newer than `next_layer_id` only if
-        // something else already handed out its id -- keep the counter ahead regardless.
-        self.next_layer_id = self.next_layer_id.max(layer.id() + 1);
         let at = index.min(self.layers.len());
         self.layers.insert(at, layer);
         self.active = at;
@@ -390,6 +370,16 @@ impl Page {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Add a layer with a fresh id, standing in for `Document::add_layer`.
+    ///
+    /// Ids come from the document now, because the renderer keys tiles by id alone and two pages
+    /// starting at 0 would collide. A page-level test therefore has to supply one.
+    fn add(p: &mut Page) -> usize {
+        let id = p.highest_layer_id() + 1;
+        let at = p.active_index();
+        p.insert_layer_above(at, id, format!("Layer {}", id + 1))
+    }
 
     #[test]
     fn extending_the_bottom_or_right_leaves_the_origin_alone() {
@@ -528,7 +518,7 @@ mod tests {
     fn a_new_layer_lands_above_the_active_one_and_takes_over() {
         let mut p = Page::new(100, 100);
         let bottom = p.active_layer().id();
-        let at = p.add_layer();
+        let at = add(&mut p);
         assert_eq!(at, 1);
         assert_eq!(p.active_index(), 1);
         assert_eq!(
@@ -539,7 +529,7 @@ mod tests {
 
         // Selecting the bottom and adding again inserts in the middle, not at the top.
         assert!(p.set_active(0));
-        let at = p.add_layer();
+        let at = add(&mut p);
         assert_eq!(at, 1);
         assert_eq!(p.layer_count(), 3);
     }
@@ -551,11 +541,11 @@ mod tests {
         let mut p = Page::new(100, 100);
         let mut seen = vec![p.active_layer().id()];
         for _ in 0..5 {
-            p.add_layer();
+            add(&mut p);
             seen.push(p.active_layer().id());
         }
         p.remove_layer(2);
-        p.add_layer();
+        add(&mut p);
         seen.push(p.active_layer().id());
 
         let mut sorted = seen.clone();
@@ -569,7 +559,7 @@ mod tests {
     #[test]
     fn removing_a_layer_reports_its_id() {
         let mut p = Page::new(100, 100);
-        p.add_layer();
+        add(&mut p);
         let doomed = p.layers()[1].id();
         assert_eq!(p.remove_layer(1), Some(doomed));
         assert_eq!(p.layer_count(), 1);
@@ -589,8 +579,8 @@ mod tests {
     #[test]
     fn removing_keeps_the_selection_valid() {
         let mut p = Page::new(100, 100);
-        p.add_layer();
-        p.add_layer();
+        add(&mut p);
+        add(&mut p);
         assert_eq!(p.active_index(), 2);
         p.remove_layer(2);
         assert_eq!(p.active_index(), 1, "selection should not dangle");
@@ -598,8 +588,8 @@ mod tests {
 
         // Deleting below the selection shifts it down with the stack.
         let mut p = Page::new(100, 100);
-        p.add_layer();
-        p.add_layer();
+        add(&mut p);
+        add(&mut p);
         assert!(p.set_active(2));
         p.remove_layer(0);
         assert_eq!(p.active_index(), 1);
@@ -610,8 +600,8 @@ mod tests {
     #[test]
     fn reordering_follows_the_active_layer() {
         let mut p = Page::new(100, 100);
-        p.add_layer();
-        p.add_layer();
+        add(&mut p);
+        add(&mut p);
         let ids: Vec<u32> = p.layers().iter().map(Layer::id).collect();
 
         assert!(p.set_active(0));
@@ -626,8 +616,8 @@ mod tests {
     #[test]
     fn reordering_around_the_selection_keeps_pointing_at_the_same_layer() {
         let mut p = Page::new(100, 100);
-        p.add_layer();
-        p.add_layer();
+        add(&mut p);
+        add(&mut p);
         assert!(p.set_active(1));
         let selected = p.active_layer().id();
 
@@ -655,7 +645,7 @@ mod tests {
     #[test]
     fn resizing_does_not_disturb_the_stack() {
         let mut p = Page::new(100, 100);
-        p.add_layer();
+        add(&mut p);
         let before: Vec<u32> = p.layers().iter().map(Layer::id).collect();
         let shift = p.resize(PageRect::new(-50, -20, 300, 300));
         assert_eq!(shift, (-50, -20));

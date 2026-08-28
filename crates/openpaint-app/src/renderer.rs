@@ -47,6 +47,13 @@ pub enum HistoryChange {
     LayerRestored { index: usize, layer: Layer },
     /// A restored layer was deleted again.
     LayerDeleted { index: usize },
+    /// A deleted page came back, and the document must put it at `index` again.
+    PageRestored {
+        index: usize,
+        page: openpaint_core::Page,
+    },
+    /// A restored page was deleted again.
+    PageDeleted { index: usize },
 }
 
 /// Everything an overlay needs to draw itself into the current frame.
@@ -242,6 +249,16 @@ impl Renderer {
         }
     }
 
+    /// Point the canvas at a different page rectangle, without recording anything.
+    ///
+    /// For switching pages and for loading, where the rectangle change *is* the navigation
+    /// rather than an edit. A resize goes through `resize_canvas` so it lands in history.
+    pub fn set_page(&mut self, page: PageRect) {
+        self.canvas_renderer.set_page(page);
+        self.stroke_layer.abandon();
+        self.recording.clear();
+    }
+
     /// Discard every tile outside the page, undoably.
     ///
     /// The **only** operation that destroys pixels. Crop deliberately does not: it moves
@@ -312,6 +329,36 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         self.canvas_renderer.discard_layer(layer);
         Some(adopted)
+    }
+
+    /// Move every tile of every layer of a page into history, so the page can be deleted
+    /// undoably. Returns `None` if there was no room to record them all.
+    pub fn adopt_page(&mut self, page: &openpaint_core::Page) -> Option<Vec<(TileKey, Slot)>> {
+        let mut all = Vec::new();
+        for layer in page.layers() {
+            match self.adopt_layer(LayerId(layer.id())) {
+                Some(mut tiles) => all.append(&mut tiles),
+                None => {
+                    // Give back what earlier layers contributed, so a refusal costs nothing and
+                    // leaves the page intact.
+                    for (_, slot) in all {
+                        self.history.release_slot(slot);
+                    }
+                    return None;
+                }
+            }
+        }
+        Some(all)
+    }
+
+    /// Record a completed page deletion, whose tiles [`Renderer::adopt_page`] already took.
+    pub fn record_page_deletion(
+        &mut self,
+        index: usize,
+        page: openpaint_core::Page,
+        tiles: Vec<(TileKey, Slot)>,
+    ) {
+        self.history.push(Op::DeletePage { index, page, tiles });
     }
 
     /// Record a completed layer deletion, whose tiles [`Renderer::adopt_layer`] already took.
@@ -507,6 +554,13 @@ impl Renderer {
                     layer: layer.clone(),
                 }
             }
+            Op::DeletePage { index, page, tiles } => {
+                self.restore_tiles(tiles);
+                HistoryChange::PageRestored {
+                    index: *index,
+                    page: page.clone(),
+                }
+            }
         };
         self.history.finish_undo(op);
         change
@@ -569,6 +623,12 @@ impl Renderer {
             Op::DeleteLayer { index, layer, .. } => {
                 self.canvas_renderer.discard_layer(LayerId(layer.id()));
                 HistoryChange::LayerDeleted { index: *index }
+            }
+            Op::DeletePage { index, page, .. } => {
+                for layer in page.layers() {
+                    self.canvas_renderer.discard_layer(LayerId(layer.id()));
+                }
+                HistoryChange::PageDeleted { index: *index }
             }
         };
         self.history.finish_redo(op);

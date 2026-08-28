@@ -36,24 +36,26 @@ impl Drop for TempFile {
 
 /// A document with two pages, several layers, and every blend mode represented.
 fn sample() -> Document {
-    let mut first = Page::new(1000, 1400);
-    first.add_layer();
-    first.add_layer();
-    first.layer_mut(0).expect("bottom").name = "Background".into();
-    first.layer_mut(1).expect("mid").blend = Blend::Multiply;
-    first.layer_mut(1).expect("mid").opacity = 0.42;
-    first.layer_mut(1).expect("mid").name = "Shadows".into();
-    first.layer_mut(2).expect("top").blend = Blend::Screen;
-    first.layer_mut(2).expect("top").visible = false;
-    first.set_active(1);
-    first.set_dpi(300.0);
+    let mut doc = Document::new(Page::new(1000, 1400), Mode::Continuous);
+    doc.add_layer();
+    doc.add_layer();
+    {
+        let first = doc.active_mut();
+        first.layer_mut(0).expect("bottom").name = "Background".into();
+        first.layer_mut(1).expect("mid").blend = Blend::Multiply;
+        first.layer_mut(1).expect("mid").opacity = 0.42;
+        first.layer_mut(1).expect("mid").name = "Shadows".into();
+        first.layer_mut(2).expect("top").blend = Blend::Screen;
+        first.layer_mut(2).expect("top").visible = false;
+        first.set_active(1);
+        first.set_dpi(300.0);
+    }
 
-    // A page extended up and left, so a negative origin is part of the round trip.
-    let mut second = Page::new(800, 800);
-    second.resize(PageRect::new(-300, -120, 1100, 920));
-
-    let mut doc = Document::restored(vec![first, second], 1, Mode::Continuous).expect("pages");
-    doc.set_mode(Mode::Continuous);
+    // A second page, extended up and left, so a negative origin is part of the round trip.
+    doc.add_page_like_active();
+    doc.active_mut()
+        .resize(PageRect::new(-300, -120, 1100, 920));
+    doc.set_active(1);
     doc
 }
 
@@ -96,6 +98,9 @@ fn a_document_round_trips_exactly() {
 
 /// Layer ids are what tiles are keyed by, so a load that renumbered them would separate every
 /// layer from its pixels. This is the single most important thing about the structure.
+///
+/// Ids are unique across the whole **document**, not per page: the renderer keys tiles by id
+/// alone, so two pages both starting at 0 would have their pixels collide.
 #[test]
 fn layer_ids_survive_and_the_counter_stays_ahead() {
     let f = TempFile::new("ids");
@@ -127,9 +132,9 @@ fn layer_ids_survive_and_the_counter_stays_ahead() {
         .collect();
     assert_eq!(ids, back_ids, "ids changed across a save");
 
-    let fresh = back.document.page_mut(0).expect("page");
-    fresh.add_layer();
-    let new_id = fresh.active_layer().id();
+    back.document.set_active(0);
+    back.document.add_layer();
+    let new_id = back.document.active().active_layer().id();
     assert!(
         !ids.contains(&new_id) && new_id != removed,
         "a new layer reused id {new_id}; ids were {ids:?} and {removed} was deleted"
@@ -258,9 +263,7 @@ fn saving_twice_replaces_rather_than_accumulates() {
     save(f.path(), &doc, [(key, patterned(1))]).expect("first save");
 
     // A smaller document over the top of a larger one: the extra page must not linger.
-    let mut smaller = Page::new(200, 200);
-    smaller.set_active(0);
-    let doc2 = Document::restored(vec![smaller], 0, Mode::Pages).expect("page");
+    let doc2 = Document::new(Page::new(200, 200), Mode::Pages);
     save(f.path(), &doc2, [(key, patterned(2))]).expect("second save");
 
     let back = load(f.path()).expect("load");
@@ -337,6 +340,69 @@ fn an_unknown_blend_mode_is_reported() {
         Err(other) => panic!("expected Malformed, got {other:?}"),
         Ok(_) => panic!("an unknown blend mode loaded silently"),
     }
+}
+
+/// Two pages must keep their pixels apart. Tiles are keyed by layer id alone, so this is the
+/// property that made layer ids document-wide -- with per-page ids both pages' first layers would
+/// be id 0 and their tiles would land on top of each other.
+#[test]
+fn two_pages_keep_their_tiles_apart() {
+    let f = TempFile::new("pages");
+    let mut doc = Document::new(Page::new(400, 400), Mode::Pages);
+    let first_layer = doc.active().active_layer().id();
+    doc.add_page_like_active();
+    let second_layer = doc.active().active_layer().id();
+    assert_ne!(first_layer, second_layer, "pages shared a layer id");
+
+    // The same tile coordinate on each page, with different pixels.
+    let a = TileRef {
+        page: 0,
+        layer_id: first_layer,
+        coord: (0, 0),
+    };
+    let b = TileRef {
+        page: 1,
+        layer_id: second_layer,
+        coord: (0, 0),
+    };
+    save(f.path(), &doc, [(a, patterned(1)), (b, patterned(2))]).expect("save");
+
+    let back = load(f.path()).expect("load");
+    assert_eq!(back.document.page_count(), 2);
+    assert_eq!(back.tiles.len(), 2, "one page's tile overwrote the other's");
+    assert_eq!(
+        back.tiles.get(&a).expect("page 0 tile").bytes(),
+        patterned(1).bytes()
+    );
+    assert_eq!(
+        back.tiles.get(&b).expect("page 1 tile").bytes(),
+        patterned(2).bytes()
+    );
+}
+
+/// A page's own geometry has to survive independently -- a sketchbook of differently-sized pages
+/// is an ordinary document, not an edge case.
+#[test]
+fn pages_keep_their_own_geometry() {
+    let f = TempFile::new("geometry");
+    let mut doc = Document::new(Page::new(400, 400), Mode::Pages);
+    doc.add_page_like_active();
+    doc.active_mut().resize(PageRect::new(-50, -60, 900, 1500));
+    doc.active_mut().set_dpi(600.0);
+    doc.set_active(0);
+
+    save(f.path(), &doc, []).expect("save");
+    let back = load(f.path()).expect("load");
+    assert_eq!(
+        back.document.page(0).expect("page").rect(),
+        PageRect::from_size(400, 400)
+    );
+    assert_eq!(
+        back.document.page(1).expect("page").rect(),
+        PageRect::new(-50, -60, 900, 1500)
+    );
+    assert!((back.document.page(1).expect("page").dpi() - 600.0).abs() < 1e-3);
+    assert_eq!(back.document.active_index(), 0, "the active page changed");
 }
 
 /// Every blend mode must have a name and get back to itself, or a mode added later can be saved
