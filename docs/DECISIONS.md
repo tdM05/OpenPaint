@@ -65,10 +65,35 @@ We explicitly do NOT want Krita's bloat or its layout/interaction choices.
 
 ### Confirmed test hardware
 Author's Windows/tablet machine: **NVIDIA GeForce RTX 3070 Ti Laptop GPU**,
-wgpu running via **DirectX 12**. Strong discrete GPU + mature D3D12 path — ample
-headroom for the tiled compositor, large/long canvases, and brush effects. The
-pipeline (Linux code → GitHub Actions → download .exe → run on Windows) is
-verified working end to end, including wgpu init and frame rendering.
+wgpu running via **DirectX 12**. The pipeline (Linux code → GitHub Actions →
+download .exe → run on Windows) is verified working end to end, including wgpu
+init and frame rendering. **This is the dev box, not the target spec** — see
+below.
+
+### Performance target → Surface-class integrated GPU, any canvas size
+Decided 2026-08-27:
+- **Minimum target is a Surface**, i.e. integrated graphics with **shared system
+  memory**, not the author's discrete 3070 Ti. The dev box is the fast case, so
+  it will happily hide problems; treat integrated as the bar.
+- Stay on **portable wgpu features** — prefer standard render pipelines and
+  fragment shaders over exotic capabilities, keep near default/downlevel limits,
+  and use nothing D3D12-specific. This is also what keeps Linux/macOS/ARM cheap
+  to add later (§6 "cross-platform by construction"), including ARM Surfaces.
+- **All canvas shapes are in scope** and none is privileged: webtoon strips
+  (~800–1600 px wide, potentially 10,000 px+ tall), print comic pages at 300 DPI,
+  and screen-resolution sketchbook pages. Design for the general case.
+
+⚠️ **Consequence: tile residency is an early problem, not a Phase-2 one.**
+A4 at 300 DPI is 2480×3508 ≈ 8.7 Mpx. At `Rgba16Float` (8 bytes/px, §4b) that's
+~70 MB *per layer*, so a ten-layer page is ~700 MB before the composite target
+and per-stroke accumulation buffer — which does not fit in a Surface's shared
+graphics memory. Therefore:
+- The GPU holds a **bounded cache of resident tiles** (the visible/working set),
+  never the whole document.
+- A tile budget + eviction policy is a **first-class early component**. The
+  roadmap defers the document/page model to Phase 2, but the *tile store* it rests
+  on has to exist before layers and undo are built on top of it (see
+  OPEN_QUESTIONS Q13).
 
 ### Development vs. validation — CONFIRMED SETUP
 - **Code is written on Linux (SSH).** The **tablet lives on the author's Windows

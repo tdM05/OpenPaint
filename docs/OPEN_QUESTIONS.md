@@ -194,6 +194,33 @@ blending (to avoid dark edge fringing). Tracked so we hold ourselves to it.
 
 ---
 
+### Q13. Tile residency + who owns tile pixels ⚠️ NEEDS DESIGN BEFORE LAYERS/UNDO
+Falls out of the Surface-class target and "any canvas size" (DECISIONS §2): the
+GPU can only hold a bounded working set of tiles, so ownership has to be explicit.
+
+**Leading answer (per the quality/modern rule):** the **GPU is authoritative for
+resident tiles**; CPU/disk holds the rest. Dirty tiles are read back
+*asynchronously* (`map_async`, never stalling a frame) on eviction, save, or when
+an undo snapshot needs to spill. This is the Procreate-shaped design. The
+alternative — CPU authoritative with the GPU as a read-only cache — forces either
+CPU dab rasterization or a readback per stroke, and both defeat §4a.
+
+**The genuinely hard part is undo.** If the GPU owns pixels, a naive undo wants a
+readback per stroke, which is exactly the stall we're avoiding. Proposed:
+**copy-on-write tile snapshots on the GPU** — at stroke start, GPU-to-GPU copy the
+tiles the stroke will touch into a snapshot pool. No readback on the hot path;
+readback only when the snapshot pool is evicted to CPU/disk in the background.
+Undo then also stores the stroke command, so history is replayable as well as
+restorable.
+
+**Open:** snapshot pool sizing and eviction policy; how tile budget adapts to
+available memory (query wgpu limits? measure?); whether undo granularity is
+per-stroke (assumed) or finer; interaction with the growable/multi-page model.
+
+**Why this can't wait:** layers and undo get built directly on the tile store, so
+its ownership model has to be settled first or both get reworked. This is the same
+sequencing risk already noted against the Phase-2 page model.
+
 ## Lower-priority / later
 
 ### Q8. PSD compatibility depth
