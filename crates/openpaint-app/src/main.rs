@@ -318,7 +318,13 @@ impl OpenPaint {
         let path = export::default_path();
         self.last_export = Some(match renderer.export_png(&path) {
             Ok(()) => {
-                let shown = path.display().to_string();
+                // Absolute, because a bare relative name leaves the user hunting
+                // for the file -- the working directory is not obvious when the app
+                // was launched from a script or an IDE.
+                let shown = std::env::current_dir()
+                    .map_or_else(|_| path.clone(), |dir| dir.join(&path))
+                    .display()
+                    .to_string();
                 println!("exported {shown}");
                 format!("Exported {shown}")
             }

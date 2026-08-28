@@ -19,7 +19,10 @@ SSH on Linux. Real test loop = build for Windows, run there with the tablet.
 Windows Ink is the primary input path; Linux tablet backend is low priority.
 
 ### Q3. Continuous-mode default → ✅ Explicit "Extend ↓" button
-Auto-grow remains an option, not the default.
+Auto-grow remains an option, not the default. **Extended 2026-08-28** into the full
+document model — see DECISIONS §5a. Key refinement: extending is generally available
+in *all* directions and mode merely hides what it doesn't need, so there is one
+general engine rather than a webtoon path and a page path.
 
 ---
 

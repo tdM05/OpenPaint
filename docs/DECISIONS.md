@@ -293,6 +293,64 @@ growable dimensions.** This single model yields three products:
 - **Print comic** = pages + spreads.
 - **Sketchbook** = many normal pages.
 
+### 5a. Document model, settled 2026-08-28
+
+Agreed in detail, because this is the decision that is expensive to get wrong.
+
+**A page has exact pixel dimensions.** 2480×3508, or whatever. Nothing is
+infinite, and nothing about it is unlike CSP or Photoshop. "Extend ↓ by 500" makes
+it 2480×4008. That is the whole concept.
+
+**One data model, no variants.** `Document { pages, mode }`. A webtoon is *one very
+tall page*; a sketchbook is *many pages*; a print comic is *many pages plus spread
+pairing*. There are deliberately **no** mode-specific code paths — two document
+types would mean two formats, two renderers, and two sets of bugs, which is exactly
+how an app acquires the bloat we are avoiding (§1).
+
+**Mode is a pure UI layer.** It *hides affordances and sets defaults*, and restricts
+nothing structurally. Webtoon mode offers only "Extend ↓" and scrolls continuously;
+page mode hides extend and navigates page-to-page; export defaults differ. The
+engine stays fully general underneath, so:
+- **Adding pages is always available**, in every mode.
+- **Extending in any direction is always possible**, whether or not the UI offers it.
+- **Upscaling is always available.**
+
+**One resize primitive:** `Page::resize(new_w, new_h, anchor)`, where `anchor` says
+where existing content sits in the new bounds. Extend-down is
+`resize(w, h + n, TopLeft)`; extend-up is the same with `BottomLeft`; crop is a
+smaller size; drag-to-resize later is a UI affordance over the same call. `n` is a
+**parameter with a default**, stored in settings — never a constant in code.
+
+**Pixels are the canvas; DPI is metadata.** "300 DPI A4" is a *preset* that computes
+2480×3508, not a mode the engine knows about. Upscaling is supported (as CSP's
+Change Image Resolution and Photoshop's Image Size both are) but is **lossy in the
+direction people want it** — it cannot invent detail, so line art softens. It is a
+rescue, not a workflow; the real answer to "started too small" is presets that start
+you large enough. Note it also invalidates undo rectangles, so a resolution change
+must transform or clear history.
+
+**Page dimensions are arbitrary pixels.** Deliberately not forced to multiples of the
+tile size: that would leak the implementation into the UX. Sparse tiles handle
+partial edge tiles fine. Tile size stays 256 (already the core constant; matches
+CSP/Krita practice).
+
+**The fixed-size workflow pays nothing for any of this.** Tiles are allocated only
+where paint lands, regardless of mode, so a 2480×3508 page you never resize costs
+exactly what it would in an app with no growth feature at all. `resize()` is simply
+never called. Supporting webtoons imposes no tax on the Photoshop-style user — that
+is a property of the tiled store, not something to be careful about.
+
+**Painting clips at the page edge — for now.** Photoshop and Krita keep pixels
+outside the canvas (Photoshop's Crop has a "Delete Cropped Pixels" checkbox for
+exactly this); Procreate clips. We clip, because it is the current behaviour, has no
+runaway-allocation risk, and is simpler to reason about.
+⚠️ **Revisit when crop lands**, not before: crop is where preservation actually earns
+its keep (crop wrongly and it is gone), and the known cost of clipping is that a
+stroke running off the edge stops dead at the old boundary if the canvas is later
+extended. This is **not** an architectural decision — the tile store behaves
+identically either way, and the entire difference is one bounds check in
+`Canvas::blend_pixel`. So it is cheap to change with real usage behind the opinion.
+
 ### Tiling enables everything
 Canvas stored as tiles (~256×256). Tiles allocated **only where paint exists**,
 so an infinitely tall or oversized canvas is nearly free until drawn on. This is
