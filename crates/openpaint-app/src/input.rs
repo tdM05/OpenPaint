@@ -52,23 +52,44 @@ pub struct PenSample {
     pub tilt: (f32, f32),
     /// When this sample reached us, on the [`now_ms`] clock.
     ///
+    /// **Private, and that is the point.** A private field cannot be named from another module,
+    /// so a backend cannot write a struct literal at all — it has to come through [`new`] or
+    /// [`at`], and the clock is not a parameter of either. The first version of this had the
+    /// field public and set it in `at`, which the mouse backend uses; the pen backend builds its
+    /// samples by hand and quietly kept `time_ms: 0.0`, so the whole latency readout measured
+    /// time-since-launch on the one backend anybody actually draws with. Making it unforgettable
+    /// is cheaper than remembering.
+    ///
     /// Read by the latency measurement, and the input that stroke smoothing and prediction will
     /// need — those want to know how fast the pen was moving, which is distance over *time*, not
     /// distance over samples. Sample rate varies with pen speed on real hardware, so treating
     /// consecutive samples as evenly spaced would make speed-dependent behaviour subtly wrong.
-    pub time_ms: f64,
+    ///
+    /// [`new`]: PenSample::new
+    /// [`at`]: PenSample::at
+    time_ms: f64,
 }
 
 impl PenSample {
-    /// Convenience constructor for a basic sample (no tilt), stamped with the arrival time.
-    pub fn at(x: f64, y: f64, pressure: f32) -> Self {
+    /// The only way to build a sample, stamped with its arrival time.
+    pub fn new(x: f64, y: f64, pressure: f32, tilt: (f32, f32)) -> Self {
         Self {
             x,
             y,
             pressure,
-            tilt: (0.0, 0.0),
+            tilt,
             time_ms: now_ms(),
         }
+    }
+
+    /// Shorthand for a backend with no tilt to report.
+    pub fn at(x: f64, y: f64, pressure: f32) -> Self {
+        Self::new(x, y, pressure, (0.0, 0.0))
+    }
+
+    /// When this sample arrived, on the [`now_ms`] clock.
+    pub fn time_ms(&self) -> f64 {
+        self.time_ms
     }
 }
 
@@ -134,4 +155,33 @@ pub trait InputBackend {
 
     /// Human-readable name of the active backend, for logging.
     fn name(&self) -> &'static str;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every sample carries a live clock, whichever constructor built it.
+    ///
+    /// Pins a bug that shipped: `time_ms` was public and only `at` stamped it, so the pen backend
+    /// — which assembles samples field by field, and is the one anybody actually draws with —
+    /// carried `0.0`, and the latency readout reported time since launch as if it were latency.
+    /// The private field now makes a struct literal impossible; this guards the constructors,
+    /// which are the remaining way to get it wrong.
+    ///
+    /// Asserts on the *difference*, not on either value: the epoch starts at the first call, so
+    /// the very first sample legitimately reads near zero. A difference cannot be faked by a
+    /// stopped clock.
+    #[test]
+    fn a_sample_is_stamped_when_it_is_made() {
+        let first = PenSample::at(1.0, 2.0, 0.5);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = PenSample::new(3.0, 4.0, 0.5, (0.1, 0.2));
+
+        let elapsed = second.time_ms() - first.time_ms();
+        assert!(
+            elapsed >= 1.0,
+            "5 ms apart should show as at least 1 ms, got {elapsed}"
+        );
+    }
 }

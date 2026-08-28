@@ -87,13 +87,12 @@ impl PenBackend {
 
     /// Build a `PenSample` from the current tracked pose.
     fn sample(&self) -> PenSample {
-        PenSample {
-            x: self.last_pos.0,
-            y: self.last_pos.1,
-            pressure: self.last_pressure,
-            tilt: self.last_tilt,
-            time_ms: 0.0,
-        }
+        PenSample::new(
+            self.last_pos.0,
+            self.last_pos.1,
+            self.last_pressure,
+            self.last_tilt,
+        )
     }
 }
 

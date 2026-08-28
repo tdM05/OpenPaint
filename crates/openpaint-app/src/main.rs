@@ -405,7 +405,7 @@ impl OpenPaint {
 
     /// Mark this sample as the one whose latency the next presented frame will measure.
     fn note_latency_input(&mut self, sample: &PenSample) {
-        self.pending_sample_ms = Some(sample.time_ms);
+        self.pending_sample_ms = Some(sample.time_ms());
     }
 
     /// The brush ring to draw at the pointer, if there should be one.
