@@ -433,6 +433,51 @@ multi-year effort; focus beats breadth.
 - **Webtoon default height behavior → explicit "Extend ↓" button.** Auto-grow
   remains available as an option, not the default.
 
+## 11a. Recurring hazards (check new code against these)
+
+Not bugs — *classes* of bug this codebase has actually produced more than once.
+Each cost real debugging time, so they are worth reading before adding code of the
+same shape.
+
+### Implicit ordering: "I did the thing, but not in the order the API guarantees"
+
+1. **State changed, but no frame was requested.** Painting is demand-driven, so any
+   state change affecting what's on screen must also ask for a frame. Bit us three
+   times: the egui panel was completely inert (input queued, no frame, so nothing
+   was ever consumed, so no frame was requested — a self-sustaining deadlock); the
+   canvas sat off-centre (a queued re-fit nobody drew); and a stroke wasn't
+   committed on pen-up.
+   **Deliberately NOT fixed with machinery.** A deferred "dirty" flag would add a
+   frame of input latency, and input latency is the project's top quality axis
+   (§4.1). Trading measurable latency for a bug class that review catches is a bad
+   deal. Every current call site is covered; check new ones by hand.
+
+2. **`Queue::write_buffer` is not ordered against draws recorded between writes.**
+   Every buffer write in a submission is applied *before any* command buffer in it
+   executes. Writing a buffer once per batch and drawing in between means all the
+   draws see only the last write. This produced visible gaps in fast strokes —
+   whole batches of dabs silently dropped, worse the faster the stroke because more
+   batches landed per frame.
+   Fixed structurally rather than by guard: `StrokeLayer::upload_dabs` is separate
+   from `stamp_range`, so the frame's data is uploaded once and draws address
+   sub-ranges. If you need per-item data, either upload once and index, or submit
+   between writes.
+
+### Verification hazards
+
+3. **Injected input cannot reach RealTimeStylus.** `SetForegroundWindow` is refused
+   to a background process, and pen input arrives via RTS rather than the window's
+   message queue. `PostMessage` reaches winit fine (good for navigation and UI
+   tests) but not the pen path, so **a human drawing is the acceptance test for
+   input-path changes.** Two "features are broken" conclusions during development
+   turned out to be a broken harness, not broken code.
+
+4. **A regression test that has never failed proves nothing.** When fixing a bug,
+   reintroduce it and confirm the new test fails. Done for the stroke-gap fix; it
+   failed by 0.955 at one pixel, which is what made the test trustworthy.
+
+---
+
 ## 11. Decisions still OPEN
 See `OPEN_QUESTIONS.md`. Notably: Windows build/delivery mechanics (Q2b), final
 UI framework, color-management depth, file-format specifics, and whether to port
