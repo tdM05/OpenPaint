@@ -654,3 +654,26 @@ fn alpha_lock_round_trips_and_older_files_default_it_off() {
         .expect("version");
     assert_eq!(version, SCHEMA_VERSION);
 }
+
+/// Clipping is a document property too, and older files default it off.
+#[test]
+fn clip_below_round_trips() {
+    let f = TempFile::new("clip-below");
+    let mut doc = sample();
+    doc.add_layer();
+    doc.active_mut().layer_mut(1).expect("top").clip_below = true;
+    save(f.path(), &doc, [], &[]).expect("save");
+
+    let back = load(f.path()).expect("load");
+    let layers = back.document.active().layers();
+    assert!(
+        layers[1].clip_below,
+        "the clip flag did not survive the file"
+    );
+    assert!(
+        !layers[0].clip_below,
+        "an unclipped layer must not come back clipped"
+    );
+    // The two flags are independent, and adjacent columns are exactly where a mix-up would hide.
+    assert!(!layers[1].lock_alpha, "clip_below leaked into lock_alpha");
+}

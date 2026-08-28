@@ -85,6 +85,8 @@ pub struct Layer {
     pub visible: bool,
     /// Freeze this layer's transparency. See [`Layer::locks_alpha`].
     pub lock_alpha: bool,
+    /// Mask this layer by the layer below it. See [`Layer::clips_below`].
+    pub clip_below: bool,
 }
 
 impl Layer {
@@ -101,6 +103,7 @@ impl Layer {
         blend: Blend,
         visible: bool,
         lock_alpha: bool,
+        clip_below: bool,
     ) -> Self {
         Self {
             id,
@@ -109,6 +112,7 @@ impl Layer {
             blend,
             visible,
             lock_alpha,
+            clip_below,
         }
     }
 
@@ -123,6 +127,7 @@ impl Layer {
             blend: Blend::Normal,
             visible: true,
             lock_alpha: false,
+            clip_below: false,
         }
     }
 
@@ -142,6 +147,22 @@ impl Layer {
     #[must_use]
     pub fn locks_alpha(&self) -> bool {
         self.lock_alpha
+    }
+
+    /// Whether this layer is masked by the one below it.
+    ///
+    /// The *non-destructive* counterpart of [`Layer::locks_alpha`], and the one the colouring
+    /// workflow actually rests on: shading and highlight layers clipped to a layer of flats stay
+    /// separately editable — their own opacity, their own blend mode, erasable without touching the
+    /// flats. Alpha lock bakes the same paint into the layer it masks, which is destructive and
+    /// therefore useful for fewer things.
+    ///
+    /// A run of consecutive clipped layers all clip to the nearest unclipped layer beneath them —
+    /// the *base* of the group. A clipped layer with no unclipped layer below it has nothing to clip
+    /// to and shows nothing, which is the only consistent reading.
+    #[must_use]
+    pub fn clips_below(&self) -> bool {
+        self.clip_below
     }
 
     /// Opacity clamped to the range the compositor accepts.

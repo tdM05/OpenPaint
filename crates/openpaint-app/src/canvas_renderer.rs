@@ -72,7 +72,8 @@ struct ParamsUniform {
 struct LayerInfoRecord {
     blend: u32,
     opacity: f32,
-    _pad: [f32; 2],
+    clip: u32,
+    _pad: f32,
 }
 
 /// Per-instance data matching `TileInst` in canvas.wgsl.
@@ -495,9 +496,10 @@ impl CanvasRenderer {
         let lx = x.rem_euclid(side) as usize;
         let ly = y.rem_euclid(side) as usize;
 
+        // Every layer, not only the visible ones: a hidden layer still has to be offered to the
+        // fold so that a clip group masks against the right base.
         let keys: Vec<TileKey> = layers
             .iter()
-            .filter(|l| l.visible)
             .map(|l| TileKey {
                 layer: LayerId(l.id()),
                 coord,
@@ -513,24 +515,18 @@ impl CanvasRenderer {
         // Over the paper because the paper is on screen too, and sampling unpainted canvas should
         // give the colour visible there rather than a transparent nothing a colour picker would have
         // to invent a value for.
-        let mut out = Canvas::paper_color();
+        let mut fold = crate::export::Composite::new(Canvas::paper_color());
         for layer in layers {
-            if !layer.visible {
-                continue;
-            }
             let key = TileKey {
                 layer: LayerId(layer.id()),
                 coord,
             };
-            // A coordinate no layer has painted is not an error; it contributes nothing.
-            let Some(tile) = tiles.get(&key) else {
-                continue;
-            };
-            let src =
-                openpaint_core::color::scale_premul(tile.texel(lx, ly), layer.effective_opacity());
-            out = crate::export::blend_over(src, out, layer.blend);
+            // A coordinate no layer has painted is not an error; a zero texel contributes nothing,
+            // and saying so is what keeps a clip group's base correct.
+            let texel = tiles.get(&key).map_or([0.0; 4], |t| t.texel(lx, ly));
+            fold.add(texel, layer);
         }
-        out
+        fold.finish()
     }
 
     /// Replace everything with the tiles of a loaded document.
@@ -676,7 +672,8 @@ impl CanvasRenderer {
             .map(|l| LayerInfoRecord {
                 blend: l.blend.code(),
                 opacity: l.effective_opacity(),
-                _pad: [0.0; 2],
+                clip: u32::from(l.clip_below),
+                _pad: 0.0,
             })
             .collect();
 
@@ -914,6 +911,120 @@ pub(crate) mod tests {
     /// The GPU tests render to an sRGB target, like the real surface, so a readback can be
     /// compared against the same encode the PNG export uses.
     const SURFACE: wgpu::TextureFormat = crate::test_gpu::SURFACE;
+
+    /// Clipping, through the real compositor, against the CPU rule.
+    ///
+    /// Four properties, each of which a plausible implementation gets wrong:
+    ///
+    /// - a clipped layer shows **only** where its base has pixels, and nowhere else;
+    /// - it is masked by the base's *alpha*, so a half-covered base half-shows it;
+    /// - **two consecutive clipped layers both clip to the same base**, not to each other — that is
+    ///   what makes shading and highlights over one set of flats work, and a naive
+    ///   "clip to the previous layer" reads identically until you add the second one;
+    /// - GPU and CPU agree, so the export and the eyedropper show what the screen shows.
+    #[test]
+    fn a_clipped_layer_is_masked_by_the_layer_below() {
+        let Some((device, queue)) = crate::test_gpu::try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        const W: u32 = 64;
+        const H: u32 = 64;
+
+        let mut document = openpaint_core::Document::new(openpaint_core::Page::new(W, H));
+        document.add_layer();
+        document.add_layer();
+        {
+            let page = document.active_mut();
+            page.layer_mut(1).expect("mid").clip_below = true;
+            page.layer_mut(2).expect("top").clip_below = true;
+        }
+        let doc = document.active();
+        let layers = doc.layers().to_vec();
+
+        let stroke = crate::test_gpu::test_stroke_layer(&device);
+        let mut canvas =
+            CanvasRenderer::new(&device, SURFACE, doc.rect(), 64 * 1024 * 1024, &stroke);
+
+        // Base: opaque red on the left third, HALF-covered red in the middle third, nothing on the
+        // right. The middle is what proves the mask is alpha rather than a boolean.
+        // Both clipped layers: solid green / solid blue everywhere, so anything visible from them
+        // is the mask's doing and nothing else.
+        for (index, fill) in [
+            None,
+            Some([0.0, 1.0, 0.0, 1.0_f32]),
+            Some([0.0, 0.0, 1.0, 1.0_f32]),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut cpu = Canvas::new(W, H);
+            for y in 0..H as i32 {
+                for x in 0..W as i32 {
+                    let px = match fill {
+                        Some(c) => *c,
+                        None if x < 21 => [1.0, 0.0, 0.0, 1.0],
+                        None if x < 42 => [0.5, 0.0, 0.0, 0.5],
+                        None => [0.0; 4],
+                    };
+                    cpu.replace_pixel(x, y, px);
+                }
+            }
+            let id = LayerId(layers[index].id());
+            let mut enc = device.create_command_encoder(&Default::default());
+            canvas.upload_dirty(&device, &queue, &mut enc, id, &mut cpu);
+            queue.submit(std::iter::once(enc.finish()));
+        }
+
+        let mut view = crate::view::View::new();
+        view.fit(W, H, doc.rect());
+        let mut enc = device.create_command_encoder(&Default::default());
+        canvas.prepare(
+            &device,
+            &queue,
+            &mut enc,
+            view.page_to_ndc(W, H),
+            view.visible_rect(W, H),
+            &layers,
+            0,
+            None,
+        );
+        queue.submit(std::iter::once(enc.finish()));
+        let _ = draw_to_target(&device, &queue, &canvas, W, H);
+
+        // Sample through the CPU rule, which the eyedropper and the export both use.
+        let opaque = canvas.sample_page_pixel(&device, &queue, 10, 32, &layers);
+        let half = canvas.sample_page_pixel(&device, &queue, 30, 32, &layers);
+        let empty = canvas.sample_page_pixel(&device, &queue, 55, 32, &layers);
+
+        // Over an opaque base, the topmost clipped layer wins outright: solid blue.
+        assert!(
+            opaque[2] > 0.9 && opaque[0] < 0.1,
+            "over an opaque base the clip group should show through fully: {opaque:?}"
+        );
+
+        // Where the base has no pixels, neither clipped layer may show anything at all -- so the
+        // result is the bare paper.
+        let paper = Canvas::paper_color();
+        for c in 0..3 {
+            assert!(
+                (empty[c] - paper[c]).abs() < 0.01,
+                "paint escaped the clip where the base is empty: {empty:?} vs paper {paper:?}"
+            );
+        }
+
+        // Over the half-covered base, the group shows at half strength: between the two.
+        assert!(
+            half[2] > 0.2 && half[2] < opaque[2] - 0.1,
+            "a half-covered base should half-show the clip group: {half:?} against {opaque:?}              and {empty:?}"
+        );
+
+        // The paper check is also what proves the *second* clipped layer clips to the group's base
+        // rather than to the layer directly below it. The green layer is solid everywhere, so a
+        // "clip to the previous layer" implementation would let blue cover the entire page --
+        // including where the base is empty, which is exactly the region checked above. Verified by
+        // sabotage per §11a.4: making the mask follow the previous layer fails that assertion.
+    }
 
     /// The eyedropper must return exactly what is on screen.
     ///

@@ -160,29 +160,84 @@ fn flatten(
         .collect();
 
     for coord in coords {
-        let mut flat = vec![paper; TILE_SIZE * TILE_SIZE];
+        let mut acc: Vec<Composite> = (0..TILE_SIZE * TILE_SIZE)
+            .map(|_| Composite::new(paper))
+            .collect();
         for layer in layers {
-            let opacity = layer.effective_opacity();
-            if opacity <= 0.0 {
-                continue;
-            }
-            let Some(src) = read_tile(device, queue, canvas, LayerId(layer.id()), coord) else {
-                continue;
+            // Every layer, even hidden or unpainted ones. `Composite::add` needs to see them to
+            // keep a clip group masked against the right base; a zero texel says "contributes
+            // nothing", which is exactly true.
+            let tile = if layer.effective_opacity() > 0.0 {
+                read_tile(device, queue, canvas, LayerId(layer.id()), coord)
+            } else {
+                None
             };
-            for (dst, s) in flat.iter_mut().zip(src) {
-                // Layer opacity scales a premultiplied texel wholesale.
-                let scaled = [
-                    s[0] * opacity,
-                    s[1] * opacity,
-                    s[2] * opacity,
-                    s[3] * opacity,
-                ];
-                *dst = blend_over(scaled, *dst, layer.blend);
+            match tile {
+                Some(src) => {
+                    for (dst, s) in acc.iter_mut().zip(src) {
+                        dst.add(s, layer);
+                    }
+                }
+                None => {
+                    for dst in &mut acc {
+                        dst.add([0.0; 4], layer);
+                    }
+                }
             }
         }
-        out.insert(coord, flat);
+        out.insert(coord, acc.into_iter().map(Composite::finish).collect());
     }
     out
+}
+
+/// Folds one pixel's worth of layer samples into the colour that pixel shows.
+///
+/// **The compositing rule, once.** Order, layer opacity, clipping to the layer below, and the blend
+/// itself. It had begun to exist in three places — `composite_fs` in canvas.wgsl, the PNG export,
+/// and the eyedropper's sampler — and clipping would have made that three separate ideas of what a
+/// stack means. The WGSL copy is unavoidable and is pinned to this one by
+/// `the_gpu_compositor_matches_the_cpu_reference`; the CPU copies are not, so there is now one.
+///
+/// Driven bottom-up: [`Composite::add`] once per layer in document order, then [`Composite::finish`].
+pub(crate) struct Composite {
+    out: [f32; 4],
+    /// Contribution alpha of the most recent unclipped layer — what a clipped layer is masked by.
+    base_alpha: f32,
+}
+
+impl Composite {
+    /// Start from the paper, which is part of what is on screen.
+    pub(crate) fn new(paper: [f32; 4]) -> Self {
+        Self {
+            out: paper,
+            // Zero, so a clipped layer with nothing beneath it shows nothing rather than
+            // everything. "Clip to the layer below" with no layer below has no other honest answer.
+            base_alpha: 0.0,
+        }
+    }
+
+    /// Add one layer's premultiplied tile texel, in bottom-up order.
+    ///
+    /// Call it for *every* layer including hidden and unpainted ones (a zero texel is fine): a
+    /// skipped layer would leave `base_alpha` describing some earlier layer, so a clip group would
+    /// silently mask against the wrong shape.
+    pub(crate) fn add(&mut self, texel: [f32; 4], layer: &Layer) {
+        // Premultiplied, so one multiply scales colour and coverage together.
+        let mut src = openpaint_core::color::scale_premul(texel, layer.effective_opacity());
+        if layer.clip_below {
+            src = openpaint_core::color::scale_premul(src, self.base_alpha);
+        } else {
+            // The base's *contribution* — pixel alpha times layer opacity — not its raw pixel
+            // alpha. One rule, from which both useful behaviours fall out rather than being
+            // special-cased: hiding the base hides the group, and fading the base fades the group.
+            self.base_alpha = src[3];
+        }
+        self.out = blend_over(src, self.out, layer.blend);
+    }
+
+    pub(crate) fn finish(self) -> [f32; 4] {
+        self.out
+    }
 }
 
 /// Composite premultiplied `src` over premultiplied `dst`, the PDF/CSS way.
@@ -315,6 +370,113 @@ fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), Ex
 
 #[cfg(test)]
 mod tests {
+    /// A layer with `clip_below` set and nothing unclipped beneath it has nothing to clip to.
+    ///
+    /// The initial `base_alpha` is what decides this, and a GPU test whose bottom layer is unclipped
+    /// never exercises it — the bottom layer overwrites the initial value before anything reads it.
+    #[test]
+    fn a_clipped_layer_at_the_bottom_shows_nothing() {
+        let mut layer = Layer::restored(1, "clipped", 1.0, Blend::Normal, true, false, true);
+        layer.clip_below = true;
+
+        let mut fold = Composite::new([0.0; 4]);
+        fold.add([1.0, 1.0, 1.0, 1.0], &layer);
+        assert_eq!(
+            fold.finish(),
+            [0.0; 4],
+            "clipping to a layer that is not there should show nothing, not everything"
+        );
+    }
+
+    /// Consecutive clipped layers all clip to the same base, not to each other.
+    ///
+    /// This is what makes shading *and* highlights sit over one set of flats. A "clip to the layer
+    /// directly below" implementation is indistinguishable until the second clipped layer exists,
+    /// and then it leaks: the first clipped layer is solid, so it becomes an unrestricted base for
+    /// the next one.
+    #[test]
+    fn consecutive_clipped_layers_share_one_base() {
+        let base = Layer::restored(1, "base", 1.0, Blend::Normal, true, false, false);
+        let mut first = Layer::restored(2, "shading", 1.0, Blend::Normal, true, false, true);
+        let mut second = Layer::restored(3, "highlights", 1.0, Blend::Normal, true, false, true);
+        first.clip_below = true;
+        second.clip_below = true;
+
+        // A base with *no* coverage here, and two solid clipped layers above it.
+        let mut fold = Composite::new([0.0; 4]);
+        fold.add([0.0; 4], &base);
+        fold.add([0.0, 1.0, 0.0, 1.0], &first);
+        fold.add([0.0, 0.0, 1.0, 1.0], &second);
+        assert_eq!(
+            fold.finish(),
+            [0.0; 4],
+            "the second clipped layer clipped to its neighbour rather than to the group's base"
+        );
+    }
+
+    /// The mask is the base's alpha, not a boolean.
+    #[test]
+    fn clipping_is_weighted_by_the_base_alpha() {
+        let base = Layer::restored(1, "base", 1.0, Blend::Normal, true, false, false);
+        let mut over = Layer::restored(2, "over", 1.0, Blend::Normal, true, false, true);
+        over.clip_below = true;
+
+        let mut half = Composite::new([0.0; 4]);
+        half.add([0.5, 0.0, 0.0, 0.5], &base);
+        half.add([0.0, 0.0, 1.0, 1.0], &over);
+        let half = half.finish();
+
+        let mut full = Composite::new([0.0; 4]);
+        full.add([1.0, 0.0, 0.0, 1.0], &base);
+        full.add([0.0, 0.0, 1.0, 1.0], &over);
+        let full = full.finish();
+
+        // Read the *blue* channel, which only the clipped layer contributes. Composite alpha would
+        // be the wrong measure: it includes the base's own coverage, so it rises even when the clip
+        // is doing nothing.
+        assert!(
+            (half[2] - 0.5).abs() < 1e-3,
+            "a half-covered base should half-show the clip: {half:?}"
+        );
+        assert!(
+            full[2] > 0.99,
+            "an opaque base should fully show it: {full:?}"
+        );
+    }
+
+    /// Fading or hiding the base carries the clip group with it.
+    ///
+    /// One rule -- the mask is the base's *contribution*, alpha times layer opacity -- from which
+    /// both behaviours fall out. Pinned because the tempting alternative (mask on raw pixel alpha)
+    /// leaves shading floating over flats that have been hidden to look at something underneath.
+    #[test]
+    fn the_clip_group_follows_the_base_opacity() {
+        let mut base = Layer::restored(1, "base", 1.0, Blend::Normal, true, false, false);
+        let mut over = Layer::restored(2, "over", 1.0, Blend::Normal, true, false, true);
+        over.clip_below = true;
+
+        base.opacity = 0.5;
+        let mut faded = Composite::new([0.0; 4]);
+        faded.add([1.0, 0.0, 0.0, 1.0], &base);
+        faded.add([0.0, 0.0, 1.0, 1.0], &over);
+        let faded = faded.finish();
+        assert!(
+            (faded[2] - 0.5).abs() < 1e-3,
+            "fading the base should fade the group: {faded:?}"
+        );
+
+        base.opacity = 1.0;
+        base.visible = false;
+        let mut hidden = Composite::new([0.0; 4]);
+        hidden.add([1.0, 0.0, 0.0, 1.0], &base);
+        hidden.add([0.0, 0.0, 1.0, 1.0], &over);
+        assert_eq!(
+            hidden.finish(),
+            [0.0; 4],
+            "hiding the base should hide what is clipped to it"
+        );
+    }
+
     use super::*;
     use openpaint_core::color::opaque_srgb8_to_linear_premul;
 

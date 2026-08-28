@@ -106,6 +106,8 @@ pub enum LayerAction {
     SetVisible { index: usize, visible: bool },
     /// Freeze or unfreeze a layer's transparency.
     SetLockAlpha { index: usize, lock: bool },
+    /// Mask a layer by the layer below it, or stop.
+    SetClipBelow { index: usize, clip: bool },
     /// Set a layer's opacity.
     SetOpacity { index: usize, opacity: f32 },
     /// Set a layer's blend mode.
@@ -532,6 +534,17 @@ impl Ui {
                                         {
                                             layer_action =
                                                 Some(LayerAction::SetLockAlpha { index, lock });
+                                        }
+                                        let mut clip = layer.clip_below;
+                                        if ui
+                                            .toggle_value(&mut clip, "⊂")
+                                            .on_hover_text(
+                                                "Clip to the layer below: this layer only shows                                                  where the one beneath it has pixels, and stays                                                  separately editable. How shading and highlights                                                  sit over flats.",
+                                            )
+                                            .changed()
+                                        {
+                                            layer_action =
+                                                Some(LayerAction::SetClipBelow { index, clip });
                                         }
                                     });
                                     if selected {

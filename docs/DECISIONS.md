@@ -391,6 +391,58 @@ engine is written:
 On-disk storage format is a **separate, later** decision (Q6) — 16-bit in memory
 does not oblige 16-bit on disk.
 
+### 4j. Clipping is the colouring workflow; alpha lock is the shortcut — 2026-08-28
+
+Asked directly, and the answer corrected a sequencing mistake: **artists clip far
+more than they alpha-lock.** Alpha lock confines painting to a layer's own pixels
+and bakes it in — destructive. Clipping masks a *separate* layer by the alpha of
+the one below, so the standard stack works:
+
+```
+line art
+highlights   ← clipped to flats, Screen
+shading      ← clipped to flats, Multiply
+flats        ← the base
+```
+
+None of that is possible with alpha lock: shading painted with the lock on is
+inside the flats layer, so its opacity, blend mode and erasability are gone. Alpha
+lock keeps its place for recolouring line art and one-off tweaks, which is a real
+but much smaller share of the work. It shipped first; it should not have.
+
+**Clipping is a compositor property, not a paint property** — nothing destructive,
+no history involvement, no `PaintMode`. A per-layer flag and a running `base_alpha`:
+while folding bottom-up, an unclipped layer records its contribution, and a
+clipped layer is multiplied by it.
+
+Three decisions inside it, each pinned by a test because each has a plausible
+wrong answer:
+
+1. **A run of consecutive clipped layers shares one base** — the nearest unclipped
+   layer beneath. "Clip to the layer directly below" is indistinguishable until the
+   *second* clipped layer exists, and then it leaks: the first clipped layer is
+   usually solid, so it becomes an unrestricted base for the next.
+2. **A clipped layer with nothing unclipped beneath it shows nothing.** `base_alpha`
+   starts at zero. The opposite default makes it show everything, and no GPU test
+   whose bottom layer is unclipped ever reaches the initial value.
+3. **The mask is the base's *contribution*** — pixel alpha times layer opacity —
+   not its raw pixel alpha. One rule, from which both wanted behaviours fall out
+   rather than being special-cased: hiding the base hides the group, and fading the
+   base fades it. The alternative leaves shading floating over flats that were
+   hidden to look at something underneath.
+
+**It forced an overdue consolidation.** The compositing *loop* had begun to exist
+three times — `composite_fs`, the PNG export, and the eyedropper's sampler — and
+clipping would have meant three separate ideas of what a stack means.
+`export::Composite` is now the single CPU rule, driven by both CPU callers; the
+WGSL copy is unavoidable and stays pinned to it by
+`the_gpu_compositor_matches_the_cpu_reference`. Its `add` must be called for
+*every* layer, hidden and unpainted ones included, or a skipped layer leaves
+`base_alpha` describing the wrong shape — which is why the shader also lost its
+`continue` for hidden layers.
+
+**Format v5** adds `layer.clip_below`, same tolerant read as v4's `lock_alpha`.
+
 ### 4i. Alpha lock and the eyedropper — landed 2026-08-28
 
 Two halves of being able to colour, and both landed as *variations of existing

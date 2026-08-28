@@ -892,6 +892,14 @@ impl OpenPaint {
                 }
                 self.mark_dirty();
             }
+            ui::LayerAction::SetClipBelow { index, clip } => {
+                // Not undoable, like visibility and alpha lock: it changes no pixels, and a switch
+                // in the undo stack would make Ctrl+Z toggle settings rather than reverse artwork.
+                if let Some(l) = self.editor.document_mut().active_mut().layer_mut(index) {
+                    l.clip_below = clip;
+                }
+                self.mark_dirty();
+            }
             ui::LayerAction::SetOpacity { index, opacity } => {
                 if let Some(l) = self.editor.document_mut().active_mut().layer_mut(index) {
                     l.opacity = opacity;

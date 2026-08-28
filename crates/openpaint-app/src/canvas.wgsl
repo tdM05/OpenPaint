@@ -46,7 +46,9 @@ struct Params {
 struct LayerInfo {
     blend: u32,
     opacity: f32,
-    _pad: vec2<f32>,
+    // Non-zero when this layer is masked by the layer below it.
+    clip: u32,
+    _pad: f32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -174,6 +176,9 @@ fn composite_fs(in: TileOut) -> @location(0) vec4<f32> {
     let stroke_slot = select(ABSENT, stroke_slots[in.instance], painting);
 
     var dst = params.paper;
+    // Contribution alpha of the most recent unclipped layer: what a clipped layer is masked by.
+    // Zero to start, so a clipped layer with nothing beneath it shows nothing.
+    var base_alpha = 0.0;
     for (var i = 0u; i < count; i = i + 1u) {
         let info = infos[i];
         let slot = slots[in.instance * count + i];
@@ -208,11 +213,20 @@ fn composite_fs(in: TileOut) -> @location(0) vec4<f32> {
             }
         }
 
-        if (info.opacity <= 0.0) {
-            continue;
-        }
         // Premultiplied, so one multiply scales colour and coverage together.
-        dst = blend_over(src * info.opacity, dst, info.blend);
+        var contribution = src * info.opacity;
+        if (info.clip != 0u) {
+            contribution = contribution * base_alpha;
+        } else {
+            // The base's *contribution*, not its raw alpha, so hiding or fading the base hides or
+            // fades the clip group without either being a special case. Mirrors
+            // `export::Composite::add`.
+            base_alpha = contribution.a;
+        }
+        // No early `continue` for a hidden layer any more: it still has to update `base_alpha`, or
+        // a clip group would mask against whichever layer happened to be visible below it.
+        // `blend_over` already returns `dst` untouched at zero alpha, so the cost is nil.
+        dst = blend_over(contribution, dst, info.blend);
     }
     return dst;
 }
