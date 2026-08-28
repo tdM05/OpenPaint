@@ -503,6 +503,29 @@ the priced slider lets the choice be made with the number visible, and a default
 can be *earned* from real use. Per-brush rather than global, for the same reason
 each tool keeps its own radius: inking wants a lot, sketching wants none.
 
+**A filter defined in time must be *driven* by time.** The first version advanced
+only when a sample arrived, which looks right while the pen is moving and breaks
+the instant it stops: the line freezes short of the cursor, and the next sample
+arrives carrying the whole accumulated `dt`, so `alpha` is near 1 and the line
+snaps forward in one straight segment. Reported from use at high strength and
+speed, which is the only regime where the trailing distance is big enough to see.
+
+`Stabilizer::advance` fixes it, and the event loop calls it for the whole duration
+of a stroke. Two details are load-bearing:
+
+- **The clock advances even when the point does not.** Declining to move it once
+  converged would bank the idle time and spend it on the next sample — the same
+  snap by another route.
+- **Arrival is judged by distance remaining, not by step size.** A heavily
+  smoothed filter takes its *smallest* steps when it still has the furthest to go,
+  so a step-size test stopped it several pixels short of a held pen. Caught by the
+  test, not by inspection.
+
+This also means a stroke in progress keeps the loop awake regardless of what the
+input backend wants, because the line is still moving after the last sample. That
+is demand-driven painting intact, not an exception to it: there genuinely is
+demand.
+
 **Where it lives:** the app's input path (`stroke_start` / `stroke_continue` /
 `stroke_finish`), between the pen and the brush — stabilization conditions input,
 and input is the shell's job. Those three methods exist as a named seam so they can

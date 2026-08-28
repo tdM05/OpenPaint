@@ -430,6 +430,27 @@ impl OpenPaint {
         self.editor.stroke_to(s.x, s.y, s.pressure);
     }
 
+    /// Let the smoothed line catch up to the pen with time alone. Returns whether it is still
+    /// converging, and so whether the loop needs to keep waking.
+    ///
+    /// The bug this fixes: draw fast with heavy stabilization and stop, and the line stopped dead
+    /// well short of the cursor, then jumped to it in a straight segment on the next twitch. The
+    /// filter was only ever advanced by arriving samples, so with no samples it stopped converging,
+    /// and the next one arrived carrying every millisecond of the pause.
+    fn tick_stabilizer(&mut self) -> bool {
+        if !self.editor.is_drawing() {
+            return false;
+        }
+        if let Some(s) = self.stabilizer.advance(input::now_ms()) {
+            self.editor.stroke_to(s.x, s.y, s.pressure);
+            self.request_redraw();
+        }
+        // Keep ticking for the whole stroke, not only while `advance` reports movement. Once it has
+        // converged there is nothing to draw, but the clock still has to be kept current: a gap
+        // with no ticks is banked and spent on the next sample, which is the snap all over again.
+        true
+    }
+
     /// End the stroke, first carrying the line to where the pen actually lifted.
     ///
     /// Smoothing trails by design, so without the tail every stabilized stroke would stop short of
@@ -1865,6 +1886,15 @@ impl ApplicationHandler for OpenPaint {
             return;
         }
 
+        // A stabilized stroke is still moving after the last sample: the line is catching up to
+        // the pen, which takes real time. So while one is in flight the loop has to keep ticking
+        // whatever the input backend wants, or the line freezes wherever it happened to be when
+        // the pen stopped. This is demand-driven painting still -- there genuinely is demand.
+        if self.tick_stabilizer() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL_INTERVAL));
+            return;
+        }
+
         if !self.input.wants_continuous_poll() {
             // Event-driven backends (mouse) stay idle until a real window event,
             // keeping the app at 0% CPU when nothing is happening.
@@ -2064,6 +2094,42 @@ mod tests {
             finished - unfinished > 40.0,
             "the convergence tail moved the end by only {}, so it is not doing its job",
             finished - unfinished
+        );
+    }
+
+    /// The freeze bug, at the seam where it actually lived.
+    ///
+    /// The filter itself could always catch up on time alone; nothing ever asked it to. The event
+    /// loop advanced a stroke only when a sample arrived, so stopping the pen stopped the line —
+    /// short of the cursor, until the next twitch snapped it forward in a straight segment.
+    ///
+    /// Uses the real clock and real sleeps, because `tick_stabilizer` reads the clock itself, and a
+    /// test that injected time would not have caught this: the wiring was the broken part.
+    #[test]
+    fn a_held_stroke_keeps_catching_up_without_new_samples() {
+        let mut app = OpenPaint::default();
+        app.editor.brush_mut().stabilization_ms = 100.0;
+
+        // One fast flick, as a quick drag looks to the filter, then the pen stops dead.
+        let t0 = input::now_ms();
+        app.stroke_start(0.0, 100.0, 1.0, t0);
+        app.stroke_continue(600.0, 100.0, 1.0, t0 + 8.0);
+        let before = app.editor.pending_stroke().1.len();
+
+        // Nothing but time passing from here. No samples, no events.
+        for _ in 0..25 {
+            std::thread::sleep(std::time::Duration::from_millis(8));
+            assert!(
+                app.tick_stabilizer(),
+                "a stroke in progress must keep the loop awake, or the ticks stop arriving"
+            );
+        }
+        let after = app.editor.pending_stroke().1.len();
+
+        assert!(
+            after > before + 50,
+            "the line went from {before} dabs to {after} while the pen was held still; it \
+             should have kept travelling toward the cursor"
         );
     }
 

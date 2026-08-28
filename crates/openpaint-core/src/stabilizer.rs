@@ -61,6 +61,15 @@ pub const MAX_LAG_MS: f32 = 200.0;
 /// Only a bound against a pathological `tau`; the loop normally exits on distance.
 const MAX_TAIL_STEPS: usize = 64;
 
+/// How close to the pen counts as arrived, in pixels.
+///
+/// Judged by distance *remaining*, deliberately, and not by how far the point moved on the last
+/// step. A heavily smoothed filter takes its smallest steps exactly when it still has the furthest
+/// to travel, so a step-size test stops it several pixels short — which looks like the line
+/// refusing to quite reach a held pen. A quarter pixel is below what a dab renders, and
+/// [`Stabilizer::finish`] closes even that exactly.
+const ARRIVED_PX: f32 = 0.25;
+
 /// Interval used for the convergence tail's steps.
 ///
 /// The tail is emitted all at once, so this does not delay anything: it only sets how finely the
@@ -114,24 +123,55 @@ impl Stabilizer {
         let raw = Smoothed { x, y, pressure };
         self.target = Some(raw);
 
-        let Some((mut point, last_t)) = self.at else {
+        let Some((point, _)) = self.at else {
             return self.begin(x, y, pressure, t_ms);
         };
         if self.tau_ms <= 0.0 {
             self.at = Some((raw, t_ms));
             return raw;
         }
+        self.step(t_ms).unwrap_or(point)
+    }
 
-        // Clamped at zero rather than trusted: a backend that ever reports time going backwards
+    /// Let time pass without a new sample, and report the new point if it moved enough to draw.
+    ///
+    /// **A filter defined in time has to be driven by time.** Advancing only on samples looks
+    /// correct while the pen is moving and breaks the moment it stops: the line freezes wherever
+    /// it had got to, still short of the pen, and then the next sample carries the whole
+    /// accumulated `dt`, so `alpha` is near 1 and the line snaps forward in one straight segment.
+    /// That is a bug that only shows up at high strength and speed — where the trailing distance
+    /// is large enough to see — which is exactly how it was found.
+    ///
+    /// `None` means "nothing worth a frame", which is the caller's signal to stop asking for them.
+    /// The timestamp still advances in that case: skipping it would bank the idle time and hand it
+    /// to the next real sample, which is the same snap by another route.
+    pub fn advance(&mut self, t_ms: f64) -> Option<Smoothed> {
+        if self.tau_ms <= 0.0 {
+            return None;
+        }
+        let target = self.target?;
+        let point = self.step(t_ms)?;
+        ((target.x - point.x).hypot(target.y - point.y) >= ARRIVED_PX).then_some(point)
+    }
+
+    /// Move the point toward the target by however much time has passed. `None` only when there is
+    /// no stroke.
+    fn step(&mut self, t_ms: f64) -> Option<Smoothed> {
+        let (mut point, last_t) = self.at?;
+        let target = self.target?;
+
+        // Clamped at zero rather than trusted: a backend that ever reported time going backwards
         // would otherwise produce a negative alpha and fling the point away from the pen.
         let dt = (t_ms - last_t).max(0.0) as f32;
-        let alpha = 1.0 - (-dt / self.tau_ms).exp();
-        point.x += (raw.x - point.x) * alpha;
-        point.y += (raw.y - point.y) * alpha;
-        point.pressure += (raw.pressure - point.pressure) * alpha;
+        if dt > 0.0 && self.tau_ms > 0.0 {
+            let alpha = 1.0 - (-dt / self.tau_ms).exp();
+            point.x += (target.x - point.x) * alpha;
+            point.y += (target.y - point.y) * alpha;
+            point.pressure += (target.pressure - point.pressure) * alpha;
+        }
 
         self.at = Some((point, t_ms));
-        point
+        Some(point)
     }
 
     /// End the stroke, returning the points that carry it to where the pen actually finished.
@@ -357,6 +397,77 @@ mod tests {
                 pair[1]
             );
         }
+    }
+
+    /// The line must keep catching up while the pen is held still.
+    ///
+    /// The reported bug: draw fast with heavy smoothing and stop, and the line froze well short of
+    /// the cursor. It froze because the filter was advanced only by arriving samples, and holding
+    /// still produces none.
+    #[test]
+    fn a_held_pen_still_lets_the_line_catch_up() {
+        let mut s = Stabilizer::default();
+        s.set_lag_ms(100.0);
+        s.begin(0.0, 0.0, 1.0, 0.0);
+        // One big jump, as a fast drag looks to the filter, then the pen stops dead.
+        let after_jump = s.push(500.0, 0.0, 1.0, 10.0);
+        assert!(
+            after_jump.x < 100.0,
+            "the filter should still be far behind here, but is at {}",
+            after_jump.x
+        );
+
+        let mut point = after_jump;
+        let mut t = 10.0;
+        let mut frames = 0;
+        // Time passes with no new samples at all.
+        while t < 1000.0 {
+            t += 8.0;
+            if let Some(p) = s.advance(t) {
+                point = p;
+                frames += 1;
+            }
+        }
+        assert!(
+            (500.0 - point.x) < 1.0,
+            "after a second of holding still the line is still {} px short",
+            500.0 - point.x
+        );
+        assert!(
+            frames > 10,
+            "it arrived in {frames} steps, which is a jump rather than catching up"
+        );
+    }
+
+    /// A pause must not be banked and spent on the next sample.
+    ///
+    /// The other half of the same bug, and the subtler one: even with `advance` in place, if it
+    /// declined to move the clock forward once converged, the idle time would accumulate and the
+    /// next sample would arrive with a huge `dt` — `alpha` near 1, and the line teleports to the
+    /// pen. Smoothing would silently switch itself off after every pause.
+    #[test]
+    fn a_pause_does_not_bank_time_for_the_next_sample() {
+        let mut s = Stabilizer::default();
+        s.set_lag_ms(50.0);
+        s.begin(0.0, 0.0, 1.0, 0.0);
+
+        // Hold still for a second. These all converge (there is nowhere to go), so `advance`
+        // reports nothing -- but it must still be moving the clock.
+        let mut t = 0.0;
+        while t < 1000.0 {
+            t += 8.0;
+            s.advance(t);
+        }
+
+        // Now the pen jumps a long way, one sample, a normal frame later.
+        t += 8.0;
+        let after = s.push(500.0, 0.0, 1.0, t);
+        assert!(
+            after.x < 120.0,
+            "one 8 ms sample at 50 ms of smoothing should move ~15% of the way, but it went to \
+             {} -- the pause was banked and smoothing turned itself off",
+            after.x
+        );
     }
 
     /// Time running backwards is bad input, but it must not fling the point away from the pen.
