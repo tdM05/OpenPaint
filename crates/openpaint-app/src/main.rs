@@ -46,6 +46,7 @@ mod renderer;
 mod stroke_layer;
 #[cfg(test)]
 mod test_gpu;
+mod tile_pool;
 mod ui;
 mod view;
 
@@ -421,68 +422,59 @@ impl OpenPaint {
     /// Move the current page to a new rectangle, keeping everything consistent.
     ///
     /// The single place that knows a resize has consequences beyond the page itself: the
-    /// GPU textures must be re-created with content copied to the new offset, and the
-    /// operation must be recorded so it can be undone. Extend, crop, and drag-to-resize
-    /// all come through here.
+    /// Extend, crop, and drag-to-resize all come through here.
+    ///
+    /// Nothing is destroyed: the page rectangle moves and the tiles stay where they are
+    /// (DECISIONS §5c). Content coordinates are stable, so nothing needs compensating
+    /// either — the rectangle moves around the drawing rather than the drawing moving
+    /// inside it.
     fn apply_page_rect(&mut self, target: PageRect) {
         let old = self.editor.document().active().rect();
 
-        // The canvas is one texture, so the page cannot exceed what the device will
-        // allocate. Requesting more used to panic inside wgpu; clamp and say so.
-        let max = self
-            .renderer
-            .as_ref()
-            .map_or(8192, Renderer::max_canvas_dimension);
-        let Some((new_w, new_h)) =
-            editor::clamp_page_size((old.w, old.h), (target.w, target.h), max)
+        let Some((new_w, new_h)) = editor::clamp_page_size((old.w, old.h), (target.w, target.h))
         else {
-            self.status_message = Some(format!(
-                "Page is already {}x{}; nothing to change (limit {max} px)",
-                old.w, old.h
-            ));
+            self.status_message = Some(format!("Page is already {}x{}", old.w, old.h));
             self.request_redraw();
             return;
         };
         if (new_w, new_h) != (target.w, target.h) {
-            self.status_message = Some(format!("Clamped to the {max} px texture limit"));
-        }
-
-        // A size within the dimension limit can still be far too much memory to
-        // allocate, and a failed allocation is a device error -- another crash, just a
-        // different one.
-        if !editor::fits_pixel_budget(new_w, new_h) {
-            let mpx = editor::MAX_CANVAS_PIXELS / (1024 * 1024);
             self.status_message = Some(format!(
-                "{new_w}x{new_h} exceeds the interim {mpx} Mpx single-texture budget; a tiled canvas is needed"
+                "Clamped to {} px, the largest coordinates stay exact at",
+                editor::MAX_PAGE_DIMENSION
             ));
-            self.request_redraw();
-            return;
         }
 
         let new = PageRect::new(target.x, target.y, new_w, new_h);
         let resize = openpaint_core::PageResize { old, new };
-        let lost = resize.loses_pixels();
 
-        // Content coordinates are stable, so nothing needs compensating: the page
-        // rectangle moves around the drawing rather than the drawing moving inside it.
         self.editor.resize_page(new);
         if let Some(r) = self.renderer.as_mut() {
             r.resize_canvas(resize, true);
         }
 
-        if lost {
-            // Say so plainly, because pixels really did disappear. Deliberately does not
-            // present Ctrl+Z as the safety net: undo is LIFO, so recovering them later
-            // means throwing away everything drawn since. Non-destructive crop is the
-            // actual fix and rides with the tiled canvas (DECISIONS 5b, Q13).
-            self.status_message = Some(format!(
-                "Page is now {new_w}x{new_h}; pixels outside were DISCARDED - undo now, or they are gone"
-            ));
-        }
-
         // Deliberately does NOT re-fit. Photoshop keeps your zoom through a canvas
         // resize, and having the camera jump is disorienting when working zoomed in --
         // press 0 to fit.
+        self.request_redraw();
+    }
+
+    /// Discard the tiles outside the page, reclaiming their memory.
+    ///
+    /// The only action that destroys pixels, which is why it is explicit and separate from
+    /// crop (DECISIONS §5c).
+    fn trim_to_page(&mut self) {
+        let Some(r) = self.renderer.as_mut() else {
+            return;
+        };
+        let (released, refused) = r.trim_to_page();
+        self.status_message = Some(match (released, refused) {
+            (0, false) => "Nothing outside the page to trim".to_owned(),
+            (0, true) => "No room to record the trim; nothing was discarded".to_owned(),
+            (n, false) => format!("Trimmed {n} tiles outside the page (undoable)"),
+            (n, true) => format!(
+                "Trimmed {n} tiles; some were kept because there was no room to record them"
+            ),
+        });
         self.request_redraw();
     }
 
@@ -736,6 +728,19 @@ impl OpenPaint {
             let (ops, dabs) = editor.pending_stroke();
             renderer.apply_stroke(ops, dabs);
             editor.clear_pending_stroke();
+
+            // Running out of tiles or out of snapshot room is a real, reachable state on a
+            // bounded pool, and the artist has to be told rather than left wondering why
+            // paint stopped landing or undo went quiet.
+            if renderer.take_exhausted() {
+                self.status_message = Some(
+                    "Canvas memory is full; part of that stroke was not painted.                      Trim to canvas, or undo."
+                        .to_owned(),
+                );
+            } else if renderer.take_unrecordable() {
+                self.status_message =
+                    Some("That stroke was too large to record; it cannot be undone".to_owned());
+            }
         }
 
         renderer.upload_canvas(editor.canvas_mut());
@@ -743,13 +748,15 @@ impl OpenPaint {
         // Fitting needs both the surface size and the UI inset, so it is deferred
         // to here rather than done at construction.
         self.view.apply_pending_fit(w, h, editor.canvas());
-        let placement = self.view.placement(w, h, editor.canvas());
+        let xform = self.view.page_to_ndc(w, h);
 
         let mut ui_wants_repaint = false;
         let mut ui_inset_left = None;
         let mut extend_request = None;
         let mut crop_request = None;
+        let mut trim_request = false;
         let history_status = renderer.history_status();
+        let residency = renderer.residency();
         let status_message = self.status_message.clone();
         let page_size = {
             let page = editor.document().active();
@@ -760,7 +767,7 @@ impl OpenPaint {
         // the view silently writes to a dead value. Disjoint field borrows make
         // this fine alongside the mutable borrows of `renderer` and `editor`.
         let view = &self.view;
-        let result = renderer.render(placement, |gpu| {
+        let result = renderer.render(xform, |gpu| {
             if let Some(ui) = ui {
                 let out = ui.render(
                     &window,
@@ -773,11 +780,13 @@ impl OpenPaint {
                         page_size,
                         crop: crop_overlay.as_ref(),
                         crop_rect,
+                        residency,
                     },
                 );
                 ui_wants_repaint = out.wants_repaint;
                 extend_request = out.extend;
                 crop_request = out.crop;
+                trim_request = out.trim;
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
@@ -794,6 +803,9 @@ impl OpenPaint {
         // re-creates the very GPU resources the frame is drawing with.
         if let Some((side, amount)) = extend_request {
             self.extend_page(side, amount);
+        }
+        if trim_request {
+            self.trim_to_page();
         }
         if let Some(action) = crop_request {
             self.crop_action(action);

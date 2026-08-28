@@ -3,46 +3,86 @@
 //! # Why this exists
 //!
 //! Dabs per stroke are in the hundreds; pixels per stroke are in the millions (see
-//! `openpaint_core::dab`). A 400px dab is ~500k pixels, and the CPU reference does
-//! one at a time with a hash lookup per pixel. This moves that work to the GPU.
+//! `openpaint_core::dab`). A 400px dab is ~500k pixels, and the CPU reference does one at
+//! a time with a hash lookup per pixel. This moves that work to the GPU.
 //!
-//! On the Surface-class target (DECISIONS §2) the *bandwidth* win matters as much
-//! as the throughput one: the CPU path had to upload every changed tile across a
-//! shared memory bus (512 KiB per tile per update), whereas this uploads the dab
-//! list — a few hundred × 32 bytes.
+//! On the Surface-class target (DECISIONS §2) the *bandwidth* win matters as much as the
+//! throughput one: the CPU path had to upload every changed tile across a shared memory
+//! bus (512 KiB per tile per update), whereas this uploads the dab list — a few hundred ×
+//! 32 bytes.
 //!
 //! # The stroke is a separate layer until it ends
 //!
-//! Dabs accumulate into a single-channel texture, and the canvas is **not touched**
-//! while the stroke is in progress. Mid-stroke the preview is drawn as a second
-//! pass over the canvas; on stroke end the accumulated paint is baked into the
-//! canvas once.
+//! Dabs accumulate into a single-channel buffer, and the canvas is **not touched** while
+//! the stroke is in progress. Mid-stroke the preview is drawn as a second pass over the
+//! canvas; on stroke end the accumulated paint is baked into the canvas once.
 //!
-//! That structure is what makes the flow/opacity model work without a snapshot:
-//! *flow* accumulates per dab while *opacity* caps the stroke total, so the stroke
-//! has to stay separable from what is underneath it right up until it's committed.
-//! It also means no readback and no ping-pong target — the canvas is only ever
-//! written by the blend unit.
+//! That structure is what makes the flow/opacity model work without a snapshot: *flow*
+//! accumulates per dab while *opacity* caps the stroke total, so the stroke has to stay
+//! separable from what is underneath it right up until it's committed. It also means no
+//! readback and no ping-pong target — the canvas is only ever written by the blend unit.
 //!
-//! Compare `openpaint_core::stroke`, which does the same thing on the CPU and holds
-//! a snapshot instead, because it *does* composite into the canvas each update.
+//! # Accumulation is tiled, for the same reason the canvas is
 //!
-//! # Known limit
+//! Because opacity caps the stroke *total*, the accumulation buffer has to cover
+//! everywhere the stroke has been — potentially the whole canvas. A page-sized
+//! accumulation texture would put back exactly the ceiling the tiled canvas removed, so
+//! this keeps its own sparse pool: one layer per tile the stroke has touched, allocated on
+//! demand and released when the stroke commits.
 //!
-//! The accumulation texture is canvas-sized, like the canvas texture itself. That
-//! shares the whole-canvas shortcut recorded in OPEN_QUESTIONS Q13/Q15: fine at
-//! 2048² (+8 MiB), wrong at 300 DPI. Both become tile-cache-sized together.
+//! Compare `openpaint_core::stroke`, which does the same thing on the CPU and holds a
+//! snapshot instead, because it *does* composite into the canvas each update.
 
-use openpaint_core::Dab;
-use wgpu::util::DeviceExt;
+use std::collections::HashSet;
 
-use crate::view::Placement;
+use openpaint_core::tile::{TileCoord, TILE_SIZE};
+use openpaint_core::{Dab, PageRect};
+
+use crate::canvas_renderer::{tile_intersects, tile_of, CanvasRenderer};
+use crate::tile_pool::{layers_for_budget, TileMap, TilePool};
+use crate::view::PageToNdc;
+
+/// Accumulation format. `R16Float` rather than `R8Unorm` because a stroke at low flow
+/// takes many dabs to approach its ceiling, and 8 bits of headroom visibly quantizes the
+/// build-up. Renderable and blendable everywhere WebGPU is.
+pub const ACCUM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
+
+/// Bytes per accumulation texel (one f16).
+const ACCUM_BYTES_PER_TEXEL: u32 = 2;
+
+/// GPU memory the in-progress stroke's accumulation tiles may occupy.
+///
+/// 32 MiB is 256 tiles at 128 KiB each — a stroke covering 16.7 Mpx, which is a stroke
+/// across a fully-inked A4 page at 300 DPI twice over. A single stroke bigger than that is
+/// pathological rather than normal use, so it is reported rather than designed for.
+const ACCUM_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Stride between per-tile uniform records.
+///
+/// Dynamic uniform offsets must be a multiple of `min_uniform_buffer_offset_alignment`,
+/// which is 256 under the default limits this app deliberately requests (DECISIONS §2).
+const TILE_PARAMS_STRIDE: u64 = 256;
+
+/// The per-tile uniform buffer is split into two disjoint regions: records for this
+/// frame's stamping, and records for a bake.
+///
+/// This is not tidiness. A bake happens in the same submission as the stamps that preceded
+/// it, and `Queue::write_buffer` applies *every* write in a submission before *any* command
+/// buffer runs -- so publishing the bake's records over the stamps' records would leave the
+/// stamps reading the bake's tiles. Separate regions make that impossible rather than
+/// merely avoided, which is the right way to handle a hazard that has already bitten this
+/// app once (see `upload_dabs`).
+#[derive(Clone, Copy)]
+enum Region {
+    Stamp,
+    Bake,
+}
 
 /// Per-dab instance data uploaded to the GPU.
 ///
-/// Colour is deliberately absent: accumulation is scalar coverage, and the stroke
-/// colour is applied once at composite time. Keeping colour out also means a
-/// colour change mid-stroke can't produce a two-tone stroke.
+/// Colour is deliberately absent: accumulation is scalar coverage, and the stroke colour is
+/// applied once at composite time. Keeping colour out also means a colour change mid-stroke
+/// can't produce a two-tone stroke.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct DabInstance {
@@ -67,117 +107,235 @@ impl From<&Dab> for DabInstance {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct CanvasSizeUniform {
-    size: [f32; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct PaintUniform {
     color: [f32; 4],
     opacity: [f32; 4],
 }
 
+/// Matching `TileParams` in stroke.wgsl.
+///
+/// Padding up to `TILE_PARAMS_STRIDE` is added when records are packed, not carried as a
+/// field: a 224-byte array in the struct would be dead weight in every copy and would have
+/// to be kept in step with the stride by hand.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct PlacementUniform {
-    tl_tr: [f32; 4],
-    bl_br: [f32; 4],
+struct TileParamsRecord {
+    tile: [f32; 4],
+    layer: [u32; 4],
 }
 
-/// Accumulation format. `R16Float` rather than `R8Unorm` because a stroke at low
-/// flow takes many dabs to approach its ceiling, and 8 bits of headroom visibly
-/// quantizes the build-up. Renderable and blendable everywhere WebGPU is.
-pub const ACCUM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
+/// Matching `Xform` in stroke.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct XformUniform {
+    x_row: [f32; 4],
+    y_row: [f32; 4],
+    page: [f32; 4],
+    params: [f32; 4],
+}
+
+/// Matching `TileInst` in stroke.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct TileInstance {
+    coord: [i32; 2],
+    layer: u32,
+    _pad: u32,
+}
 
 pub struct StrokeLayer {
-    accum_view: wgpu::TextureView,
+    pool: TilePool,
+    /// Accumulation tiles for the stroke in progress.
+    map: TileMap,
+    /// Tiles in this frame's stamping records, in record order.
+    stamp_records: Vec<TileCoord>,
     dab_pipeline: wgpu::RenderPipeline,
-    /// Composites into the canvas texture (identity quad).
     bake_pipeline: wgpu::RenderPipeline,
-    /// Composites onto the surface, following the on-screen canvas quad.
     preview_pipeline: wgpu::RenderPipeline,
-    canvas_size_group: wgpu::BindGroup,
     paint_group: wgpu::BindGroup,
-    placement_group: wgpu::BindGroup,
+    /// Bound at group 0 during the dab pass, where the accumulation array is the render
+    /// target and must not also be sampled.
+    empty_group: wgpu::BindGroup,
+    tile_group: wgpu::BindGroup,
+    xform_group: wgpu::BindGroup,
     paint_buf: wgpu::Buffer,
-    placement_buf: wgpu::Buffer,
-    /// Instance buffer, grown on demand and reused between updates.
+    tile_buf: wgpu::Buffer,
+    xform_buf: wgpu::Buffer,
+    /// Dab instances, grown on demand and reused between updates.
     instances: wgpu::Buffer,
     instance_capacity: usize,
+    /// Preview instances, one per accumulation tile.
+    tile_instances: wgpu::Buffer,
+    tile_instance_capacity: usize,
+    preview_count: u32,
+    /// The camera and page last published, so the page can be refreshed without the
+    /// caller having to supply a camera it does not have.
+    frame: (PageToNdc, PageRect),
     /// Whether anything has been accumulated since the last clear.
     dirty: bool,
+    /// Set when a stroke could not allocate an accumulation tile, so the caller can say
+    /// so rather than silently dropping paint.
+    exhausted: bool,
 }
 
 impl StrokeLayer {
-    /// `page_origin` is where the page's top-left sits in page coordinates. Dabs
-    /// arrive in page coordinates and the accumulation texture is zero-based, so the
-    /// shader subtracts it.
     pub fn new(
         device: &wgpu::Device,
-        canvas_w: u32,
-        canvas_h: u32,
-        page_origin: (i32, i32),
         canvas_format: wgpu::TextureFormat,
         surface_format: wgpu::TextureFormat,
     ) -> Self {
-        let accum = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("stroke-accum"),
-            size: wgpu::Extent3d {
-                width: canvas_w.max(1),
-                height: canvas_h.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: ACCUM_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let accum_view = accum.create_view(&wgpu::TextureViewDescriptor::default());
+        let capacity = layers_for_budget(device, ACCUM_BYTES_PER_TEXEL, ACCUM_BUDGET_BYTES);
+        let pool = TilePool::new(
+            device,
+            "stroke-accum",
+            ACCUM_FORMAT,
+            capacity,
+            ACCUM_BYTES_PER_TEXEL,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("stroke-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("stroke.wgsl").into()),
         });
 
-        // --- dab stamping -------------------------------------------------
-        let canvas_size_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("canvas-size-uniform"),
-            contents: bytemuck::bytes_of(&CanvasSizeUniform {
-                size: [
-                    canvas_w as f32,
-                    canvas_h as f32,
-                    page_origin.0 as f32,
-                    page_origin.1 as f32,
-                ],
-            }),
-            usage: wgpu::BufferUsages::UNIFORM,
+        let paint_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("paint-uniform"),
+            size: std::mem::size_of::<PaintUniform>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
-        let canvas_size_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("canvas-size-bgl"),
-                entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX)],
-            });
-        let canvas_size_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("canvas-size-bg"),
-            layout: &canvas_size_layout,
+        let tile_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stroke-tile-params"),
+            // Two disjoint regions -- see `Region`.
+            size: TILE_PARAMS_STRIDE * u64::from(capacity) * 2,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let xform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stroke-xform"),
+            size: std::mem::size_of::<XformUniform>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("accum-sampler"),
+            // Nearest: accumulation is exactly canvas-resolution, so any filtering would
+            // only smear the stroke against the canvas it is composited over.
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let paint_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("paint-bgl"),
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::FRAGMENT, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+            ],
+        });
+        let paint_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("paint-bg"),
+            layout: &paint_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: paint_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(pool.array_view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        let tile_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("stroke-tile-bgl"),
+            entries: &[uniform_entry(
+                0,
+                wgpu::ShaderStages::VERTEX_FRAGMENT,
+                // Dynamic, so one write per frame can serve every tile's pass. See the
+                // note on `TileParams` in stroke.wgsl.
+                true,
+            )],
+        });
+        let tile_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("stroke-tile-bg"),
+            layout: &tile_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: canvas_size_buf.as_entire_binding(),
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &tile_buf,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(32),
+                }),
             }],
         });
 
-        let dab_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        let xform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("stroke-xform-bgl"),
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, false)],
+        });
+        let xform_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("stroke-xform-bg"),
+            layout: &xform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: xform_buf.as_entire_binding(),
+            }],
+        });
+
+        // The dab pass renders *into* the accumulation array, so it must not also have it
+        // bound as a sampled texture -- a colour target is an exclusive usage within a pass,
+        // and binding both is a validation error rather than merely wasteful.
+        //
+        // WGSL fixes a binding's group in the module, so groups cannot be renumbered per
+        // entry point. Instead the dab pipeline gets an **empty** layout at group 0: the
+        // slot still exists positionally, and nothing is bound in it.
+        let empty_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("stroke-empty-bgl"),
+            entries: &[],
+        });
+        let empty_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("stroke-empty-bg"),
+            layout: &empty_layout,
+            entries: &[],
+        });
+
+        let dab_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("dab-pl"),
-            bind_group_layouts: &[&canvas_size_layout],
+            bind_group_layouts: &[&empty_layout, &tile_layout, &xform_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("stroke-pl"),
+            bind_group_layouts: &[&paint_layout, &tile_layout, &xform_layout],
             push_constant_ranges: &[],
         });
 
         let dab_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("dab-pipeline"),
-            layout: Some(&dab_layout),
+            layout: Some(&dab_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "dab_vs",
@@ -214,10 +372,10 @@ impl StrokeLayer {
                 entry_point: "dab_fs",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: ACCUM_FORMAT,
-                    // `a = src + dst * (1 - src)`, i.e. exactly the accumulation
-                    // formula, computed by the blend unit. `OneMinusSrc` rather
-                    // than `OneMinusSrcAlpha` because the target has only a red
-                    // channel, so relying on .a would be needlessly subtle.
+                    // `a = src + dst * (1 - src)`, i.e. exactly the accumulation formula,
+                    // computed by the blend unit. `OneMinusSrc` rather than
+                    // `OneMinusSrcAlpha` because the target has only a red channel, so
+                    // relying on .a would be needlessly subtle.
                     blend: Some(wgpu::BlendState {
                         color: wgpu::BlendComponent {
                             src_factor: wgpu::BlendFactor::One,
@@ -241,98 +399,17 @@ impl StrokeLayer {
             cache: None,
         });
 
-        // --- compositing ---------------------------------------------------
-        let paint_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("paint-uniform"),
-            size: std::mem::size_of::<PaintUniform>() as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let placement_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("stroke-placement-uniform"),
-            size: std::mem::size_of::<PlacementUniform>() as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("accum-sampler"),
-            // Nearest: the accumulation texture is exactly canvas-resolution, so
-            // any filtering would only smear the stroke against the canvas it is
-            // composited over.
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        let paint_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("paint-bgl"),
-            entries: &[
-                uniform_entry(0, wgpu::ShaderStages::FRAGMENT),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                },
-            ],
-        });
-        let paint_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("paint-bg"),
-            layout: &paint_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: paint_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&accum_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
-
-        let placement_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("stroke-placement-bgl"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX)],
-        });
-        let placement_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("stroke-placement-bg"),
-            layout: &placement_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: placement_buf.as_entire_binding(),
-            }],
-        });
-
-        let composite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("composite-pl"),
-            bind_group_layouts: &[&paint_layout, &placement_layout],
-            push_constant_ranges: &[],
-        });
-
-        let make_composite = |label: &str, vs: &str, format: wgpu::TextureFormat| {
+        let composite = |label: &str,
+                         vs: &str,
+                         format: wgpu::TextureFormat,
+                         buffers: &[wgpu::VertexBufferLayout]| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&composite_layout),
+                layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: vs,
-                    buffers: &[],
+                    buffers,
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -340,8 +417,8 @@ impl StrokeLayer {
                     entry_point: "paint_fs",
                     targets: &[Some(wgpu::ColorTargetState {
                         format,
-                        // Premultiplied "over": the fragment outputs premultiplied
-                        // paint, so this needs no destination read in the shader.
+                        // Premultiplied "over": the fragment outputs premultiplied paint,
+                        // so this needs no destination read in the shader.
                         blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -355,9 +432,30 @@ impl StrokeLayer {
             })
         };
 
-        let bake_pipeline = make_composite("bake-pipeline", "paint_vs_identity", canvas_format);
-        let preview_pipeline =
-            make_composite("preview-pipeline", "paint_vs_placed", surface_format);
+        let tile_instance_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<TileInstance>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Sint32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 8,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Uint32,
+                },
+            ],
+        };
+
+        let bake_pipeline = composite("bake-pipeline", "bake_vs", canvas_format, &[]);
+        let preview_pipeline = composite(
+            "preview-pipeline",
+            "preview_vs",
+            surface_format,
+            std::slice::from_ref(&tile_instance_layout),
+        );
 
         let instance_capacity = 256;
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
@@ -366,20 +464,43 @@ impl StrokeLayer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let tile_instance_capacity = 64;
+        let tile_instances = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stroke-tile-instances"),
+            size: (tile_instance_capacity * std::mem::size_of::<TileInstance>())
+                as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
-            accum_view,
+            pool,
+            map: TileMap::default(),
+            stamp_records: Vec::new(),
             dab_pipeline,
             bake_pipeline,
             preview_pipeline,
-            canvas_size_group,
             paint_group,
-            placement_group,
+            empty_group,
+            tile_group,
+            xform_group,
             paint_buf,
-            placement_buf,
+            tile_buf,
+            xform_buf,
             instances,
             instance_capacity,
+            tile_instances,
+            tile_instance_capacity,
+            preview_count: 0,
+            frame: (
+                PageToNdc {
+                    x_row: [0.0; 3],
+                    y_row: [0.0; 3],
+                },
+                PageRect::from_size(1, 1),
+            ),
             dirty: false,
+            exhausted: false,
         }
     }
 
@@ -389,42 +510,43 @@ impl StrokeLayer {
         self.dirty
     }
 
-    /// Clear the accumulation texture, starting a fresh stroke.
+    /// Whether the accumulation pool ran out during the current stroke.
+    #[must_use]
+    pub fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Start a fresh stroke, releasing the previous one's accumulation tiles.
     ///
-    /// A load-op clear rather than a compute or copy: it is the cheapest way to
-    /// zero a render target, and stroke starts are frequent.
-    pub fn begin_stroke(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        encoder
-            .begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("stroke-clear"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.accum_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            })
-            .forget_lifetime();
+    /// Tiles are freed rather than cleared in place: a new stroke usually touches a
+    /// different part of the canvas, and holding the old set resident would make the pool
+    /// fill up with tiles nothing is going to accumulate into.
+    pub fn begin_stroke(&mut self) {
+        for (_, slot) in self.map.drain().collect::<Vec<_>>() {
+            self.pool.free(slot);
+        }
+        self.stamp_records.clear();
         self.dirty = false;
+        self.exhausted = false;
+    }
+
+    /// Discard the stroke in progress without baking it.
+    pub fn abandon(&mut self) {
+        self.begin_stroke();
     }
 
     /// Upload a whole frame's dabs in one go.
     ///
     /// Deliberately separate from stamping, and this separation is load-bearing:
-    /// `Queue::write_buffer` does **not** interleave with recorded draws. Every
-    /// write in a submission is applied *before* any command buffer in it executes,
-    /// so writing the same buffer once per batch and drawing between writes means
-    /// all the draws see only the last batch's data. That produced visible gaps in
-    /// fast strokes, where several input batches land in one frame.
+    /// `Queue::write_buffer` does **not** interleave with recorded draws. Every write in a
+    /// submission is applied *before* any command buffer in it executes, so writing the
+    /// same buffer once per batch and drawing between writes means all the draws see only
+    /// the last batch's data. That produced visible gaps in fast strokes, where several
+    /// input batches land in one frame.
     ///
-    /// Uploading once and drawing sub-ranges avoids the hazard entirely, and suits
-    /// the data anyway: the editor already hands over a flat dab buffer with its
-    /// commands indexing into it.
+    /// Uploading once and drawing sub-ranges avoids the hazard entirely, and suits the
+    /// data anyway: the editor already hands over a flat dab buffer with its commands
+    /// indexing into it.
     pub fn upload_dabs(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, dabs: &[Dab]) {
         if dabs.is_empty() {
             return;
@@ -432,8 +554,8 @@ impl StrokeLayer {
         let data: Vec<DabInstance> = dabs.iter().map(DabInstance::from).collect();
 
         if data.len() > self.instance_capacity {
-            // Grow generously; a long stroke segment can produce a lot of dabs at
-            // once and reallocating per update would be wasteful.
+            // Grow generously; a long stroke segment can produce a lot of dabs at once and
+            // reallocating per update would be wasteful.
             self.instance_capacity = data.len().next_power_of_two();
             self.instances = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("dab-instances"),
@@ -446,37 +568,38 @@ impl StrokeLayer {
         queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&data));
     }
 
-    /// Stamp dabs `[start, start + len)` of the uploaded buffer into the
-    /// accumulation texture.
-    pub fn stamp_range(&mut self, encoder: &mut wgpu::CommandEncoder, start: usize, len: usize) {
-        if len == 0 {
-            return;
-        }
-        let mut pass = encoder
-            .begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("dab-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.accum_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        // Load, not clear: accumulation is the whole point.
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            })
-            .forget_lifetime();
+    /// Write the camera and page rectangle used by the preview and by dab clipping.
+    pub fn set_frame(&mut self, queue: &wgpu::Queue, xform: PageToNdc, page: PageRect) {
+        self.frame = (xform, page);
+        self.write_frame(queue);
+    }
 
-        pass.set_pipeline(&self.dab_pipeline);
-        pass.set_bind_group(0, &self.canvas_size_group, &[]);
-        pass.set_vertex_buffer(0, self.instances.slice(..));
-        pass.draw(0..6, start as u32..(start + len) as u32);
-        drop(pass);
+    /// Refresh just the page rectangle, keeping the camera as it was.
+    ///
+    /// Needed because dab clipping reads the page from this uniform, and stamping happens
+    /// *before* the frame is drawn — so waiting for the next `set_frame` would clip the
+    /// first frame of a stroke against a stale page. On the very first frame of all, that
+    /// page would be a 1x1 placeholder and the whole stroke would vanish.
+    pub fn set_page(&mut self, queue: &wgpu::Queue, page: PageRect) {
+        self.frame.1 = page;
+        self.write_frame(queue);
+    }
 
-        self.dirty = true;
+    /// One writer for the whole uniform, so a partial update cannot leave the page and the
+    /// camera describing different states.
+    fn write_frame(&self, queue: &wgpu::Queue) {
+        let (xform, page) = self.frame;
+        let (ex, ey) = page.end();
+        queue.write_buffer(
+            &self.xform_buf,
+            0,
+            bytemuck::bytes_of(&XformUniform {
+                x_row: [xform.x_row[0], xform.x_row[1], xform.x_row[2], 0.0],
+                y_row: [xform.y_row[0], xform.y_row[1], xform.y_row[2], 0.0],
+                page: [page.x as f32, page.y as f32, ex as f32, ey as f32],
+                params: [TILE_SIZE as f32, 0.0, 0.0, 0.0],
+            }),
+        );
     }
 
     /// Update the stroke colour and opacity used when compositing.
@@ -491,51 +614,111 @@ impl StrokeLayer {
         );
     }
 
-    /// Composite the stroke onto the surface, following the canvas quad.
+    /// Make sure every tile `dabs` can reach has an accumulation layer, and publish the
+    /// per-tile uniform records the stamping passes index into.
     ///
-    /// Used mid-stroke so the canvas underneath stays untouched.
-    pub fn draw_preview(
-        &self,
+    /// Returns how many tiles to stamp. Called once per stroke segment per frame, before
+    /// any pass in that segment, so the single uniform write cannot be reordered against
+    /// the draws that read it.
+    ///
+    /// A fresh tile is cleared through the **encoder**, not a queue write: a queue write is
+    /// applied before every command in the submission, which for a second stroke in the
+    /// same frame would wipe a layer the first stroke had not finished with.
+    pub fn prepare_tiles(
+        &mut self,
         queue: &wgpu::Queue,
-        pass: &mut wgpu::RenderPass<'_>,
-        placement: Placement,
-    ) {
-        queue.write_buffer(
-            &self.placement_buf,
-            0,
-            bytemuck::bytes_of(&PlacementUniform {
-                tl_tr: [
-                    placement.tl[0],
-                    placement.tl[1],
-                    placement.tr[0],
-                    placement.tr[1],
-                ],
-                bl_br: [
-                    placement.bl[0],
-                    placement.bl[1],
-                    placement.br[0],
-                    placement.br[1],
-                ],
-            }),
-        );
-        pass.set_pipeline(&self.preview_pipeline);
-        pass.set_bind_group(0, &self.paint_group, &[]);
-        pass.set_bind_group(1, &self.placement_group, &[]);
-        pass.draw(0..6, 0..1);
+        encoder: &mut wgpu::CommandEncoder,
+        dabs: &[Dab],
+        page: PageRect,
+    ) -> u32 {
+        let touched = tiles_touched(dabs, page);
+        let mut coords = Vec::with_capacity(touched.len());
+        for coord in touched {
+            if !self.map.contains(coord) {
+                let Some(slot) = self.pool.alloc() else {
+                    self.exhausted = true;
+                    continue;
+                };
+                // Fresh accumulation starts at zero coverage.
+                self.pool
+                    .clear_layer(encoder, &slot, wgpu::Color::TRANSPARENT);
+                debug_assert!(self.map.insert(coord, slot).is_none());
+            }
+            coords.push(coord);
+        }
+        self.stamp_records = self.publish(queue, &coords, Region::Stamp);
+        self.stamp_records.len() as u32
     }
 
-    /// Bake the accumulated stroke into the canvas texture, committing it.
-    pub fn bake(&mut self, encoder: &mut wgpu::CommandEncoder, canvas_view: &wgpu::TextureView) {
-        if !self.dirty {
+    /// Write one uniform record per tile into `region`, returning the tiles in record
+    /// order.
+    ///
+    /// A tile with no accumulation layer is skipped, so an exhausted pool loses paint in
+    /// that one tile rather than misindexing every tile after it.
+    fn publish(&self, queue: &wgpu::Queue, coords: &[TileCoord], region: Region) -> Vec<TileCoord> {
+        let mut kept = Vec::with_capacity(coords.len());
+        let mut bytes = Vec::with_capacity(coords.len() * TILE_PARAMS_STRIDE as usize);
+        for coord in coords {
+            let Some(slot) = self.map.slot(*coord) else {
+                continue;
+            };
+            let t = TILE_SIZE as f32;
+            let record = TileParamsRecord {
+                tile: [coord.0 as f32 * t, coord.1 as f32 * t, t, 0.0],
+                layer: [slot.layer(), 0, 0, 0],
+            };
+            bytes.extend_from_slice(bytemuck::bytes_of(&record));
+            bytes.resize(
+                bytes.len() + TILE_PARAMS_STRIDE as usize - size_of_record(),
+                0,
+            );
+            kept.push(*coord);
+        }
+        if !bytes.is_empty() {
+            queue.write_buffer(&self.tile_buf, self.region_base(region), &bytes);
+        }
+        kept
+    }
+
+    /// Byte offset where a region's records start.
+    fn region_base(&self, region: Region) -> u64 {
+        match region {
+            Region::Stamp => 0,
+            Region::Bake => u64::from(self.pool.capacity()) * TILE_PARAMS_STRIDE,
+        }
+    }
+
+    /// Dynamic offset for record `index` of `region`.
+    fn offset_of(&self, region: Region, index: u32) -> u32 {
+        (self.region_base(region) + u64::from(index) * TILE_PARAMS_STRIDE) as u32
+    }
+
+    /// Stamp dabs `[start, start + len)` into the accumulation tile at record `index`.
+    pub fn stamp_range(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        index: u32,
+        start: usize,
+        len: usize,
+    ) {
+        if len == 0 {
             return;
         }
+        let Some(coord) = self.stamp_records.get(index as usize).copied() else {
+            return;
+        };
+        let Some(slot) = self.map.slot(coord) else {
+            return;
+        };
         let mut pass = encoder
             .begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("stroke-bake"),
+                label: Some("dab-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: canvas_view,
+                    view: self.pool.layer_view(slot),
                     resolve_target: None,
                     ops: wgpu::Operations {
+                        // Load, not clear: accumulation is the whole point, and a tile can
+                        // be stamped again in a later frame of the same stroke.
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
@@ -545,23 +728,193 @@ impl StrokeLayer {
                 occlusion_query_set: None,
             })
             .forget_lifetime();
-        pass.set_pipeline(&self.bake_pipeline);
-        pass.set_bind_group(0, &self.paint_group, &[]);
-        pass.set_bind_group(1, &self.placement_group, &[]);
-        pass.draw(0..6, 0..1);
+
+        pass.set_pipeline(&self.dab_pipeline);
+        pass.set_bind_group(0, &self.empty_group, &[]);
+        pass.set_bind_group(1, &self.tile_group, &[self.offset_of(Region::Stamp, index)]);
+        pass.set_bind_group(2, &self.xform_group, &[]);
+        pass.set_vertex_buffer(0, self.instances.slice(..));
+        pass.draw(0..6, start as u32..(start + len) as u32);
         drop(pass);
 
+        self.dirty = true;
+    }
+
+    /// Build the preview draw list from the stroke's accumulation tiles.
+    pub fn prepare_preview(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, page: PageRect) {
+        let mut list: Vec<TileInstance> = self
+            .map
+            .iter()
+            .filter(|(coord, _)| tile_intersects(*coord, page))
+            .map(|(coord, slot)| TileInstance {
+                coord: [coord.0, coord.1],
+                layer: slot.layer(),
+                _pad: 0,
+            })
+            .collect();
+        list.sort_unstable_by_key(|i| (i.coord[1], i.coord[0]));
+
+        self.preview_count = list.len() as u32;
+        if list.is_empty() {
+            return;
+        }
+        if list.len() > self.tile_instance_capacity {
+            self.tile_instance_capacity = list.len().next_power_of_two();
+            self.tile_instances = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("stroke-tile-instances"),
+                size: (self.tile_instance_capacity * std::mem::size_of::<TileInstance>())
+                    as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        queue.write_buffer(&self.tile_instances, 0, bytemuck::cast_slice(&list));
+    }
+
+    /// Composite the stroke onto the surface, following the canvas.
+    ///
+    /// Used mid-stroke so the canvas underneath stays untouched.
+    pub fn draw_preview<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        if self.preview_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.preview_pipeline);
+        pass.set_bind_group(0, &self.paint_group, &[]);
+        pass.set_bind_group(1, &self.tile_group, &[0]);
+        pass.set_bind_group(2, &self.xform_group, &[]);
+        pass.set_vertex_buffer(0, self.tile_instances.slice(..));
+        pass.draw(0..6, 0..self.preview_count);
+    }
+
+    /// The canvas tiles a bake would write, in the order it will write them.
+    ///
+    /// Separate from [`StrokeLayer::bake`] because history has to snapshot those tiles
+    /// *before* the bake overwrites them, and asking after the fact would be too late.
+    #[must_use]
+    pub fn tiles_to_bake(&self, page: PageRect) -> Vec<TileCoord> {
+        if !self.dirty {
+            return Vec::new();
+        }
+        let mut coords: Vec<TileCoord> = self
+            .map
+            .iter()
+            .map(|(c, _)| c)
+            .filter(|c| tile_intersects(*c, page))
+            .collect();
+        coords.sort_unstable_by_key(|c| (c.1, c.0));
+        coords
+    }
+
+    /// Bake the accumulated stroke into the canvas, committing it.
+    ///
+    /// One pass per tile, because a render pass targets a single array layer. Stroke ends
+    /// are rare compared with stroke updates, so the pass count is not on a hot path.
+    ///
+    /// Returns the canvas tiles that were written, which is what history records.
+    pub fn bake(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        canvas: &mut CanvasRenderer,
+    ) -> Vec<TileCoord> {
+        if !self.dirty {
+            return Vec::new();
+        }
+        let coords = self.tiles_to_bake(canvas.page());
+
+        // Published into the bake region, so it cannot overwrite the stamping records that
+        // earlier commands in this same submission are still going to read.
+        let records = self.publish(queue, &coords, Region::Bake);
+
+        let mut written = Vec::with_capacity(records.len());
+        for (index, coord) in records.into_iter().enumerate() {
+            // A tile the stroke reached may not exist on the canvas yet.
+            let Some(_) = canvas.ensure_tile(encoder, coord) else {
+                continue;
+            };
+            let Some(target) = canvas.tile_target(coord) else {
+                continue;
+            };
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("stroke-bake"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                })
+                .forget_lifetime();
+            pass.set_pipeline(&self.bake_pipeline);
+            pass.set_bind_group(0, &self.paint_group, &[]);
+            let offset = self.offset_of(Region::Bake, index as u32);
+            pass.set_bind_group(1, &self.tile_group, &[offset]);
+            pass.set_bind_group(2, &self.xform_group, &[]);
+            pass.draw(0..6, 0..1);
+            drop(pass);
+            written.push(coord);
+        }
+
         self.dirty = false;
+        self.preview_count = 0;
+        written
     }
 }
 
-fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+/// Which tiles inside the page a set of dabs can reach.
+///
+/// A dab's footprint is its radius plus a pixel of antialiasing slack, matching the quad
+/// the vertex shader emits. Clipped to the page, because painting stops at the page edge
+/// even though storage does not.
+#[must_use]
+pub fn tiles_touched(dabs: &[Dab], page: PageRect) -> Vec<TileCoord> {
+    let mut set = HashSet::new();
+    let (px1, py1) = page.end();
+    for d in dabs {
+        let r = d.radius + 1.0;
+        let x0 = (d.x - r).floor().max(page.x as f32) as i32;
+        let y0 = (d.y - r).floor().max(page.y as f32) as i32;
+        let x1 = (d.x + r).ceil().min((px1 - 1) as f32) as i32;
+        let y1 = (d.y + r).ceil().min((py1 - 1) as f32) as i32;
+        if x1 < x0 || y1 < y0 {
+            continue;
+        }
+        let (tx0, ty0) = tile_of(x0, y0);
+        let (tx1, ty1) = tile_of(x1, y1);
+        for ty in ty0..=ty1 {
+            for tx in tx0..=tx1 {
+                set.insert((tx, ty));
+            }
+        }
+    }
+    let mut out: Vec<TileCoord> = set.into_iter().collect();
+    // Deterministic, so a frame's passes are ordered the same way every run.
+    out.sort_unstable_by_key(|c| (c.1, c.0));
+    out
+}
+
+/// Bytes one record occupies before padding to the stride.
+const fn size_of_record() -> usize {
+    std::mem::size_of::<TileParamsRecord>()
+}
+
+fn uniform_entry(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+    has_dynamic_offset: bool,
+) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility,
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
+            has_dynamic_offset,
             min_binding_size: None,
         },
         count: None,
@@ -573,8 +926,9 @@ mod tests {
     use super::*;
     use openpaint_core::{Canvas, StrokePainter};
 
+    use crate::canvas_renderer::CANVAS_FORMAT;
     use crate::test_gpu::{
-        any_paint, make_canvas, max_difference, mean_difference, readback, try_device, SIZE,
+        any_paint, max_difference, mean_difference, readback_page, try_device, SIZE,
     };
 
     const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
@@ -590,46 +944,49 @@ mod tests {
         }
     }
 
-    /// Rasterize `dabs` on the GPU and read the canvas back as linear f32 RGBA.
+    /// Rasterize `dabs` on the GPU through the real tiled path and read the page back as
+    /// linear f32 RGBA.
     fn gpu_render(dabs: &[Dab], opacity: f32) -> Vec<[f32; 4]> {
         gpu_render_batched(dabs, opacity, 1)
     }
 
-    /// As `gpu_render`, but stamping the dabs in `batches` separate draw calls
-    /// within one frame -- which is what a fast stroke produces.
+    /// As `gpu_render`, but stamping the dabs in `batches` separate draw calls within one
+    /// frame -- which is what a fast stroke produces.
     fn gpu_render_batched(dabs: &[Dab], opacity: f32, batches: usize) -> Vec<[f32; 4]> {
         let (device, queue) = try_device().expect("checked by caller");
 
-        let canvas_tex = make_canvas(&device, &queue);
-        let canvas_view = canvas_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
+        let cpu = Canvas::new(SIZE, SIZE);
+        let page = cpu.rect();
         // The preview pipeline's format is irrelevant here; it is never drawn.
-        let mut layer = StrokeLayer::new(
-            &device,
-            SIZE,
-            SIZE,
-            (0, 0),
-            crate::canvas_renderer::CANVAS_FORMAT,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-        );
+        let mut canvas = CanvasRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, &cpu);
+        let mut layer =
+            StrokeLayer::new(&device, CANVAS_FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
 
-        let mut encoder = device.create_command_encoder(&Default::default());
-        layer.begin_stroke(&mut encoder);
+        // Every uniform written once, before the single submission -- the ordering rule
+        // this module exists to respect.
+        layer.set_page(&queue, page);
         layer.set_paint(&queue, BLACK, opacity);
         layer.upload_dabs(&device, &queue, dabs);
-        // Split into `batches` draw calls, mimicking several input batches landing
-        // in a single frame.
-        let per = dabs.len().div_ceil(batches.max(1));
-        let mut start = 0;
-        while start < dabs.len() {
-            let len = per.min(dabs.len() - start);
-            layer.stamp_range(&mut encoder, start, len);
-            start += len;
-        }
-        layer.bake(&mut encoder, &canvas_view);
 
+        let mut encoder = device.create_command_encoder(&Default::default());
+        layer.begin_stroke();
+        let tiles = layer.prepare_tiles(&queue, &mut encoder, dabs, page);
+
+        // Split into `batches` draw calls, mimicking several input batches landing in a
+        // single frame.
+        let per = dabs.len().div_ceil(batches.max(1));
+        for index in 0..tiles {
+            let mut start = 0;
+            while start < dabs.len() {
+                let len = per.min(dabs.len() - start);
+                layer.stamp_range(&mut encoder, index, start, len);
+                start += len;
+            }
+        }
+        layer.bake(&queue, &mut encoder, &mut canvas);
         queue.submit(std::iter::once(encoder.finish()));
-        readback(&device, &queue, &canvas_tex)
+
+        readback_page(&device, &queue, &canvas)
     }
 
     /// Rasterize the same dabs through the CPU reference implementation.
@@ -651,10 +1008,9 @@ mod tests {
             .collect()
     }
 
-    /// The reason `openpaint_core::raster` and `openpaint_core::stroke` are kept:
-    /// the falloff curve exists twice, once in `Dab::coverage_at_distance` and once
-    /// in `stroke.wgsl`'s `dab_fs`. Two copies of a curve drift. This is what
-    /// notices.
+    /// The reason `openpaint_core::raster` and `openpaint_core::stroke` are kept: the
+    /// falloff curve exists twice, once in `Dab::coverage_at_distance` and once in
+    /// `stroke.wgsl`'s `dab_fs`. Two copies of a curve drift. This is what notices.
     #[test]
     fn gpu_rasterization_matches_the_cpu_reference() {
         let Some(_) = try_device() else {
@@ -679,8 +1035,7 @@ mod tests {
         let (worst, at) = max_difference(&gpu, &cpu);
         assert!(
             worst < 0.01,
-            "GPU and CPU disagree by {worst} at pixel {at} ({}, {}); \
-             gpu {:?} cpu {:?}",
+            "GPU and CPU disagree by {worst} at pixel {at} ({}, {}); gpu {:?} cpu {:?}",
             at as u32 % SIZE,
             at as u32 / SIZE,
             gpu[at],
@@ -690,13 +1045,12 @@ mod tests {
 
     /// Build-up with a low flow and an opacity ceiling.
     ///
-    /// Uses *soft* dabs deliberately. With `hardness = 1.0` coverage is a step
-    /// function, so a sub-pixel sampling difference between the two
-    /// implementations flips a whole dab on or off at the rim -- and with several
-    /// overlapping dabs that is a ~12% swing in the accumulated value. That is
-    /// inherent to comparing hard edges, not a defect, so the strict comparison
-    /// uses a continuous falloff where a small position error can only produce a
-    /// small value error.
+    /// Uses *soft* dabs deliberately. With `hardness = 1.0` coverage is a step function, so
+    /// a sub-pixel sampling difference between the two implementations flips a whole dab on
+    /// or off at the rim -- and with several overlapping dabs that is a ~12% swing in the
+    /// accumulated value. That is inherent to comparing hard edges, not a defect, so the
+    /// strict comparison uses a continuous falloff where a small position error can only
+    /// produce a small value error.
     #[test]
     fn gpu_build_up_matches_the_cpu_reference() {
         let Some(_) = try_device() else {
@@ -725,13 +1079,13 @@ mod tests {
             cpu[at]
         );
 
-        // Max difference can be dominated by a handful of rim pixels, so also
-        // require the two to agree closely on average.
+        // Max difference can be dominated by a handful of rim pixels, so also require the
+        // two to agree closely on average.
         let mean = mean_difference(&gpu, &cpu);
         assert!(mean < 0.002, "mean difference {mean} is too large");
 
-        // And the ceiling must actually bind: black at opacity 0.5 over paper can
-        // never darken past halfway.
+        // And the ceiling must actually bind: black at opacity 0.5 over paper can never
+        // darken past halfway.
         let paper = Canvas::paper_color()[0];
         let darkest = gpu.iter().map(|p| p[0]).fold(f32::MAX, f32::min);
         assert!(
@@ -741,16 +1095,15 @@ mod tests {
         );
     }
 
-    /// Regression: a fast stroke delivers several input batches in one frame, so the
-    /// dabs are stamped in several draw calls. Splitting them must be
-    /// indistinguishable from one call.
+    /// Regression: a fast stroke delivers several input batches in one frame, so the dabs
+    /// are stamped in several draw calls. Splitting them must be indistinguishable from one
+    /// call.
     ///
-    /// This failed before `upload_dabs` was separated from stamping: writing the
-    /// instance buffer once per batch looks correct, but `Queue::write_buffer`
-    /// applies every write in a submission *before* any of its command buffers run,
-    /// so all the draws saw only the final batch. It showed up as visible gaps in
-    /// fast strokes -- worse the faster the stroke, because more batches landed per
-    /// frame.
+    /// This failed before `upload_dabs` was separated from stamping: writing the instance
+    /// buffer once per batch looks correct, but `Queue::write_buffer` applies every write in
+    /// a submission *before* any of its command buffers run, so all the draws saw only the
+    /// final batch. It showed up as visible gaps in fast strokes -- worse the faster the
+    /// stroke, because more batches landed per frame.
     #[test]
     fn batching_dabs_does_not_change_the_result() {
         let Some(_) = try_device() else {
@@ -771,13 +1124,141 @@ mod tests {
             let (worst, at) = max_difference(&one_call, &split);
             assert!(
                 worst < 0.01,
-                "{batches} batches differ from 1 by {worst} at ({}, {}); \
-                 one {:?} split {:?}",
+                "{batches} batches differ from 1 by {worst} at ({}, {}); one {:?} split {:?}",
                 at as u32 % SIZE,
                 at as u32 / SIZE,
                 one_call[at],
                 split[at]
             );
         }
+    }
+
+    /// A stroke spanning several tiles must look exactly like the CPU reference across the
+    /// seams. This is the property the whole tiled rewrite risks: each tile is stamped in
+    /// its own pass with its own origin, so an off-by-one in that origin, or clipping a dab
+    /// quad at a tile edge instead of letting the target clip it, shows up as a visible line
+    /// every 256 pixels.
+    #[test]
+    fn a_stroke_across_tile_boundaries_has_no_seam() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+
+        // A page four tiles across, and a stroke straight through all of them.
+        const W: u32 = 900;
+        const H: u32 = 300;
+        let dabs: Vec<Dab> = (0..300)
+            .map(|i| dab(10.0 + i as f32 * 3.0, 150.0, 20.0, 0.5, 0.4))
+            .collect();
+
+        let cpu_canvas = Canvas::new(W, H);
+        let page = cpu_canvas.rect();
+        let mut canvas =
+            CanvasRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, &cpu_canvas);
+        let mut layer =
+            StrokeLayer::new(&device, CANVAS_FORMAT, wgpu::TextureFormat::Rgba8UnormSrgb);
+
+        layer.set_page(&queue, page);
+        layer.set_paint(&queue, BLACK, 1.0);
+        layer.upload_dabs(&device, &queue, &dabs);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        layer.begin_stroke();
+        let tiles = layer.prepare_tiles(&queue, &mut encoder, &dabs, page);
+        assert!(tiles >= 4, "expected several tiles, got {tiles}");
+        for index in 0..tiles {
+            layer.stamp_range(&mut encoder, index, 0, dabs.len());
+        }
+        layer.bake(&queue, &mut encoder, &mut canvas);
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let gpu = readback_page(&device, &queue, &canvas);
+
+        let mut reference = Canvas::new(W, H);
+        let mut painter = StrokePainter::new();
+        painter.begin();
+        painter.add_dabs(&reference, &dabs);
+        painter.composite(&mut reference, BLACK, 1.0);
+
+        let paper = Canvas::paper_color().map(|c| half::f16::from_f32(c).to_f32());
+        let cpu: Vec<[f32; 4]> = (0..H)
+            .flat_map(|y| (0..W).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let coord = (
+                    (x as i32).div_euclid(TILE_SIZE as i32),
+                    (y as i32).div_euclid(TILE_SIZE as i32),
+                );
+                match reference.tile(coord) {
+                    Some(tile) => tile.texel((x as usize) % TILE_SIZE, (y as usize) % TILE_SIZE),
+                    None => paper,
+                }
+            })
+            .collect();
+
+        assert!(any_paint(&gpu), "GPU produced no paint at all");
+        let (worst, at) = max_difference(&gpu, &cpu);
+        assert!(
+            worst < 0.02,
+            "seam at pixel ({}, {}): gpu {:?} cpu {:?}",
+            at as u32 % W,
+            at as u32 / W,
+            gpu[at],
+            cpu[at]
+        );
+    }
+
+    /// Painting is clipped to the page even though storage is not: a dab centred outside
+    /// the page must deposit nothing inside it, and must not allocate a tile either.
+    #[test]
+    fn dabs_outside_the_page_paint_nothing() {
+        let Some(_) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let far = [dab(-500.0, -500.0, 20.0, 1.0, 1.0)];
+        let pixels = gpu_render(&far, 1.0);
+        assert!(!any_paint(&pixels), "paint landed from a dab off the page");
+    }
+
+    /// `tiles_touched` decides how many passes a frame records, so a dab must claim exactly
+    /// the tiles its footprint reaches -- one too few loses paint at a seam, and one too
+    /// many burns a render pass and an accumulation layer on nothing.
+    #[test]
+    fn a_dab_claims_exactly_the_tiles_it_reaches() {
+        let page = PageRect::from_size(1000, 1000);
+
+        // Comfortably inside one tile.
+        assert_eq!(
+            tiles_touched(&[dab(100.0, 100.0, 10.0, 1.0, 1.0)], page),
+            vec![(0, 0)]
+        );
+
+        // Straddling the boundary at x = 256 reaches both columns.
+        assert_eq!(
+            tiles_touched(&[dab(256.0, 100.0, 10.0, 1.0, 1.0)], page),
+            vec![(0, 0), (1, 0)]
+        );
+
+        // A dab centred on a corner reaches all four.
+        assert_eq!(
+            tiles_touched(&[dab(256.0, 256.0, 10.0, 1.0, 1.0)], page),
+            vec![(0, 0), (1, 0), (0, 1), (1, 1)]
+        );
+
+        // Entirely off the page: nothing at all.
+        assert!(tiles_touched(&[dab(-500.0, -500.0, 20.0, 1.0, 1.0)], page).is_empty());
+    }
+
+    /// A page with a negative origin is the normal case after extending up or left, and its
+    /// tiles are negative too. `div_euclid` is what makes that work.
+    #[test]
+    fn tiles_touched_handles_a_negative_origin() {
+        let page = PageRect::new(-400, -400, 800, 800);
+        assert_eq!(
+            tiles_touched(&[dab(-300.0, -300.0, 10.0, 1.0, 1.0)], page),
+            vec![(-2, -2)]
+        );
+        // Clipped at the page's own edge, not at zero.
+        assert!(tiles_touched(&[dab(-450.0, -450.0, 5.0, 1.0, 1.0)], page).is_empty());
     }
 }

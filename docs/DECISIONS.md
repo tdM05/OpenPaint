@@ -100,17 +100,16 @@ Decided 2026-08-27:
   (~800–1600 px wide, potentially 10,000 px+ tall), print comic pages at 300 DPI,
   and screen-resolution sketchbook pages. Design for the general case.
 
-⚠️ **Consequence: tile residency is an early problem, not a Phase-2 one.**
-A4 at 300 DPI is 2480×3508 ≈ 8.7 Mpx. At `Rgba16Float` (8 bytes/px, §4b) that's
-~70 MB *per layer*, so a ten-layer page is ~700 MB before the composite target
-and per-stroke accumulation buffer — which does not fit in a Surface's shared
-graphics memory. Therefore:
-- The GPU holds a **bounded cache of resident tiles** (the visible/working set),
-  never the whole document.
-- A tile budget + eviction policy is a **first-class early component**. The
-  roadmap defers the document/page model to Phase 2, but the *tile store* it rests
-  on has to exist before layers and undo are built on top of it (see
-  OPEN_QUESTIONS Q13).
+✅ **Consequence: tile residency is an early problem, not a Phase-2 one.** Acted on
+2026-08-28 (§4d). A4 at 300 DPI is 2480×3508 ≈ 8.7 Mpx. At `Rgba16Float`
+(8 bytes/px, §4b) that's ~70 MB *per layer*, so a ten-layer page is ~700 MB before
+the composite target and per-stroke accumulation buffer — which does not fit in a
+Surface's shared graphics memory. Therefore:
+- The GPU holds a **bounded pool of resident tiles**, never the whole document.
+  **Done** — `tile_pool.rs`, capacity fixed at startup from a byte budget.
+- A tile budget + eviction policy is a **first-class early component**. The budget
+  exists; **spilling non-resident tiles to CPU/disk is the remaining half** and is
+  what OPEN_QUESTIONS Q13 still tracks.
 
 ### Development vs. validation — CONFIRMED SETUP
 - **Code is written on Linux (SSH).** The **tablet lives on the author's Windows
@@ -258,6 +257,66 @@ adding parameters rather than by arbitrary composition.
 This also matches CSP's actual model (§1a): a fixed set of toggleable setting
 sections, each optionally driven by pressure/tilt/velocity through a curve —
 which is the modulation layer, evaluated per dab.
+
+### 4d. The canvas is a bounded pool of GPU tiles, settled 2026-08-28
+
+Replaced the Phase-0 shortcut of one page-sized texture. That shortcut had been
+recorded as temporary from the start, and it was costing three things at once:
+
+1. **Two ceilings the UI had to apologise for.** A page could be no larger than
+   `max_texture_dimension_2d` (8192), and no larger than one allocation the driver
+   would accept (~16 Mpx at `Rgba16Float`). A real webtoon strip is taller than
+   both. The app clamped and printed an explanation.
+2. **Memory proportional to page area rather than painted area.** A blank
+   800×20000 strip cost 128 MB before a mark was made.
+3. **Nowhere to put non-destructive crop.** Storage was defined *as* the page, so
+   pixels outside it could not exist (§5c).
+
+All three had one cause, so all three were fixed by one change.
+
+**Shape: a 2D array texture, one layer per tile.** The alternatives were weighed:
+- *A texture per tile* needs a bind group and a draw call per tile — hundreds of
+  each per frame.
+- *A 2D atlas* (a tile grid inside one big texture) makes adjacent tiles physical
+  neighbours, so any filtered sample near a tile edge bleeds in whatever tile
+  happens to sit beside it. Avoiding that needs apron pixels round every tile,
+  which cost memory and have to be kept in sync on every write.
+- *An array texture* gets the single bind group without the bleed, because each
+  layer is its own image with its own clamped edges. The canvas is **one instanced
+  draw** over the visible tiles, with the layer index arriving as instance data.
+
+**The page rectangle bounds drawing and painting; it does not bound storage.**
+Tile quads are clipped to the page *in page space* — not with a scissor rectangle,
+which cannot work once the canvas is rotated on screen. Dab quads are clipped the
+same way, per corner, and the distance-from-centre is derived from the clamped
+position so coverage stays exact.
+
+**Accumulation is tiled too, and had to be.** Opacity caps a stroke's *total*, so
+the accumulation buffer must cover everywhere the stroke has been — potentially
+the whole canvas. A page-sized accumulation texture would have put the ceiling
+straight back, so a stroke allocates accumulation tiles on demand and releases
+them when it commits.
+
+**A tile is now the unit of undo.** Snapshots were arbitrary rectangles; they are
+whole tiles copied into a snapshot pool of the same shape. That makes the history
+budget *exact* rather than estimated — the pool's capacity **is** the budget, so
+there is no byte counter that can disagree with what the GPU holds.
+
+**What this deleted, which is the strongest argument for it:** the page-origin-to-
+texture-origin conversion at the GPU boundary (tiles are addressed in page
+coordinates, so §5a's invariant now holds unbroken from core to GPU); the
+reallocate-and-blit on every resize; `View::placement` and the four-corner
+placement uniform; `CanvasRect`, `BoundsBuilder`, and the stroke bounds the editor
+tracked for history's benefit; `Op::Resize`'s pre-crop snapshot and
+`PageResize::loses_pixels`; and both size ceilings with their clamping and
+messages.
+
+**What remains bounded, honestly.** Residency is 96 MiB (192 tiles), which holds a
+fully-inked A4 at 300 DPI (140 tiles). A long webtoon inked throughout exceeds it,
+and until spilling lands the pool reports exhaustion and says so in the status bar
+rather than dropping paint quietly. The one remaining page limit is 65536 px per
+side, and it is a **coordinate-precision** limit (`f32` is exact on integers only
+to 2^24), not a memory one.
 
 ### 4b. Tile pixel format → linear, premultiplied, `Rgba16Float`
 
@@ -625,6 +684,23 @@ same shape.
    from `stamp_range`, so the frame's data is uploaded once and draws address
    sub-ranges. If you need per-item data, either upload once and index, or submit
    between writes.
+
+   **Bit again, twice, during the tiled-canvas work (2026-08-28) — and the same rule
+   covers `write_texture` and render-pass clears, not just `write_buffer`:**
+   - Per-tile uniforms are selected with **dynamic offsets** into one buffer written
+     once per frame. Rewriting one uniform between per-tile passes would have left
+     every pass reading the last tile's values. The stamping and bake records live in
+     two *disjoint regions* of that buffer, so a bake cannot overwrite records the
+     stamps preceding it in the same submission still have to read.
+   - `upload_dirty` allocated a tile, cleared it with a render pass, then uploaded it
+     with `queue.write_texture` — so the clear was applied *after* the upload and wiped
+     it. Fixed by not clearing a tile that is about to be written in full. Caught by
+     the export test, which is the sort of thing that would otherwise have looked like
+     a broken export.
+
+   The general rule: **a queue write and a recorded command are not in the same
+   order you wrote them.** If both touch the same resource, either use disjoint
+   regions, do both through the encoder, or submit in between.
 
 ### Verification hazards
 

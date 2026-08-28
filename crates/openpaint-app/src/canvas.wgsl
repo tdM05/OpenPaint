@@ -1,51 +1,99 @@
-// Draws the canvas texture as a single quad, positioned by `crate::view::View`.
+// Draws the canvas: a paper sheet, then one instanced quad per resident tile.
 //
-// The quad is supplied as four independent corners in NDC rather than a min/max
-// rectangle, because a rotated canvas is not axis-aligned. The vertex shader
-// bilinearly interpolates them, which handles pan, zoom, and rotation uniformly
-// and keeps all the camera math on the CPU in one place.
+// The camera arrives as a 2x3 affine (page -> NDC) rather than four precomputed corners,
+// because each tile positions itself from its own coordinate — only the shader knows
+// where a given instance goes. `crate::view::PageToNdc` builds the affine by sampling the
+// same forward transform input uses, so the two cannot drift.
+//
+// # Storage is larger than the page, on purpose
+//
+// Tiles outside the page rectangle are kept, so a crop destroys nothing
+// (DECISIONS 5c). They must not be *drawn*, though: the page is the sheet the artist
+// sees. Each tile quad is therefore clipped to the page in page space — not with a
+// scissor rectangle, which could not work once the canvas is rotated on screen.
 
-struct Placement {
-    // Canvas corners in NDC, packed two per vec4 for unambiguous uniform layout:
-    // tl_tr = (top-left.xy, top-right.xy), bl_br = (bottom-left.xy, bottom-right.xy).
-    // "Top"/"left" refer to canvas space, so under rotation they are no longer
-    // visually up or left.
-    tl_tr: vec4<f32>,
-    bl_br: vec4<f32>,
+struct Xform {
+    // page -> NDC: ndc.x = dot(x_row.xyz, vec3(page_pos, 1.0)).
+    x_row: vec4<f32>,
+    y_row: vec4<f32>,
+    // The page rectangle in page coordinates: (x0, y0, x1, y1).
+    page: vec4<f32>,
+    // Paper colour, linear and premultiplied.
+    paper: vec4<f32>,
+    // x = tile size in pixels.
+    params: vec4<f32>,
 };
 
-@group(0) @binding(0) var<uniform> placement: Placement;
-@group(0) @binding(1) var canvas_tex: texture_2d<f32>;
-@group(0) @binding(2) var canvas_sampler: sampler;
+@group(0) @binding(0) var<uniform> xf: Xform;
+@group(0) @binding(1) var tiles: texture_2d_array<f32>;
+@group(0) @binding(2) var samp: sampler;
 
-struct VsOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
-    // Two triangles forming the quad. uv (0,0) = top-left of the texture.
+// Two triangles over the unit square, (0,0) at the top-left in page space.
+fn quad(vid: u32) -> vec2<f32> {
     var uvs = array<vec2<f32>, 6>(
         vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
         vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
     );
-    let uv = uvs[vid];
+    return uvs[vid];
+}
 
-    // Bilinear interpolation of the four corners. For an axis-aligned quad this
-    // reduces to the old min/max mix; for a rotated one it is still exact, because
-    // an affine transform maps the unit square to a parallelogram.
-    let top = mix(placement.tl_tr.xy, placement.tl_tr.zw, uv.x);
-    let bottom = mix(placement.bl_br.xy, placement.bl_br.zw, uv.x);
-    let p = mix(top, bottom, uv.y);
+fn to_ndc(p: vec2<f32>) -> vec4<f32> {
+    let h = vec3<f32>(p, 1.0);
+    return vec4<f32>(dot(xf.x_row.xyz, h), dot(xf.y_row.xyz, h), 0.0, 1.0);
+}
 
-    var out: VsOut;
-    out.pos = vec4<f32>(p, 0.0, 1.0);
-    out.uv = uv;
+// ------------------------------------------------------------------ paper sheet
+
+// Drawn under the tiles so unpainted area — which allocates no tile at all — still reads
+// as paper. Without it a fresh canvas would show the backdrop through every gap.
+@vertex
+fn sheet_vs(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
+    return to_ndc(mix(xf.page.xy, xf.page.zw, quad(vid)));
+}
+
+@fragment
+fn sheet_fs() -> @location(0) vec4<f32> {
+    return xf.paper;
+}
+
+// ------------------------------------------------------------------------ tiles
+
+struct TileInst {
+    @location(0) coord: vec2<i32>,
+    @location(1) layer: u32,
+};
+
+struct TileOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    // Flat because it is an index, not a quantity: interpolating it would sample a
+    // different layer per fragment.
+    @location(1) @interpolate(flat) layer: u32,
+};
+
+@vertex
+fn tile_vs(@builtin(vertex_index) vid: u32, inst: TileInst) -> TileOut {
+    let ts = xf.params.x;
+    let t0 = vec2<f32>(inst.coord) * ts;
+    let t1 = t0 + vec2<f32>(ts, ts);
+
+    // Clip to the page. `max(..., c0)` on the far corner matters: without it a tile
+    // wholly outside the page yields an inverted quad, and with back-face culling off
+    // that still rasterizes — drawing retained out-of-page pixels over the sheet.
+    let c0 = max(t0, xf.page.xy);
+    let c1 = max(min(t1, xf.page.zw), c0);
+
+    let p = mix(c0, c1, quad(vid));
+
+    var out: TileOut;
+    out.pos = to_ndc(p);
+    // UVs follow the clipped quad, so an edge tile shows only its in-page part.
+    out.uv = (p - t0) / ts;
+    out.layer = inst.layer;
     return out;
 }
 
 @fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(canvas_tex, canvas_sampler, in.uv);
+fn tile_fs(in: TileOut) -> @location(0) vec4<f32> {
+    return textureSample(tiles, samp, in.uv, i32(in.layer));
 }

@@ -7,12 +7,14 @@
 //! they are worth having where they can run, and a hard failure on a machine
 //! without a usable GPU would say nothing about the code.
 
+use openpaint_core::tile::{TILE_BYTES, TILE_SIZE};
 use openpaint_core::Canvas;
 
-use crate::canvas_renderer::CANVAS_FORMAT;
+use crate::canvas_renderer::CanvasRenderer;
 
-/// Side length used by the GPU tests. 128 keeps them quick, and 128 × 8 bytes is a
-/// 1024-byte row, satisfying wgpu's 256-byte `bytes_per_row` alignment for readback.
+/// Side length used by the GPU tests. 128 keeps them quick, and it is deliberately
+/// **smaller than one tile**, so a page that does not fill its tiles is the default case
+/// the comparisons run against.
 pub const SIZE: u32 = 128;
 
 /// A headless device, or `None` where there is no usable adapter.
@@ -38,98 +40,98 @@ pub fn try_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     .ok()
 }
 
-/// A canvas texture filled with paper, matching what the real renderer starts from.
-pub fn make_canvas(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Texture {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("test-canvas"),
-        size: wgpu::Extent3d {
-            width: SIZE,
-            height: SIZE,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: CANVAS_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-            | wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-
-    let paper = Canvas::paper_color();
-    let texel: Vec<half::f16> = paper.iter().map(|c| half::f16::from_f32(*c)).collect();
-    let filled: Vec<half::f16> = texel.repeat((SIZE * SIZE) as usize);
-    queue.write_texture(
-        wgpu::ImageCopyTexture {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        bytemuck::cast_slice(&filled),
-        wgpu::ImageDataLayout {
-            offset: 0,
-            bytes_per_row: Some(SIZE * 8),
-            rows_per_image: Some(SIZE),
-        },
-        wgpu::Extent3d {
-            width: SIZE,
-            height: SIZE,
-            depth_or_array_layers: 1,
-        },
-    );
-    texture
-}
-
-/// Read a `SIZE` × `SIZE` canvas texture back as linear f32 RGBA.
-pub fn readback(
+/// Read the page region of a tiled canvas back as linear f32 RGBA, row-major.
+///
+/// Area with no resident tile reads as paper, matching what the sheet quad draws — so a
+/// comparison against the CPU reference (which allocates tiles the same way) lines up
+/// without either side having to know which tiles happen to exist.
+pub fn readback_page(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
+    canvas: &CanvasRenderer,
 ) -> Vec<[f32; 4]> {
-    let bytes = (SIZE * SIZE * 8) as wgpu::BufferAddress;
+    let page = canvas.page();
+    let (w, h) = (page.w as usize, page.h as usize);
+    let paper = Canvas::paper_color().map(|c| half::f16::from_f32(c).to_f32());
+    let mut out = vec![paper; w * h];
+
+    let coords: Vec<openpaint_core::tile::TileCoord> = canvas
+        .tiles()
+        .filter(|c| crate::canvas_renderer::tile_intersects(*c, page))
+        .collect();
+    if coords.is_empty() {
+        return out;
+    }
+
+    // A tile row is 256 × 8 = 2048 bytes and a whole tile 512 KiB, both already multiples
+    // of the 256-byte copy alignment, so tiles pack end to end with no padding.
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
-        size: bytes,
+        size: (TILE_BYTES * coords.len()) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
 
     let mut encoder = device.create_command_encoder(&Default::default());
-    encoder.copy_texture_to_buffer(
-        wgpu::ImageCopyTexture {
-            texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::ImageCopyBuffer {
-            buffer: &buffer,
-            layout: wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(SIZE * 8),
-                rows_per_image: Some(SIZE),
+    for (i, coord) in coords.iter().enumerate() {
+        let Some(slot) = canvas.slot(*coord) else {
+            continue;
+        };
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: canvas.pool().texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: slot.layer(),
+                },
+                aspect: wgpu::TextureAspect::All,
             },
-        },
-        wgpu::Extent3d {
-            width: SIZE,
-            height: SIZE,
-            depth_or_array_layers: 1,
-        },
-    );
+            wgpu::ImageCopyBuffer {
+                buffer: &buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: (TILE_BYTES * i) as u64,
+                    bytes_per_row: Some(TILE_SIZE as u32 * 8),
+                    rows_per_image: Some(TILE_SIZE as u32),
+                },
+            },
+            wgpu::Extent3d {
+                width: TILE_SIZE as u32,
+                height: TILE_SIZE as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
     queue.submit(std::iter::once(encoder.finish()));
 
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     device.poll(wgpu::Maintain::Wait);
     let view = buffer.slice(..).get_mapped_range();
-    let halves: &[half::f16] = bytemuck::cast_slice(&view);
-    halves
+    let texels = bytemuck::cast_slice::<u8, half::f16>(&view)
         .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| [c[0].to_f32(), c[1].to_f32(), c[2].to_f32(), c[3].to_f32()])
-        .collect()
+        .0;
+
+    let t = TILE_SIZE as i32;
+    for (i, coord) in coords.iter().enumerate() {
+        let tile = &texels[i * TILE_SIZE * TILE_SIZE..(i + 1) * TILE_SIZE * TILE_SIZE];
+        for ly in 0..TILE_SIZE {
+            let py = coord.1 * t + ly as i32 - page.y;
+            if py < 0 || py >= page.h as i32 {
+                continue;
+            }
+            for lx in 0..TILE_SIZE {
+                let px = coord.0 * t + lx as i32 - page.x;
+                if px < 0 || px >= page.w as i32 {
+                    continue;
+                }
+                let c = tile[ly * TILE_SIZE + lx];
+                out[py as usize * w + px as usize] =
+                    [c[0].to_f32(), c[1].to_f32(), c[2].to_f32(), c[3].to_f32()];
+            }
+        }
+    }
+    out
 }
 
 /// Largest per-channel difference between two readbacks, and where it is.

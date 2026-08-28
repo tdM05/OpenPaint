@@ -30,8 +30,6 @@
 
 use openpaint_core::{Brush, Canvas, Dab, Document, Mode, Page, PageRect, StrokeState};
 
-use crate::history::{BoundsBuilder, CanvasRect};
-
 /// Starting page size. A placeholder until New-document presets exist (§5a says
 /// "300 DPI A4" and friends are presets computing pixel dimensions).
 const PAGE_W: u32 = 2048;
@@ -60,50 +58,33 @@ pub enum StrokeOp {
     Dabs { start: usize, len: usize },
     /// Commit the stroke into the canvas.
     ///
-    /// Carries the region the stroke touched so history can snapshot just that
-    /// rectangle rather than the whole canvas. `None` when the stroke landed
-    /// entirely off-canvas and there is nothing to record.
-    End { bounds: Option<CanvasRect> },
+    /// Carries nothing: the renderer knows exactly which tiles the stroke reached, so
+    /// asking the editor to track a bounding rectangle for history's benefit was both
+    /// less precise and a second place for the page-clipping rule to live.
+    End,
 }
 
-/// Interim cap on total canvas pixels, while the canvas is a single texture.
+/// Largest page dimension, in pixels.
 ///
-/// The dimension limit alone is not enough protection: 8192x8192 at `Rgba16Float` is
-/// **512 MiB** for the canvas plus 128 MiB for the stroke accumulation buffer, which
-/// a Surface sharing system memory will simply fail to allocate — and a failed
-/// allocation is a device error, i.e. another crash.
+/// **Not** a GPU limit any more. The canvas is a pool of tiles, so no allocation is
+/// proportional to page size and `max_texture_dimension_2d` no longer applies —
+/// the previous 8192 px and 16 Mpx ceilings both existed only because the canvas
+/// was one texture, and both are gone.
 ///
-/// 16 Mpx keeps the canvas at ~128 MiB and the accumulation buffer at ~32 MiB, which
-/// is defensible on integrated graphics. It permits e.g. 2048x8192 or 4096x4096.
-/// The tiled resident cache (OPEN_QUESTIONS Q13) removes this entirely, because only
-/// the visible working set is ever resident.
-pub const MAX_CANVAS_PIXELS: u64 = 16 * 1024 * 1024;
+/// What remains is a coordinate-precision limit. Page positions are `f32` in the
+/// camera and in dab geometry, and `f32` represents every integer exactly only up
+/// to 2^24. 65536 leaves a factor of 256 of headroom for intermediate sums, and is
+/// past any real artwork: at 300 DPI it is a 5.5-metre page.
+pub const MAX_PAGE_DIMENSION: u32 = 65_536;
 
-/// Whether a page of this size fits the interim single-texture budget.
-#[must_use]
-pub fn fits_pixel_budget(w: u32, h: u32) -> bool {
-    u64::from(w) * u64::from(h) <= MAX_CANVAS_PIXELS
-}
-
-/// Clamp a requested page size to what the GPU can actually allocate.
+/// Clamp a requested page size to what coordinates can represent.
 ///
-/// Returns `None` when no growth is possible at all, so the caller can say so
-/// instead of attempting a resize that changes nothing.
-///
-/// This exists because the canvas is currently **one texture**, so the page can
-/// never exceed `max_dimension` — 8192 with the default wgpu limits we deliberately
-/// stay within (DECISIONS §2). Exceeding it used to panic inside
-/// `Device::create_texture`, which is not an acceptable outcome for pressing a
-/// button. The real answer is the tiled resident cache (OPEN_QUESTIONS Q13), which
-/// removes the ceiling entirely; until then this is the honest boundary.
+/// Returns `None` when the result would not change the page, so the caller can say so
+/// instead of performing a resize that does nothing.
 #[must_use]
-pub fn clamp_page_size(
-    current: (u32, u32),
-    requested: (u32, u32),
-    max_dimension: u32,
-) -> Option<(u32, u32)> {
-    let w = requested.0.min(max_dimension).max(1);
-    let h = requested.1.min(max_dimension).max(1);
+pub fn clamp_page_size(current: (u32, u32), requested: (u32, u32)) -> Option<(u32, u32)> {
+    let w = requested.0.clamp(1, MAX_PAGE_DIMENSION);
+    let h = requested.1.clamp(1, MAX_PAGE_DIMENSION);
     if (w, h) == current {
         return None;
     }
@@ -119,8 +100,6 @@ pub struct Editor {
     dabs: Vec<Dab>,
     /// Stroke commands awaiting execution, indexing into `dabs`.
     ops: Vec<StrokeOp>,
-    /// Area the in-progress stroke has touched, for history's snapshot.
-    bounds: BoundsBuilder,
     drawing: bool,
 }
 
@@ -139,7 +118,6 @@ impl Editor {
             stroke: StrokeState::new(),
             dabs: Vec::new(),
             ops: Vec::new(),
-            bounds: BoundsBuilder::default(),
             drawing: false,
         }
     }
@@ -209,7 +187,6 @@ impl Editor {
             color_linear_premul: self.brush.color_linear_premul(),
             opacity: self.brush.opacity,
         });
-        self.bounds.clear();
         self.drawing = true;
         let from = self.dabs.len();
         self.brush
@@ -231,11 +208,9 @@ impl Editor {
     /// End the current stroke, committing it to the canvas.
     pub fn stroke_end(&mut self) {
         if self.drawing {
-            let bounds = self.bounds.to_rect(self.canvas());
-            self.ops.push(StrokeOp::End { bounds });
+            self.ops.push(StrokeOp::End);
         }
         self.drawing = false;
-        self.bounds.clear();
         self.stroke = StrokeState::new();
     }
 
@@ -244,9 +219,6 @@ impl Editor {
         let len = self.dabs.len() - from;
         if len == 0 {
             return;
-        }
-        for d in &self.dabs[from..] {
-            self.bounds.add_dab(d);
         }
         self.ops.push(StrokeOp::Dabs { start: from, len });
     }
@@ -332,7 +304,7 @@ mod tests {
 
         let (ops, dabs) = e.pending_stroke();
         assert!(matches!(ops.first(), Some(StrokeOp::Begin { .. })));
-        assert!(matches!(ops.last(), Some(StrokeOp::End { .. })));
+        assert!(matches!(ops.last(), Some(StrokeOp::End)));
         assert_eq!(
             dab_count(ops),
             dabs.len(),
@@ -366,12 +338,11 @@ mod tests {
         );
     }
 
-    /// Ending without a stroke in progress must not queue a stray commit, which
-    /// would bake whatever the previous stroke left behind a second time.
-    /// History snapshots only the region a stroke touched, so `End` must carry it
-    /// and it must actually cover the dabs.
+    /// Ending a stroke must queue exactly one commit, and it carries no geometry: which
+    /// tiles were written is the renderer's knowledge, and duplicating it here was a
+    /// second place for the page-clipping rule to disagree with itself.
     #[test]
-    fn end_reports_the_region_the_stroke_touched() {
+    fn end_queues_a_bare_commit() {
         let mut e = Editor::new();
         e.brush_mut().radius = 10.0;
         e.stroke_begin(200.0, 300.0, 1.0);
@@ -379,29 +350,12 @@ mod tests {
         e.stroke_end();
 
         let (ops, _) = e.pending_stroke();
-        match ops.last() {
-            Some(StrokeOp::End { bounds: Some(r) }) => {
-                // Page coordinates are signed now, so widen deliberately rather than
-                // mixing i32 and u32 at the comparison.
-                let right = r.x + r.w as i32;
-                let bottom = r.y + r.h as i32;
-                assert!(r.x <= 189, "left edge {} too far right", r.x);
-                assert!(right >= 411, "right edge {right} too far left");
-                assert!(r.y <= 289 && bottom >= 311, "vertical bounds {r:?}");
-            }
-            other => panic!("expected End with bounds, got {other:?}"),
-        }
-    }
-
-    /// A stroke entirely off-canvas has nothing to snapshot, and must say so rather
-    /// than producing a rectangle the GPU copy would reject.
-    #[test]
-    fn a_fully_off_canvas_stroke_reports_no_region() {
-        let mut e = Editor::new();
-        e.stroke_begin(-900.0, -900.0, 1.0);
-        e.stroke_end();
-        let (ops, _) = e.pending_stroke();
-        assert!(matches!(ops.last(), Some(StrokeOp::End { bounds: None })));
+        assert_eq!(ops.last(), Some(&StrokeOp::End));
+        assert_eq!(
+            ops.iter().filter(|o| matches!(o, StrokeOp::End)).count(),
+            1,
+            "exactly one commit per stroke"
+        );
     }
 
     #[test]
@@ -424,10 +378,7 @@ mod tests {
             .iter()
             .filter(|o| matches!(o, StrokeOp::Begin { .. }))
             .count();
-        let ends = ops
-            .iter()
-            .filter(|o| matches!(o, StrokeOp::End { .. }))
-            .count();
+        let ends = ops.iter().filter(|o| matches!(o, StrokeOp::End)).count();
         assert_eq!(begins, 2, "each stroke needs its own accumulation reset");
         assert_eq!(ends, 2);
     }
@@ -457,58 +408,67 @@ mod tests {
     #[test]
     fn a_normal_extend_is_not_clamped() {
         assert_eq!(
-            clamp_page_size((2048, 2048), (2048, 2560), 8192),
+            clamp_page_size((2048, 2048), (2048, 2560)),
             Some((2048, 2560))
         );
     }
 
-    /// The case that used to panic inside wgpu: a request past the texture limit.
+    /// Past the coordinate-precision ceiling, the request is clamped rather than refused.
     #[test]
     fn extending_past_the_limit_clamps_to_it() {
         assert_eq!(
-            clamp_page_size((2048, 8000), (2048, 9216), 8192),
-            Some((2048, 8192))
+            clamp_page_size((2048, 2048), (2048, MAX_PAGE_DIMENSION + 1)),
+            Some((2048, MAX_PAGE_DIMENSION))
         );
-    }
-
-    /// Already at the ceiling: there is nothing to do, and the caller needs to know
-    /// rather than resize to the same size and report success.
-    #[test]
-    fn no_growth_available_reports_none() {
-        assert_eq!(clamp_page_size((2048, 8192), (2048, 9216), 8192), None);
     }
 
     #[test]
     fn width_and_height_clamp_independently() {
         assert_eq!(
-            clamp_page_size((8192, 1000), (9000, 2000), 8192),
-            Some((8192, 2000))
+            clamp_page_size((MAX_PAGE_DIMENSION, 1000), (MAX_PAGE_DIMENSION + 9, 2000)),
+            Some((MAX_PAGE_DIMENSION, 2000))
         );
     }
 
     #[test]
     fn a_zero_request_is_clamped_to_something_drawable() {
-        assert_eq!(clamp_page_size((100, 100), (0, 0), 8192), Some((1, 1)));
+        assert_eq!(clamp_page_size((100, 100), (0, 0)), Some((1, 1)));
     }
 
-    /// The dimension limit alone would still permit 8192x8192, which is 512 MiB and
-    /// would fail to allocate on the target hardware -- another crash, just a
-    /// different one.
+    /// Already at the ceiling: there is nothing to do, and the caller needs to know
+    /// rather than resize to the same size and report success.
     #[test]
-    fn the_pixel_budget_rejects_sizes_the_dimension_limit_allows() {
-        assert!(!fits_pixel_budget(8192, 8192));
-        assert!(fits_pixel_budget(2048, 2048), "the default page must fit");
-        assert!(
-            fits_pixel_budget(2048, 8192),
-            "a tall webtoon-ish page should fit"
+    fn no_change_reports_none() {
+        assert_eq!(
+            clamp_page_size(
+                (2048, MAX_PAGE_DIMENSION),
+                (2048, MAX_PAGE_DIMENSION + 1024)
+            ),
+            None
         );
-        assert!(fits_pixel_budget(4096, 4096));
-        assert!(!fits_pixel_budget(4096, 8192));
+        assert_eq!(clamp_page_size((2048, 2048), (2048, 2048)), None);
     }
 
-    /// A4 at 300 DPI has to fit, or the print workflow is impossible.
+    /// The sizes the old single-texture ceilings refused must now be allowed: that they
+    /// were refused at all was the cost of the shortcut, and removing it is the point of
+    /// the tiled canvas.
     #[test]
-    fn a4_at_300_dpi_fits_the_budget() {
-        assert!(fits_pixel_budget(2480, 3508));
+    fn sizes_the_single_texture_ceiling_refused_are_now_allowed() {
+        // Past the old 8192 px dimension limit.
+        assert_eq!(
+            clamp_page_size((800, 8192), (800, 20_000)),
+            Some((800, 20_000)),
+            "a real webtoon strip must be allowed"
+        );
+        // Past the old 16 Mpx budget: a fully-inked A4 at 600 DPI.
+        assert_eq!(
+            clamp_page_size((100, 100), (4960, 7016)),
+            Some((4960, 7016))
+        );
+        // And well past 8192 in both directions at once.
+        assert_eq!(
+            clamp_page_size((100, 100), (10_000, 10_000)),
+            Some((10_000, 10_000))
+        );
     }
 }

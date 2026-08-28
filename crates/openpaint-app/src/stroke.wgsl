@@ -1,41 +1,91 @@
-// GPU dab rasterization and stroke compositing.
+// GPU dab rasterization and stroke compositing, tile by tile.
 //
-// Implements DECISIONS 4a's per-pixel half: the core decides where dabs go, this
-// turns them into pixels. Three passes:
+// Implements DECISIONS 4a's per-pixel half: the core decides where dabs go, this turns
+// them into pixels. Three passes:
 //
-//   1. `dab_*`   - stamp dabs into a single-channel accumulation texture.
-//   2. `paint_*` - composite the accumulated stroke over a target, either the
-//                  canvas texture (baking, at stroke end) or the surface
-//                  (previewing, mid-stroke).
+//   1. `dab_*`     - stamp dabs into one tile of the accumulation pool.
+//   2. `bake_*`    - composite an accumulation tile into the matching canvas tile, once,
+//                    when the stroke ends.
+//   3. `preview_*` - composite the accumulation tiles onto the surface, mid-stroke, so
+//                    the canvas underneath stays untouched until the stroke commits.
 //
 // # Why accumulation blending is free
 //
-// The model is `a += flow * coverage * (1 - a)` per dab (see
-// openpaint_core::stroke). With blend factors (One, OneMinusSrc) that is exactly
-// what the blend unit computes: `dst = src + dst * (1 - src)`. So the fragment
-// shader only outputs `flow * coverage` and the hardware does the accumulation --
-// no read-modify-write, no ping-pong target.
+// The model is `a += flow * coverage * (1 - a)` per dab (see openpaint_core::stroke).
+// With blend factors (One, OneMinusSrc) that is exactly what the blend unit computes:
+// `dst = src + dst * (1 - src)`. So the fragment shader only outputs `flow * coverage`
+// and the hardware does the accumulation -- no read-modify-write, no ping-pong target.
+//
+// # Why accumulation is tiled too
+//
+// Flow accumulates per dab while opacity caps the stroke total, so a stroke has to stay
+// separable from what is underneath it right up until it commits. That means the
+// accumulation buffer must cover everywhere the stroke has been -- which is potentially
+// the whole canvas. A page-sized accumulation texture would reintroduce exactly the
+// ceiling the tiled canvas removed, so accumulation uses its own sparse tile pool, one
+// layer per tile the stroke has touched.
+//
+// # Painting is clipped to the page; storage is not
+//
+// Dab quads are clamped to the page rectangle in *page* space. Clamping the position and
+// deriving the distance-from-centre from the clamped point keeps coverage exact, because
+// the falloff is a function of that distance and nothing else. It also means the bake
+// needs no clipping of its own: paint outside the page was never accumulated.
 //
 // # The duplicated falloff curve
 //
-// `dab_fs` below is a *second* implementation of `Dab::coverage_at_distance`, and
-// two copies of a curve can drift. That is a real risk, mitigated deliberately:
-// `tests/gpu_matches_cpu.rs` rasterizes the same dabs through both paths and
-// compares the pixels. If you change the curve here, change it there, and the test
-// is what tells you if you forgot.
+// `dab_fs` below is a *second* implementation of `Dab::coverage_at_distance`, and two
+// copies of a curve drift. That is a real risk, mitigated deliberately: the tests in
+// `stroke_layer.rs` rasterize the same dabs through both paths and compare pixels. If you
+// change the curve here, change it there, and the test is what tells you if you forgot.
 
-// ---------------------------------------------------------------- dab stamping
-
-struct CanvasSize {
-    // xy = page extent in pixels, zw = page origin in page coordinates.
-    //
-    // The origin is needed because dabs arrive in *page* coordinates, which stay stable
-    // when the page is extended, while a texture is always zero-based. Subtracting it
-    // here is the whole cost of that stability on the GPU side.
-    size: vec4<f32>,
+// Stroke colour and its ceiling.
+struct Paint {
+    // Linear and premultiplied (alpha normally 1).
+    color: vec4<f32>,
+    // x = ceiling for the whole stroke; rest unused.
+    opacity: vec4<f32>,
 };
 
-@group(0) @binding(0) var<uniform> canvas: CanvasSize;
+// Per-tile parameters, selected with a dynamic offset.
+//
+// Dynamic offsets rather than one write per tile: `Queue::write_buffer` applies every
+// write in a submission *before* any of its command buffers run, so rewriting one uniform
+// between passes would leave every pass reading the last tile's values. That hazard has
+// already produced one visible bug in this app (see `upload_dabs`).
+// The page rectangle deliberately lives only in `Xform`, so clipping has one source of
+// truth shared by every pass.
+struct TileParams {
+    // xy = tile origin in page coordinates, z = tile size in pixels.
+    tile: vec4<f32>,
+    // x = accumulation layer for this tile.
+    layer: vec4<u32>,
+};
+
+// page -> NDC, matching crate::view::PageToNdc.
+struct Xform {
+    x_row: vec4<f32>,
+    y_row: vec4<f32>,
+    page: vec4<f32>,
+    params: vec4<f32>,  // x = tile size
+};
+
+@group(0) @binding(0) var<uniform> paint: Paint;
+@group(0) @binding(1) var accum: texture_2d_array<f32>;
+@group(0) @binding(2) var accum_samp: sampler;
+@group(1) @binding(0) var<uniform> tp: TileParams;
+@group(2) @binding(0) var<uniform> xf: Xform;
+
+// Two triangles over the unit square, (0,0) at the top-left in page space.
+fn quad(vid: u32) -> vec2<f32> {
+    var uvs = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
+        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
+    );
+    return uvs[vid];
+}
+
+// ---------------------------------------------------------------- dab stamping
 
 struct DabInst {
     @location(0) center: vec2<f32>,
@@ -46,9 +96,8 @@ struct DabInst {
 
 struct DabOut {
     @builtin(position) pos: vec4<f32>,
-    // Offset from the dab centre in canvas pixels. Interpolated, so at each
-    // fragment this is the pixel *centre* relative to the dab -- matching what the
-    // CPU reference samples.
+    // Offset from the dab centre in page pixels. Interpolated, so at each fragment this is
+    // the pixel *centre* relative to the dab -- matching what the CPU reference samples.
     @location(0) local: vec2<f32>,
     @location(1) radius: f32,
     @location(2) hardness: f32,
@@ -63,18 +112,29 @@ fn dab_vs(@builtin(vertex_index) vid: u32, inst: DabInst) -> DabOut {
     );
     // One pixel of slack so the antialiased rim is never clipped by the quad.
     let extent = inst.radius + 1.0;
-    let offset = offsets[vid] * extent;
-    // Page coordinates -> texture coordinates.
-    let p = inst.center + offset - canvas.size.zw;
+    let raw = inst.center + offsets[vid] * extent;
+
+    // Clip to the page. Per-axis clamping keeps the quad an axis-aligned rectangle, and
+    // the two triangles clamp their shared corners identically, so the quad stays
+    // watertight. A dab entirely outside the page collapses to zero area and draws
+    // nothing.
+    let p = clamp(raw, xf.page.xy, xf.page.zw);
+
+    // Page coordinates -> this tile's own texture space. Geometry outside the tile is
+    // clipped by the render target, so no per-tile culling is needed on the CPU.
+    let ts = tp.tile.z;
+    let local_px = p - tp.tile.xy;
 
     var out: DabOut;
     out.pos = vec4<f32>(
-        p.x / canvas.size.x * 2.0 - 1.0,
-        1.0 - p.y / canvas.size.y * 2.0,
+        local_px.x / ts * 2.0 - 1.0,
+        1.0 - local_px.y / ts * 2.0,
         0.0,
         1.0,
     );
-    out.local = offset;
+    // Derived from the *clamped* position, so coverage is still exactly a function of
+    // distance from the dab centre.
+    out.local = p - inst.center;
     out.radius = inst.radius;
     out.hardness = inst.hardness;
     out.flow = inst.flow;
@@ -95,75 +155,64 @@ fn dab_fs(in: DabOut) -> @location(0) vec4<f32> {
         coverage = 1.0 - (dist - inner) / (in.radius - inner);
     }
     let deposit = coverage * clamp(in.flow, 0.0, 1.0);
-    // Same value in every channel: the target is single-channel, and writing it to
-    // .a as well keeps the blend valid whichever factor a pipeline picks.
+    // Same value in every channel: the target is single-channel, and writing it to .a as
+    // well keeps the blend valid whichever factor a pipeline picks.
     return vec4<f32>(deposit, deposit, deposit, deposit);
 }
 
 // ------------------------------------------------------- stroke compositing
 
-struct Paint {
-    // Stroke colour, linear and premultiplied (alpha normally 1).
-    color: vec4<f32>,
-    // Ceiling for the whole stroke; w/z unused.
-    opacity: vec4<f32>,
-};
-
-// Canvas corners in NDC, packed two per vec4, matching crate::view::Placement.
-struct Placement {
-    tl_tr: vec4<f32>,
-    bl_br: vec4<f32>,
-};
-
-@group(0) @binding(0) var<uniform> paint: Paint;
-@group(0) @binding(1) var accum_tex: texture_2d<f32>;
-@group(0) @binding(2) var accum_samp: sampler;
-@group(1) @binding(0) var<uniform> placement: Placement;
-
 struct PaintOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) layer: u32,
 };
 
-fn quad_uv(vid: u32) -> vec2<f32> {
-    var uvs = array<vec2<f32>, 6>(
-        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
-        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
-    );
-    return uvs[vid];
-}
-
-/// Bake: cover the whole target exactly, for compositing into the canvas texture.
+/// Bake: cover one canvas tile exactly. The accumulation tile and the canvas tile are the
+/// same size and aligned, so the quad is the whole target and uv is the quad.
 @vertex
-fn paint_vs_identity(@builtin(vertex_index) vid: u32) -> PaintOut {
-    let uv = quad_uv(vid);
+fn bake_vs(@builtin(vertex_index) vid: u32) -> PaintOut {
+    let q = quad(vid);
     var out: PaintOut;
-    out.pos = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
-    out.uv = uv;
+    out.pos = vec4<f32>(q.x * 2.0 - 1.0, 1.0 - q.y * 2.0, 0.0, 1.0);
+    out.uv = q;
+    out.layer = tp.layer.x;
     return out;
 }
 
-/// Preview: follow the on-screen canvas quad, so the in-progress stroke pans,
-/// zooms, and rotates with the canvas.
-@vertex
-fn paint_vs_placed(@builtin(vertex_index) vid: u32) -> PaintOut {
-    let uv = quad_uv(vid);
-    let top = mix(placement.tl_tr.xy, placement.tl_tr.zw, uv.x);
-    let bottom = mix(placement.bl_br.xy, placement.bl_br.zw, uv.x);
+struct TileInst {
+    @location(0) coord: vec2<i32>,
+    @location(1) layer: u32,
+};
 
+/// Preview: one instanced quad per accumulation tile, following the on-screen canvas so
+/// the in-progress stroke pans, zooms, and rotates with it.
+@vertex
+fn preview_vs(@builtin(vertex_index) vid: u32, inst: TileInst) -> PaintOut {
+    let ts = xf.params.x;
+    let t0 = vec2<f32>(inst.coord) * ts;
+    let t1 = t0 + vec2<f32>(ts, ts);
+    // Same clamp as the canvas tiles, including `max(..., c0)`: without it a tile outside
+    // the page yields an inverted quad, which still rasterizes with culling off.
+    let c0 = max(t0, xf.page.xy);
+    let c1 = max(min(t1, xf.page.zw), c0);
+    let p = mix(c0, c1, quad(vid));
+
+    let h = vec3<f32>(p, 1.0);
     var out: PaintOut;
-    out.pos = vec4<f32>(mix(top, bottom, uv.y), 0.0, 1.0);
-    out.uv = uv;
+    out.pos = vec4<f32>(dot(xf.x_row.xyz, h), dot(xf.y_row.xyz, h), 0.0, 1.0);
+    out.uv = (p - t0) / ts;
+    out.layer = inst.layer;
     return out;
 }
 
 @fragment
 fn paint_fs(in: PaintOut) -> @location(0) vec4<f32> {
-    let accumulated = textureSample(accum_tex, accum_samp, in.uv).r;
-    // Opacity caps the stroke's total contribution -- this is the whole reason
-    // accumulation is kept separate from the canvas until the stroke ends.
+    let accumulated = textureSample(accum, accum_samp, in.uv, i32(in.layer)).r;
+    // Opacity caps the stroke's total contribution -- the whole reason accumulation is
+    // kept separate from the canvas until the stroke ends.
     let a = clamp(accumulated, 0.0, 1.0) * paint.opacity.x;
-    // Premultiplied output, so the target's (One, OneMinusSrcAlpha) blend is a
-    // plain Porter-Duff "over".
+    // Premultiplied output, so the target's (One, OneMinusSrcAlpha) blend is a plain
+    // Porter-Duff "over".
     return vec4<f32>(paint.color.rgb * a, a);
 }

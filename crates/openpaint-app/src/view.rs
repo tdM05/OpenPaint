@@ -3,7 +3,7 @@
 //! This is *view* state, deliberately separate from the document and from the GPU.
 //! Two things must agree exactly or strokes land where the user didn't draw:
 //!
-//! 1. where the canvas quad is drawn ([`View::placement`]), and
+//! 1. where canvas geometry is drawn ([`View::page_to_ndc`]), and
 //! 2. where an input sample maps to in canvas space ([`View::screen_to_canvas`]).
 //!
 //! They are the forward and inverse of one transform, defined once here, which is
@@ -19,11 +19,11 @@
 //! `center` is the canvas point shown at the middle of the visible area, `scale`
 //! is screen pixels per canvas pixel, and `theta` is the canvas rotation.
 //!
-//! Rotation is included from the start even though only a keyboard binding drives
-//! it so far. It is what forces the drawn quad to be four independent corners
-//! rather than an axis-aligned rectangle — retrofitting that later would mean
-//! rewriting the placement uniform, the shader, and both directions of this
-//! transform. Building it once is cheaper than building it twice.
+//! Rotation is included from the start even though only a keyboard binding drives it so
+//! far. It is what forces the transform to be a general affine rather than an
+//! axis-aligned rectangle — retrofitting that later would mean rewriting the uniform, the
+//! shaders, and both directions of this transform. Building it once is cheaper than
+//! building it twice.
 
 use openpaint_core::Canvas;
 
@@ -43,18 +43,35 @@ const ZOOM_PER_NOTCH: f32 = 1.1;
 /// increments).
 pub const ROTATE_STEP: f32 = std::f32::consts::FRAC_PI_4 / 3.0;
 
-/// Where the canvas quad sits, as four corners in normalized device coordinates.
+/// The page→NDC transform as a 2×3 affine.
 ///
-/// Four corners rather than a min/max rectangle because a rotated canvas is not
-/// axis-aligned. Order is top-left, top-right, bottom-left, bottom-right *in
-/// canvas space* — so under rotation they are no longer visually top/left, and the
-/// names refer to which canvas corner each one is.
+/// The canvas is drawn as many tile quads whose page positions the shader only learns from
+/// per-instance data, so what it needs is the transform itself. An earlier version handed
+/// the shader four precomputed NDC corners instead, which could place exactly one known
+/// quad and nothing else.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Placement {
-    pub tl: [f32; 2],
-    pub tr: [f32; 2],
-    pub bl: [f32; 2],
-    pub br: [f32; 2],
+pub struct PageToNdc {
+    /// `ndc.x = x_row·(px, py, 1)`
+    pub x_row: [f32; 3],
+    /// `ndc.y = y_row·(px, py, 1)`
+    pub y_row: [f32; 3],
+}
+
+impl PageToNdc {
+    /// Map a page coordinate to normalized device coordinates.
+    ///
+    /// The CPU mirror of what the vertex shaders do with these rows, and test-only for
+    /// exactly that reason: it exists so the affine can be checked against
+    /// [`View::canvas_to_screen`], which is the property that stops drawn geometry and
+    /// input mapping drifting apart. The shipping path applies the rows on the GPU.
+    #[cfg(test)]
+    #[must_use]
+    pub fn apply(&self, px: f32, py: f32) -> [f32; 2] {
+        [
+            self.x_row[0] * px + self.x_row[1] * py + self.x_row[2],
+            self.y_row[0] * px + self.y_row[1] * py + self.y_row[2],
+        ]
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -278,27 +295,32 @@ impl View {
         )
     }
 
-    /// Where to draw the canvas quad, in NDC.
+    /// The page→NDC transform, for drawing geometry the shader positions itself.
+    ///
+    /// Built by *sampling* the forward transform at three points rather than re-deriving
+    /// the trigonometry. The transform is affine, so those three samples determine it
+    /// exactly — and this way there is no second copy of the maths that could drift from
+    /// [`View::canvas_to_screen`], which is the one property this module exists to
+    /// guarantee (see the module note).
     #[must_use]
-    pub fn placement(&self, surface_w: u32, surface_h: u32, canvas: &Canvas) -> Placement {
+    pub fn page_to_ndc(&self, surface_w: u32, surface_h: u32) -> PageToNdc {
+        let at = |px: f32, py: f32| self.canvas_to_ndc(px, py, surface_w, surface_h);
+        let o = at(0.0, 0.0);
+        let x = at(1.0, 0.0);
+        let y = at(0.0, 1.0);
+        PageToNdc {
+            x_row: [x[0] - o[0], y[0] - o[0], o[0]],
+            y_row: [x[1] - o[1], y[1] - o[1], o[1]],
+        }
+    }
+
+    /// Forward transform all the way to normalized device coordinates.
+    fn canvas_to_ndc(&self, cx: f32, cy: f32, surface_w: u32, surface_h: u32) -> [f32; 2] {
         let sw = surface_w.max(1) as f32;
         let sh = surface_h.max(1) as f32;
+        let (x, y) = self.canvas_to_screen(cx, cy, surface_w, surface_h);
         // Pixels -> NDC: x maps 0..sw to -1..1, y maps 0..sh to 1..-1.
-        let to_ndc = |(x, y): (f32, f32)| [x / sw * 2.0 - 1.0, 1.0 - y / sh * 2.0];
-        let corner = |cx: f32, cy: f32| to_ndc(self.canvas_to_screen(cx, cy, surface_w, surface_h));
-
-        // The page's own corners, which start at its origin rather than at zero.
-        let (ox, oy) = canvas.origin();
-        let (ex, ey) = canvas.end();
-        let (x0, y0) = (ox as f32, oy as f32);
-        let (x1, y1) = (ex as f32, ey as f32);
-
-        Placement {
-            tl: corner(x0, y0),
-            tr: corner(x1, y0),
-            bl: corner(x0, y1),
-            br: corner(x1, y1),
-        }
+        [x / sw * 2.0 - 1.0, 1.0 - y / sh * 2.0]
     }
 
     /// Map a window position (physical pixels) to canvas pixels.
@@ -362,6 +384,43 @@ mod tests {
         v
     }
 
+    /// The affine and the point-by-point forward transform are the same map. This is the
+    /// property that lets tiles be placed by the shader while input keeps using
+    /// `screen_to_canvas`: if they ever disagree, strokes land where nobody drew.
+    ///
+    /// Checked under rotation and a negative origin specifically, because those are where
+    /// a hand-derived matrix would go wrong (a sign slip in the rotation, or an assumption
+    /// that the page starts at zero).
+    #[test]
+    fn the_affine_agrees_with_the_forward_transform() {
+        let mut v = fitted();
+        v.rotate_by(0.7, (300.0, 200.0), SW, SH);
+        v.pan_by_screen(37.0, -19.0);
+
+        let m = v.page_to_ndc(SW, SH);
+        for (px, py) in [
+            (0.0, 0.0),
+            (1000.0, 1000.0),
+            (-512.0, -768.0),
+            (123.5, -4.25),
+            // A webtoon strip is genuinely this tall, so the transform has to stay
+            // accurate out here and not only near the origin.
+            (800.0, 40000.0),
+        ] {
+            let expect = v.canvas_to_ndc(px, py, SW, SH);
+            let got = m.apply(px, py);
+            // Relative, because both sides are f32 sums whose rounding grows with the
+            // magnitude of the input. The affine is exact in exact arithmetic; what is
+            // being checked is that it is the *same map*, not that f32 is lossless.
+            let tol = |e: f32| 1e-4 * (1.0 + e.abs());
+            assert!(
+                (got[0] - expect[0]).abs() < tol(expect[0])
+                    && (got[1] - expect[1]).abs() < tol(expect[1]),
+                "at ({px}, {py}): affine {got:?} vs forward {expect:?}"
+            );
+        }
+    }
+
     /// Round-tripping a screen point through both directions must return it. This
     /// is the property that stops strokes landing away from the pen, and it must
     /// hold under every combination of pan, zoom, and rotation.
@@ -390,7 +449,8 @@ mod tests {
                      ({sx},{sy}) -> ({cx},{cy}) -> ({bx},{by})"
                 );
             }
-            let _ = v.placement(SW, SH, &c);
+            let _ = v.page_to_ndc(SW, SH);
+            let _ = &c;
         }
     }
 
@@ -408,8 +468,16 @@ mod tests {
     fn fit_shows_the_whole_canvas() {
         let c = canvas();
         let v = fitted();
-        let p = v.placement(SW, SH, &c);
-        for corner in [p.tl, p.tr, p.bl, p.br] {
+        let m = v.page_to_ndc(SW, SH);
+        let (ox, oy) = c.origin();
+        let (ex, ey) = c.end();
+        for (px, py) in [
+            (ox as f32, oy as f32),
+            (ex as f32, oy as f32),
+            (ox as f32, ey as f32),
+            (ex as f32, ey as f32),
+        ] {
+            let corner = m.apply(px, py);
             assert!(
                 (-1.0..=1.0).contains(&corner[0]) && (-1.0..=1.0).contains(&corner[1]),
                 "corner {corner:?} outside the viewport after fit"
@@ -465,7 +533,8 @@ mod tests {
                 (sx - 450.0).abs() < 0.05 && (sy - 270.0).abs() < 0.05,
                 "rot {rot}: grabbed point went to ({sx},{sy}), expected (450,270)"
             );
-            let _ = v.placement(SW, SH, &c);
+            let _ = v.page_to_ndc(SW, SH);
+            let _ = &c;
         }
     }
 
@@ -585,7 +654,7 @@ mod tests {
         let c = canvas();
         let mut v = View::new();
         v.fit(0, 0, &c);
-        let _ = v.placement(0, 0, &c);
+        let _ = v.page_to_ndc(0, 0);
         let _ = v.screen_to_canvas(0.0, 0.0, 0, 0, &c);
     }
 

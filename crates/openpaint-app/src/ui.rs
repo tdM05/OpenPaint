@@ -60,13 +60,15 @@ pub enum CropAction {
 
 pub struct Status<'a> {
     /// Undo depth, redo depth, snapshot bytes held.
-    pub history: (usize, usize, usize),
+    pub history: (usize, usize, u64),
     pub message: Option<&'a str>,
     pub page_size: (u32, u32),
     /// Present while the crop tool is active.
     pub crop: Option<&'a CropOverlay>,
     /// The crop rectangle, for display.
     pub crop_rect: Option<(i32, i32, u32, u32)>,
+    /// Resident canvas tiles and pool capacity.
+    pub residency: (u32, u32),
 }
 
 /// What the panel wants the app to do, collected during the frame.
@@ -79,6 +81,8 @@ pub struct Outcome {
     pub wants_repaint: bool,
     pub extend: Option<(Side, u32)>,
     pub crop: Option<CropAction>,
+    /// Discard the tiles outside the page, reclaiming their memory.
+    pub trim: bool,
 }
 
 pub struct Ui {
@@ -168,6 +172,7 @@ impl Ui {
         let mut extend = None;
         let mut extend_amount = self.extend_amount;
         let mut crop_action = None;
+        let mut trim = false;
 
         let output = self.ctx.run(input, |ctx| {
             egui::SidePanel::left("brush-panel")
@@ -262,8 +267,27 @@ impl Ui {
                     ));
                     ui.label(
                         egui::RichText::new(
-                            "Ctrl+Z undoes, Ctrl+Shift+Z or Ctrl+Y redoes. Snapshots \
-                             cover only the area a stroke touched.",
+                            "Ctrl+Z undoes, Ctrl+Shift+Z or Ctrl+Y redoes. Snapshots cover \
+                             only the tiles a stroke touched.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.separator();
+                    ui.heading("Canvas memory");
+                    let (used, capacity) = status.residency;
+                    ui.label(format!(
+                        "{used} / {capacity} tiles ({:.0} MiB of {:.0} MiB)",
+                        used as f32 * 0.5,
+                        capacity as f32 * 0.5
+                    ));
+                    if ui.button("Trim to canvas").clicked() {
+                        trim = true;
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Cropping keeps the pixels outside the page, so nothing is lost \
+                             by accident. Trim discards them for good -- undoably.",
                         )
                         .small()
                         .weak(),
@@ -439,6 +463,7 @@ impl Ui {
                 .is_some_and(|v| v.repaint_delay.is_zero()),
             extend,
             crop: crop_action,
+            trim,
         }
     }
 }

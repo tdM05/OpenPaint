@@ -174,18 +174,31 @@ impl Canvas {
     /// because a GPU texture is zero-based, so its contents must be copied to a new
     /// position within the new texture.
     ///
-    /// No pixel is touched and no tile is rekeyed. Resizing is a few integers; only
-    /// dropping now-outside tiles does any work.
+    /// **Nothing is destroyed.** Tiles that fall outside the new rectangle are kept, which
+    /// is what makes a crop non-destructive (`docs/DECISIONS.md` §5c): undo is LIFO, so it
+    /// cannot recover a crop noticed an hour later, and that makes discarding here a way to
+    /// lose work permanently. Painting still stops at the page edge — [`Canvas::contains`]
+    /// is unchanged — so retained pixels are visible again only if the page is extended
+    /// back out. [`Canvas::trim`] is the one operation that discards them, on purpose.
+    ///
+    /// No pixel is touched, no tile is rekeyed, and no tile is dropped. A resize is a few
+    /// integers.
     pub fn resize(&mut self, rect: PageRect) -> (i32, i32) {
         let shift = (rect.x - self.origin_x, rect.y - self.origin_y);
         self.origin_x = rect.x;
         self.origin_y = rect.y;
         self.width = rect.w;
         self.height = rect.h;
+        shift
+    }
 
-        // A crop can leave tiles wholly outside the canvas; drop them so the memory is
-        // released. Partially-covered tiles stay, since part of them is still visible,
-        // and `contains` keeps the hidden part unpaintable.
+    /// Discard every tile lying entirely outside the canvas, returning how many went.
+    ///
+    /// The **only** operation that destroys pixels, which is why it is explicit and separate
+    /// from [`Canvas::resize`]. A partially covered tile stays: part of it is still inside,
+    /// and `contains` already keeps the outside part unpaintable.
+    pub fn trim(&mut self) -> usize {
+        let before = self.tiles.len();
         let (ox, oy) = (self.origin_x, self.origin_y);
         let (ex, ey) = self.end();
         let tile = TILE_SIZE as i32;
@@ -194,9 +207,7 @@ impl Canvas {
             let y0 = coord.1 * tile;
             x0 + tile > ox && y0 + tile > oy && x0 < ex && y0 < ey
         });
-        self.dirty.clear();
-
-        shift
+        before - self.tiles.len()
     }
 
     /// Iterate all currently allocated tiles (coord + tile).
@@ -372,9 +383,13 @@ mod tests {
         assert!(c.contains(-399, 20), "the added space should be paintable");
     }
 
-    /// Shrinking drops what falls outside -- that is what a crop is.
+    /// Shrinking hides what falls outside but **keeps** it.
+    ///
+    /// This is the property that makes a crop safe (DECISIONS §5c). Undo is LIFO, so it
+    /// cannot recover a crop the artist notices an hour later — dropping the tiles here
+    /// would be a way to lose hours of work with no route back.
     #[test]
-    fn shrinking_crops_content_outside_the_new_bounds() {
+    fn shrinking_hides_content_outside_the_new_bounds_but_keeps_it() {
         let mut c = Canvas::new(600, 600);
         c.blend_pixel(50, 50, BLACK);
         c.blend_pixel(500, 500, BLACK);
@@ -382,8 +397,32 @@ mod tests {
         c.resize(PageRect::new(0, 0, 200, 200));
         assert!(is_paint(&c, 50, 50), "in-bounds content should survive");
         assert_eq!(c.width(), 200);
-        // The far pixel is outside the new bounds and simply gone.
-        assert!(c.tile((1, 1)).is_none() && c.tile((2, 2)).is_none());
+        assert!(
+            c.tile((1, 1)).is_some(),
+            "the cropped-away tile was destroyed"
+        );
+        // ...but it is outside the page, so it cannot be painted on.
+        assert!(!c.contains(500, 500));
+
+        // Extending back out brings it into view again, unharmed.
+        c.resize(PageRect::new(0, 0, 600, 600));
+        assert!(is_paint(&c, 500, 500), "content did not come back");
+    }
+
+    /// Trim is the one operation that discards pixels, so it has to actually discard them --
+    /// otherwise the memory it exists to reclaim is never reclaimed.
+    #[test]
+    fn trim_discards_only_what_is_wholly_outside() {
+        let mut c = Canvas::new(600, 600);
+        c.blend_pixel(50, 50, BLACK);
+        c.blend_pixel(500, 500, BLACK);
+        c.resize(PageRect::new(0, 0, 200, 200));
+
+        assert_eq!(c.trim(), 1, "should have dropped exactly the outside tile");
+        assert!(c.tile((1, 1)).is_none());
+        // Tile (0, 0) is only partly inside the 200x200 page, and must survive.
+        assert!(is_paint(&c, 50, 50), "partially-covered tile was dropped");
+        assert_eq!(c.trim(), 0, "trimming twice should find nothing");
     }
 
     #[test]

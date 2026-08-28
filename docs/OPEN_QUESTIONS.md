@@ -209,7 +209,7 @@ blending (to avoid dark edge fringing). Tracked so we hold ourselves to it.
 
 ---
 
-### Q13. Tile residency + who owns tile pixels ⚠️ NEEDS DESIGN BEFORE LAYERS/UNDO
+### Q13. Tile residency + who owns tile pixels — HALF RESOLVED 2026-08-28
 Falls out of the Surface-class target and "any canvas size" (DECISIONS §2): the
 GPU can only hold a bounded working set of tiles, so ownership has to be explicit.
 
@@ -236,19 +236,49 @@ per-stroke (assumed) or finer; interaction with the growable/multi-page model.
 its ownership model has to be settled first or both get reworked. This is the same
 sequencing risk already noted against the Phase-2 page model.
 
-**Added 2026-08-28 — non-destructive crop rides with this.** DECISIONS §5c settled that
-a crop must retain the pixels outside the new page rectangle, because undo is LIFO and
-cannot recover a crop noticed late. That requires the pixel store to be decoupled from
-the page rectangle, which on today's single page-sized texture would mean a
-union-bounding-box texture that pays for empty space — so it belongs here, where sparse
-tiles pay only where paint exists. Concretely this work must deliver:
-- Tiles outside the page rectangle are **kept**, not dropped, by `Canvas::resize`.
-- Rendering and painting are both bounded by the page rectangle; storage is not.
-- **Trim to canvas**: the one explicit, undoable action that discards out-of-page tiles.
-- Deletion of the resize snapshot path (`Op::Resize::before`, `PageResize::loses_pixels`),
-  which becomes dead once a crop destroys nothing.
-- The pixel budget must be charged against *resident* tiles, not the page area — the
-  current 16 Mpx page ceiling exists only because the canvas is one texture.
+---
+
+## ✅ RESOLVED 2026-08-28 — the tile store itself
+
+Built; see DECISIONS §4d for the design and what it deleted. Delivered:
+- A bounded GPU tile pool (2D array texture, capacity fixed from a byte budget).
+- Sparse tiles: memory scales with **painted** area, not page area.
+- Storage decoupled from the page rectangle → **non-destructive crop** (§5c). Tiles
+  outside the page are kept; drawing and painting are clipped to the page; storage is
+  not.
+- **Trim to canvas**, the one explicit, undoable action that discards out-of-page tiles.
+- Per-tile copy-on-write undo snapshots in their own pool, so the budget is exact.
+- The resize snapshot path deleted (`Op::Resize::before`, `PageResize::loses_pixels`).
+- Both page-size ceilings gone. The only remaining page limit is 65536 px per side, and
+  it is coordinate precision, not memory.
+
+## ⚠️ STILL OPEN — spilling, and therefore true "any canvas size"
+
+The pool bounds residency, but non-resident tiles currently have **nowhere to go**. When
+it fills, painting stops and the status bar says so. That is honest, not finished:
+DECISIONS §2 requires any canvas size, and a long webtoon inked throughout exceeds
+96 MiB of tiles.
+
+What is left:
+- **Async readback on eviction** (`map_async`, never stalling a frame) into a CPU tile
+  store, and re-upload on demand. `openpaint_core::Canvas` already holds CPU tiles and
+  `upload_dirty` is already the re-upload seam, so the shape exists.
+- **Eviction policy.** Nothing tracks use order yet — the pool is a slab, deliberately,
+  with `TileMap` owning the key→layer mapping, so an LRU belongs beside the map rather
+  than inside the pool.
+- **How the budget adapts to available memory.** 96 MiB is a fixed guess. Query wgpu
+  limits, or measure?
+- **On-disk backing** for documents larger than RAM, and its relationship to the native
+  format (Q6).
+- **Undo snapshots spilling too.** They have their own 64 MiB pool and currently evict
+  the oldest operation rather than spilling it.
+
+Also worth revisiting once residency is under pressure: the canvas draw currently emits
+an instance for **every** resident tile intersecting the page, not just the ones on
+screen. Correct and cheap at ~200 tiles; viewport culling is the obvious next step when
+the resident set is large. And zoomed-out quality is still unfiltered beyond a single
+mip — a real resolution pyramid (as CSP and Procreate both have) is a separate piece of
+work, not a regression from the single-texture version, which had no mips either.
 
 ### Q14. Pen input cannot reach the UI layer - ARCHITECTURAL, blocks any real UI
 Surfaced 2026-08-27 when the egui debug panel landed: **only the mouse can operate
