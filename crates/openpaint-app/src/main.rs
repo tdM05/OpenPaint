@@ -35,6 +35,7 @@
 
 mod canvas_renderer;
 mod editor;
+mod export;
 mod history;
 mod input;
 mod input_mouse;
@@ -97,6 +98,9 @@ struct OpenPaint {
     /// Canvas navigation (pan/zoom) state. Kept in the shell rather than the
     /// view because it is *interaction* state, not camera state.
     nav: Nav,
+    /// Result of the most recent export, shown in the panel so the outcome isn't
+    /// only visible in a console the user may not be watching.
+    last_export: Option<String>,
     /// Set while we're inside one of our own event handlers, so a nested
     /// message pump can't re-enter our GPU/input work. See the module-level
     /// "Windows Ink reentrancy" note - without this, a re-entered frame can
@@ -156,6 +160,7 @@ impl Default for OpenPaint {
             input: Box::new(MouseBackend::new()),
             pen_events: Vec::new(),
             nav: Nav::default(),
+            last_export: None,
             in_dispatch: false,
         }
     }
@@ -265,6 +270,10 @@ impl OpenPaint {
                 let Key::Character(c) = &key.logical_key else {
                     return false;
                 };
+                if matches!(c.as_str(), "s" | "S") {
+                    self.export_png();
+                    return true;
+                }
                 let redo = match c.as_str() {
                     "z" | "Z" => self.nav.modifiers.shift_key(),
                     "y" | "Y" => true,
@@ -295,6 +304,30 @@ impl OpenPaint {
             }
             _ => false,
         }
+    }
+
+    /// Export the canvas to a PNG beside the executable's working directory.
+    ///
+    /// Ctrl+S is "export" rather than "save" for now, deliberately: there is no
+    /// native document format yet, and inventing one before the page model exists
+    /// would guarantee a migration (OPEN_QUESTIONS Q6).
+    fn export_png(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let path = export::default_path();
+        self.last_export = Some(match renderer.export_png(&path) {
+            Ok(()) => {
+                let shown = path.display().to_string();
+                println!("exported {shown}");
+                format!("Exported {shown}")
+            }
+            Err(e) => {
+                eprintln!("export failed: {e}");
+                format!("Export failed: {e}")
+            }
+        });
+        self.request_redraw();
     }
 
     /// Handle canvas navigation: pan, zoom, rotate, fit. Returns `true` if the
@@ -439,6 +472,7 @@ impl OpenPaint {
         let mut ui_wants_repaint = false;
         let mut ui_inset_left = None;
         let history_status = renderer.history_status();
+        let last_export = self.last_export.clone();
         let window = renderer.window().clone();
         // Borrowed, not copied: a copy would mean any future UI control that edits
         // the view silently writes to a dead value. Disjoint field borrows make
@@ -446,8 +480,14 @@ impl OpenPaint {
         let view = &self.view;
         let result = renderer.render(placement, |gpu| {
             if let Some(ui) = ui {
-                ui_wants_repaint =
-                    ui.render(&window, gpu, editor.brush_mut(), view, history_status);
+                ui_wants_repaint = ui.render(
+                    &window,
+                    gpu,
+                    editor.brush_mut(),
+                    view,
+                    history_status,
+                    last_export.as_deref(),
+                );
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });

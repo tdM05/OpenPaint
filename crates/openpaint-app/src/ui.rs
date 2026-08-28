@@ -101,6 +101,7 @@ impl Ui {
         brush: &mut Brush,
         view: &View,
         history: (usize, usize, usize),
+        last_export: Option<&str>,
     ) -> bool {
         let Overlay {
             device,
@@ -211,6 +212,19 @@ impl Ui {
                         .small()
                         .weak(),
                     );
+                    ui.separator();
+                    ui.heading("Export");
+                    ui.label(
+                        egui::RichText::new(
+                            "Ctrl+S writes a PNG in the working directory. Not a \
+                             save format yet: that waits for the page model (Q6).",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    if let Some(msg) = last_export {
+                        ui.label(egui::RichText::new(msg).small());
+                    }
                 });
         });
 

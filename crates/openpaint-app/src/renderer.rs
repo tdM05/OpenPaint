@@ -257,6 +257,22 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 
+    /// Read the canvas back and write it as an sRGB PNG.
+    ///
+    /// Stalls on the GPU while the readback maps, which is acceptable for an
+    /// explicit user action -- the drawing path never reads back.
+    pub fn export_png(&self, path: &std::path::Path) -> Result<(), crate::export::ExportError> {
+        let size = self.canvas_renderer.texture().size();
+        crate::export::export_canvas_png(
+            &self.device,
+            &self.queue,
+            self.canvas_renderer.texture(),
+            size.width,
+            size.height,
+            path,
+        )
+    }
+
     /// Undo and redo depths, and snapshot bytes held, for display.
     #[must_use]
     pub fn history_status(&self) -> (usize, usize, usize) {

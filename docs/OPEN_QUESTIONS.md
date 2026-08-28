@@ -134,10 +134,22 @@ DECISIONS §4b. Open: how far on color *management* — sRGB-only v1? ICC profil
 Wide-gamut/display-P3? CMYK for print later? (16-bit float in memory means we
 have the headroom whenever we want it, so this stays deferrable.)
 
-### Q6. File format specifics
+### Q6. File format specifics ⏳ DELIBERATELY DEFERRED until the page model exists
 Container is "zip of tiles + JSON" in spirit. Open: exact tile encoding
 (raw/compressed? per-tile format?), metadata schema, versioning strategy,
 thumbnail/preview embedding, autosave/recovery model.
+
+**Why it is waiting (decided 2026-08-27):** defining it now would define it for a
+single fixed-size page. Pages and a growable canvas would then force a v2 plus a
+migration path — for files nobody has yet. So the format waits for the document
+model.
+
+**PNG export shipped instead** (`openpaint-app/src/export.rs`, Ctrl+S). It has no
+format to design, it removes the immediate problem that work could not be kept at
+all, and it builds the GPU→CPU readback the native format will need anyway. Note
+the conversion PNG forces us to get right and now has tests for: **unpremultiply,
+then encode linear→sRGB.** Skipping the encode is the classic washed-out-export
+bug, and the same missing-encode error had already bitten once in the renderer.
 
 ### Q10b. Wintab is NOT provided by octotablet (correction)
 Earlier notes implied octotablet would give Wintab "for free." That is WRONG:
@@ -314,8 +326,9 @@ without a GPU.
    (DECISIONS §4a). `Canvas` carries dimensions plus the tile machinery that the
    eventual cache and readback will build on.
    **Undo no longer needs readback** — it snapshots the touched region GPU-to-GPU
-   and redoes by replaying dabs (`history.rs`). **Save and export still do**, and
-   remain blocked on Q13.
+   and redoes by replaying dabs (`history.rs`). **PNG export does read back** and now
+   exists (`export.rs`), so the readback machinery is written; the *native* format
+   still waits on the document model (Q6), not on Q13.
 
 7. **Verified by test, not by hand:** the GPU/CPU pixel comparison covers the paint
    math, but the *wiring* from real pen input through to the GPU can only be
