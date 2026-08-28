@@ -43,6 +43,44 @@ build, GitHub release/artifact download)?
 
 ---
 
+### Q10d. Tablet drivers ship with "Windows Ink" OFF → ✅ RESOLVED (and a product lesson)
+Debugged 2026-08-27 (Veikk + `VKTabletDriver` 2.0.4.4). Pressure read a flat
+`1.000`. Cause: **the Veikk driver's "Windows Ink" option was disabled.** With it
+off, the pen does not reach Windows Ink on *either* API:
+
+| API | Toggle OFF | Toggle ON |
+| --- | --- | --- |
+| RealTimeStylus (octotablet) | only tool is `name="Mouse"`, `axes=0x0` | `name="Stylus"`, `axes=PRESSURE \| TILT` ✅ |
+| `WM_POINTER` (Krita "Windows 8+ Pointer Input") | pressure flat | — |
+| Wintab (Krita default) | works | works |
+
+Enabling the driver toggle fixed it: pressure now varies correctly. Windows Ink
+is confirmed the right primary path; Wintab stays Phase 4 (Q10).
+
+Neither our code nor octotablet was at fault. `pressure=1.000` was
+`unwrap_or(1.0)` in `input_pen.rs` faithfully reporting a *missing axis*, and
+octotablet does implement `GUID_PACKETPROPERTY_GUID_NORMAL_PRESSURE`.
+
+**The lesson worth keeping — this is a product requirement, not a dev anecdote.**
+These OEM drivers default to Wintab-only for compatibility with older Photoshop/
+CSP, so a large share of our future users will start with Windows Ink off, get no
+pressure, and conclude OpenPaint is broken. Krita has the same trap and solves it
+by exposing the API choice in settings.
+Our answer should be better: **detect it and say so.** We already have the
+detection — a tool with no `PRESSURE` axis, or one named `"Mouse"` with
+`axes=0x0`. Turn that into user-facing guidance ("your tablet driver isn't
+sending pressure — enable Windows Ink in its control panel") rather than a
+`println!`. Track as a Phase-1 UX item.
+
+**Diagnostic that found it (keep this pattern):** log each tool's `tool_type`,
+`name`, and `axes.available()` on `Added`/`In`. Cheap (fires on proximity, not
+per-sample) and it turns "pressure feels broken" into a one-line answer. Lives in
+`input_pen.rs`.
+
+**Known remaining gap:** the Veikk declares `TILT` but reports `tilt=(0.000,
+0.000)` always — likely a model without real tilt hardware. Not our bug; means
+tilt-driven brushes can't be validated on this device.
+
 ### Q2d. Verifying Windows-only code from Linux → ✅ WORKFLOW FOUND
 Windows-only code (`#[cfg(windows)]`, e.g. the pen backend) is invisible to the
 Linux clippy/build, so it used to be checkable only via the slow Windows CI job.
@@ -53,6 +91,28 @@ Now we cross-check it from Linux before pushing:
 This typechecks + lints the Windows code in seconds (already caught a real
 borrow error pre-push). CI's Windows job also now runs clippy on the real
 windows-msvc target as the authoritative check.
+
+### Q2e. Debugging a Windows *hang* with no toolchain/debugger → ✅ WORKFLOW FOUND
+The Windows/tablet box has no Rust and no debugger, so a freeze in a downloaded
+CI artifact looked un-diagnosable. It isn't. What worked, in order:
+1. `Get-Process` — CPU **flat** + `Responding=False` ⇒ a genuinely blocked
+   thread, not a busy loop. (A loop spinning on redraws would climb steadily; a
+   thread parked in `GetMessage` would still report Responding.)
+2. Wait Chain Traversal (`advapi32!GetThreadWaitChain` via `Add-Type` P/Invoke)
+   — shows critical-section/COM/ALPC ownership. Caveat: it cannot see
+   `WaitOnAddress` waits, which is what Rust's `Mutex` uses, so a Rust-lock
+   deadlock shows up as "blocked on nothing".
+3. The decisive one: **minidump + module attribution.** `dbghelp!MiniDumpWriteDump`
+   via P/Invoke (no install, no admin — same-user process), then a ~60-line
+   Python script parsing the dump's module list + thread list, reading the main
+   thread's `CONTEXT` (`Rip` at 0xF8, `Rsp` at 0x98) and scanning its stack for
+   qwords that land inside a loaded module. No symbols needed: the *sequence of
+   modules* is the diagnosis. Here it read `openpaint.exe` → `user32` →
+   `InkObj.dll` → `rtscom.dll` → `tpcps.dll`/`rpcrt4`/`combase` → `user32`
+   again → `openpaint.exe` → `WaitOnAddress`, i.e. our code on the stack twice
+   around a message-pumping COM call. That *is* Q10c.
+Worth keeping: this turns "it freezes on your machine" into a precise answer
+without shipping instrumented builds around.
 
 ### Q2c. Dev-box lint tooling (rustfmt/clippy) → ✅ RESOLVED
 Installed rustup into `~/.cargo` / `~/.rustup` with `--no-modify-path` (system
@@ -79,10 +139,37 @@ thumbnail/preview embedding, autosave/recovery model.
 
 ### Q10b. Wintab is NOT provided by octotablet (correction)
 Earlier notes implied octotablet would give Wintab "for free." That is WRONG:
-octotablet supports Windows Ink (covers Surface/Veikk/modern Wacom, pressure +
-tilt) and Wayland-tablet on Linux, but NOT Wintab. Windows Ink is sufficient for
-all three target devices. Wintab remains a Phase-4 item and, when wanted, will
-be its own backend behind the InputBackend trait (like hand-rolled Windows Ink).
+octotablet supports Windows Ink and Wayland-tablet on Linux, but NOT Wintab.
+When wanted, Wintab will be its own backend behind the InputBackend trait (like
+hand-rolled Windows Ink).
+
+Windows Ink IS sufficient for all three target devices — verified on the Veikk
+(pressure + tilt axes both declared). One caveat: the tablet driver's own
+"Windows Ink" option must be enabled, or nothing arrives. See Q10d.
+
+### Q10c. octotablet's Windows Ink backend is not reentrancy-safe ⚠️ CONSTRAINT
+Discovered the hard way (step 5 froze on launch; see DECISIONS §8 and
+`input_pen.rs`). The mechanism, because it constrains any future pen backend:
+- RealTimeStylus delivers *async* plugin callbacks **on the thread that owns the
+  RTS** — our UI thread — via a window RTS creates there. "Async" means "not on
+  the pen's real-time thread", not "not on your thread".
+- octotablet holds its internal `shared_frame` mutex across those callbacks
+  while calling back into RTS/Ink over COM. Those are out-of-process calls, and
+  a COM call from an STA **pumps the message queue while it waits**.
+- So Windows can dispatch a pending `WM_PAINT` into winit *while octotablet's
+  mutex is held*, re-entering our event handlers. Calling `Manager::pump()` from
+  there deadlocks on a non-reentrant mutex on the same thread, permanently.
+
+**Our rule (enforced by comments in `input.rs` / `input_pen.rs` / `main.rs`):**
+drain any polled input backend *only* from `about_to_wait`, and keep a
+reentrancy guard on our handlers. Avoid leaving a redraw permanently pending.
+
+**Bearing on step 6:** this is a point against octotablet, though not a fatal
+one — the fix is small and lives entirely on our side of the trait. Real
+argument for the hand-rolled `WM_POINTER` backend remains latency/prediction/
+coalesced samples (and Wintab later, per Q10b). Worth re-checking whether newer
+octotablet releases stop holding the lock across COM calls; if so, upstream a
+note or a patch rather than carrying the constraint forever.
 
 ### Q7. Brush engine: port libmypaint vs. build our own
 Depends on Q1 (license). If GPL-compatible, porting/wrapping libmypaint could
@@ -107,8 +194,15 @@ Import first (blend modes, layer groups, masks, text?). How faithful? Export?
 ### Q9. Webtoon export specifics
 Slice height defaults per platform (Webtoon/Tapas/etc.), file naming, guides.
 
-### Q10. Wintab timing
-Which phase exactly; how to detect/toggle Wintab vs Windows Ink at runtime.
+### Q10. Wintab timing → stays Phase 4
+Briefly looked urgent on 2026-08-27 when Wintab appeared to be the only API
+carrying pressure on the Veikk; that turned out to be a driver toggle (Q10d), so
+the original plan stands. Windows Ink is confirmed sufficient.
+Still open: which phase exactly; how to detect/toggle Wintab vs Windows Ink at
+runtime (auto-detect whichever actually reports a pressure axis and prefer it?
+user override, as Krita does?); and whether to wrap an existing crate or bind
+`wintab32.dll` directly. Note `wintab32.dll` is present on the author's box,
+shipped by the Veikk driver, so it's testable whenever we want it.
 
 ### Q11. Cross-platform reach
 macOS/Linux as shipping targets (not just dev)? iPad/Android someday? Affects

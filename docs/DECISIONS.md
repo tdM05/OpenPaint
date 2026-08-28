@@ -46,12 +46,22 @@ We explicitly do NOT want Krita's bloat or its layout/interaction choices.
   - Microsoft Surface (Surface Pen)
   - Veikk tablets
   - Wacom tablets
-- All three speak **Windows Ink** (Windows Pointer API: pressure + tilt), so
-  one API covers all three for v1.
-- **Wintab** (legacy Wacom API) — deferred to a later phase as an optional
-  native backend. Some pros insist on it; CSP supports both. Not needed for a
-  great-feeling v1. (Note: webview/Chromium stacks can't use Wintab at all,
-  which is one reason we're going native.)
+- All three speak **Windows Ink** (pressure + tilt), so one API covers all three
+  for v1. **Verified on the Veikk 2026-08-27** — pressure varies correctly and
+  the tool enumerates as `name="Stylus"`, `axes=PRESSURE | TILT`.
+  - ⚠️ **But it is off by default in the tablet driver.** The Veikk driver ships
+    with its "Windows Ink" option disabled, and until it's enabled the pen never
+    reaches Windows Ink *at all* — on either RealTimeStylus or `WM_POINTER`. Our
+    app saw only a tool named `"Mouse"` with zero axes, and Krita lost pressure
+    the moment it was switched off Wintab. Enabling the toggle fixed both.
+  - This is a **product problem, not just a dev problem**: our future users will
+    hit exactly this and conclude the app is broken. See OPEN_QUESTIONS Q10d.
+- **Wintab** (legacy Wacom API) — stays deferred (Phase 4), as originally
+  planned. It was briefly thought to be the only working path on the Veikk; that
+  was a driver misconfiguration, not an API limitation. Some pros still insist on
+  Wintab and CSP supports both, so it remains wanted eventually — just not
+  urgent. (Note: webview/Chromium stacks can't use Wintab at all, which is one
+  more reason we're going native.)
 
 ### Confirmed test hardware
 Author's Windows/tablet machine: **NVIDIA GeForce RTX 3070 Ti Laptop GPU**,
@@ -210,7 +220,25 @@ Decision: **stay cross-platform-capable by construction, ship Windows first.**
   - [x] Step 5 — octotablet backend (Windows Ink) behind the trait; extended
         trait with a polled path (`poll` + `wants_continuous_poll`) since
         octotablet is polled, not event-driven. Windows target cross-checked
-        from Linux. AWAITING real-tablet test on Windows.
+        from Linux. **VERIFIED on the real tablet 2026-08-27:** Veikk enumerates
+        as `name="Stylus"`, `axes=PRESSURE | TILT`, and pressure varies correctly
+        (e.g. 0.18→0.23, 0.82→0.60) driving dab radius. Required enabling the
+        driver's "Windows Ink" option first — see OPEN_QUESTIONS Q10d.
+        Tilt is declared but always reports 0.0 on this device (no tilt hardware),
+        so tilt-driven behavior is still unvalidated.
+    - **The first step-5 build froze on launch (fixed).** Cause: a COM/STA
+      reentrancy deadlock, not a GPU or pen-hardware problem. RealTimeStylus
+      delivers its "async" plugin callbacks on our *own UI thread*; octotablet
+      holds an internal mutex across those callbacks while making
+      out-of-process COM calls, and a COM call from an STA pumps the message
+      queue while it waits. Because step 5 called `request_redraw()` every
+      loop iteration, a `WM_PAINT` was always pending, so that nested pump
+      re-entered our handler → `poll()` → `pump()` → the same non-reentrant
+      mutex on the same thread. Hard deadlock on frame 1 at 0% CPU.
+      Fix: drain input only from `about_to_wait` (winit calls it solely from
+      the top of its own loop, never from a window procedure), pace it with
+      `ControlFlow::WaitUntil` instead of a permanently-pending redraw, and add
+      a reentrancy guard around our handlers. See Q10c.
   - [ ] Step 6 — assess feel; if inadequate, swap to hand-rolled Windows Ink
         (WM_POINTER) behind the same trait (prediction + coalesced samples).
 - **Phase 1 — Real engine:** full brush engine; layers + blend modes + masks;
