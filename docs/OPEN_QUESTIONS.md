@@ -236,6 +236,20 @@ per-stroke (assumed) or finer; interaction with the growable/multi-page model.
 its ownership model has to be settled first or both get reworked. This is the same
 sequencing risk already noted against the Phase-2 page model.
 
+**Added 2026-08-28 — non-destructive crop rides with this.** DECISIONS §5c settled that
+a crop must retain the pixels outside the new page rectangle, because undo is LIFO and
+cannot recover a crop noticed late. That requires the pixel store to be decoupled from
+the page rectangle, which on today's single page-sized texture would mean a
+union-bounding-box texture that pays for empty space — so it belongs here, where sparse
+tiles pay only where paint exists. Concretely this work must deliver:
+- Tiles outside the page rectangle are **kept**, not dropped, by `Canvas::resize`.
+- Rendering and painting are both bounded by the page rectangle; storage is not.
+- **Trim to canvas**: the one explicit, undoable action that discards out-of-page tiles.
+- Deletion of the resize snapshot path (`Op::Resize::before`, `PageResize::loses_pixels`),
+  which becomes dead once a crop destroys nothing.
+- The pixel budget must be charged against *resident* tiles, not the page area — the
+  current 16 Mpx page ceiling exists only because the canvas is one texture.
+
 ### Q14. Pen input cannot reach the UI layer - ARCHITECTURAL, blocks any real UI
 Surfaced 2026-08-27 when the egui debug panel landed: **only the mouse can operate
 it.** Pen input arrives through octotablet, which bypasses winit's event stream

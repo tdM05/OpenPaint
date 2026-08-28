@@ -248,7 +248,8 @@ impl View {
     }
 
     /// Forward transform: canvas pixels -> physical screen pixels.
-    fn canvas_to_screen(&self, cx: f32, cy: f32, surface_w: u32, surface_h: u32) -> (f32, f32) {
+    #[must_use]
+    pub fn canvas_to_screen(&self, cx: f32, cy: f32, surface_w: u32, surface_h: u32) -> (f32, f32) {
         let (ccx, ccy) = self.content_center(surface_w, surface_h);
         let (rx, ry) = rotate(
             (cx - self.center.0) * self.scale,
@@ -259,7 +260,11 @@ impl View {
     }
 
     /// Inverse transform, without the on-canvas bounds check.
-    fn screen_to_canvas_unclipped(
+    ///
+    /// Public because the crop tool needs it: a crop handle dragged outward is legitimately
+    /// outside the page, and clamping it would make extending-by-drag impossible.
+    #[must_use]
+    pub fn screen_to_canvas_unclipped(
         &self,
         px: (f64, f64),
         surface_w: u32,

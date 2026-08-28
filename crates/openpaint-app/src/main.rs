@@ -34,6 +34,7 @@
 //!      pump can never re-enter our GPU or input work part-way through.
 
 mod canvas_renderer;
+mod crop;
 mod editor;
 mod export;
 mod history;
@@ -58,12 +59,19 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
+use crop::Crop;
 use editor::Editor;
 use input::{InputBackend, PenEvent, PenSample};
 use input_mouse::MouseBackend;
 use openpaint_core::{PageRect, Side};
 use renderer::Renderer;
 use view::{View, ROTATE_STEP};
+
+/// How close, in screen pixels, a press must be to grab a crop handle.
+///
+/// Screen-relative on purpose: converted to page units by dividing by the zoom, so a
+/// handle is equally easy to hit whether you are at 10% or 800%.
+const CROP_GRAB_PX: f32 = 10.0;
 
 /// Fallback drain cadence for a polled input backend.
 ///
@@ -99,6 +107,9 @@ struct OpenPaint {
     /// Canvas navigation (pan/zoom) state. Kept in the shell rather than the
     /// view because it is *interaction* state, not camera state.
     nav: Nav,
+    /// The crop tool, present only while it is active. Its presence *is* the tool
+    /// state, so there is no separate mode enum to keep in sync.
+    crop: Option<Crop>,
     /// Most recent notable outcome (export, resize refusal, history loss), shown in
     /// the panel so it isn't only visible in a console the user may not be watching.
     status_message: Option<String>,
@@ -161,6 +172,7 @@ impl Default for OpenPaint {
             input: Box::new(MouseBackend::new()),
             pen_events: Vec::new(),
             nav: Nav::default(),
+            crop: None,
             status_message: None,
             in_dispatch: false,
         }
@@ -182,12 +194,23 @@ impl OpenPaint {
                 if self.ui_blocks_point(sample) || self.nav.is_active() {
                     return;
                 }
+                // The crop tool consumes input entirely: no painting while it is up.
+                if self.crop.is_some() {
+                    self.crop_press(sample);
+                    return;
+                }
                 if let Some((cx, cy)) = self.to_canvas(sample) {
                     self.editor.stroke_begin(cx, cy, sample.pressure);
                     self.request_redraw();
                 }
             }
             PenEvent::Move(samples) => {
+                if self.crop.is_some() {
+                    if let Some(sample) = samples.last() {
+                        self.crop_drag(sample);
+                    }
+                    return;
+                }
                 if !self.editor.is_drawing() || self.nav.is_active() {
                     return;
                 }
@@ -199,6 +222,10 @@ impl OpenPaint {
                 self.request_redraw();
             }
             PenEvent::Up => {
+                if let Some(crop) = self.crop.as_mut() {
+                    crop.release();
+                    return;
+                }
                 // Queues the bake that commits the stroke; demand-driven painting
                 // means it needs a frame requested or it simply never happens.
                 self.editor.stroke_end();
@@ -249,6 +276,113 @@ impl OpenPaint {
         self.pen_events.clear();
         self.input.poll(&mut self.pen_events);
         self.apply_pen_events();
+    }
+
+    /// Page coordinates for a sample, **unclipped**.
+    ///
+    /// The crop tool needs points outside the page, since dragging an edge outward is how
+    /// you extend rather than crop.
+    fn to_page_unclipped(&self, sample: &PenSample) -> Option<(f32, f32)> {
+        let renderer = self.renderer.as_ref()?;
+        let (w, h) = renderer.size_px();
+        Some(
+            self.view
+                .screen_to_canvas_unclipped((sample.x, sample.y), w, h),
+        )
+    }
+
+    /// How far, in page units, a press may be from a handle to grab it.
+    fn crop_tolerance(&self) -> f32 {
+        CROP_GRAB_PX / self.view.scale().max(f32::MIN_POSITIVE)
+    }
+
+    fn crop_press(&mut self, sample: &PenSample) {
+        let Some(p) = self.to_page_unclipped(sample) else {
+            return;
+        };
+        let tolerance = self.crop_tolerance();
+        if let Some(crop) = self.crop.as_mut() {
+            if crop.press(p, tolerance) {
+                self.request_redraw();
+            }
+        }
+    }
+
+    fn crop_drag(&mut self, sample: &PenSample) {
+        let Some(p) = self.to_page_unclipped(sample) else {
+            return;
+        };
+        let dragging = self.crop.as_ref().is_some_and(Crop::is_dragging);
+        if !dragging {
+            return;
+        }
+        if let Some(crop) = self.crop.as_mut() {
+            crop.drag_to(p);
+        }
+        self.request_redraw();
+    }
+
+    /// Start, apply, or cancel the crop tool.
+    ///
+    /// Applying goes through the same `apply_page_rect` as everything else, so a crop is
+    /// undoable and memory-guarded on exactly the same terms as an extend.
+    fn crop_action(&mut self, action: ui::CropAction) {
+        match action {
+            ui::CropAction::Start => {
+                // Any stroke still in flight would otherwise bake after the geometry
+                // moved underneath it.
+                self.editor.stroke_end();
+                let page = self.editor.document().active().rect();
+                self.crop = Some(Crop::new(page));
+            }
+            ui::CropAction::Cancel => {
+                self.crop = None;
+                self.status_message = Some("Crop cancelled".to_owned());
+            }
+            ui::CropAction::Apply => {
+                if let Some(crop) = self.crop.take() {
+                    let target = crop.rect();
+                    if target == self.editor.document().active().rect() {
+                        self.status_message = Some("Crop unchanged".to_owned());
+                    } else {
+                        self.apply_page_rect(target);
+                    }
+                }
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// The crop rectangle in screen space, for the panel to paint.
+    fn crop_overlay(&self) -> Option<ui::CropOverlay> {
+        let crop = self.crop.as_ref()?;
+        let renderer = self.renderer.as_ref()?;
+        let (sw, sh) = renderer.size_px();
+        let rect = crop.rect();
+
+        let to_screen = |x: f32, y: f32| {
+            let (sx, sy) = self.view.canvas_to_screen(x, y, sw, sh);
+            [sx, sy]
+        };
+        let (x0, y0) = (rect.x as f32, rect.y as f32);
+        let (ex, ey) = rect.end();
+        let (x1, y1) = (ex as f32, ey as f32);
+
+        let mut handles = [[0.0; 2]; 8];
+        for (slot, handle) in handles.iter_mut().zip(crop::Handle::EDGES_AND_CORNERS) {
+            let (hx, hy) = handle.position(rect);
+            *slot = to_screen(hx, hy);
+        }
+
+        Some(ui::CropOverlay {
+            corners: [
+                to_screen(x0, y0),
+                to_screen(x1, y0),
+                to_screen(x1, y1),
+                to_screen(x0, y1),
+            ],
+            handles,
+        })
     }
 
     /// Mirror a geometry change from undo/redo onto the page.
@@ -337,9 +471,12 @@ impl OpenPaint {
         }
 
         if lost {
-            // Say so, because pixels just disappeared. Undo gets them back.
+            // Say so plainly, because pixels really did disappear. Deliberately does not
+            // present Ctrl+Z as the safety net: undo is LIFO, so recovering them later
+            // means throwing away everything drawn since. Non-destructive crop is the
+            // actual fix and rides with the tiled canvas (DECISIONS 5b, Q13).
             self.status_message = Some(format!(
-                "Page is now {new_w}x{new_h}; cropped pixels are restorable with Ctrl+Z"
+                "Page is now {new_w}x{new_h}; pixels outside were DISCARDED - undo now, or they are gone"
             ));
         }
 
@@ -347,6 +484,34 @@ impl OpenPaint {
         // resize, and having the camera jump is disorienting when working zoomed in --
         // press 0 to fit.
         self.request_redraw();
+    }
+
+    /// Enter applies the crop, Escape cancels it. Only while the tool is up, so neither
+    /// key is stolen from anything else.
+    fn handle_crop_keys(&mut self, event: &WindowEvent) -> bool {
+        use winit::event::ElementState;
+        use winit::keyboard::{Key, NamedKey};
+
+        if self.crop.is_none() {
+            return false;
+        }
+        let WindowEvent::KeyboardInput { event: key, .. } = event else {
+            return false;
+        };
+        if key.state != ElementState::Pressed {
+            return false;
+        }
+        match key.logical_key {
+            Key::Named(NamedKey::Enter) => {
+                self.crop_action(ui::CropAction::Apply);
+                true
+            }
+            Key::Named(NamedKey::Escape) => {
+                self.crop_action(ui::CropAction::Cancel);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Handle undo/redo shortcuts. Returns `true` if the event was consumed.
@@ -547,6 +712,14 @@ impl OpenPaint {
 
     /// Draw one frame: canvas first, then the UI on top of it.
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        // Computed up front, while `self` can still be borrowed immutably: the renderer
+        // is taken mutably just below.
+        let crop_overlay = self.crop_overlay();
+        let crop_rect = self.crop.as_ref().map(|c| {
+            let r = c.rect();
+            (r.x, r.y, r.w, r.h)
+        });
+
         // Disjoint field borrows, so the overlay closure can touch the editor and
         // the UI while the renderer is mutably borrowed.
         let Some(renderer) = self.renderer.as_mut() else {
@@ -575,6 +748,7 @@ impl OpenPaint {
         let mut ui_wants_repaint = false;
         let mut ui_inset_left = None;
         let mut extend_request = None;
+        let mut crop_request = None;
         let history_status = renderer.history_status();
         let status_message = self.status_message.clone();
         let page_size = {
@@ -597,10 +771,13 @@ impl OpenPaint {
                         history: history_status,
                         message: status_message.as_deref(),
                         page_size,
+                        crop: crop_overlay.as_ref(),
+                        crop_rect,
                     },
                 );
                 ui_wants_repaint = out.wants_repaint;
                 extend_request = out.extend;
+                crop_request = out.crop;
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
@@ -617,6 +794,9 @@ impl OpenPaint {
         // re-creates the very GPU resources the frame is drawing with.
         if let Some((side, amount)) = extend_request {
             self.extend_page(side, amount);
+        }
+        if let Some(action) = crop_request {
+            self.crop_action(action);
         }
 
         match result {
@@ -678,6 +858,11 @@ impl OpenPaint {
             if consumed {
                 return;
             }
+        }
+
+        // The crop tool claims Enter and Escape while it is up.
+        if self.handle_crop_keys(&event) {
+            return;
         }
 
         // Undo/redo before navigation, so Ctrl+Z is never eaten as a plain 'z'.

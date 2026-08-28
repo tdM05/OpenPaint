@@ -38,11 +38,35 @@ const PANEL_WIDTH: f32 = 280.0;
 /// A struct rather than more parameters: `render` had already grown to the point of
 /// needing an `allow(too_many_arguments)` once, and that was a signal rather than a
 /// lint to silence.
+/// The crop rectangle in screen space, ready to paint.
+///
+/// Given as points rather than a rect because the canvas can be rotated, so the crop
+/// outline is a parallelogram on screen. Physical pixels; the panel converts to egui's
+/// logical points itself.
+pub struct CropOverlay {
+    /// Corners in page order: top-left, top-right, bottom-right, bottom-left.
+    pub corners: [[f32; 2]; 4],
+    /// The eight edge and corner handles.
+    pub handles: [[f32; 2]; 8],
+}
+
+/// What the crop tool should do next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CropAction {
+    Start,
+    Apply,
+    Cancel,
+}
+
 pub struct Status<'a> {
     /// Undo depth, redo depth, snapshot bytes held.
     pub history: (usize, usize, usize),
     pub message: Option<&'a str>,
     pub page_size: (u32, u32),
+    /// Present while the crop tool is active.
+    pub crop: Option<&'a CropOverlay>,
+    /// The crop rectangle, for display.
+    pub crop_rect: Option<(i32, i32, u32, u32)>,
 }
 
 /// What the panel wants the app to do, collected during the frame.
@@ -54,6 +78,7 @@ pub struct Outcome {
     /// egui wants another frame soon.
     pub wants_repaint: bool,
     pub extend: Option<(Side, u32)>,
+    pub crop: Option<CropAction>,
 }
 
 pub struct Ui {
@@ -142,6 +167,7 @@ impl Ui {
         let mut color_srgb = brush.color_srgb8();
         let mut extend = None;
         let mut extend_amount = self.extend_amount;
+        let mut crop_action = None;
 
         let output = self.ctx.run(input, |ctx| {
             egui::SidePanel::left("brush-panel")
@@ -289,8 +315,68 @@ impl Ui {
                         .small()
                         .weak(),
                     );
+                    ui.separator();
+                    match status.crop_rect {
+                        None => {
+                            if ui.button("Crop / resize by dragging").clicked() {
+                                crop_action = Some(CropAction::Start);
+                            }
+                        }
+                        Some((x, y, w, h)) => {
+                            ui.label(format!("Crop to {w} x {h} at ({x}, {y})"));
+                            ui.horizontal(|ui| {
+                                if ui.button("Apply").clicked() {
+                                    crop_action = Some(CropAction::Apply);
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    crop_action = Some(CropAction::Cancel);
+                                }
+                            });
+                            ui.label(
+                                egui::RichText::new(
+                                    "Drag an edge or corner; drag inside to move it. Dragging \
+                                     outward extends the page. Enter applies, Escape cancels.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        }
+                    }
                 });
         });
+
+        // Paint the crop outline over the canvas. Deliberately painted, not built from
+        // widgets: egui never sees pen input (Q14), so widget handles would be
+        // mouse-only. Input is handled in the app's own path instead.
+        if let Some(overlay) = status.crop {
+            let ppp = self.ctx.pixels_per_point();
+            let to_point = |p: [f32; 2]| egui::pos2(p[0] / ppp, p[1] / ppp);
+            let painter = self.ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("crop-overlay"),
+            ));
+
+            // Outline: two strokes, dark under light, so it stays visible over both
+            // white paper and dark artwork.
+            let pts: Vec<egui::Pos2> = overlay.corners.iter().copied().map(to_point).collect();
+            for (a, b) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
+                painter.line_segment(
+                    [pts[a], pts[b]],
+                    egui::Stroke::new(3.0_f32, egui::Color32::from_black_alpha(160)),
+                );
+                painter.line_segment(
+                    [pts[a], pts[b]],
+                    egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
+                );
+            }
+
+            for h in &overlay.handles {
+                let c = to_point(*h);
+                let r = egui::Rect::from_center_size(c, egui::vec2(9.0, 9.0));
+                painter.rect_filled(r, 0.0, egui::Color32::from_black_alpha(160));
+                painter.rect_filled(r.shrink(1.5), 0.0, egui::Color32::WHITE);
+            }
+        }
 
         brush.set_color_srgb8(color_srgb);
         self.extend_amount = extend_amount;
@@ -352,6 +438,7 @@ impl Ui {
                 .get(&ViewportId::ROOT)
                 .is_some_and(|v| v.repaint_delay.is_zero()),
             extend,
+            crop: crop_action,
         }
     }
 }

@@ -377,12 +377,84 @@ by 500" still just makes it taller.
 outside the canvas (Photoshop's Crop has a "Delete Cropped Pixels" checkbox for
 exactly this); Procreate clips. We clip, because it is the current behaviour, has no
 runaway-allocation risk, and is simpler to reason about.
-⚠️ **Revisit when crop lands**, not before: crop is where preservation actually earns
-its keep (crop wrongly and it is gone), and the known cost of clipping is that a
-stroke running off the edge stops dead at the old boundary if the canvas is later
-extended. This is **not** an architectural decision — the tile store behaves
-identically either way, and the entire difference is one bounds check in
-`Canvas::blend_pixel`. So it is cheap to change with real usage behind the opinion.
+Revisited when crop landed, and **clipping stays** — but for a reason that turned out to
+be independent of crop. Painting clips at the page edge so the artist never has to
+wonder whether strokes outside the canvas do anything. That is a *painting* rule. Whether
+already-painted pixels **survive a crop** is a separate question, and the answer is now
+no-loss (§5c). The known cost of clipping stands: a stroke running off the edge stops
+dead at the old boundary if the page is later extended. One bounds check in
+`Canvas::blend_pixel`, cheap to revisit once real usage has an opinion.
+
+### 5c. Crop must not destroy pixels — and undo is not the safety net
+
+Settled 2026-08-28, **reversing** what §5a said hours earlier. The original claim was
+that retaining out-of-page pixels earned nothing, "because a crop is one undo step, and
+undo snapshots the region it is about to lose." That is wrong, and wrong in a way worth
+recording because it is a tempting mistake:
+
+> **Undo is LIFO, so it structurally cannot recover a mistake noticed late.**
+
+An artist who crops, works for two hours, then notices, cannot reach those pixels: the
+snapshot exists, but getting to it means discarding the two hours. This is not a
+history-budget problem and not fixable by pinning the snapshot — the ordering is the
+problem. Two further holes in the same reasoning: the history budget (64 MiB) evicts
+oldest-first, and history does not survive a save at all.
+
+**So crop changes the page rectangle and retains the pixels outside it.** Painting still
+clips to the page, so nothing changes about how drawing feels. Deleting out-of-page
+content becomes one explicit action — **Trim to canvas** — which is the only operation
+that ever discards pixels, and is itself undoable.
+
+**This design has less machinery, not more.** If a crop destroys nothing, undoing one is
+pure geometry: `Op::Resize`'s `before: Option<wgpu::Texture>`, `PageResize::loses_pixels`,
+and the snapshot/restore path for resizes all become dead and get deleted. Same signal as
+the signed-origin change (§5a) — fixing the cause removed code.
+
+**It must land on the tiled canvas, not on today's single texture.** The pixel store is
+currently one page-sized texture. Retaining outside pixels there means sizing it to the
+union of page-and-content — a *bounding box*, so it pays for empty space, and
+crop-narrow-then-extend-the-other-way would make memory grow **because the canvas got
+smaller**, eventually failing the pixel budget. Sparse tiles pay only where paint exists,
+which is the honest version. Non-destructive crop is therefore part of the tiled-canvas
+work (Q13), not a step before it.
+
+⚠️ Until that lands, a crop that loses pixels says so bluntly and does **not** advertise
+Ctrl+Z as a safety net.
+
+### 5b. Crop is a direct-manipulation tool, not a dialog
+
+Settled 2026-08-28, after a numeric "Canvas Size" dialog with a 3×3 anchor grid was
+built and rejected. The dialog was the wrong shape for the job: an anchor grid exists
+only to answer "which edges move?", and on a rectangle you are dragging, the drag
+already answers it. Direct manipulation is also what every reference does — Windows
+Photos, PowerPoint, Photoshop, CSP — so it is what the UX north star (§1a) demands.
+
+**Dragging outward extends; dragging inward crops.** One tool, because `Page::resize`
+takes a rectangle (§5a) and does not care which is larger. Splitting "crop" from
+"extend" would be two tools over one primitive.
+
+**The camera never moves while the tool is up.** No auto-fit, no zoom change, no
+recentering — the rectangle is expressed in page coordinates and re-projected each
+frame, so panning and zooming keep the outline glued to the page instead of fighting
+it. A tool that re-frames the view mid-gesture makes the gesture unaimable.
+
+**Applying goes through the same `apply_page_rect` as everything else**, so a crop is
+undoable and guarded by the same dimension and pixel-budget limits as an extend, with
+no crop-specific path to keep in sync.
+
+**The handles are painted, not egui widgets.** Pen input never reaches egui
+(OPEN_QUESTIONS Q14), so widget handles would be mouse-only — unusable with the very
+input device this app is for. Geometry lives in `crop.rs` in page coordinates, driven
+from the app's own input path, which sees pen and mouse alike; egui only draws the
+outline. Keeping the geometry free of GPU and UI types is also what makes the eight
+drag behaviours and the hit-testing directly testable.
+
+**Grab tolerance is screen-relative, capped per axis.** A screen-pixel radius divided
+by the zoom keeps handles equally easy to aim at at any magnification, but at low zoom
+that radius becomes wider *in page units* than the rectangle itself — at which point
+every press reads as a corner and neither the edges nor the interior can be grabbed.
+Capping the tolerance at a quarter of each side fixes it; the test that pins this was
+confirmed to fail without the cap.
 
 ### Tiling enables everything
 Canvas stored as tiles (~256×256). Tiles allocated **only where paint exists**,
