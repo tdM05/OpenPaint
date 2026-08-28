@@ -262,6 +262,15 @@ impl Editor {
         &self.brushes[self.tool as usize]
     }
 
+    /// The brush a colour sample should land on, whatever tool is active.
+    ///
+    /// Separate from [`Editor::brush_mut`], which follows the active tool. An eyedropper used while
+    /// the eraser is selected still means "this is what I want to paint with", and the eraser has no
+    /// colour to set.
+    pub fn paint_brush_mut(&mut self) -> &mut Brush {
+        &mut self.brushes[Tool::Brush as usize]
+    }
+
     pub fn brush_mut(&mut self) -> &mut Brush {
         &mut self.brushes[self.tool as usize]
     }

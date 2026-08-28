@@ -497,21 +497,72 @@ impl TileStore {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Vec<(TileKey, Tile)> {
+        self.settle(device);
+
+        let spilled: Vec<(TileKey, Tile)> =
+            self.spilled.iter().map(|(k, t)| (*k, t.clone())).collect();
+        let resident: Vec<TileKey> = self.resident.keys().copied().collect();
+        let mut out = self.read_back(device, queue, resident);
+        out.extend(spilled);
+        out
+    }
+
+    /// Read specific tiles, wherever they currently live.
+    ///
+    /// The targeted counterpart of [`snapshot_all`], for the eyedropper: sampling one pixel needs
+    /// one tile per layer, and reading the entire working set — up to the whole budget — to answer
+    /// a single click would be absurd. Missing keys are simply absent from the result, which is the
+    /// right answer for a coordinate no layer has painted.
+    ///
+    /// [`snapshot_all`]: TileStore::snapshot_all
+    pub fn snapshot_some(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        keys: &[TileKey],
+    ) -> Vec<(TileKey, Tile)> {
+        self.settle(device);
+
+        let mut out = Vec::new();
+        let mut resident = Vec::new();
+        for key in keys {
+            if let Some(tile) = self.spilled.get(key) {
+                out.push((*key, tile.clone()));
+            } else if self.resident.contains_key(key) {
+                resident.push(*key);
+            }
+        }
+        out.extend(self.read_back(device, queue, resident));
+        out
+    }
+
+    /// Land every readback still in flight.
+    ///
+    /// Anything in flight has to be resolved before its tile is read, or the copy would be stale.
+    fn settle(&mut self, device: &wgpu::Device) {
         self.drain_inflight();
-        // Anything still in flight has to land, or its tile would be saved from a stale copy.
         let pending: Vec<TileKey> = self.inflight.iter().map(|e| e.key).collect();
         for key in pending {
             self.resolve(device, key);
         }
+    }
 
-        let mut out: Vec<(TileKey, Tile)> =
-            self.spilled.iter().map(|(k, t)| (*k, t.clone())).collect();
-
-        let resident: Vec<(TileKey, u32)> = self
-            .resident
-            .iter()
-            .map(|(k, r)| (*k, r.slot.layer()))
+    /// Copy resident tiles off the GPU.
+    ///
+    /// One buffer and one submission for the whole batch, whether that batch is the entire working
+    /// set (a save) or a handful (a colour sample). Sharing the path means the alignment reasoning
+    /// below is written once and cannot drift between the two callers.
+    fn read_back(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        keys: Vec<TileKey>,
+    ) -> Vec<(TileKey, Tile)> {
+        let resident: Vec<(TileKey, u32)> = keys
+            .into_iter()
+            .filter_map(|k| self.resident.get(&k).map(|r| (k, r.slot.layer())))
             .collect();
+        let mut out = Vec::new();
         if resident.is_empty() {
             return out;
         }

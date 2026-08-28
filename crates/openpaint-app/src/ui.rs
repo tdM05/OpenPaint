@@ -338,6 +338,13 @@ impl Ui {
                                     }),
                             );
                             ui.add(egui::Slider::new(&mut brush.spacing, 0.01..=1.0).text("Spacing"));
+                            ui.label(
+                                egui::RichText::new(
+                                    "Alt+click picks the colour under the pointer, sampled from                                      the composited image rather than from one layer.",
+                                )
+                                .small()
+                                .weak(),
+                            );
 
                             ui.separator();
                             ui.add(

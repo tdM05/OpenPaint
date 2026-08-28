@@ -397,6 +397,15 @@ impl Renderer {
     ///
     /// Stalls to read the resident tiles back, which is fine for an explicit save; the drawing
     /// path never reads back. Undo history is deliberately not saved -- see `openpaint_file`.
+    /// The composited colour at a page pixel, as the artist sees it.
+    ///
+    /// Delegates to [`CanvasRenderer::sample_page_pixel`], which owns the tiles and is testable
+    /// without a surface.
+    pub fn sample_page_pixel(&mut self, x: i32, y: i32, layers: &[Layer]) -> [f32; 4] {
+        self.canvas_renderer
+            .sample_page_pixel(&self.device, &self.queue, x, y, layers)
+    }
+
     pub fn save_document(
         &mut self,
         document: &openpaint_core::Document,

@@ -470,6 +470,69 @@ impl CanvasRenderer {
         self.store.snapshot_all(device, queue)
     }
 
+    /// The composited colour at a page pixel, as the artist sees it.
+    ///
+    /// **Composited, not the active layer.** An eyedropper answers "what colour is *that*", and what
+    /// the artist points at is the whole stack — line art on one layer over flats on another is
+    /// exactly the case where sampling a single layer gives the wrong answer. (CSP offers both; the
+    /// per-layer variant is a setting for later, not a different mechanism.)
+    ///
+    /// Folded with `export::blend_over`, the same arithmetic as `composite_fs` in canvas.wgsl and
+    /// already pinned to it by `the_gpu_compositor_matches_the_cpu_reference`. So this returns the
+    /// displayed colour by construction rather than by a second implementation that resembles it.
+    ///
+    /// Reads one tile per visible layer, never the working set — see `TileStore::snapshot_some`.
+    pub fn sample_page_pixel(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        x: i32,
+        y: i32,
+        layers: &[openpaint_core::Layer],
+    ) -> [f32; 4] {
+        let coord = tile_of(x, y);
+        let side = TILE_SIZE as i32;
+        let lx = x.rem_euclid(side) as usize;
+        let ly = y.rem_euclid(side) as usize;
+
+        let keys: Vec<TileKey> = layers
+            .iter()
+            .filter(|l| l.visible)
+            .map(|l| TileKey {
+                layer: LayerId(l.id()),
+                coord,
+            })
+            .collect();
+        let tiles: std::collections::HashMap<TileKey, openpaint_core::tile::Tile> = self
+            .store
+            .snapshot_some(device, queue, &keys)
+            .into_iter()
+            .collect();
+
+        // The paper first, then bottom up: the same order and the same fold as the compositor.
+        // Over the paper because the paper is on screen too, and sampling unpainted canvas should
+        // give the colour visible there rather than a transparent nothing a colour picker would have
+        // to invent a value for.
+        let mut out = Canvas::paper_color();
+        for layer in layers {
+            if !layer.visible {
+                continue;
+            }
+            let key = TileKey {
+                layer: LayerId(layer.id()),
+                coord,
+            };
+            // A coordinate no layer has painted is not an error; it contributes nothing.
+            let Some(tile) = tiles.get(&key) else {
+                continue;
+            };
+            let src =
+                openpaint_core::color::scale_premul(tile.texel(lx, ly), layer.effective_opacity());
+            out = crate::export::blend_over(src, out, layer.blend);
+        }
+        out
+    }
+
     /// Replace everything with the tiles of a loaded document.
     ///
     /// They go to the CPU side, not the GPU: residency pulls in what the viewport needs, so
@@ -847,6 +910,95 @@ pub(crate) mod tests {
     /// The GPU tests render to an sRGB target, like the real surface, so a readback can be
     /// compared against the same encode the PNG export uses.
     const SURFACE: wgpu::TextureFormat = crate::test_gpu::SURFACE;
+
+    /// The eyedropper must return exactly what is on screen.
+    ///
+    /// Not "close to the active layer" and not "the CPU fold agrees with itself": this renders the
+    /// stack through the real compositor, reads the pixel back off the rendered target, and asks the
+    /// sampler for the same coordinate. Anything that made the two disagree — sampling one layer,
+    /// forgetting layer opacity, forgetting the paper underneath, mixing up premultiplication —
+    /// shows up here as a colour mismatch.
+    ///
+    /// Uses a **partially transparent top layer over an opaque one over paper**, because a fully
+    /// opaque stack hides every one of those mistakes.
+    #[test]
+    fn a_sampled_colour_is_the_displayed_colour() {
+        let Some((device, queue)) = crate::test_gpu::try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        const W: u32 = 64;
+        const H: u32 = 64;
+        const UNDER: [f32; 4] = [0.80, 0.30, 0.10, 1.0];
+        const OVER: [f32; 4] = [0.15, 0.60, 0.90, 0.55];
+
+        let mut document = openpaint_core::Document::new(openpaint_core::Page::new(W, H));
+        document.add_layer();
+        // Partial layer opacity as well as partial pixel alpha: two different multiplies, and
+        // dropping either is a plausible mistake.
+        document.active_mut().layer_mut(1).expect("top").opacity = 0.7;
+        let doc = document.active();
+
+        let stroke = crate::test_gpu::test_stroke_layer(&device);
+        let mut canvas =
+            CanvasRenderer::new(&device, SURFACE, doc.rect(), 64 * 1024 * 1024, &stroke);
+
+        for (index, fill) in [UNDER, OVER].iter().enumerate() {
+            let mut cpu = Canvas::new(W, H);
+            let a = fill[3];
+            let premul = [fill[0] * a, fill[1] * a, fill[2] * a, a];
+            for y in 0..H as i32 {
+                for x in 0..W as i32 {
+                    cpu.replace_pixel(x, y, premul);
+                }
+            }
+            let id = LayerId(doc.layers()[index].id());
+            let mut enc = device.create_command_encoder(&Default::default());
+            canvas.upload_dirty(&device, &queue, &mut enc, id, &mut cpu);
+            queue.submit(std::iter::once(enc.finish()));
+        }
+
+        let mut view = crate::view::View::new();
+        view.fit(W, H, doc.rect());
+        let mut enc = device.create_command_encoder(&Default::default());
+        canvas.prepare(
+            &device,
+            &queue,
+            &mut enc,
+            view.page_to_ndc(W, H),
+            view.visible_rect(W, H),
+            doc.layers(),
+            0,
+            None,
+        );
+        queue.submit(std::iter::once(enc.finish()));
+        let rendered = draw_to_target(&device, &queue, &canvas, W, H);
+
+        // The fit insets the page, so screen and page coordinates are not the same. The fills are
+        // uniform, so read the screen at its centre -- guaranteed inside the page -- and compare
+        // against several page coordinates, all of which must give that same colour.
+        let shown = rendered[(H as usize / 2) * W as usize + W as usize / 2];
+
+        let layers = doc.layers().to_vec();
+        for (x, y) in [(0_i32, 0_i32), (17, 31), (63, 63)] {
+            let sampled = canvas.sample_page_pixel(&device, &queue, x, y, &layers);
+            let sampled = crate::export::to_srgb8_for_test(sampled);
+            for c in 0..3 {
+                let d = i32::from(sampled[c]) - i32::from(shown[c]);
+                assert!(
+                    d.abs() <= 2,
+                    "at page ({x}, {y}) the eyedropper says {sampled:?} but the screen shows                      {shown:?}"
+                );
+            }
+        }
+
+        // A pixel no layer has painted must read as the paper, not as transparent black: it is
+        // what the artist can see there.
+        let empty = canvas.sample_page_pixel(&device, &queue, -500, -500, &layers);
+        let empty = crate::export::to_srgb8_for_test(empty);
+        let paper = crate::export::to_srgb8_for_test(Canvas::paper_color());
+        assert_eq!(empty, paper, "unpainted canvas should sample as the paper");
+    }
 
     /// The compositor's arithmetic exists twice -- `composite_fs` in canvas.wgsl and
     /// `openpaint_core::layer::Blend` plus `export::blend_over` on the CPU. Two copies of a

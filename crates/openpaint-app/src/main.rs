@@ -317,6 +317,14 @@ impl OpenPaint {
                 {
                     return;
                 }
+                // Alt turns any press into a colour sample, which is how every art app does it and
+                // is far more used than a tool-palette entry would be. It gets a place in the tool
+                // palette too once there is one — the modifier is the workflow, the palette entry
+                // is discoverability, and only one of them is reachable today.
+                if self.nav.modifiers.alt_key() {
+                    self.sample_color(sample);
+                    return;
+                }
                 // The crop tool consumes input entirely: no painting while it is up.
                 if self.crop.is_some() {
                     self.crop_press(sample);
@@ -471,6 +479,30 @@ impl OpenPaint {
             self.editor.stroke_to(s.x, s.y, s.pressure);
         }
         self.editor.stroke_end();
+    }
+
+    /// Pick up the colour under the pointer as the brush colour.
+    ///
+    /// Sets the *brush's* colour even when the eraser is active: the eraser has no colour, so
+    /// sampling while erasing would otherwise be silently ignored — and someone reaching for the
+    /// eyedropper is choosing what to paint with next.
+    fn sample_color(&mut self, sample: &PenSample) {
+        let Some((cx, cy)) = self.to_canvas(sample) else {
+            return;
+        };
+        let layers = self.editor.layers().to_vec();
+        #[allow(clippy::cast_possible_truncation)]
+        let picked = match self.renderer.as_mut() {
+            Some(r) => r.sample_page_pixel(cx.floor() as i32, cy.floor() as i32, &layers),
+            None => return,
+        };
+        let srgb = openpaint_core::color::opaque_linear_premul_to_srgb8(picked);
+        self.editor.paint_brush_mut().set_color_srgb8(srgb);
+        self.status_message = Some(format!(
+            "Picked #{:02X}{:02X}{:02X}",
+            srgb[0], srgb[1], srgb[2]
+        ));
+        self.request_redraw();
     }
 
     /// Mark this sample as the one whose latency the next presented frame will measure.
