@@ -43,6 +43,7 @@ mod input_mouse;
 #[cfg(target_os = "windows")]
 mod input_pen;
 mod renderer;
+mod stroke_exec;
 mod stroke_layer;
 #[cfg(test)]
 mod test_gpu;

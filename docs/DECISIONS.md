@@ -657,9 +657,9 @@ multi-year effort; focus beats breadth.
 
 ## 11a. Recurring hazards (check new code against these)
 
-Not bugs — *classes* of bug this codebase has actually produced more than once.
-Each cost real debugging time, so they are worth reading before adding code of the
-same shape.
+Not bugs — *classes* of bug this codebase has actually produced, most of them more
+than once. Each cost real debugging time, so they are worth reading before adding code
+of the same shape.
 
 ### Implicit ordering: "I did the thing, but not in the order the API guarantees"
 
@@ -701,6 +701,32 @@ same shape.
    The general rule: **a queue write and a recorded command are not in the same
    order you wrote them.** If both touch the same resource, either use disjoint
    regions, do both through the encoder, or submit in between.
+
+6. **A side effect inside `debug_assert!` does not happen in release.** Written as
+
+   ```rust
+   debug_assert!(self.map.insert(coord, slot).is_none());   // WRONG
+   ```
+
+   the insert runs in debug and **vanishes in release**, because `debug_assert!` does
+   not evaluate its expression there at all. This shipped a build in which the app
+   painted nothing whatsoever: every tile was allocated and then dropped on the floor,
+   while all 178 tests passed — because tests build in debug.
+
+   Fixed by moving the call out of the macro so the assert only inspects a bound value.
+
+   **The guard is `cargo test --workspace --release` in CI**, now run alongside the debug
+   suite. Verified the way §11a.4 demands: with the bug reintroduced, the debug suite
+   passes 90/90 while release fails 7 tests. Any future divergence between profiles has
+   the same chance of being caught.
+
+   `clippy::debug_assert_with_mut_call` is also denied workspace-wide, but **it does not
+   catch this case** — it fires on `&mut` *arguments*, not on a mutating method receiver,
+   and was confirmed silent on the exact line that shipped. It is kept because the shapes
+   it does catch are the same mistake; it is not the reason this cannot recur.
+
+   General rule: **an assertion must not be load-bearing.** If deleting it changes what
+   the program does, it is not an assertion.
 
 ### Verification hazards
 

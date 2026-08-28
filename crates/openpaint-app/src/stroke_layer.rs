@@ -642,7 +642,14 @@ impl StrokeLayer {
                 // Fresh accumulation starts at zero coverage.
                 self.pool
                     .clear_layer(encoder, &slot, wgpu::Color::TRANSPARENT);
-                debug_assert!(self.map.insert(coord, slot).is_none());
+                // Outside `debug_assert!`, which does not evaluate its expression in a
+                // release build -- see DECISIONS 11a.6. This exact line, written the other
+                // way, shipped a build that painted nothing at all.
+                let displaced = self.map.insert(coord, slot);
+                debug_assert!(displaced.is_none(), "accum tile {coord:?} already mapped");
+                if let Some(slot) = displaced {
+                    self.pool.free(slot);
+                }
             }
             coords.push(coord);
         }

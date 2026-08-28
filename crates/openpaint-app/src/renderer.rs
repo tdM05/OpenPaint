@@ -25,10 +25,11 @@ use winit::window::Window;
 use crate::canvas_renderer::{CanvasRenderer, CANVAS_FORMAT};
 use crate::editor::StrokeOp;
 use crate::history::{History, Op, TileBefore};
+use crate::stroke_exec::StrokeExec;
 use crate::stroke_layer::StrokeLayer;
 use crate::tile_pool::TilePool;
 use crate::view::PageToNdc;
-use openpaint_core::{PageRect, PageResize};
+use openpaint_core::PageResize;
 
 /// What an undo or redo did, and therefore what the caller must reconcile.
 ///
@@ -199,123 +200,23 @@ impl Renderer {
 
     /// Execute the editor's pending stroke commands on the GPU.
     ///
-    /// Submitted separately from [`Renderer::render`] and before it, so the canvas tiles
-    /// are already up to date by the time the frame reads them. An extra submit per frame
-    /// is immaterial next to avoiding one per input sample.
+    /// Submitted separately from [`Renderer::render`] and before it, so the canvas tiles are
+    /// already up to date by the time the frame reads them. An extra submit per frame is
+    /// immaterial next to avoiding one per input sample.
     ///
-    /// # Ordering
-    ///
-    /// The frame's ops are grouped into stroke *segments* at each `Begin`. Every segment
-    /// needs its own uniform writes (paint, and the per-tile records), and every write in a
-    /// submission lands before any of its commands — so a segment boundary is also a
-    /// submission boundary. Within a segment there is exactly one write of each, which is
-    /// what keeps the common case at one submit.
+    /// The work itself lives in [`crate::stroke_exec`], which needs no surface and is
+    /// therefore testable — see the note there.
     pub fn apply_stroke(&mut self, ops: &[StrokeOp], dabs: &[openpaint_core::Dab]) {
-        if ops.is_empty() {
-            return;
-        }
-
-        // Upload every dab once, up front. Per-batch uploads would be clobbered: all of a
-        // submission's buffer writes are applied before any of its command buffers
-        // execute. See StrokeLayer::upload_dabs.
-        self.stroke_layer
-            .upload_dabs(&self.device, &self.queue, dabs);
-        // Dab clipping reads the page from the stroke layer's uniform, and stamping happens
-        // before the frame is drawn -- so the page has to be current *here*, not at render
-        // time.
-        self.stroke_layer
-            .set_page(&self.queue, self.canvas_renderer.page());
-
-        for segment in segments(ops) {
-            self.run_segment(segment, dabs);
-        }
-    }
-
-    /// Execute one stroke segment: at most one `Begin`, its stamping, and its `End`.
-    fn run_segment(&mut self, ops: &[StrokeOp], dabs: &[openpaint_core::Dab]) {
-        let page = self.canvas_renderer.page();
-        let mut encoder = self.new_stroke_encoder();
-
-        if let Some(StrokeOp::Begin {
-            color_linear_premul,
-            opacity,
-        }) = ops.first()
-        {
-            self.recording.clear();
-            self.recording_paint = (*color_linear_premul, *opacity);
-            self.stroke_layer
-                .set_paint(&self.queue, *color_linear_premul, *opacity);
-            self.stroke_layer.begin_stroke();
-        }
-
-        // The union of this segment's dabs decides which accumulation tiles are needed, so
-        // the per-tile records can be written once for the whole segment.
-        let ranges: Vec<(usize, usize)> = ops
-            .iter()
-            .filter_map(|op| match *op {
-                StrokeOp::Dabs { start, len } if start + len <= dabs.len() => Some((start, len)),
-                _ => None,
-            })
-            .collect();
-
-        if let Some(&(first, _)) = ranges.first() {
-            let last = ranges.last().expect("non-empty");
-            let span = &dabs[first..last.0 + last.1];
-            self.recording.extend_from_slice(span);
-            let tiles = self
-                .stroke_layer
-                .prepare_tiles(&self.queue, &mut encoder, span, page);
-            for index in 0..tiles {
-                for &(start, len) in &ranges {
-                    self.stroke_layer
-                        .stamp_range(&mut encoder, index, start, len);
-                }
-            }
-        }
-
-        if ops.iter().any(|op| matches!(op, StrokeOp::End)) {
-            self.commit_stroke(&mut encoder, page);
-        }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-    }
-
-    /// Snapshot what the stroke is about to overwrite, then bake it.
-    fn commit_stroke(&mut self, encoder: &mut wgpu::CommandEncoder, page: PageRect) {
-        let tiles = self.stroke_layer.tiles_to_bake(page);
-        if tiles.is_empty() || self.recording.is_empty() {
-            self.stroke_layer
-                .bake(&self.queue, encoder, &mut self.canvas_renderer);
-            return;
-        }
-
-        // Snapshot *before* baking: this is the pre-stroke image undo restores. A
-        // GPU-to-GPU copy per tile, so nothing comes back to the CPU on the interactive
-        // path.
-        let before = self
-            .history
-            .snapshot_tiles(encoder, &self.canvas_renderer, &tiles);
-        self.stroke_layer
-            .bake(&self.queue, encoder, &mut self.canvas_renderer);
-
-        match before {
-            Some(before) => {
-                let (color_linear_premul, opacity) = self.recording_paint;
-                self.history.push(Op::Stroke {
-                    before,
-                    dabs: std::mem::take(&mut self.recording),
-                    color_linear_premul,
-                    opacity,
-                });
-            }
-            None => {
-                // Recording a stroke we cannot fully revert would let undo produce a state
-                // that never existed. Refusing is the honest outcome, and the caller
-                // surfaces it.
-                self.recording.clear();
-                self.unrecordable = true;
-            }
-        }
+        let mut exec = StrokeExec {
+            device: &self.device,
+            queue: &self.queue,
+            canvas: &mut self.canvas_renderer,
+            layer: &mut self.stroke_layer,
+            history: &mut self.history,
+            recording: &mut self.recording,
+            recording_paint: &mut self.recording_paint,
+        };
+        self.unrecordable |= exec.run(ops, dabs);
     }
 
     /// React to the page being resized.
@@ -620,70 +521,5 @@ impl Renderer {
     #[must_use]
     pub fn window(&self) -> &Arc<Window> {
         &self.window
-    }
-}
-
-/// Split a frame's ops into stroke segments, each starting at a `Begin`.
-///
-/// A segment is the unit that needs its own uniform writes, and therefore its own
-/// submission. Ops before the first `Begin` belong to the stroke already in progress.
-fn segments(ops: &[StrokeOp]) -> Vec<&[StrokeOp]> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    for (i, op) in ops.iter().enumerate() {
-        if i > 0 && matches!(op, StrokeOp::Begin { .. }) {
-            out.push(&ops[start..i]);
-            start = i;
-        }
-    }
-    out.push(&ops[start..]);
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn begin() -> StrokeOp {
-        StrokeOp::Begin {
-            color_linear_premul: [0.0; 4],
-            opacity: 1.0,
-        }
-    }
-
-    #[test]
-    fn one_stroke_is_one_segment() {
-        let ops = [begin(), StrokeOp::Dabs { start: 0, len: 3 }, StrokeOp::End];
-        assert_eq!(segments(&ops).len(), 1);
-    }
-
-    /// Two strokes in one frame must not share uniform writes, because the second's paint
-    /// and tile records would land before the first's draws executed.
-    #[test]
-    fn two_strokes_in_a_frame_are_two_segments() {
-        let ops = [
-            begin(),
-            StrokeOp::Dabs { start: 0, len: 3 },
-            StrokeOp::End,
-            begin(),
-            StrokeOp::Dabs { start: 3, len: 2 },
-        ];
-        let segs = segments(&ops);
-        assert_eq!(segs.len(), 2);
-        assert_eq!(segs[0].len(), 3);
-        assert_eq!(segs[1].len(), 2);
-    }
-
-    /// Mid-stroke frames carry no `Begin` at all: those ops continue the segment that is
-    /// already running, so they must not be dropped.
-    #[test]
-    fn ops_without_a_begin_are_one_continuing_segment() {
-        let ops = [
-            StrokeOp::Dabs { start: 0, len: 3 },
-            StrokeOp::Dabs { start: 3, len: 4 },
-        ];
-        let segs = segments(&ops);
-        assert_eq!(segs.len(), 1);
-        assert_eq!(segs[0].len(), 2);
     }
 }

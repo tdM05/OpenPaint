@@ -315,7 +315,14 @@ impl CanvasRenderer {
         let layer = slot.layer();
         self.pool
             .clear_layer(encoder, &slot, paper_clear_color(Canvas::paper_color()));
-        debug_assert!(self.map.insert(coord, slot).is_none());
+        // The insert must happen outside `debug_assert!`, which does not evaluate its
+        // expression in a release build -- see DECISIONS 11a.6. Freeing a displaced slot
+        // rather than dropping it means a logic error cannot also leak a layer.
+        let displaced = self.map.insert(coord, slot);
+        debug_assert!(displaced.is_none(), "tile {coord:?} was already mapped");
+        if let Some(slot) = displaced {
+            self.pool.free(slot);
+        }
         Some(layer)
     }
 
@@ -333,7 +340,14 @@ impl CanvasRenderer {
         }
         let slot = self.pool.alloc()?;
         let layer = slot.layer();
-        debug_assert!(self.map.insert(coord, slot).is_none());
+        // The insert must happen outside `debug_assert!`, which does not evaluate its
+        // expression in a release build -- see DECISIONS 11a.6. Freeing a displaced slot
+        // rather than dropping it means a logic error cannot also leak a layer.
+        let displaced = self.map.insert(coord, slot);
+        debug_assert!(displaced.is_none(), "tile {coord:?} was already mapped");
+        if let Some(slot) = displaced {
+            self.pool.free(slot);
+        }
         Some(layer)
     }
 
@@ -586,5 +600,153 @@ mod tests {
         let page = PageRect::new(-400, -500, 900, 1200);
         assert!(tile_intersects((-2, -2), page));
         assert!(tile_intersects((-1, -1), page));
+    }
+
+    /// Draw the canvas into an offscreen target and check what lands on screen.
+    ///
+    /// The other half of the paint path, and it had no coverage: every GPU test until now
+    /// stopped at "the tile holds the right pixels", which says nothing about whether the
+    /// tile is ever drawn. Uses a fitted `View`, so the affine, the instance buffer, the
+    /// page clip and the sheet are all exercised the way a frame exercises them.
+    #[test]
+    fn a_painted_tile_is_actually_drawn() {
+        let Some((device, queue)) = crate::test_gpu::try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        const SURFACE: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+        const VIEW_W: u32 = 256;
+        const VIEW_H: u32 = 256;
+
+        // A small page, painted red in one corner through the CPU reference upload.
+        let mut cpu = Canvas::new(400, 400);
+        let red = [1.0, 0.0, 0.0, 1.0];
+        for y in 0..64 {
+            for x in 0..64 {
+                cpu.replace_pixel(x, y, red);
+            }
+        }
+
+        let mut canvas = CanvasRenderer::new(&device, SURFACE, &cpu);
+        canvas.upload_dirty(&queue, &mut cpu);
+        assert_eq!(
+            canvas.residency().0,
+            1,
+            "expected exactly one tile resident"
+        );
+
+        let mut view = crate::view::View::new();
+        view.fit(VIEW_W, VIEW_H, &cpu);
+        canvas.prepare(&device, &queue, view.page_to_ndc(VIEW_W, VIEW_H));
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("draw-test-target"),
+            size: wgpu::Extent3d {
+                width: VIEW_W,
+                height: VIEW_H,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SURFACE,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("draw-test-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // Blue backdrop, so "nothing was drawn" is unmistakable.
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLUE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            canvas.draw(&mut pass);
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let pixels = read_rgba8(&device, &queue, &target, VIEW_W, VIEW_H);
+        let at = |x: u32, y: u32| pixels[(y * VIEW_W + x) as usize];
+
+        // The page is fitted and centred, so its own centre is the view's centre and must be
+        // paper -- not the backdrop.
+        // Paper is bright in every channel; the backdrop is pure blue.
+        let mid = at(VIEW_W / 2, VIEW_H / 2);
+        assert!(
+            mid[0] > 200 && mid[1] > 200,
+            "the paper sheet was not drawn; centre is {mid:?}"
+        );
+
+        // And the painted tile covers the page's top-left eighth, so a point just inside the
+        // page's top-left corner must be red.
+        let (px, py) = view.canvas_to_screen(20.0, 20.0, VIEW_W, VIEW_H);
+        let corner = at(px.round() as u32, py.round() as u32);
+        assert!(
+            corner[0] > 200 && corner[1] < 80 && corner[2] < 80,
+            "the painted tile was not drawn; got {corner:?} at ({px}, {py})"
+        );
+    }
+
+    /// Read an RGBA8 target back, skipping row padding.
+    fn read_rgba8(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        w: u32,
+        h: u32,
+    ) -> Vec<[u8; 4]> {
+        let unpadded = w * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = unpadded.div_ceil(align) * align;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("draw-test-readback"),
+            size: u64::from(padded) * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let mapped = buffer.slice(..).get_mapped_range();
+        let mut out = Vec::with_capacity((w * h) as usize);
+        for row in 0..h {
+            let start = (row * padded) as usize;
+            let end = start + unpadded as usize;
+            out.extend_from_slice(mapped[start..end].as_chunks::<4>().0);
+        }
+        out
     }
 }

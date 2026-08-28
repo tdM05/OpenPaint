@@ -5,6 +5,15 @@ members = [
     "crates/openpaint-app",
 ]
 
+# `debug_assert_with_mut_call` catches side effects inside `debug_assert!`, which vanish
+# in a release build (DECISIONS 11a.6). Note its reach is narrower than the hazard: it
+# fires on `&mut` *arguments*, not on a mutating method receiver, so it would **not** have
+# caught `debug_assert!(map.insert(k, v).is_none())`. Kept because the shapes it does
+# catch are the same mistake; the actual guard for that hazard is `cargo test --release`
+# in CI.
+[workspace.lints.clippy]
+debug_assert_with_mut_call = "deny"
+
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
