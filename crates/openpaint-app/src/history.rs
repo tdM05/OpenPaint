@@ -1,44 +1,48 @@
-//! Undo / redo for strokes.
+//! Undo / redo.
 //!
 //! # Why it lives on the GPU side
 //!
 //! The GPU is authoritative for pixels (DECISIONS §4a), so history has to work in
 //! GPU resources. That is not ideal layering — history is conceptually a document
 //! concern — but the alternative is reading pixels back to the CPU on every stroke,
-//! which is exactly the stall we designed the paint path to avoid.
+//! which is exactly the stall the paint path is designed to avoid.
 //!
-//! # What is stored
+//! # Strict LIFO is what makes this simple
 //!
-//! Per stroke, a **before-image of the region the stroke touched**, plus the dabs
-//! and paint that produced it:
+//! Operations are undone in exactly the reverse order they happened, which gives a
+//! property worth stating outright: **the page geometry while undoing an operation is
+//! always the geometry that operation was recorded against.** Any resize that came
+//! after it must already have been undone.
 //!
-//! - **Undo** copies the before-image back over that region. One GPU-to-GPU copy.
-//! - **Redo** *replays the dabs* rather than restoring an after-image. That halves
-//!   the memory (no second snapshot) and costs only a re-rasterization, which is
-//!   the cheap direction now that dabs are stamped on the GPU.
+//! That is why nothing here rewrites stored coordinates. An earlier version did — it
+//! shifted every rectangle and dab position whenever the page resized — but that was
+//! only necessary because resizes were not themselves undoable. Making [`Op::Resize`]
+//! an operation removed the need entirely, and deleted that machinery with it.
 //!
-//! Snapshots are bounded to the stroke's rectangle rather than the whole canvas,
-//! because most strokes touch a small fraction of it. A full-canvas stroke at 2048²
-//! costs ~34 MiB, so there is also a byte budget (see [`BUDGET_BYTES`]) that evicts
-//! the oldest entries — losing old undo levels is far better than exhausting a
-//! Surface's shared graphics memory.
+//! Eviction does not break the invariant: it drops the *oldest* operations, so undo
+//! simply cannot reach that far back. Everything still on the stack stays consistent.
 //!
-//! # Not yet
+//! # What each operation stores
 //!
-//! History is per-stroke only: navigation isn't undoable (correct — no art app
-//! undoes panning), and there is nothing else undoable yet. When layers arrive this
-//! grows an operation type; the snapshot-plus-replay shape should still hold.
+//! - [`Op::Stroke`] keeps a **before-image of the region the stroke touched**, plus
+//!   the dabs and paint that produced it. Undo copies the before-image back; redo
+//!   *replays the dabs* rather than storing an after-image, which halves the memory
+//!   and costs only a re-rasterization — the cheap direction now that dabs are
+//!   stamped on the GPU.
+//! - [`Op::Resize`] keeps the old and new dimensions and the anchor. **Growing needs
+//!   no pixels saved**, because shrinking back is lossless — which is what makes
+//!   undoable extends nearly free. **Shrinking does**, so a crop keeps a copy of the
+//!   whole pre-crop canvas; that is the only way to give back what it removed.
 
-use openpaint_core::Dab;
+use openpaint_core::{Anchor, Dab};
 
 use crate::canvas_renderer::CANVAS_FORMAT;
 
-/// How much snapshot memory history may hold before evicting its oldest entries.
+/// How much snapshot memory history may hold before evicting its oldest operations.
 ///
-/// 64 MiB is roughly two full-canvas strokes at 2048², or a great many typical
-/// ones. Deliberately modest: the target shares graphics memory with the system
-/// (DECISIONS §2), and an app that dies from undo history is worse than one that
-/// forgets far-back edits.
+/// Deliberately modest: the target shares graphics memory with the system (DECISIONS
+/// §2), and an app that dies from undo history is worse than one that forgets
+/// far-back edits.
 pub const BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// A rectangle of canvas pixels.
@@ -104,109 +108,88 @@ impl BoundsBuilder {
     }
 }
 
-/// Copy a canvas region into a fresh rect-sized texture — the before-image.
+/// A page resize, from which the content offset is **derived** rather than passed in.
 ///
-/// Texture-to-texture, so no row-alignment constraints apply and any rectangle
-/// works (unlike readback to a buffer, which needs 256-byte rows).
-pub fn snapshot_region(
-    device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
-    canvas: &wgpu::Texture,
-    rect: CanvasRect,
-) -> wgpu::Texture {
-    let snapshot = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("history-snapshot"),
-        size: wgpu::Extent3d {
-            width: rect.w,
-            height: rect.h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: CANVAS_FORMAT,
-        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    copy_region(encoder, canvas, rect_origin(rect), &snapshot, zero(), rect);
-    snapshot
+/// Deriving it removes a class of bug: an offset carried alongside the sizes can
+/// disagree with them, and the result is content copied to the wrong place with no
+/// error raised.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageResize {
+    pub old_w: u32,
+    pub old_h: u32,
+    pub new_w: u32,
+    pub new_h: u32,
+    pub anchor: Anchor,
 }
 
-/// Copy a before-image back over the canvas region it came from.
-pub fn restore_region(
-    encoder: &mut wgpu::CommandEncoder,
-    snapshot: &wgpu::Texture,
-    canvas: &wgpu::Texture,
-    rect: CanvasRect,
-) {
-    copy_region(encoder, snapshot, zero(), canvas, rect_origin(rect), rect);
-}
+impl PageResize {
+    /// How far existing content moves.
+    #[must_use]
+    pub fn offset(&self) -> (i32, i32) {
+        self.anchor
+            .offset(self.old_w, self.old_h, self.new_w, self.new_h)
+    }
 
-fn zero() -> wgpu::Origin3d {
-    wgpu::Origin3d::ZERO
-}
+    /// The inverse resize, for undoing this one.
+    ///
+    /// Swapping the sizes and keeping the anchor is sufficient, because the offset is
+    /// computed from the size difference — so the same anchor yields exactly the
+    /// opposite movement.
+    #[must_use]
+    pub fn inverted(&self) -> Self {
+        Self {
+            old_w: self.new_w,
+            old_h: self.new_h,
+            new_w: self.old_w,
+            new_h: self.old_h,
+            anchor: self.anchor,
+        }
+    }
 
-fn rect_origin(rect: CanvasRect) -> wgpu::Origin3d {
-    wgpu::Origin3d {
-        x: rect.x,
-        y: rect.y,
-        z: 0,
+    /// Whether this resize loses pixels, and therefore needs them saved.
+    #[must_use]
+    pub fn shrinks(&self) -> bool {
+        self.new_w < self.old_w || self.new_h < self.old_h
     }
 }
 
-/// The snapshot is always origin-based and rect-sized; the canvas side is offset by
-/// the rect. Taking both origins explicitly rather than a direction flag makes it
-/// hard to get them the wrong way round, which would be a silent corruption.
-fn copy_region(
-    encoder: &mut wgpu::CommandEncoder,
-    src: &wgpu::Texture,
-    src_origin: wgpu::Origin3d,
-    dst: &wgpu::Texture,
-    dst_origin: wgpu::Origin3d,
-    rect: CanvasRect,
-) {
-    encoder.copy_texture_to_texture(
-        wgpu::ImageCopyTexture {
-            texture: src,
-            mip_level: 0,
-            origin: src_origin,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::ImageCopyTexture {
-            texture: dst,
-            mip_level: 0,
-            origin: dst_origin,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::Extent3d {
-            width: rect.w,
-            height: rect.h,
-            depth_or_array_layers: 1,
-        },
-    );
+/// One undoable operation.
+pub enum Op {
+    Stroke {
+        rect: CanvasRect,
+        /// The canvas region as it was *before* the stroke.
+        before: wgpu::Texture,
+        /// Everything needed to reproduce the stroke for redo.
+        dabs: Vec<Dab>,
+        color_linear_premul: [f32; 4],
+        opacity: f32,
+    },
+    Resize {
+        resize: PageResize,
+        /// The whole pre-resize canvas, kept only when the resize **lost** pixels.
+        before: Option<wgpu::Texture>,
+    },
 }
 
-/// One undoable stroke.
-pub struct Entry {
-    pub rect: CanvasRect,
-    /// The canvas region as it was *before* the stroke.
-    pub before: wgpu::Texture,
-    /// Everything needed to reproduce the stroke for redo.
-    pub dabs: Vec<Dab>,
-    pub color_linear_premul: [f32; 4],
-    pub opacity: f32,
-}
-
-impl Entry {
+impl Op {
     fn bytes(&self, bytes_per_texel: usize) -> usize {
-        self.rect.bytes(bytes_per_texel)
+        match self {
+            Self::Stroke { rect, .. } => rect.bytes(bytes_per_texel),
+            Self::Resize { resize, before } => {
+                if before.is_some() {
+                    resize.old_w as usize * resize.old_h as usize * bytes_per_texel
+                } else {
+                    0
+                }
+            }
+        }
     }
 }
 
 /// The undo/redo stacks and their memory budget.
 pub struct History {
-    undo: Vec<Entry>,
-    redo: Vec<Entry>,
+    undo: Vec<Op>,
+    redo: Vec<Op>,
     bytes: usize,
     bytes_per_texel: usize,
 }
@@ -240,110 +223,146 @@ impl History {
         self.bytes
     }
 
-    /// Record a completed stroke.
+    /// Record a completed operation.
     ///
     /// Clears the redo stack, as any edit after undoing must: the redone future no
     /// longer follows from the present.
-    pub fn push(&mut self, entry: Entry) {
+    pub fn push(&mut self, op: Op) {
         self.redo.clear();
-        self.bytes += entry.bytes(self.bytes_per_texel);
-        self.undo.push(entry);
+        self.bytes += op.bytes(self.bytes_per_texel);
+        self.undo.push(op);
         self.enforce_budget();
     }
 
-    /// Take the most recent stroke off the undo stack, for the caller to restore.
+    /// Take the most recent operation, for the caller to revert.
     ///
-    /// The caller must hand it back via [`History::finish_undo`] once restored, so
-    /// it becomes redoable.
-    pub fn pop_undo(&mut self) -> Option<Entry> {
-        let entry = self.undo.pop()?;
-        self.bytes -= entry.bytes(self.bytes_per_texel);
-        Some(entry)
+    /// It must be handed back via [`History::finish_undo`] once reverted, so it
+    /// becomes redoable.
+    pub fn pop_undo(&mut self) -> Option<Op> {
+        let op = self.undo.pop()?;
+        self.bytes -= op.bytes(self.bytes_per_texel);
+        Some(op)
     }
 
-    /// A restored entry becomes redoable. Its snapshot is still the *before* image,
-    /// which is exactly what a later undo of the redone stroke needs.
-    pub fn finish_undo(&mut self, entry: Entry) {
-        self.bytes += entry.bytes(self.bytes_per_texel);
-        self.redo.push(entry);
+    /// A reverted operation becomes redoable, keeping whatever it stored — that data
+    /// is exactly what a later undo of the redone operation needs again.
+    pub fn finish_undo(&mut self, op: Op) {
+        self.bytes += op.bytes(self.bytes_per_texel);
+        self.redo.push(op);
     }
 
-    /// Take the most recent undone stroke, for the caller to replay.
-    pub fn pop_redo(&mut self) -> Option<Entry> {
-        let entry = self.redo.pop()?;
-        self.bytes -= entry.bytes(self.bytes_per_texel);
-        Some(entry)
+    /// Take the most recent undone operation, for the caller to re-apply.
+    pub fn pop_redo(&mut self) -> Option<Op> {
+        let op = self.redo.pop()?;
+        self.bytes -= op.bytes(self.bytes_per_texel);
+        Some(op)
     }
 
-    /// A replayed entry becomes undoable again.
-    pub fn finish_redo(&mut self, entry: Entry) {
-        self.bytes += entry.bytes(self.bytes_per_texel);
-        self.undo.push(entry);
+    /// A re-applied operation becomes undoable again.
+    pub fn finish_redo(&mut self, op: Op) {
+        self.bytes += op.bytes(self.bytes_per_texel);
+        self.undo.push(op);
         self.enforce_budget();
     }
 
-    /// Shift every stored coordinate by `(dx, dy)` after a page resize.
+    /// Drop the oldest operations until within budget.
     ///
-    /// Returns `false` if history had to be discarded instead.
-    ///
-    /// Both the rectangles **and** the dab positions need shifting: rectangles say
-    /// where to put a before-image back, and the dabs are replayed at their recorded
-    /// positions for redo. Missing either would silently restore or repaint in the
-    /// wrong place, which is why this is one operation rather than two.
-    ///
-    /// When a shifted rectangle would fall outside the new bounds — a crop, not an
-    /// extend — the whole history is dropped. Partial history cannot be restored
-    /// correctly and dropping it is the honest outcome. (Growing a page never
-    /// triggers this, since the new bounds always contain the old content.)
-    pub fn shift(&mut self, dx: i32, dy: i32, new_w: u32, new_h: u32) -> bool {
-        let fits = |r: &CanvasRect| {
-            let x = r.x as i64 + i64::from(dx);
-            let y = r.y as i64 + i64::from(dy);
-            x >= 0
-                && y >= 0
-                && x + i64::from(r.w) <= i64::from(new_w)
-                && y + i64::from(r.h) <= i64::from(new_h)
-        };
-        let all_fit = self
-            .undo
-            .iter()
-            .chain(&self.redo)
-            .all(|entry| fits(&entry.rect));
-
-        if !all_fit {
-            self.clear();
-            return false;
-        }
-
-        for entry in self.undo.iter_mut().chain(&mut self.redo) {
-            entry.rect.x = (entry.rect.x as i64 + i64::from(dx)) as u32;
-            entry.rect.y = (entry.rect.y as i64 + i64::from(dy)) as u32;
-            for dab in &mut entry.dabs {
-                dab.x += dx as f32;
-                dab.y += dy as f32;
-            }
-        }
-        true
-    }
-
-    /// Drop all history, releasing its snapshots.
-    pub fn clear(&mut self) {
-        self.undo.clear();
-        self.redo.clear();
-        self.bytes = 0;
-    }
-
-    /// Drop the oldest undo levels until within budget.
-    ///
-    /// Oldest-first: recent history is what users reach for. A single stroke larger
+    /// Oldest-first: recent history is what users reach for. A single operation larger
     /// than the whole budget is kept anyway — refusing to record it would silently
-    /// make that stroke unundoable, which is worse than briefly exceeding the cap.
+    /// make that edit unundoable, which is worse than briefly exceeding the cap.
     fn enforce_budget(&mut self) {
         while self.bytes > BUDGET_BYTES && self.undo.len() > 1 {
             let dropped = self.undo.remove(0);
             self.bytes -= dropped.bytes(self.bytes_per_texel);
         }
     }
+}
+
+/// Copy a canvas region into a fresh rect-sized texture — the before-image.
+///
+/// Texture-to-texture, so no row-alignment constraints apply and any rectangle works
+/// (unlike readback to a buffer, which needs 256-byte rows).
+pub fn snapshot_region(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    canvas: &wgpu::Texture,
+    rect: CanvasRect,
+) -> wgpu::Texture {
+    let snapshot = new_snapshot(device, rect.w, rect.h);
+    copy_region(encoder, canvas, rect_origin(rect), &snapshot, zero(), rect);
+    snapshot
+}
+
+/// Copy a before-image back over the canvas region it came from.
+pub fn restore_region(
+    encoder: &mut wgpu::CommandEncoder,
+    snapshot: &wgpu::Texture,
+    canvas: &wgpu::Texture,
+    rect: CanvasRect,
+) {
+    copy_region(encoder, snapshot, zero(), canvas, rect_origin(rect), rect);
+}
+
+/// A snapshot texture of the given size.
+pub fn new_snapshot(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("history-snapshot"),
+        size: wgpu::Extent3d {
+            width: w.max(1),
+            height: h.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: CANVAS_FORMAT,
+        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
+
+fn zero() -> wgpu::Origin3d {
+    wgpu::Origin3d::ZERO
+}
+
+fn rect_origin(rect: CanvasRect) -> wgpu::Origin3d {
+    wgpu::Origin3d {
+        x: rect.x,
+        y: rect.y,
+        z: 0,
+    }
+}
+
+/// The snapshot is always origin-based and rect-sized; the canvas side is offset by
+/// the rect. Taking both origins explicitly rather than a direction flag makes it hard
+/// to get them the wrong way round, which would be a silent corruption.
+fn copy_region(
+    encoder: &mut wgpu::CommandEncoder,
+    src: &wgpu::Texture,
+    src_origin: wgpu::Origin3d,
+    dst: &wgpu::Texture,
+    dst_origin: wgpu::Origin3d,
+    rect: CanvasRect,
+) {
+    encoder.copy_texture_to_texture(
+        wgpu::ImageCopyTexture {
+            texture: src,
+            mip_level: 0,
+            origin: src_origin,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::ImageCopyTexture {
+            texture: dst,
+            mip_level: 0,
+            origin: dst_origin,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::Extent3d {
+            width: rect.w,
+            height: rect.h,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 #[cfg(test)]
@@ -361,12 +380,24 @@ mod tests {
         }
     }
 
+    fn grow() -> Op {
+        Op::Resize {
+            resize: PageResize {
+                old_w: 100,
+                old_h: 100,
+                new_w: 100,
+                new_h: 200,
+                anchor: Anchor::TOP_LEFT,
+            },
+            before: None,
+        }
+    }
+
     #[test]
     fn bounds_cover_a_dab_and_its_radius() {
         let mut b = BoundsBuilder::default();
         b.add_dab(&dab(100.0, 100.0, 10.0));
         let r = b.to_rect(2048, 2048).expect("non-empty");
-        // 10px radius plus a pixel of slack, so 89..111 inclusive.
         assert!(r.x <= 89 && r.y <= 89);
         assert!(r.x + r.w >= 111 && r.y + r.h >= 111);
     }
@@ -382,8 +413,8 @@ mod tests {
         assert!(r.y + r.h >= 306);
     }
 
-    /// A stroke that runs off the canvas must clip, or the snapshot copy would
-    /// address pixels outside the texture and fail validation.
+    /// A stroke running off the canvas must clip, or the snapshot copy would address
+    /// pixels outside the texture and fail validation.
     #[test]
     fn bounds_clip_to_the_canvas() {
         let mut b = BoundsBuilder::default();
@@ -415,248 +446,118 @@ mod tests {
         assert!(b.to_rect(2048, 2048).is_none());
     }
 
-    /// A snapshot/restore round trip must return the canvas exactly, and must put
-    /// the pixels back **where they came from**. Getting the source and destination
-    /// origins the wrong way round would corrupt a different region silently, which
-    /// is why the helpers take both origins explicitly rather than a flag.
+    /// A grow costs no snapshot memory. That is what makes undoable extends nearly
+    /// free, and why they can be recorded unconditionally.
     #[test]
-    fn snapshot_and_restore_round_trips_exactly() {
-        use crate::test_gpu::{make_canvas, max_difference, readback, try_device, SIZE};
-
-        let Some((device, queue)) = try_device() else {
-            eprintln!("skipping: no usable GPU adapter");
-            return;
-        };
-
-        let canvas = make_canvas(&device, &queue);
-        let pristine = readback(&device, &queue, &canvas);
-
-        // An off-centre, non-square region, so a transposed or origin-swapped copy
-        // cannot accidentally look correct.
-        let rect = CanvasRect {
-            x: 17,
-            y: 40,
-            w: 61,
-            h: 33,
-        };
-
-        let mut encoder = device.create_command_encoder(&Default::default());
-        let snapshot = snapshot_region(&device, &mut encoder, &canvas, rect);
-
-        // Scribble over a larger area than the snapshot, then restore only the
-        // snapshotted rect: the rest must stay scribbled.
-        let scribble = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("scribble"),
-            size: wgpu::Extent3d {
-                width: SIZE,
-                height: SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: CANVAS_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let scribble_view = scribble.create_view(&Default::default());
-        encoder
-            .begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scribble-fill"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &scribble_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::RED),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            })
-            .forget_lifetime();
-        let whole = CanvasRect {
-            x: 0,
-            y: 0,
-            w: SIZE,
-            h: SIZE,
-        };
-        copy_region(&mut encoder, &scribble, zero(), &canvas, zero(), whole);
-
-        restore_region(&mut encoder, &snapshot, &canvas, rect);
-        queue.submit(std::iter::once(encoder.finish()));
-
-        let after = readback(&device, &queue, &canvas);
-
-        // Inside the restored rect: identical to pristine.
-        for y in rect.y..rect.y + rect.h {
-            for x in rect.x..rect.x + rect.w {
-                let i = (y * SIZE + x) as usize;
-                let (d, _) = max_difference(&[after[i]], &[pristine[i]]);
-                assert!(d < 1e-6, "({x},{y}) not restored: {:?}", after[i]);
-            }
-        }
-
-        // Just outside it: still scribbled, so the copy landed in the right place.
-        let outside = ((rect.y + rect.h + 2) * SIZE + rect.x) as usize;
-        assert!(
-            after[outside][0] > 0.5 && after[outside][1] < 0.1,
-            "region outside the rect was restored too: {:?}",
-            after[outside]
-        );
-    }
-
-    /// A 1x1 snapshot, so history entries can be built without a real canvas.
-    fn stub_entry(rect: CanvasRect, dabs: Vec<Dab>) -> Option<Entry> {
-        let (device, _queue) = crate::test_gpu::try_device()?;
-        let before = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("stub-snapshot"),
-            size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: CANVAS_FORMAT,
-            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        Some(Entry {
-            rect,
-            before,
-            dabs,
-            color_linear_premul: [0.0, 0.0, 0.0, 1.0],
-            opacity: 1.0,
-        })
-    }
-
-    /// Extending up shifts every existing pixel down, so history must follow --
-    /// **both** the rectangle (where a before-image goes back) and the dab positions
-    /// (replayed for redo). Missing either restores or repaints in the wrong place,
-    /// and neither would raise an error.
-    #[test]
-    fn shifting_moves_both_rects_and_dab_positions() {
-        let rect = CanvasRect {
-            x: 10,
-            y: 20,
-            w: 30,
-            h: 40,
-        };
-        let Some(entry) = stub_entry(rect, vec![dab(100.0, 200.0, 5.0)]) else {
-            eprintln!("skipping: no usable GPU adapter");
-            return;
-        };
-
+    fn a_grow_costs_no_snapshot_memory() {
         let mut h = History::new(8);
-        h.push(entry);
-
-        // Extending upward by 500 on a page that grew 1000 -> 1500 tall.
-        assert!(
-            h.shift(0, 500, 1000, 1500),
-            "growth should preserve history"
-        );
-
-        let e = h.pop_undo().expect("entry still present");
-        assert_eq!((e.rect.x, e.rect.y), (10, 520), "rect not shifted");
-        assert_eq!(
-            (e.dabs[0].x, e.dabs[0].y),
-            (100.0, 700.0),
-            "dabs not shifted"
-        );
-    }
-
-    /// Growing a page can never push a snapshot out of bounds, so history always
-    /// survives an extend. This is the case that must not regress -- silently
-    /// dropping undo on every extend would be a miserable bug to notice.
-    #[test]
-    fn growing_always_preserves_history() {
-        let rect = CanvasRect {
-            x: 0,
-            y: 0,
-            w: 1000,
-            h: 1000,
-        };
-        let Some(entry) = stub_entry(rect, vec![]) else {
-            eprintln!("skipping: no usable GPU adapter");
-            return;
-        };
-        let mut h = History::new(8);
-        h.push(entry);
-
-        assert!(h.shift(0, 0, 1000, 4000), "extend down");
+        h.push(grow());
         assert_eq!(h.undo_depth(), 1);
-        assert!(h.shift(500, 0, 1500, 4000), "extend left");
-        assert_eq!(h.undo_depth(), 1);
+        assert_eq!(h.bytes_held(), 0, "a grow should not need pixels saved");
     }
 
-    /// A crop can move a snapshot outside the page. Partial history cannot be
-    /// restored correctly, so it is discarded outright rather than left to corrupt.
+    /// A crop is charged for the whole pre-crop canvas, because giving back what it
+    /// removed is the only way to undo it.
     #[test]
-    fn cropping_out_of_bounds_discards_history() {
-        let rect = CanvasRect {
-            x: 400,
-            y: 400,
-            w: 200,
-            h: 200,
-        };
-        let Some(entry) = stub_entry(rect, vec![]) else {
+    fn a_crop_is_charged_for_the_old_canvas() {
+        let Some((device, _q)) = crate::test_gpu::try_device() else {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
         let mut h = History::new(8);
-        h.push(entry);
-
-        assert!(!h.shift(0, 0, 300, 300), "should report history discarded");
-        assert_eq!(h.undo_depth(), 0);
-        assert_eq!(h.redo_depth(), 0);
-        assert_eq!(h.bytes_held(), 0, "byte accounting left stale");
+        h.push(Op::Resize {
+            resize: PageResize {
+                old_w: 100,
+                old_h: 50,
+                new_w: 40,
+                new_h: 20,
+                anchor: Anchor::TOP_LEFT,
+            },
+            before: Some(new_snapshot(&device, 100, 50)),
+        });
+        assert_eq!(h.bytes_held(), 100 * 50 * 8);
     }
 
-    /// The redo stack must be shifted too, or redoing after an extend repaints in
-    /// the wrong place.
     #[test]
-    fn shifting_covers_the_redo_stack() {
-        let rect = CanvasRect {
-            x: 5,
-            y: 5,
-            w: 10,
-            h: 10,
-        };
-        let Some(entry) = stub_entry(rect, vec![dab(50.0, 60.0, 4.0)]) else {
-            eprintln!("skipping: no usable GPU adapter");
-            return;
-        };
+    fn pushing_after_an_undo_clears_the_redo_stack() {
         let mut h = History::new(8);
-        h.push(entry);
-        let undone = h.pop_undo().expect("entry");
-        h.finish_undo(undone);
+        h.push(grow());
+        let op = h.pop_undo().expect("op");
+        h.finish_undo(op);
         assert_eq!(h.redo_depth(), 1);
 
-        assert!(h.shift(100, 0, 2000, 2000));
-        let e = h.pop_redo().expect("redo entry");
-        assert_eq!(e.rect.x, 105);
-        assert_eq!(e.dabs[0].x, 150.0);
+        h.push(grow());
+        assert_eq!(h.redo_depth(), 0, "a new edit must invalidate redo");
+    }
+
+    /// Round-tripping through both stacks must leave the accounting where it started.
+    #[test]
+    fn byte_accounting_survives_undo_and_redo() {
+        let mut h = History::new(8);
+        h.push(grow());
+        let before = h.bytes_held();
+
+        let op = h.pop_undo().expect("op");
+        h.finish_undo(op);
+        let op = h.pop_redo().expect("op");
+        h.finish_redo(op);
+
+        assert_eq!(h.bytes_held(), before);
+        assert_eq!(h.undo_depth(), 1);
+        assert_eq!(h.redo_depth(), 0);
+    }
+
+    /// Undo must not be able to pop past the bottom of the stack.
+    #[test]
+    fn popping_an_empty_history_yields_nothing() {
+        let mut h = History::new(8);
+        assert!(h.pop_undo().is_none());
+        assert!(h.pop_redo().is_none());
+    }
+
+    /// Inverting a resize must produce exactly the opposite content movement, since
+    /// that is what undoing one relies on.
+    #[test]
+    fn inverting_a_resize_reverses_its_offset() {
+        for anchor in [
+            Anchor::TOP_LEFT,
+            Anchor::BOTTOM_LEFT,
+            Anchor::TOP_RIGHT,
+            Anchor::CENTER,
+        ] {
+            let forward = PageResize {
+                old_w: 300,
+                old_h: 300,
+                new_w: 800,
+                new_h: 700,
+                anchor,
+            };
+            let (fx, fy) = forward.offset();
+            let (bx, by) = forward.inverted().offset();
+            assert_eq!((bx, by), (-fx, -fy), "anchor {anchor:?} did not invert");
+        }
     }
 
     #[test]
-    fn clearing_releases_everything() {
-        let rect = CanvasRect {
-            x: 0,
-            y: 0,
-            w: 4,
-            h: 4,
+    fn only_a_shrink_needs_pixels_saved() {
+        let grow = PageResize {
+            old_w: 100,
+            old_h: 100,
+            new_w: 100,
+            new_h: 400,
+            anchor: Anchor::TOP_LEFT,
         };
-        let Some(entry) = stub_entry(rect, vec![]) else {
-            eprintln!("skipping: no usable GPU adapter");
-            return;
+        assert!(!grow.shrinks());
+        assert!(grow.inverted().shrinks(), "undoing a grow is a shrink");
+
+        // Growing in one axis while shrinking the other still loses pixels.
+        let mixed = PageResize {
+            old_w: 400,
+            old_h: 100,
+            new_w: 100,
+            new_h: 400,
+            anchor: Anchor::TOP_LEFT,
         };
-        let mut h = History::new(8);
-        h.push(entry);
-        h.clear();
-        assert_eq!(h.undo_depth(), 0);
-        assert_eq!(h.bytes_held(), 0);
+        assert!(mixed.shrinks());
     }
 }

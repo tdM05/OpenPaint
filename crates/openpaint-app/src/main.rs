@@ -260,6 +260,22 @@ impl OpenPaint {
         self.apply_pen_events();
     }
 
+    /// Mirror a geometry change from undo/redo onto the page.
+    ///
+    /// The renderer has already resized its textures; the page's dimensions live in
+    /// the editor, so both halves must be applied for them to agree. Resizing the page
+    /// here must **not** be recorded in history -- it *is* the undo, not a new edit.
+    fn apply_history_change(&mut self, change: renderer::HistoryChange) {
+        match change {
+            renderer::HistoryChange::None => {}
+            renderer::HistoryChange::Pixels => self.request_redraw(),
+            renderer::HistoryChange::Geometry { w, h, anchor } => {
+                self.editor.resize_page(w, h, anchor);
+                self.request_redraw();
+            }
+        }
+    }
+
     /// Grow the current page in one direction and keep everything consistent.
     ///
     /// The single place that knows a resize has three consequences: the page's
@@ -310,23 +326,29 @@ impl OpenPaint {
         if !editor::fits_pixel_budget(new_w, new_h) {
             let mpx = editor::MAX_CANVAS_PIXELS / (1024 * 1024);
             self.status_message = Some(format!(
-                "{new_w}x{new_h} exceeds the interim {mpx} Mpx single-texture budget;                  a tiled canvas is needed to go further"
+                "{new_w}x{new_h} exceeds the interim {mpx} Mpx single-texture budget; a tiled canvas is needed"
             ));
             self.request_redraw();
             return;
         }
 
-        let (dx, dy) = self.editor.resize_page(new_w, new_h, anchor);
-        let history_kept = match self.renderer.as_mut() {
-            Some(r) => r.resize_canvas(new_w, new_h, dx, dy),
-            None => true,
-        };
-        if !history_kept {
-            self.status_message = Some("Undo history cleared by the resize".to_owned());
+        self.editor.resize_page(new_w, new_h, anchor);
+        if let Some(r) = self.renderer.as_mut() {
+            r.resize_canvas(
+                history::PageResize {
+                    old_w: w,
+                    old_h: h,
+                    new_w,
+                    new_h,
+                    anchor,
+                },
+                true,
+            );
         }
 
-        // Show the new extent, so the user can see what they just added.
-        self.view.request_fit();
+        // Deliberately does NOT re-fit. Photoshop keeps your zoom through a canvas
+        // resize, and having the camera jump on every extend is disorienting when you
+        // are working zoomed in -- press 0 to fit.
         self.request_redraw();
     }
 
@@ -372,14 +394,12 @@ impl OpenPaint {
                 let Some(renderer) = self.renderer.as_mut() else {
                     return true;
                 };
-                let changed = if redo {
+                let change = if redo {
                     renderer.redo()
                 } else {
                     renderer.undo()
                 };
-                if changed {
-                    self.request_redraw();
-                }
+                self.apply_history_change(change);
                 true
             }
             _ => false,

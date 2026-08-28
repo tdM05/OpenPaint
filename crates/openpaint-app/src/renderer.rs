@@ -24,12 +24,30 @@ use winit::window::Window;
 
 use crate::canvas_renderer::{CanvasRenderer, CANVAS_FORMAT};
 use crate::editor::StrokeOp;
-use crate::history::{self, Entry, History};
+use crate::history::{self, CanvasRect, History, Op, PageResize};
 use crate::stroke_layer::StrokeLayer;
 use crate::view::Placement;
 
 /// Bytes per canvas texel (`Rgba16Float`), for history's memory accounting.
 const CANVAS_BYTES_PER_TEXEL: usize = 8;
+
+/// What an undo or redo did, and therefore what the caller must reconcile.
+///
+/// Geometry changes cannot be handled entirely in here: the page's dimensions live in
+/// the editor while its pixels live on the GPU, so the shell has to apply both halves.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HistoryChange {
+    /// Nothing to undo or redo.
+    None,
+    /// Pixels changed; just redraw.
+    Pixels,
+    /// The page's size changed; the editor's page must be resized to match.
+    Geometry {
+        w: u32,
+        h: u32,
+        anchor: openpaint_core::Anchor,
+    },
+}
 
 /// Everything an overlay needs to draw itself into the current frame.
 pub struct Overlay<'a> {
@@ -249,7 +267,7 @@ impl Renderer {
                                 rect,
                             );
                             let (color_linear_premul, opacity) = self.recording_paint;
-                            self.history.push(Entry {
+                            self.history.push(Op::Stroke {
                                 rect,
                                 before,
                                 dabs: std::mem::take(&mut self.recording),
@@ -267,19 +285,50 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 
-    /// React to the page being resized: re-create the GPU resources that are sized
-    /// to the canvas, and shift history so it still refers to the right pixels.
+    /// React to the page being resized: re-create the GPU resources that are sized to
+    /// the canvas, and record the resize so it can be undone.
     ///
-    /// Returns `false` if history had to be discarded (a crop moved a snapshot out
-    /// of bounds), so the caller can say so rather than leaving the user to notice.
-    pub fn resize_canvas(&mut self, new_w: u32, new_h: u32, dx: i32, dy: i32) -> bool {
+    /// `record` is false when the resize *is* an undo/redo, so reverting a resize does
+    /// not push another one.
+    pub fn resize_canvas(&mut self, resize: PageResize, record: bool) {
+        let PageResize {
+            old_w,
+            old_h,
+            new_w,
+            new_h,
+            ..
+        } = resize;
+        let (dx, dy) = resize.offset();
+
+        // A crop loses pixels, and the only way to give them back is to have kept
+        // them. A grow needs nothing: shrinking back is lossless.
+        let before = if record && resize.shrinks() {
+            let snapshot = history::new_snapshot(&self.device, old_w, old_h);
+            let mut encoder = self.new_stroke_encoder();
+            history::restore_region(
+                &mut encoder,
+                self.canvas_renderer.texture(),
+                &snapshot,
+                CanvasRect {
+                    x: 0,
+                    y: 0,
+                    w: old_w,
+                    h: old_h,
+                },
+            );
+            self.queue.submit(std::iter::once(encoder.finish()));
+            Some(snapshot)
+        } else {
+            None
+        };
+
         self.canvas_renderer
             .resize(&self.device, &self.queue, new_w, new_h, dx, dy);
 
-        // The stroke layer's accumulation texture is canvas-sized, and its bind
-        // group points at it, so it is rebuilt wholesale. Pipelines are rebuilt too,
-        // which is wasteful -- but resizing is rare and a partial rebuild would be
-        // easy to get subtly wrong.
+        // The stroke layer's accumulation texture is canvas-sized and its bind group
+        // points at it, so it is rebuilt wholesale. Pipelines are rebuilt too, which is
+        // wasteful -- but resizing is rare and a partial rebuild would be easy to get
+        // subtly wrong.
         self.stroke_layer = StrokeLayer::new(
             &self.device,
             new_w,
@@ -290,7 +339,9 @@ impl Renderer {
         // Any in-progress stroke belonged to the old geometry.
         self.recording.clear();
 
-        self.history.shift(dx, dy, new_w, new_h)
+        if record {
+            self.history.push(Op::Resize { resize, before });
+        }
     }
 
     /// Read the canvas back and write it as an sRGB PNG.
@@ -319,50 +370,97 @@ impl Renderer {
         )
     }
 
-    /// Undo the most recent stroke by restoring its before-image.
+    /// Undo the most recent operation.
     ///
-    /// Returns `true` if anything changed, so the caller knows to request a frame.
-    pub fn undo(&mut self) -> bool {
-        let Some(entry) = self.history.pop_undo() else {
-            return false;
+    /// Returns what the caller must reconcile: a geometry change has to be mirrored
+    /// onto the page in the editor, since the page's dimensions live there and the
+    /// pixels live here.
+    pub fn undo(&mut self) -> HistoryChange {
+        let Some(op) = self.history.pop_undo() else {
+            return HistoryChange::None;
         };
-        let mut encoder = self.new_stroke_encoder();
-        history::restore_region(
-            &mut encoder,
-            &entry.before,
-            self.canvas_renderer.texture(),
-            entry.rect,
-        );
-        self.queue.submit(std::iter::once(encoder.finish()));
-        // The snapshot is still the *before* image, which is exactly what a later
-        // undo of the redone stroke needs -- so it carries over untouched.
-        self.history.finish_undo(entry);
-        true
+        let change = match &op {
+            Op::Stroke { rect, before, .. } => {
+                let mut encoder = self.new_stroke_encoder();
+                history::restore_region(
+                    &mut encoder,
+                    before,
+                    self.canvas_renderer.texture(),
+                    *rect,
+                );
+                self.queue.submit(std::iter::once(encoder.finish()));
+                HistoryChange::Pixels
+            }
+            Op::Resize { resize, before } => {
+                // Resizing back with the *same* anchor gives exactly the opposite
+                // offset, because the offset is derived from the size difference.
+                self.resize_canvas(resize.inverted(), false);
+
+                // A crop's removed pixels come back from the snapshot.
+                if let Some(before) = before {
+                    let mut encoder = self.new_stroke_encoder();
+                    history::restore_region(
+                        &mut encoder,
+                        before,
+                        self.canvas_renderer.texture(),
+                        CanvasRect {
+                            x: 0,
+                            y: 0,
+                            w: resize.old_w,
+                            h: resize.old_h,
+                        },
+                    );
+                    self.queue.submit(std::iter::once(encoder.finish()));
+                }
+                HistoryChange::Geometry {
+                    w: resize.old_w,
+                    h: resize.old_h,
+                    anchor: resize.anchor,
+                }
+            }
+        };
+        self.history.finish_undo(op);
+        change
     }
 
-    /// Redo by replaying the stroke's dabs, rather than storing an after-image.
-    pub fn redo(&mut self) -> bool {
-        let Some(entry) = self.history.pop_redo() else {
-            return false;
+    /// Re-apply the most recent undone operation.
+    pub fn redo(&mut self) -> HistoryChange {
+        let Some(op) = self.history.pop_redo() else {
+            return HistoryChange::None;
         };
+        let change = match &op {
+            Op::Stroke {
+                dabs,
+                color_linear_premul,
+                opacity,
+                ..
+            } => {
+                // Replayed rather than restored from an after-image. Paint is a queue
+                // write, so it is set before the draws that consume it.
+                self.stroke_layer
+                    .set_paint(&self.queue, *color_linear_premul, *opacity);
+                self.stroke_layer
+                    .upload_dabs(&self.device, &self.queue, dabs);
 
-        // Paint is a queue write, so it must be ordered before the draws that use
-        // it -- set it, then record in a fresh submission.
-        self.stroke_layer
-            .set_paint(&self.queue, entry.color_linear_premul, entry.opacity);
-        self.stroke_layer
-            .upload_dabs(&self.device, &self.queue, &entry.dabs);
-
-        let mut encoder = self.new_stroke_encoder();
-        self.stroke_layer.begin_stroke(&mut encoder);
-        self.stroke_layer
-            .stamp_range(&mut encoder, 0, entry.dabs.len());
-        self.stroke_layer
-            .bake(&mut encoder, self.canvas_renderer.target_view());
-        self.queue.submit(std::iter::once(encoder.finish()));
-
-        self.history.finish_redo(entry);
-        true
+                let mut encoder = self.new_stroke_encoder();
+                self.stroke_layer.begin_stroke(&mut encoder);
+                self.stroke_layer.stamp_range(&mut encoder, 0, dabs.len());
+                self.stroke_layer
+                    .bake(&mut encoder, self.canvas_renderer.target_view());
+                self.queue.submit(std::iter::once(encoder.finish()));
+                HistoryChange::Pixels
+            }
+            Op::Resize { resize, .. } => {
+                self.resize_canvas(*resize, false);
+                HistoryChange::Geometry {
+                    w: resize.new_w,
+                    h: resize.new_h,
+                    anchor: resize.anchor,
+                }
+            }
+        };
+        self.history.finish_redo(op);
+        change
     }
 
     fn new_stroke_encoder(&self) -> wgpu::CommandEncoder {

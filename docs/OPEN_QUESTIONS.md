@@ -278,6 +278,13 @@ consequences, so the limits are known rather than discovered:
   current one over the restored image — a state the user never asked for. Ideally a
   mid-stroke Ctrl+Z would *cancel* the stroke; that needs stroke cancellation, which
   does not exist yet (also noted in Q16).
+- **Resizes are undoable** as of 2026-08-28, which turned out to *simplify* history
+  rather than complicate it: because operations are undone strictly in reverse order,
+  the page geometry while undoing an operation is always the geometry it was recorded
+  against. That removed the coordinate-shifting machinery entirely (an earlier version
+  rewrote every rectangle and dab position on resize, which was only necessary because
+  resizes were *not* undoable). A grow needs no pixels saved since shrinking back is
+  lossless; only a crop stores the pre-crop canvas.
 - History lives beside the GPU resources rather than with the document, which is not
   where it belongs conceptually. Revisit when the document/page model lands: history
   will need to be per-document, and probably per-page.
