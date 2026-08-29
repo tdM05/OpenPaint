@@ -626,6 +626,32 @@ to lift, so nothing in it runs headlessly, and a sabotage swapping `content_boun
 caught; that one is the gap, and it is written above the function rather than left for
 someone to discover.
 
+### 6b. Nothing may fail silently — 2026-08-29
+
+Raised by the author while reporting the transform bug, and it generalises past it:
+*"we should cover all edge cases in future so user is never confused and it just does
+not work."*
+
+**A refusal is a feature, not an omission.** When the app declines to do something —
+painting on a text layer, filling with nothing selected, an edit too large to record —
+it must say **what happened, why, and what to do instead**. An app that quietly does
+nothing teaches the artist that it is broken, and they are not wrong to think so: from
+where they sit, "refused for a good reason" and "bug" look identical.
+
+Two consequences, both listed as work in `TODO.md` §1 rather than done here:
+
+- **A status line on a debug panel is not a notification surface.** It is invisible to
+  someone looking at their drawing, and the panel is throwaway anyway (§3). Refusals
+  need a transient notice near the canvas, and a dialog for anything that risks work.
+- **Refusals need one seam.** Today each writes its own string at its own call site,
+  which is how coverage ends up patchy — the same shape as §4l, where every tool had
+  its own idea of who owned the pointer. One place to call, and the audit becomes "who
+  calls it".
+
+`TODO.md` §1 holds the audit table: every place the app can decline, and whether it
+currently says so. It is deliberately a table of *known gaps* rather than a claim of
+completeness.
+
 ### 5e. A transform stays in the air until it is committed — 2026-08-29
 
 A quick drag lifts, moves and puts down in one gesture. That is all one

@@ -1,0 +1,84 @@
+# OpenPaint — TODO
+
+> Work that is **decided but not done**. Different from the other two docs on purpose:
+> `DECISIONS.md` records what we agreed and why; `OPEN_QUESTIONS.md` holds things we
+> have not decided yet. This is the list of things we know we want, have not built,
+> and would otherwise forget.
+>
+> An item leaves this file when it ships, and the reasoning behind it moves to
+> `DECISIONS.md`.
+
+Last updated: 2026-08-29
+
+---
+
+## 1. Nothing may fail silently ⚠️ the standing one
+
+**Raised by the author, 2026-08-29:** *"if they are on a text layer, and try to draw,
+it should notify them that they cannot paint because it is a text layer (it sorta has
+a message, but the point is we should cover all edge cases in future so user is never
+confused and it just does not work)."*
+
+The principle is in `DECISIONS.md` §6b. This is the audit list that goes with it: every
+place the app can decline to do something, and whether it currently says so.
+
+The rule for each row: **a refusal must say what happened, why, and what to do instead**
+— and it must appear where the artist is looking, which for a canvas gesture is not a
+line at the bottom of a side panel.
+
+| Situation | Today | Wanted |
+| --- | --- | --- |
+| Paint on a text layer | status line, and only on the *first* refused stroke | in-canvas notice; offer "convert to raster" |
+| Paint on a hidden layer | nothing happens at all | say the layer is hidden, offer to show it |
+| Paint on a locked layer | (lock not built yet) | say so when it is |
+| Fill / delete with no selection | status line | fine, but should not be panel-only |
+| Transform with no selection | status line | same |
+| Transform an empty selection | status line | same |
+| Press outside the transform box | nothing happens | probably right, but confirm it does not read as dead |
+| Wand finds nothing at the seed | (unverified) | say "no region here at this tolerance" |
+| Undo with an empty stack | nothing happens | say "nothing to undo" |
+| An edit too large to record in history | status line, after the fact | should be *before*, or at least unmissable |
+| Save fails (permissions, disk full) | (unverified) | must be a dialog, never a status line |
+| A font in the document is not installed | reported in the panel | good — this is the model for the rest |
+| A brush tip file will not load | (unverified) | say which file and why |
+| Autosave fails | (unverified) | must be visible; silent autosave failure is the worst case here |
+
+**Two things to build before the table can be finished:**
+
+1. **A real notification surface.** A one-line `status_message` on a debug panel is not
+   it — the panel is explicitly throwaway (§3), and a message there is invisible to
+   someone looking at their drawing. Wanted: a transient notice near the canvas, and a
+   dialog for anything that risks work.
+2. **A single place refusals go.** Today each refusal writes its own string at its own
+   call site, which is exactly how coverage ends up patchy — the same shape as the
+   pointer-capture bug in §4l, where every tool had its own idea of who owned the
+   pointer. One `refuse(reason)` seam, and the audit becomes "who calls it".
+
+---
+
+## 2. Known defects
+
+- **The app test binary occasionally dies with `STATUS_ACCESS_VIOLATION`** rather than
+  failing a test — roughly one run in ten on the dev box, always at process level, never
+  in a named test. Suspected wgpu/D3D12 teardown in the GPU cross-check tests. Not
+  chased yet; recorded because a sabotage sweep read one such crash as "the sabotage was
+  not caught", which is a false negative of exactly the kind §11a warns about.
+
+---
+
+## 3. Deferred features (decided we want them; not now)
+
+- **Cursor feedback on the transform box** — a scale cursor on the handles, a rotate
+  cursor on the ring. Needs a cursor seam that works for pen as well as mouse (Q14).
+- **Numeric entry while transforming** — type an exact angle or size. The panel has the
+  fields; a real UI wants them on the box.
+- **Snapping** — rotation to 15°, scale to whole percentages, both with a modifier.
+- **Transform a whole layer**, not only a selection.
+- **Text**: on-canvas text box with a caret and handles; a vertical-align field;
+  colour fonts; variable-font axes. Vertical writing mode is modelled but unimplemented.
+- **Speech bubbles** — the author flagged wanting "a good text bubble system later".
+  Almost certainly a vector shape plus a text block plus a tail, which is why the text
+  layer was built on content-is-truth rather than on pixels.
+- **Brush presets** — unblocked now that a tip can be a bitmap (§4p).
+- **Layer groups** — structural; changes the document model and the compositor.
+- **Marching ants that actually march.** The selection outline is dashed but static.
