@@ -1203,7 +1203,8 @@ impl OpenPaint {
     /// Fill the selection with the brush colour, on the active layer.
     fn fill_selection(&mut self) {
         let mode = self.editor.fill_mode();
-        let brush = *self.editor.brush();
+        // Cloned rather than copied: a brush now owns response curves, so it is no longer Copy.
+        let brush = self.editor.brush().clone();
         self.paint_selection(
             brush.color_linear_premul(),
             brush.opacity,

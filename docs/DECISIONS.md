@@ -391,6 +391,44 @@ engine is written:
 On-disk storage format is a **separate, later** decision (Q6) — 16-bit in memory
 does not oblige 16-bit on disk.
 
+### 4m. Pressure drives brushes through curves — landed 2026-08-28
+
+The first piece of brush depth (§4.2), and the one that makes brush *presets*
+worth having: presets over the parameters we had would have produced six
+slightly different round brushes.
+
+**An inking pen and a pencil are not two sizes of the same dab.** What
+separates them is mostly how they answer pressure — a pen holds its width and
+then opens up, a pencil responds from the lightest touch. Same rasterizer,
+same parameters; only the mapping differs. So the mapping is the thing to make
+editable.
+
+**Control points, monotone cubic (Fritsch–Carlson).** Two properties, neither
+cosmetic. It *passes through* the points, so a curve editor can be trusted.
+And it **cannot overshoot**: a plain cubic spline dips below the lowest point
+and bulges past the highest between widely spaced points, which on a size
+curve reads as pressing harder briefly making a *thinner* line. A straight
+line between two points is the same representation, so "no curve" needs no
+flag — and a flat curve *is* the "pressure does not affect size" switch, which
+is why there is no checkbox that could disagree with it.
+
+**Pressure drives size and flow, not opacity — and that is forced, not
+chosen.** Opacity is a ceiling on the whole stroke (§stroke): it is what stops
+overlapping dabs building past it. A ceiling that changed halfway along a
+stroke would not be a ceiling. Flow is per dab, so it is the parameter
+pressure can honestly drive, and driving it gives the light-touch-faint-mark
+behaviour that pressure-to-opacity is usually reached for.
+
+**Defaults preserve the old feel deliberately**: size is the identity curve
+(what the brush did before), flow is flat. A gentler default size curve
+probably suits most hands, but changing how the existing brush feels is a
+separate decision from making it adjustable, and only one of those was being
+taken.
+
+The curve is general over its *input*, so tilt and velocity are later new
+sources rather than new machinery. Dab shape and textured tips are the
+remaining pieces of §4.2 and are separable from this one.
+
 ### 4l. One pointer capture, decided at the press — 2026-08-28
 
 Every tool that took pointer input added another arm to `handle_pen_event`,

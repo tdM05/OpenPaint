@@ -23,15 +23,20 @@
 //! per stroke so overlapping dabs build toward the opacity ceiling instead of
 //! darkening on every overlap.
 //!
-//! Still to come (docs Q7a): GPU dab rasterization, textures, a tuned falloff
-//! curve, and modulation of parameters by pressure/tilt/velocity through curves.
-//! Only radius is pressure-driven so far.
+//! Pressure drives size and flow through editable response curves ([`crate::curve`]), which is
+//! what makes a pencil and an inking pen different tools rather than two sizes of one.
+//!
+//! Still to come (docs Q7a): dab *shape* -- elliptical, roundness, angle, following stroke
+//! direction or tilt -- and textured tips, which is what a pencil or charcoal actually needs. Tilt
+//! and velocity as curve inputs alongside pressure: the curve machinery is already general over
+//! its input, so those are new sources rather than new mechanisms.
 
 use crate::color::{opaque_linear_premul_to_srgb8, opaque_srgb8_to_linear_premul};
+use crate::curve::Curve;
 use crate::dab::Dab;
 
 /// Brush parameters. Sizes are in canvas pixels.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Brush {
     /// Dab radius at full pressure, in pixels.
     pub radius: f32,
@@ -42,6 +47,18 @@ pub struct Brush {
     pub spacing: f32,
     /// How much paint each dab deposits, `0.0..=1.0`.
     pub flow: f32,
+    /// How pressure drives dab size. See [`crate::curve`].
+    ///
+    /// A flat curve is "pressure does not affect size", so there is no separate switch for that.
+    pub size_response: Curve,
+    /// How pressure drives flow — how much paint each dab lays down.
+    ///
+    /// **Flow rather than opacity, and that is forced by the model rather than chosen.** Opacity is
+    /// a ceiling on the *whole stroke* (see [`crate::stroke`]): it is what stops overlapping dabs
+    /// from building past it. A ceiling that changed halfway along a stroke would not be a ceiling.
+    /// Flow is per dab, so it is the parameter pressure can honestly drive, and driving it gives the
+    /// light-touch-faint-mark behaviour that pressure-to-opacity is usually reached for.
+    pub flow_response: Curve,
     /// Ceiling the whole stroke may reach, `0.0..=1.0`.
     ///
     /// Per *stroke*, not per dab and not per layer: overlapping dabs build toward
@@ -68,6 +85,14 @@ impl Default for Brush {
             hardness: 0.5,
             spacing: 0.25,
             flow: 1.0,
+            // Identity, which is what the brush did before curves existed: size tracks pressure
+            // exactly. Not necessarily the *best* default -- a slight curve suits most hands -- but
+            // changing the feel of the existing brush is a separate decision from making it
+            // adjustable, and only one of those is being made here.
+            size_response: Curve::linear(),
+            // Flat: flow ignores pressure until asked to. Full flow at every pressure is the
+            // behaviour that was there before.
+            flow_response: Curve::constant(1.0),
             opacity: 1.0,
             // Off by default, and that is a deliberate refusal to guess. Smoothing buys steadiness
             // with latency (see `stabilizer`), and how much an artist needs depends entirely on
@@ -125,20 +150,26 @@ impl Brush {
     }
 
     /// Effective dab radius for a given pressure in `0.0..=1.0`.
+    ///
+    /// Floored at half a pixel so the lightest touch still makes a mark rather than a degenerate
+    /// dab: a brush that silently does nothing at low pressure reads as a broken pen.
     fn radius_for(&self, pressure: f32) -> f32 {
-        // Simple linear pressure→size for now. A configurable response curve
-        // arrives with the real engine.
-        (self.radius * pressure.clamp(0.0, 1.0)).max(0.5)
+        (self.radius * self.size_response.at(pressure)).max(0.5)
     }
 
-    /// Build one dab at `(cx, cy)` with the given radius.
-    fn dab_at(&self, cx: f32, cy: f32, radius: f32) -> Dab {
+    /// Effective flow for a given pressure.
+    fn flow_for(&self, pressure: f32) -> f32 {
+        (self.flow * self.flow_response.at(pressure)).clamp(0.0, 1.0)
+    }
+
+    /// Build one dab at `(cx, cy)` for a given pressure.
+    fn dab_at(&self, cx: f32, cy: f32, pressure: f32) -> Dab {
         Dab {
             x: cx,
             y: cy,
-            radius,
+            radius: self.radius_for(pressure),
             hardness: self.hardness,
-            flow: self.flow,
+            flow: self.flow_for(pressure),
             color_linear_premul: self.color_linear_premul,
         }
     }
@@ -152,7 +183,7 @@ impl Brush {
         y: f32,
         pressure: f32,
     ) {
-        out.push(self.dab_at(x, y, self.radius_for(pressure)));
+        out.push(self.dab_at(x, y, pressure));
         state.last = Some((x, y));
         state.residual = 0.0;
     }
@@ -190,7 +221,7 @@ impl Brush {
         while traveled + step <= seg_len {
             traveled += step;
             let t = traveled;
-            out.push(self.dab_at(px + ux * t, py + uy * t, radius));
+            out.push(self.dab_at(px + ux * t, py + uy * t, pressure));
         }
         state.residual = seg_len - traveled;
         state.last = Some((x, y));
@@ -255,6 +286,93 @@ mod tests {
         assert_eq!(dabs.len(), one_segment.len());
         for (a, b) in dabs.iter().zip(&one_segment) {
             assert!((a.x - b.x).abs() < 1e-3, "{} vs {}", a.x, b.x);
+        }
+    }
+
+    /// The point of the whole feature: two brushes with the same numbers and different curves
+    /// make genuinely different marks at the same pressure.
+    ///
+    /// A pencil answers from the lightest touch; an inking pen holds its width and then opens up.
+    /// Both are this rasterizer with these parameters — only the mapping from pressure differs, and
+    /// that is what makes them different *tools* rather than two sizes of one.
+    #[test]
+    fn the_size_curve_is_what_separates_a_pencil_from_a_pen() {
+        let mut pencil = Brush {
+            radius: 20.0,
+            ..Brush::default()
+        };
+        let mut pen = pencil.clone();
+        pencil.size_response =
+            Curve::from_points(vec![(0.0, 0.0), (0.2, 0.55), (1.0, 1.0)]).expect("valid");
+        pen.size_response =
+            Curve::from_points(vec![(0.0, 0.0), (0.7, 0.25), (1.0, 1.0)]).expect("valid");
+
+        let light = 0.2_f32;
+        let pencil_dab = stroke(&pencil, 0.0, 0.0, light);
+        let pen_dab = stroke(&pen, 0.0, 0.0, light);
+        assert!(
+            pencil_dab[0].radius > pen_dab[0].radius * 2.0,
+            "at light pressure the pencil should already be wide: {} vs {}",
+            pencil_dab[0].radius,
+            pen_dab[0].radius
+        );
+
+        // And both reach full width when leaned on, or one is simply a smaller brush.
+        let hard = 1.0_f32;
+        for b in [&pencil, &pen] {
+            let dab = stroke(b, 0.0, 0.0, hard);
+            assert!(
+                (dab[0].radius - 20.0).abs() < 0.1,
+                "full pressure should give the full radius, got {}",
+                dab[0].radius
+            );
+        }
+    }
+
+    /// Pressure drives *flow*, and the flow curve reaches the dabs.
+    #[test]
+    fn the_flow_curve_reaches_the_dabs() {
+        let mut brush = Brush {
+            radius: 10.0,
+            flow: 1.0,
+            ..Brush::default()
+        };
+        // Flat by default, so pressure does nothing until asked.
+        assert!(
+            (stroke(&brush, 0.0, 0.0, 0.2)[0].flow - 1.0).abs() < 1e-3,
+            "the default flow curve should ignore pressure"
+        );
+
+        brush.flow_response = Curve::linear();
+        let faint = stroke(&brush, 0.0, 0.0, 0.25);
+        let firm = stroke(&brush, 0.0, 0.0, 1.0);
+        assert!(
+            (faint[0].flow - 0.25).abs() < 0.02,
+            "a light touch should lay down little paint, got {}",
+            faint[0].flow
+        );
+        assert!(
+            (firm[0].flow - 1.0).abs() < 0.02,
+            "and a firm one all of it, got {}",
+            firm[0].flow
+        );
+    }
+
+    /// A flat size curve is how "pressure does not affect size" is expressed, so it has to work.
+    #[test]
+    fn a_flat_size_curve_makes_pressure_irrelevant() {
+        let brush = Brush {
+            radius: 12.0,
+            size_response: Curve::constant(1.0),
+            ..Brush::default()
+        };
+        for p in [0.05_f32, 0.5, 1.0] {
+            let dab = stroke(&brush, 0.0, 0.0, p);
+            assert!(
+                (dab[0].radius - 12.0).abs() < 0.01,
+                "pressure {p} changed the radius to {}",
+                dab[0].radius
+            );
         }
     }
 

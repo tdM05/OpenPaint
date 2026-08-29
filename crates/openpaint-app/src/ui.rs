@@ -23,7 +23,7 @@
 
 use crate::editor::Tool;
 use egui::ViewportId;
-use openpaint_core::{Blend, Brush, Layer};
+use openpaint_core::{Blend, Brush, Curve, Layer};
 use winit::window::Window;
 
 use crate::editor::DEFAULT_EXTEND;
@@ -218,6 +218,123 @@ pub struct Status<'a> {
     pub has_selection: bool,
     /// Wand settings: colour tolerance, how far to grow the region, and whether a click fills.
     pub wand: WandSettings,
+}
+
+/// A small editable response curve.
+///
+/// Drag a point to move it, click empty space to add one, right-click a point to remove it. The
+/// ends stay pinned in x, because a curve that does not span the input range has an undefined
+/// answer at the edges — and "what happens at full pressure" is not a question a brush may decline.
+///
+/// Drawn rather than assembled from widgets, for the same reason the crop and selection overlays
+/// are: this is direct manipulation of a shape, and a shape is not a stack of rectangles.
+fn curve_editor(ui: &mut egui::Ui, label: &str, curve: &mut Curve) -> bool {
+    const SIDE: f32 = 108.0;
+    ui.label(egui::RichText::new(label).small());
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(SIDE, SIDE), egui::Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+
+    // Curve space is (0,0) bottom-left to (1,1) top-right; screen y runs the other way.
+    let to_screen = |p: (f32, f32)| {
+        egui::pos2(
+            rect.left() + p.0 * rect.width(),
+            rect.bottom() - p.1 * rect.height(),
+        )
+    };
+    let to_curve = |p: egui::Pos2| {
+        (
+            ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
+            ((rect.bottom() - p.y) / rect.height()).clamp(0.0, 1.0),
+        )
+    };
+
+    painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+    // The identity, as a reference against which a curve's shape is legible.
+    painter.line_segment(
+        [to_screen((0.0, 0.0)), to_screen((1.0, 1.0))],
+        egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color()),
+    );
+
+    let mut points: Vec<(f32, f32)> = curve.points().to_vec();
+    let mut changed = false;
+
+    if let Some(pos) = response.interact_pointer_pos() {
+        let hit = points
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, to_screen(*p).distance(pos)))
+            .filter(|(_, d)| *d < 10.0)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _)| i);
+
+        if response.secondary_clicked() {
+            // Never below two, and never an end: an end is what defines the range.
+            if let Some(i) = hit {
+                if points.len() > 2 && i != 0 && i != points.len() - 1 {
+                    points.remove(i);
+                    changed = true;
+                }
+            }
+        } else if response.dragged() || response.clicked() {
+            let target = to_curve(pos);
+            match hit {
+                Some(i) => {
+                    // The ends may move in y but not in x, and interior points stay between their
+                    // neighbours -- a curve whose points crossed over would have two answers at one
+                    // input.
+                    let x = if i == 0 {
+                        points[0].0
+                    } else if i == points.len() - 1 {
+                        points[i].0
+                    } else {
+                        target
+                            .0
+                            .clamp(points[i - 1].0 + 0.02, points[i + 1].0 - 0.02)
+                    };
+                    points[i] = (x, target.1);
+                    changed = true;
+                }
+                None if response.clicked() => {
+                    let at = points
+                        .iter()
+                        .position(|p| p.0 > target.0)
+                        .unwrap_or(points.len());
+                    if at > 0 && at < points.len() {
+                        points.insert(at, target);
+                        changed = true;
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
+    if changed {
+        if let Some(next) = Curve::from_points(points.clone()) {
+            *curve = next;
+        } else {
+            // Refused rather than repaired: the clamping above should make this unreachable, and
+            // silently sorting the points would hide it if it were not.
+            changed = false;
+        }
+    }
+
+    // The curve itself, sampled.
+    let samples: Vec<egui::Pos2> = (0..=48)
+        .map(|i| {
+            let x = i as f32 / 48.0;
+            to_screen((x, curve.at(x)))
+        })
+        .collect();
+    painter.add(egui::Shape::line(
+        samples,
+        egui::Stroke::new(2.0_f32, ui.visuals().strong_text_color()),
+    ));
+    for p in curve.points() {
+        painter.circle_filled(to_screen(*p), 3.5, ui.visuals().strong_text_color());
+    }
+    changed
 }
 
 /// Where to draw the brush outline, and how big.
@@ -519,6 +636,19 @@ impl Ui {
                                 .small()
                                 .weak(),
                             );
+
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(
+                                    "How pressure drives the brush. Drag a point, click to add one, right-click to remove. A flat curve means pressure is ignored.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            ui.horizontal(|ui| {
+                                curve_editor(ui, "Size", &mut brush.size_response);
+                                curve_editor(ui, "Flow", &mut brush.flow_response);
+                            });
 
                             ui.separator();
                             ui.add(egui::Slider::new(&mut brush.flow, 0.0..=1.0).text("Flow"));

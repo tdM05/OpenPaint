@@ -10,6 +10,7 @@
 pub mod brush;
 pub mod canvas;
 pub mod color;
+pub mod curve;
 pub mod dab;
 pub mod document;
 pub mod layer;
@@ -24,6 +25,7 @@ pub mod tile;
 
 pub use brush::{Brush, StrokeState};
 pub use canvas::Canvas;
+pub use curve::Curve;
 pub use dab::Dab;
 pub use document::Document;
 pub use layer::{Blend, Layer};
