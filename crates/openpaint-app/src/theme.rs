@@ -26,10 +26,6 @@
 //! Every measurement is logical, matching [`crate::layout`]. The display scale is applied once at
 //! draw time. See that module for why this is not a detail to settle later.
 
-// Built ahead of the shell that will draw it, like `crate::layout`. `expect` rather than `allow`
-// so it becomes an error the moment the shell starts calling it.
-#![expect(dead_code, reason = "the theme lands before the widgets that read it")]
-
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -44,14 +40,8 @@ impl Color {
         Self([r, g, b])
     }
 
-    /// This colour at `alpha`, for overlays drawn over the artwork.
-    #[must_use]
-    pub fn with_alpha(self, alpha: u8) -> [u8; 4] {
-        [self.0[0], self.0[1], self.0[2], alpha]
-    }
-
     /// Relative luminance, for the contrast check.
-    #[must_use]
+    #[cfg(test)]
     fn luminance(self) -> f32 {
         let channel = |c: u8| {
             let c = f32::from(c) / 255.0;
@@ -68,6 +58,10 @@ impl Color {
     }
 
     /// WCAG contrast ratio against another colour, from 1 (identical) to 21 (black on white).
+    ///
+    /// Only the tests read this, and that is the point of it: nothing at runtime asks whether a
+    /// theme is legible, because a theme that is not legible should never have been committed.
+    #[cfg(test)]
     #[must_use]
     pub fn contrast(self, other: Self) -> f32 {
         let (a, b) = (self.luminance(), other.luminance());

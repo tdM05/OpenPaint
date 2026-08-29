@@ -27,14 +27,6 @@
 //! bookkeeping plus a free list. The tree is at most a few dozen nodes, so the usual reason to
 //! reach for an arena does not apply.
 
-// Built ahead of the shell that will drive it, so nothing calls any of this yet. `expect` rather
-// than `allow` on purpose: it becomes an error the moment the shell does start calling it, which
-// is exactly when this note should be deleted rather than quietly left behind.
-#![expect(
-    dead_code,
-    reason = "the layout tree lands before the UI shell that consumes it"
-)]
-
 /// Which panel a leaf holds. Opaque on purpose — see the module note.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PanelId(pub u32);
@@ -456,6 +448,29 @@ impl Layout {
             .find_map(|p| p.tabs.iter().position(|q| *q == panel).map(|i| (p.path, i)))
     }
 
+    /// Set a child's share of its split directly.
+    ///
+    /// For building a default arrangement and for restoring a saved one — the two cases where the
+    /// proportions are known rather than dragged to. Weights are relative, so callers normally set
+    /// every child of a split together and need not make them sum to anything in particular.
+    ///
+    /// Floored above zero for the same reason a splitter drag is: a child at exactly nothing has
+    /// no header left to grab, and a layout you cannot grab is a layout you cannot fix.
+    pub fn set_weight(&mut self, path: &[usize], weight: f32) -> bool {
+        let Some((index, parent)) = path.split_last() else {
+            // The root has no parent to take a share of.
+            return false;
+        };
+        let Some(Node::Split { children, .. }) = self.node_mut(parent) else {
+            return false;
+        };
+        let Some(child) = children.get_mut(*index) else {
+            return false;
+        };
+        child.weight = weight.max(MIN_WEIGHT_FRACTION);
+        true
+    }
+
     /// Which panel is tab `tab` of the leaf at `path`.
     #[must_use]
     pub fn tab_at(&self, path: &[usize], tab: usize) -> Option<PanelId> {
@@ -624,6 +639,8 @@ impl LayoutHistory {
         Some(next)
     }
 
+    /// How much there is to undo and to redo. Read by the tests that pin "a tap records nothing".
+    #[cfg(test)]
     #[must_use]
     pub fn depth(&self) -> (usize, usize) {
         (self.undo.len(), self.redo.len())

@@ -59,6 +59,7 @@ mod tile_store;
 mod transform_box;
 mod ui;
 mod view;
+mod workspace;
 
 use std::error::Error;
 use std::sync::Arc;
@@ -162,6 +163,13 @@ struct OpenPaint {
     /// why `save_brush_preset` asks the *brush* whether it is stamped rather than trusting this to
     /// be current: the brush is the truth, and this is only how to find the file again.
     brush_tip_path: Option<std::path::PathBuf>,
+    /// The panel workspace, and whether it is the UI on screen.
+    ///
+    /// Both are here while the old side panel still exists. They are two answers to the same
+    /// question, so exactly one is drawn — see `Ui::render`. The old one goes when every section
+    /// has been ported across.
+    workspace: workspace::Workspace,
+    workspace_mode: bool,
     /// The saved brushes, read once at startup.
     ///
     /// An app resource, not document content (§4p): nothing about a preset reaches a `.openpaint`
@@ -674,6 +682,8 @@ impl Default for OpenPaint {
             kernel: openpaint_core::Kernel::default(),
             font_families: Vec::new(),
             brush_tip_path: None,
+            workspace: workspace::Workspace::default(),
+            workspace_mode: false,
             brushes: presets::Library::load(),
             font_substituted: None,
             selection: None,
@@ -3123,6 +3133,53 @@ impl OpenPaint {
                 }
 
                 match &key.logical_key {
+                    // Escape abandons a panel drag before it abandons anything else: it is the
+                    // gesture most recently begun, and the one the artist is looking at.
+                    Key::Named(NamedKey::Escape)
+                        if pressed && self.workspace_mode && self.workspace.cancel_drag() =>
+                    {
+                        self.request_redraw();
+                        true
+                    }
+                    // Switch the look. The whole point of the theme being data is that this
+                    // changes nine colours and nothing else.
+                    Key::Named(NamedKey::F4) if pressed && self.workspace_mode => {
+                        self.status_message = Some(self.workspace.cycle_theme());
+                        self.request_redraw();
+                        true
+                    }
+                    // Switch between the panel workspace and the old side panel.
+                    //
+                    // Temporary by design, and worth saying so: two UIs is not a feature, it is
+                    // the transition. It goes when the last section has been ported across.
+                    Key::Named(NamedKey::F2) if pressed => {
+                        self.workspace_mode = !self.workspace_mode;
+                        // The canvas viewport is about to change shape completely, so refit
+                        // rather than leaving the artwork half off the edge of its new panel.
+                        self.view.request_fit();
+                        self.status_message = Some(if self.workspace_mode {
+                            "Panel workspace. Hold a panel's header to move it;                              Ctrl+Shift+Z resets the layout."
+                                .to_owned()
+                        } else {
+                            "Back to the old panel.".to_owned()
+                        });
+                        self.request_redraw();
+                        true
+                    }
+                    // Undo a layout change, on its own stack: Ctrl+Z belongs to the artwork, and
+                    // rearranging panels must never take an undo step away from painting.
+                    Key::Named(NamedKey::F3) if pressed && self.workspace_mode => {
+                        let moved = if self.nav.modifiers.shift_key() {
+                            self.workspace.redo()
+                        } else {
+                            self.workspace.undo()
+                        };
+                        if !moved {
+                            self.status_message = Some("No layout change to take back.".to_owned());
+                        }
+                        self.request_redraw();
+                        true
+                    }
                     Key::Named(NamedKey::Space) => {
                         self.nav.space_held = pressed;
                         if !pressed {
@@ -3132,6 +3189,22 @@ impl OpenPaint {
                     }
                     // By logical key, so these are stable across keyboard layouts. Modifiers
                     // are excluded so Ctrl+S and friends are not eaten here.
+                    // The way back from any arrangement at all, including one with no menu bar
+                    // left to reach a command from. A shortcut rather than a button for exactly
+                    // that reason (§1c).
+                    Key::Character(c)
+                        if pressed
+                            && self.workspace_mode
+                            && self.nav.modifiers.control_key()
+                            && self.nav.modifiers.shift_key()
+                            && c.eq_ignore_ascii_case("z") =>
+                    {
+                        self.workspace.reset();
+                        self.status_message =
+                            Some("Layout reset. F3 takes that back too.".to_owned());
+                        self.request_redraw();
+                        true
+                    }
                     Key::Character(c) if pressed && !self.nav.modifiers.control_key() => {
                         match c.as_str() {
                             "0" => {
@@ -3248,7 +3321,7 @@ impl OpenPaint {
         let visible = self.view.visible_rect(w, h);
 
         let mut ui_wants_repaint = false;
-        let mut ui_inset_left = None;
+        let mut ui_viewport = None;
         let mut extend_request = None;
         let mut crop_request = None;
         let mut trim_request = false;
@@ -3289,6 +3362,7 @@ impl OpenPaint {
         let mut text_edit = editor.active_text().cloned();
         let font_families = &self.font_families;
         let brushes = &self.brushes;
+        let workspace = self.workspace_mode.then_some(&mut self.workspace);
         let brush_trouble = self.brushes.trouble.as_deref();
         let font_substituted = self.font_substituted.clone();
         let mut text_request = None;
@@ -3341,6 +3415,7 @@ impl OpenPaint {
                         transform: live_transform,
                         kernel: self.kernel,
                     },
+                    workspace,
                 );
                 ui_wants_repaint = out.wants_repaint;
                 extend_request = out.extend;
@@ -3359,7 +3434,7 @@ impl OpenPaint {
                 preset_name = out.preset_name;
                 transform_request = out.transform;
                 transform_state = out.transform_state;
-                ui_inset_left = Some(ui.inset_left_px());
+                ui_viewport = Some(ui.canvas_viewport());
             }
         });
 
@@ -3381,7 +3456,7 @@ impl OpenPaint {
         // Keep the canvas centered in the area the panel leaves free. The first
         // fit necessarily ran before the UI existed, so learning the inset queues
         // another one -- which needs a frame to actually apply.
-        let refit_queued = ui_inset_left.is_some_and(|inset| self.view.set_inset_left(inset));
+        let refit_queued = ui_viewport.is_some_and(|area| self.view.set_viewport(area));
         if ui_wants_repaint || refit_queued {
             self.request_redraw();
         }

@@ -31,13 +31,6 @@
 //! is the one ordering hazard in this module and it is exactly §11a's shape: the operation is
 //! correct, and doing it in the wrong order is silently wrong rather than loud.
 
-// Built ahead of the shell that will drive it, like `crate::layout`. `expect` rather than `allow`
-// so it becomes an error the moment the shell does start calling it.
-#![expect(
-    dead_code,
-    reason = "the panel gesture lands before the UI shell that consumes it"
-)]
-
 use crate::layout::{Axis, Layout, LayoutHistory, PanelId, Path, Placed, Rect, Zone};
 
 /// How far a pointer may wander before a press becomes a drag, in logical units.

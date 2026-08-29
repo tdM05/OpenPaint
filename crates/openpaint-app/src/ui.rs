@@ -614,6 +614,111 @@ fn response_editor(ui: &mut egui::Ui, label: &str, response: &mut Response) {
     curve_editor(ui, label, &mut response.curve);
 }
 
+/// What each panel of the workspace shows.
+///
+/// **The seam.** Everything above this line is layout and chrome, which are ours; everything below
+/// is widgets, which are egui's for now. Replacing the widget layer later means rewriting this
+/// function and nothing else — which is what "a panel is a narrow trait" was promising when the
+/// plan was made.
+///
+/// Deliberately a first pass. These are the controls needed to prove the workspace works — a
+/// slider you can drag, a list you can click, colours you can pick — not the full set, which comes
+/// as the old panel's sections are ported across one at a time.
+fn workspace_panel(
+    panel: crate::layout::PanelId,
+    ui: &mut egui::Ui,
+    brush: &mut Brush,
+    color_srgb: &mut [u8; 3],
+    layers: &[Layer],
+    active_layer: usize,
+) {
+    use crate::workspace as ws;
+    ui.spacing_mut().item_spacing.y = 5.0;
+
+    match panel {
+        ws::MENU => {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("OpenPaint").strong());
+                for item in ["File", "Edit", "Layer", "Select", "View"] {
+                    ui.label(item);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new("F2 old panel  \u{b7}  Ctrl+Shift+Z reset layout")
+                            .small()
+                            .weak(),
+                    );
+                });
+            });
+        }
+        ws::TOOLS => {
+            // A wrapped grid, so the rail works whether it is a column on the left or a strip
+            // along the bottom. Nothing here knows which it currently is.
+            ui.horizontal_wrapped(|ui| {
+                for (glyph, hint) in [
+                    ("\u{270E}", "Brush"),
+                    ("\u{25CB}", "Ellipse select"),
+                    ("\u{25A1}", "Rectangle select"),
+                    ("\u{2726}", "Wand"),
+                    ("T", "Text"),
+                    ("\u{25E9}", "Gradient"),
+                ] {
+                    ui.add_sized([26.0, 26.0], egui::Button::new(glyph))
+                        .on_hover_text(hint);
+                }
+            });
+        }
+        ws::BRUSH => {
+            ui.add(
+                egui::Slider::new(&mut brush.radius, 0.5..=400.0)
+                    .logarithmic(true)
+                    .text("Size"),
+            );
+            ui.add(egui::Slider::new(&mut brush.opacity, 0.0..=1.0).text("Opacity"));
+            ui.add(egui::Slider::new(&mut brush.hardness, 0.0..=1.0).text("Hardness"));
+            ui.add(egui::Slider::new(&mut brush.spacing, 0.01..=1.0).text("Spacing"));
+        }
+        ws::LAYERS => {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // Top of the list is the top of the stack, which is how every layers panel
+                    // reads and the opposite of how the document stores it.
+                    for (index, layer) in layers.iter().enumerate().rev() {
+                        let shown = index == active_layer;
+                        ui.horizontal(|ui| {
+                            ui.label(if layer.visible {
+                                "\u{25CF}"
+                            } else {
+                                "\u{25CB}"
+                            });
+                            // Selecting a layer from here comes with the port of the layers
+                            // section; for now it shows which is active.
+                            let _ = ui.selectable_label(shown, &layer.name);
+                        });
+                    }
+                });
+        }
+        ws::COLOUR => {
+            ui.horizontal(|ui| {
+                ui.color_edit_button_srgb(color_srgb);
+                ui.label(format!(
+                    "#{:02X}{:02X}{:02X}",
+                    color_srgb[0], color_srgb[1], color_srgb[2]
+                ));
+            });
+        }
+        ws::HISTORY => {
+            ui.label(
+                egui::RichText::new("Undo history moves here once the old panel is ported.")
+                    .small()
+                    .weak(),
+            );
+        }
+        _ => {}
+    }
+}
+
 /// Draw a box with its eight handles.
 ///
 /// Two strokes for the outline and two fills for each handle, dark under light, because the
@@ -698,6 +803,16 @@ pub struct Ui {
     /// Screen-space rect (physical pixels) egui is currently occupying, so canvas
     /// input can be excluded from it.
     occupied: egui::Rect,
+    /// In the workspace, the canvas panel in physical pixels; `None` with the old side panel.
+    ///
+    /// Used to answer `blocks_point` by complement — see where it is set.
+    workspace_canvas: Option<(f32, f32, f32, f32)>,
+    /// Where the canvas may draw, in physical pixels.
+    ///
+    /// The whole surface minus the side panel in the old layout; the canvas *panel's* rectangle
+    /// in the workspace. A rectangle either way, because the canvas is a panel and can be
+    /// anywhere (§1c) — see [`crate::view::View::set_viewport`].
+    canvas_viewport: (f32, f32, f32, f32),
     /// How much an Extend adds. Lives in the UI because it is a user preference; it
     /// will move to settings when those exist (DECISIONS §5a: never a constant).
     extend_amount: u32,
@@ -731,6 +846,8 @@ impl Ui {
             state,
             renderer,
             occupied: egui::Rect::NOTHING,
+            canvas_viewport: (0.0, 0.0, 1.0, 1.0),
+            workspace_canvas: None,
             extend_amount: DEFAULT_EXTEND,
             preset_name: String::new(),
         }
@@ -745,8 +862,8 @@ impl Ui {
     /// Physical pixels of the left edge the panel occupies, so the canvas can be
     /// centered in the area actually visible rather than partly underneath it.
     #[must_use]
-    pub fn inset_left_px(&self) -> f32 {
-        self.occupied.max.x.max(0.0)
+    pub fn canvas_viewport(&self) -> (f32, f32, f32, f32) {
+        self.canvas_viewport
     }
 
     /// Whether a point in physical window pixels lies over the panel.
@@ -754,6 +871,11 @@ impl Ui {
     /// Used to keep pen strokes from painting underneath the UI. egui's own
     /// pointer handling cannot do this for us because it never sees pen input.
     pub fn blocks_point(&self, x: f64, y: f64) -> bool {
+        if let Some((cx, cy, cw, ch)) = self.workspace_canvas {
+            // Everything that is not the canvas is a panel, so the pen is refused there.
+            let (x, y) = (x as f32, y as f32);
+            return !(x >= cx && y >= cy && x < cx + cw && y < cy + ch);
+        }
         self.occupied.contains(egui::pos2(x as f32, y as f32))
     }
 
@@ -764,6 +886,11 @@ impl Ui {
     /// is only interactive while frames keep coming -- and any action the panel
     /// requested.
     #[must_use]
+    // Eight, and the shape is already the fix: `Status` exists because this grew past the lint
+    // once before. Splitting further would mean a struct per call rather than per concern, which
+    // is bookkeeping rather than clarity -- and the workspace argument goes away entirely when
+    // the old panel does.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         window: &Window,
@@ -772,6 +899,7 @@ impl Ui {
         text: Option<&mut openpaint_core::TextBlock>,
         view: &View,
         status: Status<'_>,
+        mut workspace: Option<&mut crate::workspace::Workspace>,
     ) -> Outcome {
         let Overlay {
             device,
@@ -804,7 +932,44 @@ impl Ui {
         let mut wand = status.wand;
 
         let mut panel_rect = egui::Rect::NOTHING;
+        let mut panel_canvas: Option<(f32, f32, f32, f32)> = None;
+        let mut workspace_canvas_px: Option<(f32, f32, f32, f32)> = None;
         let output = self.ctx.run(input, |ctx| {
+            // The panel workspace, when it is switched on. Drawn *instead of* the side panel
+            // rather than beside it: they are two answers to the same question, and showing both
+            // would put the same controls on screen twice.
+            if let Some(ws) = workspace.as_deref_mut() {
+                let screen = ctx.screen_rect();
+                let area = crate::layout::Rect::new(
+                    screen.min.x,
+                    screen.min.y,
+                    screen.width(),
+                    screen.height(),
+                );
+                let layers = status.layers;
+                let active_layer = status.active_layer;
+                ws.show(ctx, area, |panel, ui| {
+                    workspace_panel(panel, ui, brush, &mut color_srgb, layers, active_layer);
+                });
+                let scale = ctx.pixels_per_point();
+                let canvas = ws.canvas_rect().unwrap_or(crate::layout::Rect::new(
+                    0.0,
+                    0.0,
+                    screen.width(),
+                    screen.height(),
+                ));
+                panel_canvas = Some((
+                    canvas.x * scale,
+                    canvas.y * scale,
+                    canvas.w * scale,
+                    canvas.h * scale,
+                ));
+                // Nothing is "the panel" any more, so the pen must be refused only where a panel
+                // actually is -- which is everywhere except the canvas.
+                workspace_canvas_px = panel_canvas;
+                return;
+            }
+
             let panel = egui::SidePanel::left("brush-panel")
                 .exact_width(PANEL_WIDTH)
                 .show(ctx, |ui| {
@@ -1979,6 +2144,16 @@ impl Ui {
             egui::pos2(used.min.x * scale, used.min.y * scale),
             egui::pos2(used.max.x * scale, used.max.y * scale),
         );
+        self.canvas_viewport = panel_canvas.unwrap_or((
+            self.occupied.max.x.max(0.0),
+            0.0,
+            (size_px[0] as f32 - self.occupied.max.x).max(1.0),
+            size_px[1] as f32,
+        ));
+        // In the workspace the canvas is a panel, so everything that is *not* it belongs to the
+        // UI. Expressed as the complement rather than as a list of panel rectangles: one
+        // answer cannot drift from another, and a new panel needs no bookkeeping here.
+        self.workspace_canvas = workspace_canvas_px;
 
         self.state
             .handle_platform_output(window, output.platform_output);

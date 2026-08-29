@@ -16,13 +16,6 @@
 //! instead of a row of names. Any panel may use it; nothing here knows which ones do, and the
 //! choice arrives as a parameter rather than being decided by looking at the panel.
 
-// Built ahead of the shell that will draw it, like `crate::layout`. `expect` rather than `allow`
-// so it becomes an error the moment the shell starts calling it.
-#![expect(
-    dead_code,
-    reason = "the chrome geometry lands before the painting that uses it"
-)]
-
 use crate::layout::{Placed, Rect};
 use crate::panel_drag::Target;
 use crate::theme::Metrics;
@@ -227,6 +220,10 @@ impl DropRegion {
     ///
     /// By the sign of the cross product against each edge, which works for any convex shape and so
     /// does not care that four of the five are trapezoids and one is a rectangle.
+    ///
+    /// Read only by the test that holds these regions and `Layout::zone_at` to the same answer —
+    /// the drop itself asks the layout, so there is exactly one decision at runtime.
+    #[cfg(test)]
     #[must_use]
     pub fn contains(&self, x: f32, y: f32) -> bool {
         let mut positive = false;
@@ -245,6 +242,7 @@ impl DropRegion {
     }
 
     /// The area it covers, for checking the five tile the panel.
+    #[cfg(test)]
     #[must_use]
     pub fn area(&self) -> f32 {
         let mut sum = 0.0;

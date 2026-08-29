@@ -84,7 +84,13 @@ pub struct View {
     center: (f32, f32),
     /// Physical pixels along the left edge the UI occupies, so the canvas uses the
     /// area actually visible rather than hiding under the panel.
-    inset_left_px: f32,
+    /// Where on the surface the canvas may draw, in physical pixels, or `None` for all of it.
+    ///
+    /// **A rectangle rather than a left inset**, which the panel workspace forced and which was
+    /// the better shape all along: the canvas is a panel like any other (§1c), so it can sit
+    /// anywhere — middle, right, bottom, or beside a second canvas. A left inset could only ever
+    /// describe one arrangement, and it was the one the old side panel happened to have.
+    viewport: Option<(f32, f32, f32, f32)>,
     /// Set when the view should re-fit on the next frame. Deferred rather than
     /// applied immediately because fitting needs the surface size *and* the UI
     /// inset, which aren't both known at construction.
@@ -105,7 +111,7 @@ impl Default for View {
             scale: 1.0,
             rotation: 0.0,
             center: (0.0, 0.0),
-            inset_left_px: 0.0,
+            viewport: None,
             needs_fit: true,
             auto_fit: true,
         }
@@ -128,16 +134,22 @@ impl View {
         self.rotation
     }
 
-    /// Tell the view how much of the left edge the UI covers.
+    /// Tell the view which part of the surface the canvas may use.
     ///
     /// Returns `true` if this queued a re-fit, in which case the caller **must**
     /// request another frame. Painting is demand-driven, so a queued fit that
     /// nobody asks to draw simply never happens -- the same trap as egui needing a
     /// frame to process its input.
-    pub fn set_inset_left(&mut self, px: f32) -> bool {
-        let px = px.max(0.0);
-        if (px - self.inset_left_px).abs() > 0.5 {
-            self.inset_left_px = px;
+    pub fn set_viewport(&mut self, area: (f32, f32, f32, f32)) -> bool {
+        let area = (area.0.max(0.0), area.1.max(0.0), area.2, area.3);
+        let moved = self.viewport.is_none_or(|old| {
+            (old.0 - area.0).abs() > 0.5
+                || (old.1 - area.1).abs() > 0.5
+                || (old.2 - area.2).abs() > 0.5
+                || (old.3 - area.3).abs() > 0.5
+        });
+        if moved {
+            self.viewport = Some(area);
             if self.auto_fit {
                 self.needs_fit = true;
                 return true;
@@ -253,8 +265,15 @@ impl View {
     fn content_area(&self, surface_w: u32, surface_h: u32) -> (f32, f32, f32, f32) {
         let sw = surface_w.max(1) as f32;
         let sh = surface_h.max(1) as f32;
-        let left = self.inset_left_px.min(sw - 1.0);
-        (left, 0.0, (sw - left).max(1.0), sh)
+        let Some((x, y, w, h)) = self.viewport else {
+            return (0.0, 0.0, sw, sh);
+        };
+        // Clamped to the surface, because a stale viewport from the frame before a resize would
+        // otherwise put the canvas partly off-screen -- and the fit that corrects it needs a
+        // sane rectangle to fit *into*.
+        let x = x.min(sw - 1.0);
+        let y = y.min(sh - 1.0);
+        (x, y, w.clamp(1.0, sw - x), h.clamp(1.0, sh - y))
     }
 
     /// Center of the visible area, in physical pixels.
@@ -611,10 +630,15 @@ mod tests {
     }
 
     #[test]
-    fn the_ui_inset_shifts_the_visible_center() {
+    fn the_viewport_shifts_the_visible_center() {
         let c = canvas();
         let mut v = View::new();
-        let _ = v.set_inset_left(200.0);
+        let _ = v.set_viewport((
+            200.0,
+            0.0,
+            f32::from(SW as u16) - 200.0,
+            f32::from(SH as u16),
+        ));
         v.fit(SW, SH, c);
         // Center of the area right of the panel maps to the canvas center.
         let (cx, cy) = v.screen_to_canvas_unclipped((200.0 + 300.0, 300.0), SW, SH);
@@ -626,12 +650,20 @@ mod tests {
     /// view must re-fit once it does -- otherwise the canvas sits centred on the
     /// whole window with half of it behind the panel.
     #[test]
-    fn learning_the_ui_inset_refits_while_auto_fitting() {
+    fn learning_the_viewport_refits_while_auto_fitting() {
         let c = canvas();
         let mut v = View::new();
         assert!(v.apply_pending_fit(SW, SH, c));
 
-        assert!(v.set_inset_left(280.0), "inset change should queue a fit");
+        assert!(
+            v.set_viewport((
+                280.0,
+                0.0,
+                f32::from(SW as u16) - 280.0,
+                f32::from(SH as u16)
+            )),
+            "a viewport change should queue a fit"
+        );
         assert!(
             v.apply_pending_fit(SW, SH, c),
             "inset change did not trigger a re-fit"
@@ -654,7 +686,12 @@ mod tests {
         let zoomed = v.scale();
 
         v.surface_resized();
-        let _ = v.set_inset_left(280.0);
+        let _ = v.set_viewport((
+            280.0,
+            0.0,
+            f32::from(SW as u16) - 280.0,
+            f32::from(SH as u16),
+        ));
         assert!(
             !v.apply_pending_fit(SW, SH, c),
             "auto-fit re-fitted after the user navigated"
