@@ -871,6 +871,7 @@ impl OpenPaint {
             }
             ui::SelectAction::None => self.set_selection(None, "Deselected"),
             ui::SelectAction::Fill => self.fill_selection(),
+            ui::SelectAction::Clear => self.clear_selection_pixels(),
             ui::SelectAction::Invert => {
                 // Inverting nothing selects everything, which is what every art app does and is
                 // more useful than refusing.
@@ -887,39 +888,60 @@ impl OpenPaint {
     }
 
     /// Fill the selection with the brush colour, on the active layer.
+    /// Fill the selection with the brush colour, on the active layer.
     fn fill_selection(&mut self) {
-        let Some(selection) = self.selection.as_ref().map(|s| s.mask.clone()) else {
-            self.status_message = Some("Nothing is selected".to_owned());
-            self.request_redraw();
-            return;
-        };
-        // The same guard a stroke gets: erasing an alpha-locked layer cannot do anything, so say so
-        // rather than appearing to work.
-        let Some(mode) = self.editor.paint_mode() else {
+        let mode = self.editor.fill_mode();
+        let brush = *self.editor.brush();
+        self.paint_selection(
+            brush.color_linear_premul(),
+            brush.opacity,
+            mode,
+            "Filled the selection",
+        );
+    }
+
+    /// Clear the selection, on the active layer.
+    ///
+    /// The other half of fill, and a separate command rather than a mode of it — see
+    /// [`Editor::fill_mode`]. Delete and Backspace both, because muscle memory differs and neither
+    /// is doing anything else.
+    fn clear_selection_pixels(&mut self) {
+        let Some(mode) = self.editor.clear_mode() else {
             self.status_message = Some(
-                "This layer's alpha is locked, so filling cannot erase. Unlock it, or paint."
+                "This layer's alpha is locked, so clearing cannot remove anything. Unlock it first."
                     .to_owned(),
             );
             self.request_redraw();
             return;
         };
+        // Colour is irrelevant to an erase — the blend discards the source entirely — but opacity
+        // is not: it is how much coverage comes off, so a partial clear is expressible.
+        self.paint_selection([0.0; 4], 1.0, mode, "Cleared the selection");
+    }
 
-        let brush = *self.editor.brush();
+    /// Apply paint to the selection on the active layer, undoably.
+    fn paint_selection(
+        &mut self,
+        color_linear_premul: [f32; 4],
+        opacity: f32,
+        mode: editor::PaintMode,
+        done: &str,
+    ) {
+        let Some(selection) = self.selection.as_ref().map(|s| s.mask.clone()) else {
+            self.status_message = Some("Nothing is selected".to_owned());
+            self.request_redraw();
+            return;
+        };
         let layer = tile_store::LayerId(self.editor.active_layer_id());
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        let recorded = renderer.fill_selection(
-            &selection,
-            layer,
-            brush.color_linear_premul(),
-            brush.opacity,
-            mode,
-        );
+        let recorded =
+            renderer.fill_selection(&selection, layer, color_linear_premul, opacity, mode);
         self.status_message = Some(if recorded {
-            "Filled the selection".to_owned()
+            done.to_owned()
         } else {
-            "That fill was too large to record; it cannot be undone".to_owned()
+            "That was too large to record; it cannot be undone".to_owned()
         });
         self.mark_dirty();
         self.request_redraw();
@@ -2253,6 +2275,24 @@ impl OpenPaint {
             }
         }
 
+        // Delete clears the selection, the binding every art app uses. Handled before the crop
+        // tool's own keys because a selection and a crop cannot both be up.
+        if self.selection.is_some() && self.crop.is_none() {
+            if let WindowEvent::KeyboardInput { event: key, .. } = &event {
+                use winit::event::ElementState;
+                use winit::keyboard::{Key, NamedKey};
+                if key.state == ElementState::Pressed
+                    && matches!(
+                        key.logical_key,
+                        Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace)
+                    )
+                {
+                    self.clear_selection_pixels();
+                    return;
+                }
+            }
+        }
+
         // The unsaved-changes prompt claims Enter and Escape while it is up, and takes
         // precedence over the crop tool: it is a question that has to be answered.
         if self.pending_confirm.is_some() {
@@ -2753,6 +2793,51 @@ mod tests {
 
         app.apply_select_action(ui::SelectAction::Use(ui::SelectTool::Rect));
         assert!(app.select.is_none(), "the tool did not toggle off");
+    }
+
+    /// Fill never erases, whatever tool is selected.
+    ///
+    /// A fill that changed meaning with the active tool would make Ctrl+F depend on state you have
+    /// to go and check, and would make a button reading "fill with brush colour" a lie. Clearing is
+    /// its own command instead.
+    #[test]
+    fn fill_and_clear_do_not_depend_on_the_tool() {
+        let mut app = OpenPaint::default();
+
+        app.editor.set_tool(editor::Tool::Brush);
+        assert_eq!(app.editor.fill_mode(), editor::PaintMode::Normal);
+        assert_eq!(app.editor.clear_mode(), Some(editor::PaintMode::Erase));
+
+        app.editor.set_tool(editor::Tool::Eraser);
+        assert_eq!(
+            app.editor.fill_mode(),
+            editor::PaintMode::Normal,
+            "fill turned into an erase because the eraser happened to be selected"
+        );
+        assert_eq!(app.editor.clear_mode(), Some(editor::PaintMode::Erase));
+    }
+
+    /// Alpha lock is a property of the layer, so it applies to both regardless of tool.
+    #[test]
+    fn alpha_lock_still_governs_fill_and_clear() {
+        let mut app = OpenPaint::default();
+        app.editor
+            .document_mut()
+            .active_mut()
+            .layer_mut(0)
+            .expect("the layer")
+            .lock_alpha = true;
+
+        assert_eq!(
+            app.editor.fill_mode(),
+            editor::PaintMode::LockAlpha,
+            "a fill on a locked layer must stay inside the pixels already there"
+        );
+        assert_eq!(
+            app.editor.clear_mode(),
+            None,
+            "clearing is a change in alpha, which is exactly what the lock forbids"
+        );
     }
 
     /// The ring reports the size of the mark *on screen*, so it has to track zoom.

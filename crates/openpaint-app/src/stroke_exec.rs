@@ -1114,6 +1114,85 @@ mod tests {
         );
     }
 
+    /// Clearing a selection removes coverage rather than painting over it.
+    ///
+    /// The distinction is invisible on a single layer against paper — painting white and erasing
+    /// both look white — so this puts the cleared layer *above* another one. Only genuine removal
+    /// reveals what is underneath.
+    ///
+    /// It also exercises the path `Delete` uses, which is the same fill with `PaintMode::Erase`.
+    #[test]
+    fn clearing_a_selection_removes_coverage() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        const SIDE: u32 = 200;
+
+        let mut editor = Editor::new();
+        editor.resize_page(openpaint_core::PageRect::from_size(SIDE, SIDE));
+        editor.document_mut().add_layer();
+        let page = editor.page_rect();
+        let layer_ids: Vec<u32> = editor
+            .layers()
+            .iter()
+            .map(openpaint_core::Layer::id)
+            .collect();
+        let (under, over) = (LayerId(layer_ids[0]), LayerId(layer_ids[1]));
+
+        let stroke_probe = test_stroke_layer(&device);
+        let mut canvas = test_canvas(&device, page, &stroke_probe);
+        let mut stroke = test_stroke_layer(&device);
+        let mut history = History::new(&device);
+
+        // Both layers opaque, so anything visible on the lower one after the clear got there by
+        // removal and not by painting.
+        for id in [under, over] {
+            let mut cpu = openpaint_core::Canvas::new(SIDE, SIDE);
+            for y in 0..SIDE as i32 {
+                for x in 0..SIDE as i32 {
+                    cpu.replace_pixel(x, y, [0.4, 0.4, 0.4, 1.0]);
+                }
+            }
+            let mut enc = device.create_command_encoder(&Default::default());
+            canvas.upload_dirty(&device, &queue, &mut enc, id, &mut cpu);
+            queue.submit(std::iter::once(enc.finish()));
+        }
+
+        let selection = openpaint_core::Selection::from_rect(
+            openpaint_core::PageRect::new(50, 50, 60, 60),
+            page,
+        );
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        stroke.set_page(&queue, page);
+        stroke.set_paint(&queue, [0.0; 4], 1.0, crate::editor::PaintMode::Erase);
+        stroke.begin_stroke();
+        stroke.fill_from_mask(&device, &queue, &mut encoder, &selection, page);
+        let tiles = stroke.tiles_to_bake(page);
+        let before = history.snapshot_tiles(&mut encoder, &canvas, over, &tiles);
+        stroke.bake(&device, &queue, &mut encoder, &mut canvas, over);
+        queue.submit(std::iter::once(encoder.finish()));
+        assert!(before.is_some(), "the clear should have been recordable");
+
+        let after = crate::test_gpu::readback_tile(&device, &queue, &canvas, over, (0, 0))
+            .expect("the cleared layer should be resident");
+        let at = |x: usize, y: usize| after[y * openpaint_core::tile::TILE_SIZE + x];
+
+        let hole = at(80, 80);
+        assert!(
+            hole[3] < 0.01,
+            "the clear left coverage behind, so it painted rather than removed: {hole:?}"
+        );
+        assert!(hole[0] < 0.01, "colour survived the clear: {hole:?}");
+
+        let kept = at(20, 20);
+        assert!(
+            kept[3] > 0.99,
+            "the clear spread outside the selection: {kept:?}"
+        );
+    }
+
     /// Alpha lock means alpha cannot change. Not "mostly", not "except at the edges".
     ///
     /// Paints a half-covered patch, locks the layer, then scrubs a much larger stroke of a different

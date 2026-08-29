@@ -131,6 +131,8 @@ pub enum SelectAction {
     Invert,
     /// Fill the selection with the brush colour.
     Fill,
+    /// Clear the selection.
+    Clear,
 }
 
 /// What the crop tool should do next.
@@ -379,18 +381,26 @@ impl Ui {
                                     select_action = Some(SelectAction::Invert);
                                 }
                             });
-                            if ui
-                                .add_enabled(
-                                    status.has_selection,
-                                    egui::Button::new("Fill with brush colour"),
-                                )
-                                .clicked()
-                            {
-                                select_action = Some(SelectAction::Fill);
-                            }
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        status.has_selection,
+                                        egui::Button::new("Fill with brush colour"),
+                                    )
+                                    .clicked()
+                                {
+                                    select_action = Some(SelectAction::Fill);
+                                }
+                                if ui
+                                    .add_enabled(status.has_selection, egui::Button::new("Clear"))
+                                    .clicked()
+                                {
+                                    select_action = Some(SelectAction::Clear);
+                                }
+                            });
                             ui.label(
                                 egui::RichText::new(
-                                    "Ctrl+A selects everything, Ctrl+D deselects, Ctrl+Shift+I inverts, Ctrl+F fills. A fill is a stroke whose coverage came from the mask, so it honours erase, alpha lock and clipping, and undoes like one.",
+                                    "Ctrl+A selects everything, Ctrl+D deselects, Ctrl+Shift+I inverts, Ctrl+F fills and Delete clears. Fill never erases and Clear always does, so neither depends on which tool is selected.",
                                 )
                                 .small()
                                 .weak(),

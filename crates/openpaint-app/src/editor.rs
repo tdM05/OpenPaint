@@ -308,17 +308,47 @@ impl Editor {
     /// broken app, and the caller can say why instead.
     #[must_use]
     pub fn paint_mode(&self) -> Option<PaintMode> {
-        let locked = self
-            .document
-            .active()
-            .layer(self.active_layer_index())
-            .is_some_and(openpaint_core::Layer::locks_alpha);
+        let locked = self.active_layer_locks_alpha();
         match (self.tool.erases(), locked) {
             (true, true) => None,
             (true, false) => Some(PaintMode::Erase),
             (false, true) => Some(PaintMode::LockAlpha),
             (false, false) => Some(PaintMode::Normal),
         }
+    }
+
+    /// Whether the layer being painted has its transparency frozen.
+    fn active_layer_locks_alpha(&self) -> bool {
+        self.document
+            .active()
+            .layer(self.active_layer_index())
+            .is_some_and(openpaint_core::Layer::locks_alpha)
+    }
+
+    /// How a fill is applied. **Never erases.**
+    ///
+    /// Filling and clearing are separate commands, as they are in every art app, rather than one
+    /// command that changes meaning with the selected tool. Two reasons, and neither is convention
+    /// for its own sake: what a keystroke does should not depend on state you have to go and check,
+    /// and a button reading "fill with brush colour" that erased instead would simply be lying.
+    ///
+    /// Alpha lock still applies, because that is a property of the layer rather than of the tool.
+    #[must_use]
+    pub fn fill_mode(&self) -> PaintMode {
+        if self.active_layer_locks_alpha() {
+            PaintMode::LockAlpha
+        } else {
+            PaintMode::Normal
+        }
+    }
+
+    /// How a clear is applied. Always erases, and `None` where that could do nothing.
+    ///
+    /// `None` on an alpha-locked layer, for exactly the reason the eraser is refused there: alpha
+    /// lock means alpha cannot change, and clearing is nothing but a change in alpha.
+    #[must_use]
+    pub fn clear_mode(&self) -> Option<PaintMode> {
+        (!self.active_layer_locks_alpha()).then_some(PaintMode::Erase)
     }
 
     /// Begin a stroke at a canvas-space position.
