@@ -97,6 +97,62 @@ fn kind(id: PanelId) -> Option<&'static PanelKind> {
     PANELS.iter().find(|k| k.id == id)
 }
 
+/// The name a panel is saved under, and the panel a name refers to.
+///
+/// One table answering both directions, so a saved workspace cannot name something this build
+/// would resolve differently. `PANELS` is the single source; adding a panel is still a row.
+#[must_use]
+fn name_for(id: PanelId) -> Option<String> {
+    kind(id).map(|k| k.name.to_owned())
+}
+
+#[must_use]
+fn id_for(name: &str) -> Option<PanelId> {
+    PANELS.iter().find(|k| k.name == name).map(|k| k.id)
+}
+
+/// Where the saved workspace lives, beside the brush library and the theme.
+fn layout_path() -> Option<std::path::PathBuf> {
+    let dir = dirs::data_local_dir()?.join("OpenPaint");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("workspace.json"))
+}
+
+/// Read the saved arrangement, if there is one.
+///
+/// A missing file is the ordinary case. A broken one is reported and the default used, rather
+/// than opening into some half-parsed workspace — the same tolerance the brush library and the
+/// theme take with theirs.
+fn load_layout() -> Option<Layout> {
+    let path = layout_path()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<crate::layout::SavedLayout>(&text) {
+        Ok(saved) => {
+            let layout = Layout::from_saved(&saved, id_for);
+            // A file that resolved to nothing at all -- every panel in it renamed away, say --
+            // would open into an empty window with no way back but a shortcut. The default is the
+            // better answer, and it is not silent.
+            if layout.resolve(Rect::new(0.0, 0.0, 1.0, 1.0)).len() == 1
+                && layout.find(CANVAS).is_none()
+            {
+                eprintln!(
+                    "workspace: {} named nothing this build knows; using the default",
+                    path.display()
+                );
+                return None;
+            }
+            Some(layout)
+        }
+        Err(e) => {
+            eprintln!(
+                "workspace: {} could not be read ({e}); using the default",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 /// The workspace: a layout, its history, the gesture in progress, and the look.
 pub struct Workspace {
     pub layout: Layout,
@@ -110,7 +166,7 @@ pub struct Workspace {
 impl Default for Workspace {
     fn default() -> Self {
         Self {
-            layout: default_layout(),
+            layout: load_layout().unwrap_or_else(default_layout),
             history: LayoutHistory::default(),
             theme: load_theme().unwrap_or_default(),
             drag: PanelDrag::default(),
@@ -238,11 +294,62 @@ impl Workspace {
         }
     }
 
+    /// Write the arrangement out, so it is still there next time.
+    ///
+    /// Called when a change *settles* — a gesture ending, a panel opened or closed — rather than
+    /// on every frame of a divider drag, which would write the file sixty times a second to no
+    /// purpose.
+    ///
+    /// Failure is reported and otherwise ignored: losing an arrangement is a nuisance, and
+    /// refusing to let go of a panel because a file could not be written would be worse.
+    fn remember(&self) {
+        let Some(path) = layout_path() else {
+            return;
+        };
+        let saved = self.layout.to_saved(name_for);
+        match serde_json::to_string_pretty(&saved)
+            .map_err(|e| e.to_string())
+            .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()))
+        {
+            Ok(()) => {}
+            Err(e) => eprintln!("workspace: could not save the layout ({e})"),
+        }
+    }
+
+    /// Whether a panel is currently somewhere in the workspace.
+    #[must_use]
+    pub fn is_open(&self, panel: PanelId) -> bool {
+        self.layout.find(panel).is_some()
+    }
+
+    /// Show a panel if it is hidden, or put it away if it is showing.
+    ///
+    /// The only way to close one, and therefore the thing that makes "everything closed" a state
+    /// an artist can reach and come back from rather than a theoretical one. Undoable like any
+    /// other layout change.
+    pub fn toggle(&mut self, panel: PanelId) {
+        self.history.record(self.layout.clone());
+        if self.layout.find(panel).is_some() {
+            self.layout.remove(panel);
+        } else {
+            // Into whichever leaf is showing, as a tab. Somewhere visible beats somewhere clever.
+            let path = self
+                .layout
+                .resolve(Rect::new(0.0, 0.0, 1.0, 1.0))
+                .first()
+                .map(|p| p.path.clone())
+                .unwrap_or_default();
+            self.layout.insert(&path, Zone::Center, panel);
+        }
+        self.remember();
+    }
+
     /// Undo the last layout change. Returns whether there was one.
     pub fn undo(&mut self) -> bool {
         match self.history.undo(&self.layout) {
             Some(previous) => {
                 self.layout = previous;
+                self.remember();
                 true
             }
             None => false,
@@ -254,6 +361,7 @@ impl Workspace {
         match self.history.redo(&self.layout) {
             Some(next) => {
                 self.layout = next;
+                self.remember();
                 true
             }
             None => false,
@@ -268,6 +376,7 @@ impl Workspace {
     pub fn reset(&mut self) {
         self.history.record(self.layout.clone());
         self.layout = default_layout();
+        self.remember();
     }
 
     /// Show a panel, bringing it forward if it is already open.
@@ -355,8 +464,15 @@ impl Workspace {
                 // A panel let go outside is asked to float; until floating windows exist, put it
                 // back rather than dropping it on the floor. Silently losing a panel would be the
                 // worst possible answer (§6b).
-                if let Outcome::Floated(panel) = outcome {
-                    self.open(panel);
+                match outcome {
+                    Outcome::Floated(panel) => {
+                        // Until floating windows exist, put it back rather than dropping it on the
+                        // floor. Silently losing a panel would be the worst possible answer (§6b).
+                        self.open(panel);
+                        self.remember();
+                    }
+                    Outcome::Moved | Outcome::Resized => self.remember(),
+                    Outcome::Nothing | Outcome::Switched => {}
                 }
             } else {
                 preview = self.drag.drag(&mut self.layout, screen, x, y, now_ms);

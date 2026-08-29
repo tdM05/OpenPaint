@@ -590,6 +590,125 @@ fn shares(axis: Axis, area: Rect, children: &[Child]) -> Vec<Rect> {
     out
 }
 
+/// A layout as it goes to disk: the same tree, with panels named rather than numbered.
+///
+/// **Names, not ids.** A [`PanelId`] is whatever position a panel happens to occupy in the app's
+/// table, so a saved file full of them would rearrange itself the day a panel is added or removed
+/// — silently, and into a workspace nobody asked for. A name survives that.
+///
+/// The tree itself is unchanged, which is the point: a saved workspace is this structure and
+/// nothing more (§1c).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SavedLayout {
+    root: SavedNode,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SavedNode {
+    Split {
+        axis: SavedAxis,
+        children: Vec<SavedChild>,
+    },
+    Leaf {
+        panels: Vec<String>,
+        active: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct SavedChild {
+    weight: f32,
+    node: SavedNode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SavedAxis {
+    Horizontal,
+    Vertical,
+}
+
+impl Layout {
+    /// Convert to the on-disk form, naming each panel.
+    ///
+    /// A panel the caller cannot name is dropped rather than guessed at — the same tolerance a
+    /// missing font gets (§6a). What comes back is still a valid layout, just without it.
+    #[must_use]
+    pub fn to_saved(&self, name_of: impl Fn(PanelId) -> Option<String> + Copy) -> SavedLayout {
+        SavedLayout {
+            root: save_node(&self.root, name_of),
+        }
+    }
+
+    /// Rebuild from the on-disk form.
+    ///
+    /// Names the caller does not recognise are dropped — a workspace saved by a newer build, or
+    /// one naming a panel since removed, still opens. It comes back missing that panel rather than
+    /// refusing to open at all, which is the only answer that lets someone recover.
+    ///
+    /// Empty leaves and one-child splits are collapsed afterwards, so dropping panels cannot leave
+    /// the tree carrying nodes that hold nothing.
+    #[must_use]
+    pub fn from_saved(saved: &SavedLayout, id_of: impl Fn(&str) -> Option<PanelId> + Copy) -> Self {
+        let mut layout = Self {
+            root: load_node(&saved.root, id_of),
+        };
+        Self::collapse(&mut layout.root);
+        layout
+    }
+}
+
+fn save_node(node: &Node, name_of: impl Fn(PanelId) -> Option<String> + Copy) -> SavedNode {
+    match node {
+        Node::Leaf { tabs, active } => {
+            let panels: Vec<String> = tabs.iter().filter_map(|p| name_of(*p)).collect();
+            SavedNode::Leaf {
+                active: (*active).min(panels.len().saturating_sub(1)),
+                panels,
+            }
+        }
+        Node::Split { axis, children } => SavedNode::Split {
+            axis: match axis {
+                Axis::Horizontal => SavedAxis::Horizontal,
+                Axis::Vertical => SavedAxis::Vertical,
+            },
+            children: children
+                .iter()
+                .map(|c| SavedChild {
+                    weight: c.weight,
+                    node: save_node(&c.node, name_of),
+                })
+                .collect(),
+        },
+    }
+}
+
+fn load_node(node: &SavedNode, id_of: impl Fn(&str) -> Option<PanelId> + Copy) -> Node {
+    match node {
+        SavedNode::Leaf { panels, active } => {
+            let tabs: Vec<PanelId> = panels.iter().filter_map(|n| id_of(n)).collect();
+            Node::Leaf {
+                active: (*active).min(tabs.len().saturating_sub(1)),
+                tabs,
+            }
+        }
+        SavedNode::Split { axis, children } => Node::Split {
+            axis: match axis {
+                SavedAxis::Horizontal => Axis::Horizontal,
+                SavedAxis::Vertical => Axis::Vertical,
+            },
+            children: children
+                .iter()
+                .map(|c| Child {
+                    weight: c.weight,
+                    node: load_node(&c.node, id_of),
+                })
+                .collect(),
+        },
+    }
+}
+
 /// Undo and redo for the layout.
 ///
 /// A stack of whole clones, which is affordable for exactly the reason it is not for the canvas: a
@@ -957,6 +1076,83 @@ mod tests {
             placed[0].rect.w
         );
         assert!(placed[0].rect.w < area().w * 0.05, "but really a sliver");
+    }
+
+    /// A layout survives a round trip through its saved form, weights and tabs included.
+    #[test]
+    fn a_layout_round_trips_through_its_saved_form() {
+        let name = |p: PanelId| Some(format!("panel-{}", p.0));
+        let id = |n: &str| {
+            n.strip_prefix("panel-")
+                .and_then(|d| d.parse().ok())
+                .map(PanelId)
+        };
+
+        // Both axes, because a layout of only horizontal splits cannot tell whether the axis
+        // survived the trip — a sabotage that wrote every split as horizontal passed against
+        // exactly that. Tabs and an uneven weight too, so nothing is left to chance.
+        let mut original = three_across();
+        original.insert(&[2], Zone::Center, HISTORY);
+        original.insert(&[1], Zone::Bottom, COLOUR);
+        original.drag_splitter(&[], 0, 0.07);
+        assert!(
+            original.split_axis(&[1]) == Some(Axis::Vertical)
+                && original.split_axis(&[]) == Some(Axis::Horizontal),
+            "the fixture must contain both axes, or this proves less than it looks"
+        );
+
+        let saved = original.to_saved(name);
+        let back = Layout::from_saved(&saved, id);
+        assert_eq!(back, original);
+    }
+
+    /// The saved form names panels rather than numbering them, so adding a panel to the app's
+    /// table cannot silently rearrange somebody's workspace.
+    #[test]
+    fn the_saved_form_is_written_in_names() {
+        let name = |p: PanelId| Some(format!("panel-{}", p.0));
+        let text = serde_json::to_string(&three_across().to_saved(name)).expect("serialises");
+        assert!(
+            text.contains("panel-1") && !text.contains("\"tabs\""),
+            "the file should be readable andname-based, got:\n{text}"
+        );
+    }
+
+    /// A workspace naming a panel this build does not have still opens, without it.
+    ///
+    /// The alternative — refusing to open — leaves someone with a file they cannot recover from,
+    /// which is a much worse answer than a workspace missing one panel.
+    #[test]
+    fn an_unknown_panel_is_dropped_rather_than_refused() {
+        let name = |p: PanelId| Some(format!("panel-{}", p.0));
+        let saved = three_across().to_saved(name);
+
+        // This build knows nothing about panel 1 -- say it was removed since.
+        let picky = |n: &str| id_from(n).filter(|p| *p != TOOLS);
+        let back = Layout::from_saved(&saved, picky);
+        assert!(back.find(TOOLS).is_none(), "the unknown panel is gone");
+        assert!(back.find(CANVAS).is_some(), "and the rest survived");
+        assert_eq!(
+            back.resolve(area()).len(),
+            2,
+            "the leaf it left behind collapsed rather than lingering"
+        );
+    }
+
+    fn id_from(n: &str) -> Option<PanelId> {
+        n.strip_prefix("panel-")
+            .and_then(|d| d.parse().ok())
+            .map(PanelId)
+    }
+
+    /// A panel the caller cannot name is dropped on the way *out* too, rather than written as
+    /// something that will not come back.
+    #[test]
+    fn an_unnameable_panel_is_dropped_on_the_way_out() {
+        let saved = three_across().to_saved(|p| (p != TOOLS).then(|| format!("panel-{}", p.0)));
+        let back = Layout::from_saved(&saved, id_from);
+        assert!(back.find(TOOLS).is_none());
+        assert_eq!(back.resolve(area()).len(), 2);
     }
 
     /// Undo restores the layout exactly, and redo puts it back.

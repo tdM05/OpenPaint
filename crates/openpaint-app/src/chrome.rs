@@ -83,25 +83,49 @@ pub fn panel(
     // way round: the header is the only part that can be grabbed to undo the drag by hand.
     .min(outer.h);
 
-    let header = Rect::new(outer.x, outer.y, outer.w, bar);
-    let content = Rect::new(outer.x, outer.y + bar, outer.w, (outer.h - bar).max(0.0));
-
     let mut tabs = Vec::new();
+    let mut rows = 1.0_f32;
     if style == HeaderStyle::Named {
-        let mut x = outer.x;
-        for index in 0..placed.tabs.len() {
-            let w = measure(index) + metrics.tab_padding * 2.0;
-            // Tabs run off the end rather than shrinking. A tab narrower than its label is a tab
-            // you cannot read *and* cannot aim at; overflowing at least leaves the ones you can
-            // see usable, and scrolling them is a later refinement with somewhere to go.
+        // **Tabs wrap onto more rows rather than running off the edge.**
+        //
+        // A panel is draggable anywhere, so any panel can end up narrow — there is no arrangement
+        // to design against. A row that overflowed would put its later tabs permanently out of
+        // reach, and for the menu that would mean losing the way to reopen a closed panel: the one
+        // thing that must always be reachable.
+        //
+        // Shrinking tabs instead was the alternative and is worse: a tab narrower than its label
+        // is one you can neither read nor aim at. Height is the cheaper thing to spend.
+        let widths: Vec<f32> = (0..placed.tabs.len())
+            .map(|i| (measure(i) + metrics.tab_padding * 2.0).min(outer.w.max(1.0)))
+            .collect();
+        let (mut x, mut y) = (outer.x, outer.y);
+        for (index, w) in widths.iter().copied().enumerate() {
+            if x > outer.x && x + w > outer.x + outer.w {
+                x = outer.x;
+                y += bar;
+                rows += 1.0;
+            }
             tabs.push(Tab {
                 index,
-                rect: Rect::new(x, header.y, w.min((outer.x + outer.w - x).max(0.0)), bar),
+                rect: Rect::new(x, y, w, bar),
                 active: index == placed.active,
             });
             x += w;
         }
     }
+
+    // The header grows to hold however many rows the tabs needed, and the content gives up the
+    // room. Never past the panel itself: a header taller than its panel would leave no content at
+    // all, and a panel squeezed to a sliver keeps its header because that is the only part that
+    // can be grabbed to undo the squeeze.
+    let bar_total = (bar * rows).min(outer.h);
+    let header = Rect::new(outer.x, outer.y, outer.w, bar_total);
+    let content = Rect::new(
+        outer.x,
+        outer.y + bar_total,
+        outer.w,
+        (outer.h - bar_total).max(0.0),
+    );
 
     PanelChrome {
         outer,
@@ -362,6 +386,69 @@ mod tests {
             "tabs must meet, not overlap or gap"
         );
         assert!(c.tabs[1].active, "the shown panel is the marked tab");
+    }
+
+    /// **Tabs wrap rather than running off the edge**, and the header grows to hold them.
+    ///
+    /// Any panel can be dragged somewhere narrow, so there is no arrangement to design against. A
+    /// row that overflowed would put its later tabs permanently out of reach — and in the menu
+    /// that means losing the way to reopen a closed panel.
+    #[test]
+    fn tabs_wrap_onto_more_rows_when_the_panel_is_narrow() {
+        let placed = Placed {
+            path: vec![],
+            rect: Rect::new(0.0, 0.0, 160.0, 400.0),
+            tabs: vec![CANVAS, LAYERS, HISTORY, PanelId(9)],
+            active: 0,
+        };
+        // Four tabs of ~64 units each against a 160-unit panel: two per row.
+        let c = panel(&placed, &metrics(), HeaderStyle::Named, |_| 40.0);
+        assert_eq!(c.tabs.len(), 4);
+
+        let rows: std::collections::BTreeSet<i32> =
+            c.tabs.iter().map(|t| t.rect.y as i32).collect();
+        assert!(
+            rows.len() > 1,
+            "they should have wrapped, all sat at {rows:?}"
+        );
+        for t in &c.tabs {
+            assert!(
+                t.rect.x + t.rect.w <= c.outer.x + c.outer.w + 0.01,
+                "tab {} runs off the panel and can never be reached",
+                t.index
+            );
+        }
+        assert!(
+            c.header.h > metrics().header,
+            "the header should have grown to hold the extra row"
+        );
+        assert!(
+            (c.header.h + c.content.h - c.outer.h).abs() < 0.001,
+            "and the content gave up exactly that much"
+        );
+    }
+
+    /// A header can never grow past its own panel, however many tabs it has.
+    ///
+    /// Otherwise a narrow panel with several tabs would be all header and no content — or worse,
+    /// a negative content height.
+    #[test]
+    fn a_wrapped_header_never_outgrows_its_panel() {
+        let placed = Placed {
+            path: vec![],
+            rect: Rect::new(0.0, 0.0, 90.0, 60.0),
+            tabs: vec![CANVAS, LAYERS, HISTORY, PanelId(9), PanelId(10)],
+            active: 0,
+        };
+        let c = panel(&placed, &metrics(), HeaderStyle::Named, |_| 40.0);
+        assert!(
+            c.header.h <= c.outer.h + 0.001,
+            "header {} of {}",
+            c.header.h,
+            c.outer.h
+        );
+        assert!(c.content.h >= 0.0);
+        assert!((c.header.h + c.content.h - c.outer.h).abs() < 0.001);
     }
 
     /// A compact header has no tabs and takes less room, but is still a header.
