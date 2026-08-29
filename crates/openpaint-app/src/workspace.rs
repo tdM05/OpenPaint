@@ -433,7 +433,16 @@ impl Workspace {
                         let Some(id) = slot.tabs.get(t.index).copied() else {
                             continue;
                         };
-                        let colour = if t.active { p.bright } else { p.dim };
+                        // The same quiet mark the dividers use, for the same reason: a pen hovers,
+                        // so it can say "this is a thing" before you commit to it. A finger gets
+                        // nothing here and loses nothing, because the hold is what starts a
+                        // gesture either way.
+                        let hovered =
+                            pointer.is_some_and(|q| t.rect.contains(q.x, q.y)) && preview.is_none();
+                        if hovered && !t.active {
+                            painter.rect_filled(to_egui(t.rect), m.radius, rgb(p.edge));
+                        }
+                        let colour = if t.active || hovered { p.bright } else { p.dim };
                         painter.text(
                             egui::pos2(t.rect.x + m.tab_padding, t.rect.y + t.rect.h / 2.0),
                             egui::Align2::LEFT_CENTER,
