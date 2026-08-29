@@ -391,6 +391,37 @@ engine is written:
 On-disk storage format is a **separate, later** decision (Q6) — 16-bit in memory
 does not oblige 16-bit on disk.
 
+### 4n. Dabs are ellipses — 2026-08-28
+
+Roundness and angle, which together make a chisel nib: a mark thick across its
+travel and thin along it. That is most of what inked line weight actually *is*,
+and it is the piece that gives `Source::Direction` a home — point angle at it
+with a straight curve and the dab follows the stroke.
+
+**The ellipse is handled by transforming the point, not by a separate
+elliptical falloff.** The sample is rotated back into the dab's frame and its
+minor axis stretched up to the major, so an ellipse becomes a circle and the
+existing falloff needs to know nothing about shape. Two things follow, and both
+are why it is done this way:
+
+- **Hardness means the same at every roundness.** A separate elliptical falloff
+  would have to re-derive what "half way out" means, and would not agree with
+  the round case at the boundary.
+- **Nothing that reasons about a dab's extent changes.** Radius is the *major*
+  axis, so a flattened dab reaches no further than a round one — the pixel
+  bounds, the GPU quad and the tile-touching calculation are all still correct
+  without a line of change.
+
+Angle is **turns** on the brush and **radians** on the dab. Modulation works in
+0–1, so a full turn being 1.0 is what makes "angle follows direction" an
+identity curve rather than a conversion constant; by the time a dab exists the
+value is geometry, and geometry is radians.
+
+The shape transform now exists twice — `Dab::distance_to` and `dab_fs` — which
+is the §11a hazard the rasterization cross-check was built for. Extended with a
+rotated, flattened case at awkward angles: a quarter turn would hide a swapped
+axis and a whole turn would hide a wrong sign, and both sabotages fail it now.
+
 ### 4m. Any input can drive any parameter through a curve — 2026-08-28
 
 Asked well: *"just because we cannot see a use case does not mean one does not

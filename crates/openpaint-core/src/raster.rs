@@ -68,6 +68,8 @@ mod tests {
             radius,
             hardness,
             flow: 1.0,
+            roundness: 1.0,
+            angle: 0.0,
             color_linear_premul: [0.0, 0.0, 0.0, 1.0],
         }
     }

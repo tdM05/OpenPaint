@@ -659,6 +659,26 @@ impl Ui {
                                     }),
                             );
                             ui.add(egui::Slider::new(&mut brush.spacing, 0.01..=1.0).text("Spacing"));
+                            ui.add(
+                                egui::Slider::new(&mut brush.roundness, 0.02..=1.0)
+                                    .text("Roundness")
+                                    .custom_formatter(|v, _| match v {
+                                        v if v >= 0.999 => "1.00 round".to_owned(),
+                                        v => format!("{v:.2}"),
+                                    }),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut brush.angle, 0.0..=1.0)
+                                    .text("Angle (turns)")
+                                    .custom_formatter(|v, _| format!("{:.0}°", v * 360.0)),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "A flattened dab is a chisel nib. Point Angle at Direction with a straight curve and it follows the stroke, which is where inked line weight comes from.",
+                                )
+                                .small()
+                                .weak(),
+                            );
                             ui.label(
                                 egui::RichText::new(
                                     "Alt+click picks the colour under the pointer, sampled from                                      the composited image rather than from one layer.",

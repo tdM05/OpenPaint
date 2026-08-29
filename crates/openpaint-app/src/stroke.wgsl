@@ -94,6 +94,8 @@ struct DabInst {
     @location(1) radius: f32,
     @location(2) hardness: f32,
     @location(3) flow: f32,
+    @location(4) roundness: f32,
+    @location(5) angle: f32,
 };
 
 struct DabOut {
@@ -104,6 +106,8 @@ struct DabOut {
     @location(1) radius: f32,
     @location(2) hardness: f32,
     @location(3) flow: f32,
+    @location(4) roundness: f32,
+    @location(5) angle: f32,
 };
 
 @vertex
@@ -140,12 +144,22 @@ fn dab_vs(@builtin(vertex_index) vid: u32, inst: DabInst) -> DabOut {
     out.radius = inst.radius;
     out.hardness = inst.hardness;
     out.flow = inst.flow;
+    out.roundness = inst.roundness;
+    out.angle = inst.angle;
     return out;
 }
 
 @fragment
 fn dab_fs(in: DabOut) -> @location(0) vec4<f32> {
-    let dist = length(in.local);
+    // Rotate back into the dab's own frame and stretch the minor axis up to the major, so an
+    // ellipse becomes a circle and the falloff below needs to know nothing about shape. Mirrors
+    // `Dab::distance_to`; the two are pinned together by the rasterization cross-check, which is
+    // the only thing keeping a formula that exists twice from drifting.
+    let c = cos(in.angle);
+    let s = sin(in.angle);
+    let rx = in.local.x * c + in.local.y * s;
+    let ry = -in.local.x * s + in.local.y * c;
+    let dist = length(vec2<f32>(rx, ry / max(in.roundness, 0.02)));
     // Solid core radius; outside it, coverage ramps to zero at the edge.
     let inner = max(in.radius * in.hardness, 0.0);
     var coverage: f32;

@@ -60,6 +60,18 @@ pub struct Brush {
     pub hardness_response: Response,
     /// What drives the spacing between dabs.
     pub spacing_response: Response,
+    /// Minor axis as a fraction of the major. One is a circle.
+    pub roundness: f32,
+    /// What drives the roundness.
+    pub roundness_response: Response,
+    /// Rotation of the major axis, in **turns**.
+    ///
+    /// Turns rather than degrees so that a full turn is 1.0, and therefore so that pointing this
+    /// at `Source::Direction` with an identity curve makes the dab follow the stroke exactly —
+    /// which is a chisel nib, and the reason modulation was generalised before this landed.
+    pub angle: f32,
+    /// What drives the angle.
+    pub angle_response: Response,
     /// Ceiling the whole stroke may reach, `0.0..=1.0`.
     ///
     /// Per *stroke*, not per dab and not per layer: overlapping dabs build toward
@@ -95,6 +107,11 @@ impl Default for Brush {
             flow_response: Response::fixed(),
             hardness_response: Response::fixed(),
             spacing_response: Response::fixed(),
+            // A circle, unrotated: exactly the dab that existed before shape did.
+            roundness: 1.0,
+            roundness_response: Response::fixed(),
+            angle: 0.0,
+            angle_response: Response::fixed(),
             opacity: 1.0,
             // Off by default, and that is a deliberate refusal to guess. Smoothing buys steadiness
             // with latency (see `stabilizer`), and how much an artist needs depends entirely on
@@ -239,6 +256,9 @@ impl Brush {
             radius: self.radius_for(input),
             hardness: (self.hardness * self.hardness_response.factor(input)).clamp(0.0, 1.0),
             flow: (self.flow * self.flow_response.factor(input)).clamp(0.0, 1.0),
+            roundness: (self.roundness * self.roundness_response.factor(input))
+                .clamp(crate::dab::MIN_ROUNDNESS, 1.0),
+            angle: (self.angle * self.angle_response.factor(input)) * std::f32::consts::TAU,
             color_linear_premul: self.color_linear_premul,
         }
     }
@@ -248,12 +268,14 @@ impl Brush {
     /// Returned as a list rather than named one at a time so the panel cannot fall behind the
     /// engine: adding a parameter here makes an editor for it appear, rather than needing a second
     /// edit somewhere that is easy to forget.
-    pub fn responses_mut(&mut self) -> [(&'static str, &mut Response); 4] {
+    pub fn responses_mut(&mut self) -> [(&'static str, &mut Response); 6] {
         [
             ("Size", &mut self.radius_response),
             ("Flow", &mut self.flow_response),
             ("Hardness", &mut self.hardness_response),
             ("Spacing", &mut self.spacing_response),
+            ("Roundness", &mut self.roundness_response),
+            ("Angle", &mut self.angle_response),
         ]
     }
 

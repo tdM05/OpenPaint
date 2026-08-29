@@ -203,6 +203,8 @@ mod tests {
             // arithmetic under test isn't entangled with the falloff curve.
             hardness: 0.0,
             flow,
+            roundness: 1.0,
+            angle: 0.0,
             color_linear_premul: BLACK,
         }
     }

@@ -96,7 +96,9 @@ struct DabInstance {
     radius: f32,
     hardness: f32,
     flow: f32,
-    _pad: [f32; 3],
+    roundness: f32,
+    angle: f32,
+    _pad: f32,
 }
 
 impl From<&Dab> for DabInstance {
@@ -106,7 +108,9 @@ impl From<&Dab> for DabInstance {
             radius: d.radius,
             hardness: d.hardness,
             flow: d.flow,
-            _pad: [0.0; 3],
+            roundness: d.roundness,
+            angle: d.angle,
+            _pad: 0.0,
         }
     }
 }
@@ -361,6 +365,16 @@ impl StrokeLayer {
                         wgpu::VertexAttribute {
                             offset: 16,
                             shader_location: 3,
+                            format: wgpu::VertexFormat::Float32,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 20,
+                            shader_location: 4,
+                            format: wgpu::VertexFormat::Float32,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 24,
+                            shader_location: 5,
                             format: wgpu::VertexFormat::Float32,
                         },
                     ],
@@ -1088,12 +1102,27 @@ mod tests {
     const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
     fn dab(x: f32, y: f32, radius: f32, hardness: f32, flow: f32) -> Dab {
+        shaped(x, y, radius, hardness, flow, 1.0, 0.0)
+    }
+
+    /// A dab with an explicit shape, for the elliptical cases.
+    fn shaped(
+        x: f32,
+        y: f32,
+        radius: f32,
+        hardness: f32,
+        flow: f32,
+        roundness: f32,
+        angle: f32,
+    ) -> Dab {
         Dab {
             x,
             y,
             radius,
             hardness,
             flow,
+            roundness,
+            angle,
             color_linear_premul: BLACK,
         }
     }
@@ -1157,6 +1186,44 @@ mod tests {
                 None => [0.0; 4],
             })
             .collect()
+    }
+
+    /// The elliptical dab, through both rasterizers.
+    ///
+    /// The shape transform exists twice — `Dab::distance_to` and `dab_fs` in stroke.wgsl — and two
+    /// copies of a formula drift. A rotated, flattened dab is the case where a sign error in the
+    /// rotation or a swapped axis is unmistakable, and invisible on a circle.
+    #[test]
+    fn gpu_elliptical_dabs_match_the_cpu_reference() {
+        let Some(_) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+
+        // Deliberately awkward angles: a quarter turn would hide a swapped axis, and a whole turn
+        // would hide a wrong sign.
+        let dabs = [
+            shaped(40.0, 64.0, 18.0, 1.0, 1.0, 0.3, 0.0),
+            shaped(60.0, 64.0, 18.0, 0.5, 1.0, 0.3, 0.7),
+            shaped(80.0, 64.0, 18.0, 0.0, 1.0, 0.15, 2.2),
+            shaped(96.0, 70.0, 12.0, 0.5, 1.0, 0.6, -1.1),
+        ];
+
+        let gpu = gpu_render(&dabs, 1.0);
+        let cpu = cpu_render(&dabs, 1.0);
+
+        assert!(any_paint(&gpu), "GPU produced no paint at all");
+        assert!(any_paint(&cpu), "CPU reference produced no paint");
+
+        let (worst, at) = max_difference(&gpu, &cpu);
+        assert!(
+            worst < 0.01,
+            "GPU and CPU disagree by {worst} at pixel {at} ({}, {}); gpu {:?} cpu {:?}",
+            at as u32 % SIZE,
+            at as u32 / SIZE,
+            gpu[at],
+            cpu[at]
+        );
     }
 
     /// The reason `openpaint_core::raster` and `openpaint_core::stroke` are kept: the

@@ -37,6 +37,12 @@
 //!
 //! See DECISIONS §4a and §4c.
 
+/// The narrowest a dab may be, as a fraction of its radius.
+///
+/// Not zero: roundness divides, and a dab with no width would cover nothing anywhere while costing
+/// the same to rasterize. A fiftieth of the major axis is already a hairline at any usable size.
+pub const MIN_ROUNDNESS: f32 = 0.02;
+
 /// One stamp of the brush tip: pure data, no pixels, no canvas, no GPU.
 ///
 /// Deliberately small and `Copy`. A stroke produces hundreds of these into a
@@ -48,7 +54,10 @@ pub struct Dab {
     /// Center in canvas pixels.
     pub x: f32,
     pub y: f32,
-    /// Radius in canvas pixels, after pressure has been applied.
+    /// Radius in canvas pixels, after modulation. The **major** axis of the dab.
+    ///
+    /// Major rather than mean, so narrowing a dab never makes it reach further than its radius —
+    /// which is what lets the bounds and the GPU quad stay the same for every shape.
     pub radius: f32,
     /// Edge hardness in `0.0..=1.0`: **1 = hard edge, 0 = fully soft falloff**.
     ///
@@ -67,6 +76,17 @@ pub struct Dab {
     /// mapping in Photoshop and CSP. Opacity, by contrast, is a *stroke*-level
     /// ceiling and so lives on the brush, not here.
     pub flow: f32,
+    /// Minor axis as a fraction of the major, `0.0..=1.0`. One is a circle.
+    ///
+    /// With [`Dab::angle`], this is what makes a chisel nib: a stroke thick across its travel and
+    /// thin along it, which is most of what inked line weight actually is.
+    pub roundness: f32,
+    /// Rotation of the major axis, in radians, clockwise on screen.
+    ///
+    /// Radians here and turns on the brush: the brush's angle is a *parameter* that modulation
+    /// scales, and modulation works in `0..=1`, so turns are its natural unit. By the time a dab
+    /// exists the value is geometry, and geometry is radians.
+    pub angle: f32,
     /// Color, linear and premultiplied (see [`crate::color`]). Normally opaque
     /// (alpha 1.0); coverage and flow are applied when the dab is rasterized.
     pub color_linear_premul: [f32; 4],
@@ -86,10 +106,25 @@ impl Dab {
     /// correct-shaped but not yet correct-valued.
     #[must_use]
     pub fn coverage_at(&self, px: f32, py: f32) -> f32 {
+        self.coverage_at_distance(self.distance_to(px, py))
+    }
+
+    /// Distance from the centre, measured in the dab's own frame.
+    ///
+    /// The point is rotated back by the dab's angle and the minor axis stretched to match the
+    /// major, so an ellipse becomes a circle and the falloff below needs to know nothing about
+    /// shape. Two things follow from doing it this way rather than with a separate elliptical
+    /// falloff: hardness means the same thing at every roundness, and the result is still bounded
+    /// by `radius`, so nothing that reasons about a dab's extent has to change.
+    #[must_use]
+    pub fn distance_to(&self, px: f32, py: f32) -> f32 {
         let dx = px - self.x;
         let dy = py - self.y;
-        let dist = (dx * dx + dy * dy).sqrt();
-        self.coverage_at_distance(dist)
+        let (sin, cos) = self.angle.sin_cos();
+        let rx = dx * cos + dy * sin;
+        let ry = -dx * sin + dy * cos;
+        // Floored so a fully flattened dab is a very thin ellipse rather than a division by zero.
+        rx.hypot(ry / self.roundness.clamp(MIN_ROUNDNESS, 1.0))
     }
 
     /// Coverage as a function of distance from the dab center.
@@ -131,6 +166,8 @@ mod tests {
             radius,
             hardness,
             flow: 1.0,
+            roundness: 1.0,
+            angle: 0.0,
             color_linear_premul: [0.0, 0.0, 0.0, 1.0],
         }
     }
@@ -190,6 +227,109 @@ mod tests {
         }
     }
 
+    /// A flattened dab is narrow across its minor axis and full width along its major.
+    #[test]
+    fn roundness_flattens_the_dab() {
+        let d = Dab {
+            roundness: 0.25,
+            ..dab(20.0, 1.0)
+        };
+        // Unrotated, the major axis runs along x.
+        assert!(d.coverage_at(19.0, 0.0) > 0.9, "along the major axis");
+        assert!(d.coverage_at(21.0, 0.0) < 0.01, "and stops at the radius");
+        assert!(d.coverage_at(0.0, 4.0) > 0.9, "across the minor axis");
+        assert!(
+            d.coverage_at(0.0, 6.0) < 0.01,
+            "the minor axis should end at a quarter of the radius"
+        );
+    }
+
+    /// The angle turns the whole shape, so what was the long way round becomes the short way.
+    #[test]
+    fn the_angle_rotates_the_shape() {
+        let flat = Dab {
+            roundness: 0.25,
+            ..dab(20.0, 1.0)
+        };
+        let turned = Dab {
+            angle: std::f32::consts::FRAC_PI_2,
+            ..flat
+        };
+
+        assert!(flat.coverage_at(15.0, 0.0) > 0.9 && flat.coverage_at(0.0, 15.0) < 0.01);
+        assert!(
+            turned.coverage_at(0.0, 15.0) > 0.9 && turned.coverage_at(15.0, 0.0) < 0.01,
+            "a quarter turn should swap the axes"
+        );
+    }
+
+    /// A round dab is unaffected by its angle, which is the property that lets angle default to
+    /// zero and be ignored by every brush that does not want it.
+    #[test]
+    fn a_circle_does_not_care_about_its_angle() {
+        let plain = dab(20.0, 0.5);
+        let turned = Dab {
+            angle: 1.234,
+            ..plain
+        };
+        for (x, y) in [(5.0_f32, 0.0_f32), (0.0, 5.0), (9.0, 9.0), (14.0, 3.0)] {
+            assert!(
+                (plain.coverage_at(x, y) - turned.coverage_at(x, y)).abs() < 1e-4,
+                "rotating a circle changed it at ({x}, {y})"
+            );
+        }
+    }
+
+    /// Hardness has to mean the same thing whatever the shape, which is why the ellipse is handled
+    /// by transforming the *point* rather than by a separate elliptical falloff.
+    #[test]
+    fn hardness_means_the_same_at_every_roundness() {
+        let round = dab(20.0, 0.5);
+        let flat = Dab {
+            roundness: 0.25,
+            ..round
+        };
+        // Halfway out along each dab's own major axis, the falloff should have progressed equally.
+        assert!(
+            (round.coverage_at(15.0, 0.0) - flat.coverage_at(15.0, 0.0)).abs() < 1e-4,
+            "the falloff differs along the major axis"
+        );
+        // And equally at the matching fraction across the minor.
+        assert!(
+            (round.coverage_at(0.0, 15.0) - flat.coverage_at(0.0, 15.0 * 0.25)).abs() < 1e-4,
+            "the falloff differs across the minor axis"
+        );
+    }
+
+    /// However flat, a dab never reaches past its radius -- which is what lets the pixel bounds
+    /// and the GPU quad stay the same for every shape.
+    #[test]
+    fn no_shape_reaches_past_the_radius() {
+        for roundness in [1.0_f32, 0.5, 0.02] {
+            for angle in [0.0_f32, 0.7, 2.5] {
+                let d = Dab {
+                    roundness,
+                    angle,
+                    ..dab(20.0, 1.0)
+                };
+                let (min_x, min_y, max_x, max_y) = d.pixel_bounds();
+                for y in (min_y - 3)..=(max_y + 3) {
+                    for x in (min_x - 3)..=(max_x + 3) {
+                        let outside = x < min_x || y < min_y || x > max_x || y > max_y;
+                        if outside {
+                            assert_eq!(
+                                d.coverage_at(x as f32, y as f32),
+                                0.0,
+                                "roundness {roundness} angle {angle} covered ({x}, {y}), \
+                                 which is outside its own bounds"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn coverage_at_matches_coverage_at_distance() {
         let d = dab(10.0, 0.5);
@@ -205,6 +345,8 @@ mod tests {
             radius: 8.0,
             hardness: 0.5,
             flow: 1.0,
+            roundness: 1.0,
+            angle: 0.0,
             color_linear_premul: [0.0, 0.0, 0.0, 1.0],
         };
         let (min_x, min_y, max_x, max_y) = d.pixel_bounds();
