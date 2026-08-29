@@ -240,6 +240,46 @@ impl Composite {
     }
 }
 
+/// One tile of a merge: `upper`'s pixels folded into `lower`'s, as the compositor already shows
+/// them.
+///
+/// Lives here, beside [`Composite`], because it is the same rule seen from a different angle — a
+/// merge must produce *what the artist was already looking at*, so it has to answer exactly as the
+/// compositor does about opacity, blend and clipping. A second copy of that arithmetic anywhere is
+/// a second idea of what a stack means, which is the mistake this module was extracted to undo.
+///
+/// `under` is `None` where the lower layer has no tile, which is transparent — not an error, since
+/// a layer routinely has pixels its neighbour does not.
+///
+/// What deliberately does *not* happen here: the lower layer's own opacity and blend are not baked
+/// in. They stay on the layer and go on applying to the merged result, which is what every app does
+/// and is exact whenever it is Normal at full strength. Baking them would change how the merged
+/// layer sits against everything *below* it, which is a bigger lie than the one it fixes.
+#[must_use]
+pub(crate) fn merge_tile(
+    src: &openpaint_core::tile::Tile,
+    under: Option<&openpaint_core::tile::Tile>,
+    upper: &Layer,
+    lower: &Layer,
+) -> openpaint_core::tile::Tile {
+    let mut out = openpaint_core::tile::Tile::transparent();
+    for i in 0..openpaint_core::tile::TILE_TEXELS {
+        let (x, y) = (i % TILE_SIZE, i / TILE_SIZE);
+        let base = under.map_or([0.0; 4], |t| t.texel(x, y));
+        // The upper layer's contribution: its own opacity, then its clip to the layer below if it
+        // has one. Exactly `Composite::add`, for one layer over one backdrop.
+        let mut over =
+            openpaint_core::color::scale_premul(src.texel(x, y), upper.effective_opacity());
+        if upper.clip_below {
+            // The base's *contribution* alpha, not its raw pixel alpha -- the same rule
+            // `Composite::add` uses, so that fading the base fades what is clipped to it.
+            over = openpaint_core::color::scale_premul(over, base[3] * lower.effective_opacity());
+        }
+        out.set_texel(x, y, blend_over(over, base, upper.blend));
+    }
+    out
+}
+
 /// Composite premultiplied `src` over premultiplied `dst`, the PDF/CSS way.
 ///
 /// Mirrors `blend_over` in canvas.wgsl. Blend functions are defined on straight colour, so this

@@ -155,6 +155,35 @@ impl Document {
         self.active_mut().insert_layer_above(at, id, name)
     }
 
+    /// Copy a layer's *properties* above it, and select the copy. Returns its index, and the id
+    /// of the new layer so the caller can copy the pixels into it.
+    ///
+    /// Properties only, because pixels are not the document's to move: they live on the GPU, and
+    /// the whole point of the split is that this module never learns about tiles. The caller
+    /// copies them, which it is in a position to do and this is not.
+    ///
+    /// Text comes along as text, so duplicating a caption gives a second editable caption rather
+    /// than a picture of the first. That falls out of the content being the layer's source of
+    /// truth (§6a) rather than needing a case of its own.
+    pub fn duplicate_layer(&mut self, index: usize) -> Option<(usize, u32)> {
+        let source = self.active().layer(index)?.clone();
+        let id = self.take_layer_id();
+        let at = self
+            .active_mut()
+            .insert_layer_above(index, id, copy_name(&source.name));
+        let copy = self
+            .active_mut()
+            .layer_mut(at)
+            .expect("the layer just inserted");
+        copy.opacity = source.opacity;
+        copy.blend = source.blend;
+        copy.visible = source.visible;
+        copy.lock_alpha = source.lock_alpha;
+        copy.clip_below = source.clip_below;
+        copy.set_content(source.content().clone());
+        Some((at, id))
+    }
+
     /// Add a text layer above the active one, and select it. Returns its index.
     ///
     /// Named from its own text rather than from the id, unlike [`Document::add_layer`]: a caption
@@ -219,9 +248,69 @@ impl Document {
     }
 }
 
+/// What a duplicate is called: "Ink" becomes "Ink copy", and "Ink copy" stays "Ink copy 2".
+///
+/// Numbered on the second copy rather than the first, which is what every app does and reads
+/// better than "Ink copy copy".
+fn copy_name(name: &str) -> String {
+    let Some(stem) = name.strip_suffix(" copy") else {
+        return match name.rsplit_once(" copy ") {
+            Some((stem, n)) => match n.parse::<u32>() {
+                Ok(n) => format!("{stem} copy {}", n + 1),
+                Err(_) => format!("{name} copy"),
+            },
+            None => format!("{name} copy"),
+        };
+    };
+    format!("{stem} copy 2")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A duplicate carries everything that makes the layer look the way it does, and its content
+    /// with it — so duplicating a caption gives a second editable caption, not a picture of one.
+    #[test]
+    fn a_duplicate_is_the_same_layer_with_a_new_name() {
+        let mut doc = Document::new(Page::new(256, 256));
+        {
+            let layer = doc.active_mut().layer_mut(0).expect("the first layer");
+            layer.name = "Ink".to_owned();
+            layer.opacity = 0.4;
+            layer.blend = crate::Blend::Multiply;
+            layer.clip_below = true;
+            layer.lock_alpha = true;
+            layer.visible = false;
+        }
+        let (at, id) = doc.duplicate_layer(0).expect("the layer exists");
+        let source = doc.active().layer(0).expect("still there").clone();
+        let copy = doc.active().layer(at).expect("the copy");
+
+        assert_eq!(at, 1, "the copy sits directly above its source");
+        assert_ne!(
+            id,
+            source.id(),
+            "a copy is its own layer, not a second name for one"
+        );
+        assert_eq!(copy.name, "Ink copy");
+        assert_eq!(copy.opacity, source.opacity);
+        assert_eq!(copy.blend, source.blend);
+        assert_eq!(copy.clip_below, source.clip_below);
+        assert_eq!(copy.lock_alpha, source.lock_alpha);
+        assert_eq!(copy.visible, source.visible);
+    }
+
+    /// Copies of copies number rather than stacking the word.
+    #[test]
+    fn copy_names_number_instead_of_repeating() {
+        assert_eq!(copy_name("Ink"), "Ink copy");
+        assert_eq!(copy_name("Ink copy"), "Ink copy 2");
+        assert_eq!(copy_name("Ink copy 2"), "Ink copy 3");
+        // Not a number: treat it as an ordinary name rather than guessing.
+        assert_eq!(copy_name("Ink copy of mine"), "Ink copy of mine copy");
+    }
+
     use crate::layer::Layer;
     use crate::page::PageRect;
 

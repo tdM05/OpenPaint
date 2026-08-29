@@ -385,6 +385,136 @@ impl Renderer {
         Some(adopted)
     }
 
+    /// Copy every tile of one layer onto another, replacing what is there.
+    ///
+    /// For a duplicate, where the destination is brand new and so has nothing to preserve.
+    pub fn copy_layer_pixels(&mut self, from: LayerId, to: LayerId) {
+        let coords: Vec<openpaint_core::tile::TileCoord> =
+            self.canvas_renderer.layer_tiles(from).collect();
+        let tiles = self
+            .canvas_renderer
+            .read_tiles(&self.device, &self.queue, from, &coords);
+        for (coord, tile) in tiles {
+            self.canvas_renderer
+                .replace_tile(TileKey::new(to, coord), tile);
+        }
+    }
+
+    /// Fold `upper` down onto `lower`, undoably. Returns whether it happened.
+    ///
+    /// Refused rather than performed when the snapshot pool has no room, and refused *before*
+    /// anything changes: both snapshots are taken first, so a failure costs nothing but the pool
+    /// space it gives straight back. A merge destroys the separation between two layers, and an
+    /// undo that produced a state which never existed would be worse than a merge that did not.
+    ///
+    /// # The composite is `export::Composite`'s rule, not a fourth copy of it
+    ///
+    /// What a merge must produce is *what the artist already sees*, so it has to agree with the
+    /// compositor exactly — blend mode, opacity and clipping included. `blend_over` is the rule the
+    /// GPU compositor is pinned to by `the_gpu_compositor_matches_the_cpu_reference`, so using it
+    /// here means a merge cannot quietly change the picture. Writing the blend a fourth time is how
+    /// it would.
+    pub fn merge_layer_down(&mut self, index: usize, upper: &Layer, lower: &Layer) -> bool {
+        let up = LayerId(upper.id());
+        let Some(before) = self.snapshot_for_merge(up, LayerId(lower.id())) else {
+            return false;
+        };
+        let Some(tiles) = self.snapshot_layer(up) else {
+            // Give back what the first snapshot took, so a refusal leaves the pool as it was.
+            self.history.release_all(before);
+            return false;
+        };
+        self.merge_pixels(upper, lower);
+        self.canvas_renderer.discard_layer(up);
+        self.history.push(Op::MergeLayer {
+            index,
+            layer: upper.clone(),
+            tiles,
+            lower: lower.clone(),
+            before,
+        });
+        true
+    }
+
+    /// Copy every tile of a layer into the history pool, leaving the canvas untouched.
+    ///
+    /// [`Renderer::adopt_layer`] is this plus a discard. They are separate because a merge has to
+    /// keep the pixels until the composite has read them, and only then let go.
+    fn snapshot_layer(&mut self, layer: LayerId) -> Option<Vec<(TileKey, Slot)>> {
+        let coords: Vec<openpaint_core::tile::TileCoord> =
+            self.canvas_renderer.layer_tiles(layer).collect();
+        let mut encoder = self.new_stroke_encoder();
+        let mut kept = Vec::with_capacity(coords.len());
+        for coord in coords {
+            let key = TileKey::new(layer, coord);
+            match self
+                .history
+                .adopt_tile(&mut encoder, &self.canvas_renderer, key)
+            {
+                Some(slot) => kept.push((key, slot)),
+                None => {
+                    self.queue.submit(std::iter::once(encoder.finish()));
+                    for (_, slot) in kept {
+                        self.history.release_slot(slot);
+                    }
+                    return None;
+                }
+            }
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        Some(kept)
+    }
+
+    /// The composite half of a merge, with nothing recorded.
+    ///
+    /// Separate because redo needs exactly this and no history: the op it is replaying is already
+    /// in the stack.
+    fn merge_pixels(&mut self, upper: &Layer, lower: &Layer) {
+        let (up, low) = (LayerId(upper.id()), LayerId(lower.id()));
+        // Every tile either layer touches. A tile the lower one has not got still receives paint,
+        // and a tile only it has is left alone -- but it is cheaper to ask for both than to reason
+        // about which.
+        let mut coords: Vec<openpaint_core::tile::TileCoord> =
+            self.canvas_renderer.layer_tiles(up).collect();
+        coords.sort_unstable();
+        coords.dedup();
+
+        let ups = self
+            .canvas_renderer
+            .read_tiles(&self.device, &self.queue, up, &coords);
+        let lows = self
+            .canvas_renderer
+            .read_tiles(&self.device, &self.queue, low, &coords);
+
+        for coord in coords {
+            let Some(src) = ups.get(&coord) else {
+                continue;
+            };
+            let out = crate::export::merge_tile(src, lows.get(&coord), upper, lower);
+            self.canvas_renderer
+                .replace_tile(TileKey::new(low, coord), out);
+        }
+    }
+
+    /// Snapshot the tiles a merge is about to overwrite.
+    ///
+    /// The tiles of the *upper* layer, because those are the ones the composite writes. Taken
+    /// before anything changes, so a pool that turns out to be full costs nothing.
+    fn snapshot_for_merge(
+        &mut self,
+        upper: LayerId,
+        into: LayerId,
+    ) -> Option<Vec<(openpaint_core::tile::TileCoord, TileBefore)>> {
+        let coords: Vec<openpaint_core::tile::TileCoord> =
+            self.canvas_renderer.layer_tiles(upper).collect();
+        let mut encoder = self.new_stroke_encoder();
+        let before =
+            self.history
+                .snapshot_tiles(&mut encoder, &self.canvas_renderer, into, &coords);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        before
+    }
+
     /// Every font family this machine can letter with, for a font picker.
     pub fn font_families(&mut self) -> Vec<String> {
         self.text.families()
@@ -958,6 +1088,22 @@ impl Renderer {
                     layer: layer.clone(),
                 }
             }
+            // Both halves, and in this order: the destination goes back to what it held, then the
+            // layer that was folded into it comes back on top of nothing.
+            Op::MergeLayer {
+                index,
+                layer,
+                tiles,
+                lower,
+                before,
+            } => {
+                let index = *index;
+                let into = LayerId(lower.id());
+                let layer = layer.clone();
+                self.revert_tiles(into, before);
+                self.restore_tiles(tiles);
+                HistoryChange::LayerRestored { index, layer }
+            }
             Op::DeletePage { index, page, tiles } => {
                 self.restore_tiles(tiles);
                 HistoryChange::PageRestored {
@@ -1077,6 +1223,19 @@ impl Renderer {
             Op::DeleteLayer { index, layer, .. } => {
                 self.canvas_renderer.discard_layer(LayerId(layer.id()));
                 HistoryChange::LayerDeleted { index: *index }
+            }
+            // Re-run the composite rather than restoring an after-image: the undo put the upper
+            // layer's pixels back, so everything the merge needs is on the canvas again.
+            Op::MergeLayer {
+                index,
+                layer,
+                lower,
+                ..
+            } => {
+                let (index, upper, lower) = (*index, layer.clone(), lower.clone());
+                self.merge_pixels(&upper, &lower);
+                self.canvas_renderer.discard_layer(LayerId(upper.id()));
+                HistoryChange::LayerDeleted { index }
             }
             Op::DeletePage { index, page, .. } => {
                 for layer in page.layers() {

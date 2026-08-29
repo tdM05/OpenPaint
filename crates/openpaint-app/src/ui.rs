@@ -105,6 +105,10 @@ pub enum LayerAction {
     Add,
     /// Delete this layer. Undoable, or it would not be offered at all.
     Delete(usize),
+    /// Copy this layer, pixels and all, above itself.
+    Duplicate(usize),
+    /// Fold this layer into the one below it.
+    MergeDown(usize),
     /// Move a layer to a new index.
     Move { from: usize, to: usize },
     /// Show or hide a layer.
@@ -1408,13 +1412,44 @@ impl Ui {
                                                 layer_action = Some(LayerAction::Delete(index));
                                             }
                                         });
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .button("Duplicate")
+                                                .on_hover_text(
+                                                    "Copy this layer, pixels and all, above                                                      itself.",
+                                                )
+                                                .clicked()
+                                            {
+                                                layer_action = Some(LayerAction::Duplicate(index));
+                                            }
+                                            // Nothing below means nothing to merge into, and a
+                                            // button that explains itself beats one that does
+                                            // nothing when pressed.
+                                            if ui
+                                                .add_enabled(
+                                                    index > 0,
+                                                    egui::Button::new("Merge down"),
+                                                )
+                                                .on_hover_text(
+                                                    "Fold this layer into the one below, as it                                                      looks now. Undoable.",
+                                                )
+                                                .on_disabled_hover_text(
+                                                    "There is no layer below this one.",
+                                                )
+                                                .clicked()
+                                            {
+                                                layer_action = Some(LayerAction::MergeDown(index));
+                                            }
+                                        });
                                     }
                                 });
                             }
                             ui.label(
                                 egui::RichText::new(
-                                    "Multiply darkens what is under it, Screen lightens. Deleting a \
-                                     layer is undoable -- otherwise it would not be offered.",
+                                    "Multiply darkens what is under it, Screen lightens. Deleting \
+                                     and merging are undoable -- otherwise they would not be \
+                                     offered. Duplicating is not, because the way back is to \
+                                     delete the copy.",
                                 )
                                 .small()
                                 .weak(),

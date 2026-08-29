@@ -750,6 +750,51 @@ the state changes below — so a sabotage that wrongly marked the document dirty
 on cancel *passed*, because the line was unreachable in the test. Obligations
 first, then branch. That hazard has now bitten three times.
 
+### 6c. Merging is the compositor's rule seen from the other side — 2026-08-29
+
+A page is unfinishable without merge down and duplicate, so they land together.
+
+**A merge must produce what the artist was already looking at.** That is the whole
+specification, and it means the merge has to answer exactly as the compositor does about
+opacity, blend and clipping. So `export::merge_tile` sits beside `Composite` and shares
+`blend_over` — the rule the GPU compositor is pinned to. A fourth copy of that arithmetic
+would be a fourth idea of what a stack means, which is what `export::Composite` was
+extracted to prevent in the first place.
+
+**The lower layer's own opacity and blend are deliberately not baked in.** They stay on
+it and go on applying to the merged result, which is exact whenever it is Normal at full
+strength and is what every app does. Baking them would change how the merged layer sits
+against everything *below* it — a bigger lie than the one it fixes. When they are not
+neutral the status line says so, rather than leaving the artist to notice the picture
+shifted (§6b).
+
+**Undo is one entry**, because it is one action: a state with the pixels combined and
+both layers still present never existed. Redo re-runs the composite rather than storing
+an after-image — the undo has already put the upper layer's pixels back, so everything
+the merge needs is on the canvas again. Both snapshots are taken *before* anything
+changes, so a full snapshot pool refuses the merge for free.
+
+**Duplicate is not undoable, and that is consistent rather than lazy**: "Add layer" is
+not either, neither destroys anything, and the way back is to delete the copy — which
+is. A structural addition in the undo stack would make Ctrl+Z walk through structure
+instead of artwork.
+
+#### The sabotage that mattered most
+
+The first version of the merge test spelled the compositing arithmetic out again inside
+the test rather than calling the shared function. Ignoring the blend mode entirely
+*passed*, and so did ignoring the clip and the empty-tile case — because the test was
+checking its own copy of the rule against itself. It proved the duplicate, not the code.
+
+That is §11a's "one definition, split across two lists" wearing a test's clothes, and it
+is worth naming separately: **a test that reimplements the thing it is testing tests
+nothing.** The fixed version calls `export::merge_tile`, the same function the renderer
+calls, and all four sabotages then fail it.
+
+A second lesson from the same test: it had no precondition that the upper layer visibly
+changed the picture. Without one, "the picture is unchanged after the merge" is satisfied
+by a merge that did nothing at all.
+
 ### 4q. A selection is a property of the destination — 2026-08-29
 
 Reported plainly: *"if I select, then go to brush tool… the paint goes anywhere. is

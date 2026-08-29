@@ -1051,6 +1051,156 @@ mod tests {
 
     /// A fill lands inside the mask, stops at its edge, and follows its coverage.
     ///
+    /// A merge produces exactly what the artist was already looking at.
+    ///
+    /// **The property that matters, and the only one worth asserting.** A merge is not "add the
+    /// two layers"; it is "make one layer that looks like the two of them did". So the test
+    /// composites the stack through `export::Composite` — the same rule the GPU compositor is
+    /// pinned to — before and after, and demands the picture is unchanged.
+    ///
+    /// Multiply at partial opacity, because that is where a merge written as a plain source-over
+    /// would look right in every flat case and wrong here.
+    #[test]
+    fn a_merge_leaves_the_picture_unchanged() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        const SIDE: u32 = 200;
+
+        let mut editor = Editor::new();
+        editor.resize_page(openpaint_core::PageRect::from_size(SIDE, SIDE));
+        let page = editor.page_rect();
+        let layer = test_stroke_layer(&device);
+        let mut canvas = test_canvas(&device, page, &layer);
+        let mut stroke = test_stroke_layer(&device);
+
+        // Two layers with pixels: a red field below, a blue patch above at 60% Multiply.
+        let lower_index = 0;
+        let upper_index = editor.document_mut().add_layer();
+        let lower_id = LayerId(
+            editor
+                .document()
+                .active()
+                .layer(lower_index)
+                .expect("lower")
+                .id(),
+        );
+        let upper_id = LayerId(
+            editor
+                .document()
+                .active()
+                .layer(upper_index)
+                .expect("upper")
+                .id(),
+        );
+        {
+            let upper = editor
+                .document_mut()
+                .active_mut()
+                .layer_mut(upper_index)
+                .expect("upper");
+            upper.opacity = 0.6;
+            upper.blend = openpaint_core::Blend::Multiply;
+            // Clipped as well, so the merge has to honour all three at once. Without this the
+            // clip arm is never taken and a merge that ignored it would pass.
+            upper.clip_below = true;
+        }
+
+        let mut fill = |target: LayerId, rect: openpaint_core::PageRect, colour: [f32; 4]| {
+            let selection = openpaint_core::Selection::from_rect(rect, page);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            stroke.set_page(&queue, page);
+            stroke.set_paint(&queue, colour, 1.0, crate::editor::PaintMode::Normal);
+            stroke.begin_stroke();
+            stroke.fill_from_mask(&device, &queue, &mut encoder, &selection, page);
+            stroke.bake(&device, &queue, &mut encoder, &mut canvas, target);
+            queue.submit(std::iter::once(encoder.finish()));
+        };
+        // The lower layer stops at 180; the upper patch runs past it to 190. The overhang is
+        // what a clip has to cut off, and it is why the probes include a point out there.
+        fill(lower_id, openpaint_core::PageRect::new(0, 0, 180, 180), RED);
+        fill(
+            upper_id,
+            openpaint_core::PageRect::new(40, 40, 150, 150),
+            [0.0, 0.0, 0.4, 1.0],
+        );
+
+        let layers = editor.document().active().layers().to_vec();
+        let probes = [
+            (60, 60),
+            (100, 100),
+            (20, 20),
+            (170, 170),
+            (185, 100),
+            (100, 185),
+        ];
+        let seen_before: Vec<[f32; 4]> = probes
+            .iter()
+            .map(|&(x, y)| canvas.sample_page_pixel(&device, &queue, x, y, &layers))
+            .collect();
+
+        // The detour has to actually do something: if the upper layer changes nothing, then
+        // "the picture is unchanged" is true of a merge that did nothing at all, and the test
+        // proves only that removing an invisible layer is invisible.
+        let bare = canvas.sample_page_pixel(&device, &queue, 60, 60, &layers[..1]);
+        assert!(
+            (bare[2] - seen_before[0][2]).abs() > 0.05
+                || (bare[0] - seen_before[0][0]).abs() > 0.05,
+            "the upper layer must visibly change the picture, or this test proves nothing: \
+             {bare:?} against {:?}",
+            seen_before[0]
+        );
+
+        // Merge, exactly as the app does.
+        let upper = layers[upper_index].clone();
+        let lower = layers[lower_index].clone();
+        let mut renderer_history = History::new(&device);
+        let _ = &mut renderer_history;
+        merge_for_test(&device, &queue, &mut canvas, &upper, &lower);
+        editor.document_mut().active_mut().remove_layer(upper_index);
+
+        let after_layers = editor.document().active().layers().to_vec();
+        for (i, &(x, y)) in probes.iter().enumerate() {
+            let now = canvas.sample_page_pixel(&device, &queue, x, y, &after_layers);
+            for c in 0..4 {
+                assert!(
+                    (now[c] - seen_before[i][c]).abs() < 0.02,
+                    "the merge changed the picture at ({x}, {y}): {:?} became {now:?}",
+                    seen_before[i]
+                );
+            }
+        }
+    }
+
+    /// The composite half of a merge, driving the one shared rule.
+    ///
+    /// Calls `export::merge_tile`, which is what `Renderer::merge_pixels` calls. The first version
+    /// of this spelled the arithmetic out again instead — and the sabotages proved why that is
+    /// worthless: ignoring the blend mode entirely passed, because the test was checking its own
+    /// copy of the rule rather than the one the app uses.
+    ///
+    /// What stays out of reach is `Renderer` itself, which needs a window and a surface. So a
+    /// sabotage of the loop that walks the tiles would not fail this — only a sabotage of the rule.
+    fn merge_for_test(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        canvas: &mut crate::canvas_renderer::CanvasRenderer,
+        upper: &openpaint_core::Layer,
+        lower: &openpaint_core::Layer,
+    ) {
+        let (up, low) = (LayerId(upper.id()), LayerId(lower.id()));
+        let coords: Vec<openpaint_core::tile::TileCoord> = canvas.layer_tiles(up).collect();
+        let ups = canvas.read_tiles(device, queue, up, &coords);
+        let lows = canvas.read_tiles(device, queue, low, &coords);
+        for coord in coords {
+            let Some(src) = ups.get(&coord) else { continue };
+            let out = crate::export::merge_tile(src, lows.get(&coord), upper, lower);
+            canvas.replace_tile(crate::tile_store::TileKey::new(low, coord), out);
+        }
+        canvas.discard_layer(up);
+    }
+
     /// Three properties, and the third is the reason a selection is a byte per pixel rather than a
     /// bit: a partially selected pixel must fill partially. A boolean mask could not express that,
     /// and a fill that hard-edged every selection would make feathering pointless before it exists.

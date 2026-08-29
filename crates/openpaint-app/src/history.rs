@@ -160,6 +160,28 @@ pub enum Op {
         /// through a caption one letter at a time — which is not what anyone means by undo.
         at: std::time::Instant,
     },
+    /// Two layers folded into one: the upper one's pixels baked into the lower, the upper removed.
+    ///
+    /// One entry rather than two, because it is one action — undoing a merge halfway, to a state
+    /// where the pixels are combined but both layers still exist, would be a state that never
+    /// existed.
+    ///
+    /// Redo re-runs the composite rather than storing the result. The undo has already put the
+    /// upper layer's pixels back on the canvas, so everything the merge needs is there again, and
+    /// an after-image would double what a merge costs the snapshot pool.
+    MergeLayer {
+        /// Where the merged-away layer sat, so undo restores the order and not just the pixels.
+        index: usize,
+        layer: Layer,
+        tiles: Vec<(TileKey, Slot)>,
+        /// The layer that received the paint, and what its tiles held beforehand.
+        ///
+        /// The whole layer rather than its id, because a redo has to run the composite again and
+        /// the blend, opacity and clip that decide the result live on it. The renderer does not own
+        /// the stack and so cannot look it up — see the module note on the split.
+        lower: Layer,
+        before: Vec<(TileCoord, TileBefore)>,
+    },
     /// A deleted layer, kept whole so undo can put it back exactly where it was.
     DeleteLayer {
         /// Where it sat in the stack, so undo restores the order and not just the pixels.
@@ -188,6 +210,17 @@ impl Op {
             Self::Trim { tiles }
             | Self::DeleteLayer { tiles, .. }
             | Self::DeletePage { tiles, .. } => tiles.into_iter().map(|(_, slot)| slot).collect(),
+            // Both halves: a merge holds the layer it consumed *and* the before-image of the layer
+            // it was folded into. Releasing one and forgetting the other leaks the pool until the
+            // app restarts, which is exactly the shape of bug this function exists to prevent.
+            Self::MergeLayer { tiles, before, .. } => tiles
+                .into_iter()
+                .map(|(_, slot)| slot)
+                .chain(before.into_iter().filter_map(|(_, b)| match b {
+                    TileBefore::Content(slot) => Some(slot),
+                    TileBefore::Absent => None,
+                }))
+                .collect(),
         }
     }
 }

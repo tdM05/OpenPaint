@@ -2087,6 +2087,8 @@ impl OpenPaint {
                 self.status_message = Some(format!("Added layer {}", index + 1));
             }
             ui::LayerAction::Delete(index) => self.delete_layer(index),
+            ui::LayerAction::Duplicate(index) => self.duplicate_layer(index),
+            ui::LayerAction::MergeDown(index) => self.merge_layer_down(index),
             ui::LayerAction::Move { from, to } => {
                 self.editor.document_mut().active_mut().move_layer(from, to);
             }
@@ -2127,6 +2129,98 @@ impl OpenPaint {
     }
 
     /// Delete a layer, undoably.
+    /// Copy a layer above itself, pixels and all.
+    ///
+    /// Not undoable, and deliberately consistent with "Add layer", which is not either: neither
+    /// destroys anything, and the way back is to delete the new layer — which *is* undoable. A
+    /// switch or an addition in the undo stack would make Ctrl+Z walk through structure instead of
+    /// artwork, which is the more surprising behaviour by far.
+    fn duplicate_layer(&mut self, index: usize) {
+        self.editor.stroke_end();
+        let Some(source) = self
+            .editor
+            .document()
+            .active()
+            .layer(index)
+            .map(openpaint_core::Layer::id)
+        else {
+            return;
+        };
+        let Some((at, id)) = self.editor.document_mut().duplicate_layer(index) else {
+            return;
+        };
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.copy_layer_pixels(tile_store::LayerId(source), tile_store::LayerId(id));
+        }
+        let name = self
+            .editor
+            .document()
+            .active()
+            .layer(at)
+            .map_or_else(String::new, |l| l.name.clone());
+        self.status_message = Some(format!("Duplicated as \"{name}\""));
+        self.mark_dirty();
+        self.request_redraw();
+    }
+
+    /// Fold a layer into the one below it.
+    ///
+    /// Refused when there is nothing below, and refused when it could not be recorded — a merge
+    /// destroys the separation between two layers, so one that cannot be undone is worse than one
+    /// that did not happen. Both refusals say why (§6b).
+    fn merge_layer_down(&mut self, index: usize) {
+        self.editor.stroke_end();
+        if index == 0 {
+            self.status_message =
+                Some("There is no layer below this one to merge into.".to_owned());
+            self.request_redraw();
+            return;
+        }
+        let page = self.editor.document().active();
+        let (Some(upper), Some(lower)) =
+            (page.layer(index).cloned(), page.layer(index - 1).cloned())
+        else {
+            return;
+        };
+        // A text layer's pixels come from its text, so merging *into* one would be paint that
+        // disappears the next time the text changed -- the same reason painting on one is refused.
+        if !lower.accepts_paint() {
+            self.status_message = Some(
+                "The layer below is a text layer, so its pixels come from its text. Convert it to \
+                 a raster layer first."
+                    .to_owned(),
+            );
+            self.request_redraw();
+            return;
+        }
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        if !renderer.merge_layer_down(index, &upper, &lower) {
+            self.status_message =
+                Some("No room to record the merge, so the layers were kept".to_owned());
+            self.request_redraw();
+            return;
+        }
+        self.editor.document_mut().active_mut().remove_layer(index);
+        // Whether the lower layer's own opacity and blend still change the result. They do -- they
+        // stay on it -- and that is exact only when it is Normal at full strength. Saying so is
+        // cheaper than leaving the artist to wonder why the merge looks different.
+        let faithful = (lower.opacity - 1.0).abs() < 1e-4
+            && lower.blend == openpaint_core::Blend::Normal
+            && !lower.clip_below;
+        self.status_message = Some(if faithful {
+            format!("Merged into \"{}\"", lower.name)
+        } else {
+            format!(
+                "Merged into \"{}\". Its own opacity and blend still apply to the result.",
+                lower.name
+            )
+        });
+        self.mark_dirty();
+        self.request_redraw();
+    }
+
     fn delete_layer(&mut self, index: usize) {
         self.editor.stroke_end();
         let Some(layer) = self.editor.document().active().layer(index).cloned() else {
@@ -4353,6 +4447,31 @@ mod tests {
             "the frame paid the debt"
         );
         app.refresh_float();
+    }
+
+    /// The bottom layer has nothing to merge into, and says so.
+    ///
+    /// Both halves matter and the second is the point of §6b: the merge must not happen, *and* the
+    /// artist must be told why. A guard that silently returns is indistinguishable from a broken
+    /// button. This one is reachable headlessly because it answers before the renderer is needed —
+    /// which is itself a reason to put the cheap refusals first.
+    #[test]
+    fn merging_the_bottom_layer_is_refused_out_loud() {
+        let mut app = OpenPaint::default();
+        let before = app.editor.document().active().layers().len();
+
+        app.merge_layer_down(0);
+
+        assert_eq!(
+            app.editor.document().active().layers().len(),
+            before,
+            "the merge should not have happened"
+        );
+        let said = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            said.contains("no layer below"),
+            "the refusal has to say why, got {said:?}"
+        );
     }
 
     /// The whole point of capture: a press that was refused owns nothing afterwards.
