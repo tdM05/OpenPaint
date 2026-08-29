@@ -9,10 +9,41 @@
 
 pub mod brush;
 pub mod canvas;
+pub mod color;
+pub mod curve;
+pub mod dab;
+pub mod document;
+pub mod layer;
+pub mod lifted;
+pub mod modulation;
+pub mod page;
+pub mod preset;
+pub mod raster;
+pub mod region;
+pub mod selection;
+pub mod stabilizer;
+pub mod stamp;
+pub mod stroke;
+pub mod text;
 pub mod tile;
+pub mod transform;
 
 pub use brush::{Brush, StrokeState};
 pub use canvas::Canvas;
+pub use curve::Curve;
+pub use dab::Dab;
+pub use document::Document;
+pub use layer::{Blend, Content, Layer};
+pub use lifted::Lifted;
+pub use modulation::{Input, Response, Source};
+pub use page::{Page, PageRect, PageResize, Side};
+pub use preset::{BrushPreset, TipRef};
+pub use selection::Selection;
+pub use stabilizer::{Smoothed, Stabilizer};
+pub use stamp::Stamp;
+pub use stroke::StrokePainter;
+pub use text::{TextBlock, TextRenderer};
+pub use transform::{Kernel, Transform, MIN_SCALE};
 
 /// Crate version, surfaced so the app/UI can display it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

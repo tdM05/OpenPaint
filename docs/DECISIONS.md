@@ -3,7 +3,7 @@
 > Living record of what we've agreed on. Update this whenever a decision is
 > made or changed. Anything still undecided lives in `OPEN_QUESTIONS.md`.
 
-Last updated: 2026-08-27
+Last updated: 2026-08-29 (roadmap rewritten)
 
 ---
 
@@ -31,6 +31,136 @@ Primary purposes:
 Design/UX north star: **CSP and Procreate**. We like CSP's design and layout.
 We explicitly do NOT want Krita's bloat or its layout/interaction choices.
 
+### 1a. CSP EX is the north star for UX — but NOT for internals
+Decided 2026-08-27, to keep design decisions simple and consistent: when in
+doubt about *what a feature should be or look like*, do what CSP EX does. Its
+UX, feature model, layout, tool/sub-tool hierarchy, brush setting sections, and
+page management are the reference.
+
+**Three places where copying CSP would be a downgrade — deviate deliberately:**
+1. **Color depth.** CSP works at 8 bits per channel and composites in sRGB. We
+   use linear `Rgba16Float` (§4b). CSP's ceiling shows up as banding in gradients
+   and dark fringing on soft brush edges. Do not follow it down.
+2. **Rendering architecture.** CSP is largely CPU-based with GPU acceleration
+   bolted on, which is why it struggles with large canvases and many layers.
+   Follow Procreate's GPU-first model instead (§4a).
+3. **File format.** CSP's is closed. Ours is an open documented container (§7).
+
+Short version: **CSP for UX, Procreate-and-better for the engine.**
+
+### 1b. What the UI has to be — stated by the author 2026-08-29
+
+Three goals, in the author's words, before any framework is chosen. Written down first
+because they are the criteria a choice gets judged against, and a criterion invented
+after the fact is not a criterion.
+
+1. **Intuitive — "not messy like Krita."** The failure mode being named is not ugliness,
+   it is a UI where everything is available and nothing is findable. §1 already rules out
+   feature-maximalism; this rules out its interface equivalent.
+2. **Clean and modern, but not flashy.** The UI is a frame around the artwork. Anything
+   that draws attention to itself is taking attention from the page.
+3. **Customizable in a *general* way.** Panels go where the artist puts them — not "these
+   three panels may live in this one dock". The author's framing is the important part:
+   *"as little hardcoding as possible, so that the inherent design is so good, things
+   follow from this."*
+
+The third is the demanding one and it is a real constraint on Q4, not a wish. "Any panel
+anywhere" means a genuine docking model — panels as interchangeable content in a layout
+tree the artist edits — rather than a fixed arrangement with a few movable pieces. Most
+UI toolkits make the second easy and the third hard, and which of those a candidate makes
+easy is the question to ask of it first.
+
+It also rhymes with how the engine has been built and is worth stating as one idea rather
+than two: the general primitive, once, with the specific behaviours falling out of it.
+That is §4k's mask with many producers and consumers, §4q's one gate every stroke passes
+through, §4m's any-input-drives-any-parameter. A layout tree of interchangeable panels is
+the same move applied to the UI.
+
+### 1c. The UI is a layout tree with no exceptions in it — 2026-08-29
+
+The structural half of §1b's third goal, settled before any framework is chosen or
+anything is sketched, because it decides which of those are even possible.
+
+**Every piece of the interface is a panel, and the layout is a tree of splits.** Nodes
+are horizontal or vertical splits with weighted children; leaves hold one or more panels
+as tabs. Sizes are the weights. Stacking is a leaf with several panels. Floating is a
+second tree in a second window.
+
+```
+Split(vertical, [
+  Split(horizontal, [ Leaf[Layers, History] , Leaf[Canvas] , Leaf[Colour] ]),
+  Leaf[Timeline],
+])
+```
+
+That is Unity's structure, and it is the same move the engine makes everywhere: one
+general primitive, the specific behaviours falling out of it rather than being listed.
+§4k's mask with many producers and consumers, §4q's one gate every stroke passes through,
+§4m's any input driving any parameter — and now a layout that does not know what a panel
+*is*.
+
+#### The invariant, which is the whole decision
+
+**The layout must never branch on which panel it holds.** The moment there is an
+`if panel == Toolbar` in the layout code we have rebuilt Photoshop, whose top options bar,
+left toolbar and canvas area are chrome rather than panels — which is exactly the thing
+the author objects to in every drawing app: *"some things like tool bar are fixed and
+different."*
+
+Two consequences taken deliberately, both the author's call:
+
+- **The canvas is a panel.** Document tabs and reference-image-beside-canvas then cost
+  nothing, because they are just a leaf with two panels and a split. It takes the
+  leftover space at startup, but that is a property of the *default layout*, not a rule
+  in the tree.
+- **The menu bar is a panel too.** The obvious objection is that you can then delete your
+  own File menu. The answer is not an exception; it is a general safety net that helps
+  everywhere — see layout undo below. Solving one case with a rule and every other case
+  not at all is the worse trade.
+
+#### Uniform tree, individual panels
+
+The tree knows only "this leaf holds these panels at this weight". What a panel does with
+the size it is given is entirely the panel's business, and that is what makes deferring
+per-panel constraints safe rather than merely convenient.
+
+So a colour panel can later grow "under 200 px I show swatches without labels" and no
+layout code changes — it is a property of the colour panel. A minimum useful size is a
+*hint* the layout may consult, defaulting to no opinion. **For now there are no
+constraints at all**, deliberately: some artists will happily keep a panel tiny, and
+guessing a floor for them is the kind of hardcoding this section exists to avoid.
+
+#### Three things to do better than the case studies
+
+Unity and Blender both get the structure right and share the same three defects.
+
+1. **Layout changes are undoable.** Neither Unity, Blender nor Photoshop can undo a
+   layout mistake; you rebuild it by hand or reload a saved layout and lose everything
+   since. The tree is small, so snapshotting it is free, and this project already has the
+   undo discipline. This is also what makes a movable menu bar safe.
+2. **Drop targets are big.** Both infer intent from the cursor against small regions — a
+   few-pixel edge, a corner widget, the gap between "split left" and "insert as tab". A
+   mouse hunts and hovers before it commits; **a pen arrives already down**, so a
+   mouse-first drop interaction cannot simply be inherited. Instead, a panel being dragged
+   over shows a five-zone overlay: four large edge regions and a large centre, the centre
+   meaning "join as a tab". Aiming at a quarter of a panel works with a pen and is better
+   with a mouse.
+3. **Grabbing is unambiguous without a separate widget.** On a tab, tapping should switch
+   to it and dragging should move it, and a pen gives no hover to tell those apart. The
+   touch idiom settles it: **tap switches, press-and-hold-then-move drags.** No grip
+   widget, no layout-edit mode, and a mouse user who drags immediately sees no difference.
+
+#### What is deliberately taken from Blender and what is not
+
+Taken: the refusal to special-case anything, including the topbar.
+
+Not taken: Blender's areas cannot be *stacked* — each shows one editor chosen from a
+dropdown — so Layers, History and a navigator cannot share one slot and flip between
+them. In a paint app the screen belongs to the canvas, and panels used rarely and never
+together must be able to share space. Also not taken: split-by-corner-drag and
+join-by-dragging-an-edge, which are the most complained-about interactions in Blender
+with a mouse and would be worse with a pen.
+
 ### Explicitly NOT doing
 - **Not building on / forking Krita.** It's GPL, ~1M+ lines of C++/Qt, and its
   bloat *is* the codebase. Its UI is welded to Qt; matching a CSP feel means
@@ -46,19 +176,54 @@ We explicitly do NOT want Krita's bloat or its layout/interaction choices.
   - Microsoft Surface (Surface Pen)
   - Veikk tablets
   - Wacom tablets
-- All three speak **Windows Ink** (Windows Pointer API: pressure + tilt), so
-  one API covers all three for v1.
-- **Wintab** (legacy Wacom API) — deferred to a later phase as an optional
-  native backend. Some pros insist on it; CSP supports both. Not needed for a
-  great-feeling v1. (Note: webview/Chromium stacks can't use Wintab at all,
-  which is one reason we're going native.)
+- All three speak **Windows Ink** (pressure + tilt), so one API covers all three
+  for v1. **Verified on the Veikk 2026-08-27** — pressure varies correctly and
+  the tool enumerates as `name="Stylus"`, `axes=PRESSURE | TILT`.
+  - ⚠️ **But it is off by default in the tablet driver.** The Veikk driver ships
+    with its "Windows Ink" option disabled, and until it's enabled the pen never
+    reaches Windows Ink *at all* — on either RealTimeStylus or `WM_POINTER`. Our
+    app saw only a tool named `"Mouse"` with zero axes, and Krita lost pressure
+    the moment it was switched off Wintab. Enabling the toggle fixed both.
+  - This is a **product problem, not just a dev problem**: our future users will
+    hit exactly this and conclude the app is broken. See OPEN_QUESTIONS Q10d.
+- **Wintab** (legacy Wacom API) — stays deferred (Phase 4), as originally
+  planned. It was briefly thought to be the only working path on the Veikk; that
+  was a driver misconfiguration, not an API limitation. Some pros still insist on
+  Wintab and CSP supports both, so it remains wanted eventually — just not
+  urgent. (Note: webview/Chromium stacks can't use Wintab at all, which is one
+  more reason we're going native.)
 
 ### Confirmed test hardware
 Author's Windows/tablet machine: **NVIDIA GeForce RTX 3070 Ti Laptop GPU**,
-wgpu running via **DirectX 12**. Strong discrete GPU + mature D3D12 path — ample
-headroom for the tiled compositor, large/long canvases, and brush effects. The
-pipeline (Linux code → GitHub Actions → download .exe → run on Windows) is
-verified working end to end, including wgpu init and frame rendering.
+wgpu running via **DirectX 12**. The pipeline (Linux code → GitHub Actions →
+download .exe → run on Windows) is verified working end to end, including wgpu
+init and frame rendering. **This is the dev box, not the target spec** — see
+below.
+
+### Performance target → Surface-class integrated GPU, any canvas size
+Decided 2026-08-27:
+- **Minimum target is a Surface**, i.e. integrated graphics with **shared system
+  memory**, not the author's discrete 3070 Ti. The dev box is the fast case, so
+  it will happily hide problems; treat integrated as the bar.
+- Stay on **portable wgpu features** — prefer standard render pipelines and
+  fragment shaders over exotic capabilities, keep near default/downlevel limits,
+  and use nothing D3D12-specific. This is also what keeps Linux/macOS/ARM cheap
+  to add later (§6 "cross-platform by construction"), including ARM Surfaces.
+- **All canvas shapes are in scope** and none is privileged: webtoon strips
+  (~800–1600 px wide, potentially 10,000 px+ tall), print comic pages at 300 DPI,
+  and screen-resolution sketchbook pages. Design for the general case.
+
+✅ **Consequence: tile residency is an early problem, not a Phase-2 one.** Acted on
+2026-08-28 (§4d). A4 at 300 DPI is 2480×3508 ≈ 8.7 Mpx. At `Rgba16Float`
+(8 bytes/px, §4b) that's ~70 MB *per layer*, so a ten-layer page is ~700 MB before
+the composite target and per-stroke accumulation buffer — which does not fit in a
+Surface's shared graphics memory. Therefore:
+- The GPU holds a **bounded pool of resident tiles**, never the whole document.
+  **Done** — `tile_pool.rs`, capacity fixed at startup from a byte budget.
+- A tile budget + eviction policy is a **first-class early component**. **Done** -
+  `tile_store.rs` spills non-resident tiles to the CPU, so document size is not limited
+  by graphics memory. The budget itself is a heuristic on adapter type, because wgpu
+  exposes no memory query (Q13).
 
 ### Development vs. validation — CONFIRMED SETUP
 - **Code is written on Linux (SSH).** The **tablet lives on the author's Windows
@@ -116,6 +281,1322 @@ These, not features, are what separate a pro tool from a toy:
    composited on GPU; canvas stored as tiles (e.g. 256×256) so large multi-layer,
    multi-page docs don't blow up RAM or stall. Blend in **linear color space**.
 
+### 4a. Where the brush engine lives → core emits dabs, GPU rasterizes them
+
+Earlier drafts said both "the core is pure Rust with no OS calls" and
+"compositing happens on the GPU." Those conflict, because real quality requires
+rasterizing dabs on the GPU. Resolution:
+
+- **`openpaint-core` owns the dab *math*** — where each dab lands along the path,
+  its radius, and its pressure/tilt-derived parameters — plus tile storage, the
+  layer tree, the document model, and file I/O. Pure, portable, no GPU types.
+- **The renderer owns dab *rasterization* and compositing** — it consumes the dab
+  stream and stamps into tile textures on the GPU.
+
+Why this and not the alternatives: it's how the field works (Krita's brush
+engines emit dabs into tiled paint devices; Photoshop and CSP are stamp-based;
+Procreate rasterizes dabs on the GPU). Keeping dab *generation* pure makes it
+deterministic and unit-testable, which is the only credible way to chase
+Photoshop's falloff curve (Q7a) rather than eyeball it. The existing CPU
+`Canvas::blend_pixel` path is retained as the **reference implementation** that
+tests compare GPU output against.
+
+**BUILT (2026-08-27).** GPU dab rasterization lives in
+`openpaint-app/src/stroke_layer.rs` + `stroke.wgsl`. Structure worth knowing:
+- Dabs stamp into a **single-channel accumulation texture**, and the canvas is not
+  touched until the stroke ends. Mid-stroke the stroke is composited on top for the
+  preview; on stroke end it is baked into the canvas once.
+- That is what lets the flow/opacity model work with **no snapshot and no
+  readback** — the CPU reference needs a snapshot precisely because it composites
+  into the canvas on every update.
+- The accumulation formula `a += flow·cov·(1−a)` *is* standard "over" blending, so
+  blend factors `(One, OneMinusSrc)` make the hardware compute it. The fragment
+  shader only outputs `flow · coverage`.
+- **Consequence: the GPU is now authoritative for pixels.** The CPU `Canvas` holds
+  the document's dimensions and the tile machinery the future cache/readback will
+  use (Q13), but not painted pixels.
+- The falloff curve therefore exists **twice** — `Dab::coverage_at_distance` and
+  `dab_fs` in the shader. Two copies of a curve drift, so
+  `stroke_layer.rs`'s tests rasterize the same dabs both ways and compare pixels.
+  That test is what makes keeping the CPU reference worthwhile rather than dead
+  weight.
+
+**Accumulation, not rasterization, is the hard part — DONE.** Dabs within one
+stroke cannot simply be alpha-blended in a batch: **flow** accumulates per dab
+while **opacity** caps the stroke's total contribution, per *stroke* rather than
+per layer (so a second stroke builds on top of the first). Implemented in
+`openpaint-core/src/stroke.rs`.
+
+The mechanism turned out to matter beyond the brush. Showing a stroke build up
+live requires keeping the **pre-stroke state of every tile the stroke touches** and
+re-compositing them as dabs land, because the result must be *recomputed* rather
+than progressively darkened. Recomputation is idempotent, which is what makes a
+mid-stroke preview and the committed result identical.
+
+That snapshot is exactly the copy-on-write tile snapshot undo needs (Q13). **A
+correct brush and undo share one mechanism**, which is why this landed before
+either layers or history.
+
+### 4e. Layers composite per tile, through a cache — decided 2026-08-28
+
+Settled before writing the layer stack, because it decides the shape of everything above it.
+Rather than drawing N layers to the screen each frame, the stack is composited **per tile**
+into a cache tile, and only the cache is drawn.
+
+Four consequences, and together they are the reason:
+
+1. **Blend modes stop needing a destination read.** The compositor *samples* each layer as a
+   texture, so Multiply, Screen and Overlay are plain shader maths. The obvious alternative -
+   compositing through an intermediate page-sized target so the blend unit can read it - would
+   have reintroduced exactly the ceiling 4d removed.
+2. **Residency stops scaling with layer count.** Peak need is the visible cache tiles, the
+   active layer, and one tile per layer *transiently* while recompositing. A screenful of a
+   20-layer document fits in a couple of hundred tiles, so a single 256-layer array texture is
+   enough and the pool needs no multi-texture complication.
+3. **Display cost is independent of layer count** - one instanced draw - and recompositing
+   touches only tiles that changed.
+4. **The stroke preview stops being a special case.** It slots into the middle of the stack by
+   recompositing the touched tiles with the accumulation injected at the active layer's
+   position: same compositor, same maths. So the preview is *exactly* the committed result
+   rather than an approximation of it, which is the property the current separate preview pass
+   only approximates.
+
+One thing this changes about pixels: **a layer tile is transparent where unpainted, not
+paper.** The paper moves to the bottom of the compositor, where the sheet quad effectively is
+today.
+
+⚠️ **The cache itself is deferred; the compositor landed first.** Revised while building,
+2026-08-28. The compositor runs in the display pass, sampling every layer per screen pixel,
+with no cache tile in between. Reasons, in order:
+- The compositor is the risky part and the cache is a pure optimisation on top of it. Landing
+  the risky part alone, verifiable, was worth more than landing both at once.
+- Output is identical either way, so this is not a quality trade. Points 1 and 4 above —
+  blend modes as plain maths, and the preview being exactly the committed result — come from
+  the *compositor*, not the cache, and are already true.
+- Cache invalidation is the kind of thing to design against observed usage rather than
+  guessed usage.
+
+What is genuinely deferred with it is point 2: **residency does scale with layer count for
+now**, because every visible tile of every layer must be resident at once. Roughly, layers ×
+visible tiles must fit the pool, and exceeding it reports the same "zoom in" message spilling
+already uses. Point 3 goes too: per-frame cost scales with layer count, though sampling a few
+layers per pixel is cheap enough that this will not be what bites first.
+
+The cache becomes worth building when real layer counts make either of those bite. It does not
+change the layer model, the blend modes, the UI, or the shader's maths — only where the
+compositor writes.
+
+### 4c. Brush modularity → composable per *dab*, fixed per *pixel*
+
+The question was whether to make brush features arbitrary plug-in components
+(Blender-modifier style) so users can invent brushes. Answer: **yes, but only on
+the per-dab side of the boundary.** Two real reasons, neither of them "other
+apps don't do it":
+
+**1. Loop nesting, not component cost.** Components are cheap; it matters which
+loop they sit in. Dabs per stroke are in the hundreds, pixels per stroke in the
+millions (see `openpaint-core/src/dab.rs` for the arithmetic) — three to four
+orders of magnitude. Per-dab dispatch is free. Per-pixel, a *dynamic* stage list
+is not expressible on a GPU at all: WGSL has no function pointers and WebGPU no
+dynamic shader linking. It degrades into either shader-permutation explosion
+(2^N variants; lazily compiling one mid-stroke is a frame hitch exactly while
+drawing) or an uber-shader whose register pressure drops occupancy so a plain
+round brush runs at the speed of the most complex brush. On the Surface-class
+target (§2) neither is affordable.
+
+**2. Composition needs a uniform type.** Blender modifiers compose arbitrarily
+because every one is `Mesh → Mesh`. Brush stages are heterogeneous — some adjust
+scalars, some inject randomness, some change dab *count*, some change pixel
+appearance — so "any stage in any order" has no well-defined semantics ("what
+does Texture-before-Spacing mean?"). But there *is* a uniform type available:
+`Dab → Dab`. That composes cleanly in any order, and it covers most of what
+users actually want to invent with — size and pressure response, scatter, jitter,
+angle, roundness, spacing, color dynamics, tilt response.
+
+So: **per-dab is a composable, serializable, user-authored stage list. Per-pixel
+dab appearance is one fixed parameterized shader**, extended deliberately by
+adding parameters rather than by arbitrary composition.
+
+This also matches CSP's actual model (§1a): a fixed set of toggleable setting
+sections, each optionally driven by pressure/tilt/velocity through a curve —
+which is the modulation layer, evaluated per dab.
+
+### 4d. The canvas is a bounded pool of GPU tiles, settled 2026-08-28
+
+Replaced the Phase-0 shortcut of one page-sized texture. That shortcut had been
+recorded as temporary from the start, and it was costing three things at once:
+
+1. **Two ceilings the UI had to apologise for.** A page could be no larger than
+   `max_texture_dimension_2d` (8192), and no larger than one allocation the driver
+   would accept (~16 Mpx at `Rgba16Float`). A real webtoon strip is taller than
+   both. The app clamped and printed an explanation.
+2. **Memory proportional to page area rather than painted area.** A blank
+   800×20000 strip cost 128 MB before a mark was made.
+3. **Nowhere to put non-destructive crop.** Storage was defined *as* the page, so
+   pixels outside it could not exist (§5c).
+
+All three had one cause, so all three were fixed by one change.
+
+**Shape: a 2D array texture, one layer per tile.** The alternatives were weighed:
+- *A texture per tile* needs a bind group and a draw call per tile — hundreds of
+  each per frame.
+- *A 2D atlas* (a tile grid inside one big texture) makes adjacent tiles physical
+  neighbours, so any filtered sample near a tile edge bleeds in whatever tile
+  happens to sit beside it. Avoiding that needs apron pixels round every tile,
+  which cost memory and have to be kept in sync on every write.
+- *An array texture* gets the single bind group without the bleed, because each
+  layer is its own image with its own clamped edges. The canvas is **one instanced
+  draw** over the visible tiles, with the layer index arriving as instance data.
+
+**The page rectangle bounds drawing and painting; it does not bound storage.**
+Tile quads are clipped to the page *in page space* — not with a scissor rectangle,
+which cannot work once the canvas is rotated on screen. Dab quads are clipped the
+same way, per corner, and the distance-from-centre is derived from the clamped
+position so coverage stays exact.
+
+**Accumulation is tiled too, and had to be.** Opacity caps a stroke's *total*, so
+the accumulation buffer must cover everywhere the stroke has been — potentially
+the whole canvas. A page-sized accumulation texture would have put the ceiling
+straight back, so a stroke allocates accumulation tiles on demand and releases
+them when it commits.
+
+**A tile is now the unit of undo.** Snapshots were arbitrary rectangles; they are
+whole tiles copied into a snapshot pool of the same shape. That makes the history
+budget *exact* rather than estimated — the pool's capacity **is** the budget, so
+there is no byte counter that can disagree with what the GPU holds.
+
+**What this deleted, which is the strongest argument for it:** the page-origin-to-
+texture-origin conversion at the GPU boundary (tiles are addressed in page
+coordinates, so §5a's invariant now holds unbroken from core to GPU); the
+reallocate-and-blit on every resize; `View::placement` and the four-corner
+placement uniform; `CanvasRect`, `BoundsBuilder`, and the stroke bounds the editor
+tracked for history's benefit; `Op::Resize`'s pre-crop snapshot and
+`PageResize::loses_pixels`; and both size ceilings with their clamping and
+messages.
+
+**What remains bounded, honestly.** Residency is 96 MiB (192 tiles), which holds a
+fully-inked A4 at 300 DPI (140 tiles). A long webtoon inked throughout exceeds it,
+and until spilling lands the pool reports exhaustion and says so in the status bar
+rather than dropping paint quietly. The one remaining page limit is 65536 px per
+side, and it is a **coordinate-precision** limit (`f32` is exact on integers only
+to 2^24), not a memory one.
+
+### 4b. Tile pixel format → linear, premultiplied, `Rgba16Float`
+
+- **Linear color space**, not sRGB. Already committed to above; this encodes it.
+- **Premultiplied alpha**, not straight.
+- **`Rgba16Float`** tile textures. sRGB conversion happens *only* at the final
+  display blit (the surface is already an `*Srgb` format, so it's free).
+
+Premultiplied is the one that matters most and the one that's cheap now and
+expensive later: it's what makes layer filtering, masks, and blend modes correct,
+and switching after the fact means auditing every blend site in the engine.
+
+**Current code contradicts all three axes** and must be migrated before the brush
+engine is written:
+- `openpaint-core/src/tile.rs` — hardcodes RGBA8 (`TILE_BYTES`, `pixel_mut`
+  returning `&mut [u8]`) and documents straight alpha.
+- `openpaint-core/src/canvas.rs` — `blend_pixel` blends in sRGB space with u8
+  rounding.
+- `openpaint-app/src/canvas_renderer.rs` — imports `TILE_BYTES` and creates an
+  `Rgba8Unorm` texture, so the format is an API-surface fact, not internal.
+
+On-disk storage format is a **separate, later** decision (Q6) — 16-bit in memory
+does not oblige 16-bit on disk.
+
+### 6a. A layer has a source of truth; text is the first that is not pixels — 2026-08-29
+
+The question text forced, and the one worth answering carefully: **a caption
+typed on Monday has to be retypeable on Thursday.** That is impossible if what
+the document keeps is the pixels a rasterizer once produced.
+
+So `Layer` gained a `Content`:
+
+- **`Raster`** — the tiles *are* the truth. A brush writes them, nothing
+  regenerates them, and a stroke therefore survives forever.
+- **`Text(TextBlock)`** — the block is the truth. The tiles are a *cache*,
+  thrown away and rebuilt whenever the text, font or box changes.
+
+**Nothing downstream changes, and that is the whole design.** The compositor
+reads tiles keyed by layer id and neither knows nor cares which of the two
+filled them, so blend modes, opacity, clipping, alpha lock, selection, export
+and the file's tile table all keep working with no text-specific code in any of
+them. Text was built without touching the compositor at all.
+
+The one thing that does change is **who may write those tiles**, and it is asked
+as a question about the *layer* — `Layer::accepts_paint` — rather than checked
+per tool. Brush, eraser, fill and clear all inherit the answer, so a tool added
+later cannot forget. Painting on a text layer would not fail at the time; it
+would vanish the next time someone fixed a typo, which is far worse. The way out
+is the same bargain CSP strikes: convert to raster, one-way, keeping the pixels.
+
+`Content` is also where **vector layers** land. That is the reason this work
+does not have to be redone to get there: the shape of the answer is already "a
+layer has a source of truth", and a vector layer is another arm of the enum. A
+speech-bubble system is that plus a shape object re-deriving alongside the text.
+
+**Undo is the text changing, not the tiles.** A text edit costs a string in the
+history stack instead of a tile snapshot, and undo is exact rather than a
+re-rasterization that has to match.
+
+#### Undo of a text edit is the text, not the pixels
+
+`Op::Content` holds a `Content` on each side and **no tiles at all**. That is
+the payoff of derived content rather than a saving bolted onto it: the pixels
+follow from the block, so undo restores the block and re-derives. A caption
+costs a string in the history stack instead of a snapshot of every tile it
+covers, and the restore is exact rather than a re-rasterization that has to
+match what was there before.
+
+Undo and redo differ only in which side of the operation they take, so they are
+one function. Restoring `Text` re-renders; restoring `Raster` leaves the tiles
+alone, which is correct — converting to raster never changed a pixel, it only
+stopped them being recomputed.
+
+**Consecutive edits coalesce inside `History::push`**, on a 700 ms pause. Not
+per keystroke, which would make Ctrl+Z walk back through a caption a letter at a
+time; not per focus change either, which would make a long caption one
+all-or-nothing entry. The merge keeps the *earlier* `before` and the *later*
+`after`, which is what makes the merged entry describe the whole run. It refuses
+to merge across layers however fast the edits arrive, since the merged entry
+would otherwise restore one layer's words onto another.
+
+#### The font stack is a separate crate, not a module
+
+`openpaint-text` owns parley, swash and fontique; `openpaint-core` owns
+`TextBlock` and has no font dependency at all. A module boundary would have made
+the seam a convention — a crate boundary makes it a fact the compiler enforces,
+so replacing the text stack cannot reach the document model, the file format or
+the renderer.
+
+parley over cosmic-text for its **span model**: per-word styling and Japanese
+*furigana* are ranges of differently styled text inside one block, which is the
+shape parley is built around. Both handle the horizontal Latin case that landed
+first, so the tiebreak is what comes after it.
+
+**What crosses the seam is an 8-bit coverage mask**, not positioned glyphs.
+Glyph ids are meaningless without the font that produced them, so handing those
+back would have leaked the library's types across the boundary the crate exists
+to draw. Colour is applied where the mask becomes tiles, which is the path a
+selection fill already takes — so text inherits correct linear blending instead
+of reimplementing it.
+
+#### A missing font is reported, not hidden
+
+`FontSpec` is a *request*; `FontResolution` says what was actually used, read out
+of the font file itself. Documents travel, and lettering silently reflowed into
+a substituted face is the failure this whole path exists to prevent.
+
+Better than CSP on one point, and it costs nothing: **the derived tiles are
+saved too.** Open a document on a machine without the font and the page still
+looks right, from the cache, *and* says the font is missing — rather than
+quietly re-laying it out. Re-rendering happens on edit, not on load, which is
+what makes that work.
+
+#### Things deliberately not done yet
+
+- **Vertical writing** (*tategaki*) is reserved in the model and the file format
+  and unimplemented in the renderer, which returns `UnsupportedWritingMode`
+  rather than falling back to horizontal. Setting a manga page silently sideways
+  is worse than not drawing it.
+- **An on-canvas caret.** The block is edited through an egui `TextEdit`, which
+  already brings caret, selection, clipboard and IME — so Japanese and Korean
+  input work today. Writing a text editor inside a panel that is explicitly
+  throwaway (§3) would be work thrown away; the canvas caret belongs with the
+  real UI.
+- **Colour fonts** render as flat outlines, and **variable fonts** expose their
+  named instances rather than continuous axes. Both are work, neither is a
+  design limit.
+
+#### Schema v6
+
+`layer_text`, a separate table rather than fifteen mostly-null columns on
+`layer`: a raster layer has none of them, and the file stays legible to anyone
+dumping it. Absence reads as "no text layers", the same tolerance `lock_alpha`
+established, so a v5 file loads without a branch on the version.
+
+The migration also found a hazard worth keeping: every structure change so far
+recreates the structure tables, and each branch had its own copy of the `DROP`
+list. `layer_text` was added to `STRUCTURE_SCHEMA` and not to those, and *every*
+migration failed with "table already exists". There is now one `DROP_STRUCTURE`,
+and the branches collapsed into one, since they all did the same thing.
+
+### 5d. Scale and rotate resample; a move must not — 2026-08-29
+
+A whole-pixel move is a copy and is *lossless*. The moment a transform
+rotates or scales, a destination pixel no longer lands on a source pixel and
+its colour has to be reconstructed from the neighbours it falls between —
+which degrades the image, every time it is applied.
+
+So `Transform::is_a_plain_move` is checked first and takes the copy path.
+That is not an optimisation: it is the difference between a move that can be
+repeated a hundred times without damage and one that cannot.
+
+**The filter is a cubic, and the default is Mitchell–Netravali.** Line art is
+the worst case for resampling and it is what this app is for. Nearest
+neighbour turns a rotated ink line into a staircase; bilinear turns it into a
+blur; a cubic is the first that keeps an inked edge looking inked. Every
+*interpolating* cubic overshoots at a hard edge, so the choice is how much:
+Mitchell's negative lobe is about −0.035 against Catmull–Rom's −0.063, which
+buys about half the ringing for a little sharpness. That is the right way
+round for ink, where a dark halo beside a line is exactly the artefact a
+printed page shows off. Catmull–Rom is offered anyway, because it
+*interpolates* — an unmoved pixel comes back exactly, which Mitchell cannot
+promise — and that suits flat colour.
+
+**Minification widens the footprint.** Shrinking is the case a fixed-radius
+filter gets wrong: many source pixels fall into one destination pixel, and
+reading only the nearest few is undersampling, which reads as sparkle and
+broken lines. Scaling the kernel's footprint by the minification factor is
+the standard fix and needs no mip pyramid.
+
+**Filtering premultiplied is why §4b was worth holding.** Interpolating
+straight colour across an edge into transparency mixes in whatever is stored
+in the fully transparent texels, which is a halo around every rotated
+selection. Premultiplied has nothing to leak.
+
+**The mask follows the pixels.** `Selection::transformed` resamples coverage
+through the *same* filter, by treating coverage as alpha. An outline still
+sitting square around rotated pixels would describe a selection of something
+that is no longer there — the same bug undo had before `HistoryChange::Moved`
+existed. Sharing the filter rather than writing a second loop matters because
+a mask filtered differently from the pixels it covers would disagree with them
+at exactly the soft edges both exist to get right.
+
+A sabotage worth recording: removing the footprint widening did **not** fail
+the first minification test, because a checkerboard averages to grey however
+badly it is sampled. Evenly spaced thin lines are the case that separates
+them, and the test now measures the *spread* across the output rather than its
+average. Another instance of §11a's rule — a sabotage that does not fail tells
+you about the test.
+
+### 5f. A transform is edited on the canvas, not in a panel — 2026-08-29
+
+Reported the morning after §5e shipped, and the report is worth quoting because it
+names both halves: *"all transforms work, but moving does not… I use lasso to select,
+then try to move by dragging after clicking transform, but then it just lassos again.
+shouldn't it create some transform box just like photoshop or csp?"*
+
+**The bug.** `decide_capture` asked which *tool* was up before it asked whether
+anything was floating. The way you get a selection is to draw one, so the lasso is
+still armed when the transform begins — and every press on the floating pixels started
+a fresh lasso across them. Every panel control worked; the one gesture anybody reaches
+for first did not.
+
+**A transform in the air is modal**, and now sits in the same clause as an open prompt
+rather than below the tools. That is what it *is*: something the artist is in the
+middle of, which every press on the canvas belongs to until it is applied or abandoned.
+The fix is one clause because §4l put the decision in one place — the previous design,
+with a guard per tool, would have needed a guard per tool again.
+
+**The missing half was the box.** A transform reachable only from a panel is a form,
+not a tool. `transform_box.rs` is the eight handles, the rotation ring just outside
+them, and the interior — the same shape as every raster app, because that shape *is*
+how a transform is edited.
+
+Four things in it are decisions rather than mechanics:
+
+1. **The hit test runs in source space.** The pointer is mapped backwards through the
+   transform and tested against the *untransformed* rectangle. Rotation then costs
+   nothing — a rotated box is still grabbed by the corner it came from, not by the one
+   it now resembles on screen — and there is one piece of geometry instead of two that
+   have to agree. The grab tolerance is divided by the scale on the way in, or a
+   selection at 400% would grow its grab zones with it and swallow its own interior.
+
+2. **A drag is a pure function of the transform at the press.** Nothing accumulates, so
+   dragging out and back is exact rather than nearly right. An incremental version
+   passes every other test and drifts a little on each of the hundreds of samples a pen
+   sends — which is the kind of bug that gets blamed on the resampling filter.
+
+3. **Scaling pins the opposite corner without moving the pivot.** The tempting way is
+   to move `Transform::pivot` to the anchor, but the pivot is also what rotation turns
+   about, and rotation must stay about the centre of the box. So the pivot is left alone
+   and the anchor is held by solving for the translation: one line of algebra rather
+   than a second meaning for a field. Under rotation this is the case that separates a
+   real solution from a plausible one — read the scale off the pointer without undoing
+   the rotation first and the box shears instead of scaling.
+
+4. **A quick drag is now the same machinery with the interior already grabbed.** §5e
+   deliberately kept the quick drag separate; a second, simpler kind of drag is exactly
+   how the two would come to disagree about what a move means. One `apply_grab` serves
+   both, and the whole-pixel rounding that keeps a move lossless (§5d) lives in one
+   place.
+
+**The box hugs the coverage, which needed a new primitive.** `Selection::bounds` is
+tile-aligned, and a box snapped out to 256-pixel tiles would hang off the artwork,
+put handles where nothing was selected, and — worse — put the *pivot* up to half a tile
+off centre, so rotating would swing the pixels instead of turning them in place.
+`Selection::content_bounds` is the tight box. Both are kept: the resampling loop only
+needs a rectangle it is safe to walk, and paying for a scan there would be waste.
+
+**One overlay type for the crop rectangle and the transform box.** They are the same
+drawing answering the same question, and §11a.8 is about exactly this — the day one
+grew a handle the other would silently not have it.
+
+A seam that stays untested and is named in the code: `begin_transform` needs a renderer
+to lift, so nothing in it runs headlessly, and a sabotage swapping `content_bounds` for
+`bounds` there passes the whole suite. Thirteen of the fourteen sabotages tried were
+caught; that one is the gap, and it is written above the function rather than left for
+someone to discover.
+
+### 6b. Nothing may fail silently — 2026-08-29
+
+Raised by the author while reporting the transform bug, and it generalises past it:
+*"we should cover all edge cases in future so user is never confused and it just does
+not work."*
+
+**A refusal is a feature, not an omission.** When the app declines to do something —
+painting on a text layer, filling with nothing selected, an edit too large to record —
+it must say **what happened, why, and what to do instead**. An app that quietly does
+nothing teaches the artist that it is broken, and they are not wrong to think so: from
+where they sit, "refused for a good reason" and "bug" look identical.
+
+**The gap is coverage, not the surface.** Corrected by the author on the day this was
+written: the status line works and the messages it carries are good. What is missing is
+the cases that reach it — painting on a hidden layer, a wand that finds nothing, a
+failed save — and those are missing one at a time, silently.
+
+So the work is one seam, listed in `TODO.md` §1 rather than done here: today each
+refusal writes its own string at its own call site, which is how coverage ends up patchy
+— the same shape as §4l, where every tool had its own idea of who owned the pointer. One
+place to call, and the audit becomes "who calls it".
+
+The one thing the status line should *not* carry is a refusal that risks work — a failed
+save or autosave. Those want a dialog, because a line nobody happens to look at is
+indistinguishable from silence in exactly the case where silence is worst.
+
+`TODO.md` §1 holds the audit table: every place the app can decline, and whether it
+currently says so. It is deliberately a table of *known gaps* rather than a claim of
+completeness.
+
+### 5g. Placement is a frame's work, and a filter tap must not hash — 2026-08-29
+
+Reported the same day the box landed: *"transform works now; though it appears very
+very laggy."* It was, and by a lot. Measured on the dev box, in release, **per pointer
+sample**:
+
+| Selection | Before | After |
+| --- | --- | --- |
+| 256×256 | 275 ms | 33 ms |
+| 512×512 | 620 ms | 126 ms |
+| 1024×1024 | 1763 ms | 453 ms |
+
+Three separate mistakes, none of them the algorithm:
+
+1. **Every filter tap was a hash lookup.** A cubic reads sixteen to twenty-five source
+   pixels per destination pixel, and each went through a `HashMap`. Hashing, not
+   filtering, was most of what a rotate cost. `TileGrid` is a dense index over the
+   handful of tiles an operation touches — an index, not storage, so the sparse map
+   stays the canvas's shape and only the inner loop stops paying for it.
+
+2. **It resampled the tile-aligned bounds.** `Lifted::bounds` snaps out to 256-pixel
+   tiles, so a selection sitting inside one tile filtered four times its own area,
+   three quarters of it reconstructing transparency. `Lifted::content_bounds` is tight
+   to the ink. The old doc claimed the consumer "skips transparent source anyway" — it
+   does not, and that claim is why nobody wrote the tight one.
+
+3. **It resampled once per pointer sample.** A pen reports several samples per
+   displayed frame, so most of that work was thrown away unseen. Placement is now
+   computed once at the top of a frame. The transform still follows every sample; only
+   the *pixels* wait, because a frame is the only thing that shows them.
+
+Also removed: a full clone of the lifted tiles on every sample, which for a large
+selection is megabytes of memcpy for nothing.
+
+**The separable weights are hoisted, and that is where the danger was.** The horizontal
+weights depend only on the column, so computing them once per destination pixel rather
+than once per tap removes four fifths of the cubic evaluations. But the hoisted array
+and the source read now have to agree about which column is which — and a sabotage that
+shifted one against the other passed the *entire* suite. Every resampling test measured
+what came out and none measured where. `an_untouched_axis_does_not_drift` is the fix: a
+vertical stretch must not move a horizontal edge by even a pixel. Worth recording as a
+general lesson — **a test that checks a value can be blind to a coordinate.**
+
+**This is a floor, not a fix.** Resampling is O(area) with a twenty-tap filter, so the
+CPU will never make a large selection interactive; 453 ms for a 1024-pixel selection is
+still not a live drag. The architectural answer is §4a's: the float should be *rendered*
+by the GPU into destination tiles rather than reconstructed on the CPU, which changes
+nothing about `Lifted`, the commit path, or the compositor — it swaps the machine doing
+the arithmetic. Recorded in `TODO.md` as the next real piece of work, because it is the
+same class of change as layer groups and wants deciding rather than assuming.
+
+The commit path keeps the CPU resample and should: it runs once per gesture, and that is
+exactly where Mitchell's quality is worth its cost (§5d).
+
+### 5e. A transform stays in the air until it is committed — 2026-08-29
+
+A quick drag lifts, moves and puts down in one gesture. That is all one
+button and no keyboard can express, and it is the right interaction for a
+move — but it leaves nowhere to adjust a scale, because the moment you let
+go it has landed.
+
+So a *transform* is a session: lift, hold, adjust, then Enter to apply or
+Escape to put it back. Both are the same machinery, and `Dragging.persistent`
+is the one bit that says which is happening — so a release cannot silently
+end a session someone is still working in.
+
+**Added rather than substituted.** Pressing inside a selection still means
+"drag it, commit on release", exactly as before. Making the persistent
+session the only model would have been tidier and would also have changed
+behaviour that already works, so the quick drag stays and the transform is
+reached from the panel.
+
+**Cancelling is free**, which is the property the lift/float/put-down split
+exists for: the layer is untouched between the lift and the put-down, so an
+abandoned transform is not an edit to undo but an edit that never happened.
+Nothing reaches the history stack and the document is not marked dirty.
+
+**`Op::Move` carries the transform and the filter**, not an offset. A redo
+that resampled with a different kernel would produce different pixels from the
+ones that were undone. It also carries the *source* mask rather than an offset
+to invert: a non-uniform scale combined with a rotation has no inverse in this
+parameterisation, and keeping the mask that was already being kept is both
+exact and cheaper than deriving one.
+
+The live outline is now mapped through the transform rather than offset by it,
+so a rotated selection is drawn rotated. An outline is a path, and a path is
+exactly what an affine transform is cheap to apply to.
+
+One §11a.7 repeat caught by a sabotage: `commit_transform` and
+`cancel_transform` both bailed out early when there was no renderer, skipping
+the state changes below — so a sabotage that wrongly marked the document dirty
+on cancel *passed*, because the line was unreachable in the test. Obligations
+first, then branch. That hazard has now bitten three times.
+
+### 6d. A palette belongs to the comic, not to the machine — 2026-08-29
+
+Colour was a picker and nothing else: mix a skin tone, use it, lose it. The question was
+where the swatches live, and it has a clear answer for this app.
+
+**Document content.** A comic's palette is a property of the comic — the skin tone that
+has to match on page forty is the one from page one, and it has to survive being handed
+to a colourist on another machine. A per-user swatch list is a different and smaller
+feature ("colours I like" rather than "colours this story uses") and can arrive later
+without this being in its way. Note this is the opposite call from brush presets (§4r)
+and for the opposite reason: a brush is a tool you own, a palette is part of the work.
+
+**Stored as authored sRGB, not converted.** A swatch is a colour the artist *chose*, so
+it is kept the way they chose it. Round-tripping through linear at eight bits is lossy,
+and a swatch that drifted a shade each time the file was opened would be worse than
+useless. Everywhere else in the engine colour is linear premultiplied (§4b) because that
+is what arithmetic wants; this is not arithmetic, it is a record.
+
+**Duplicates are refused, and the refusal says so.** A palette that fills with six copies
+of the same black is one nobody can pick from — but pressing a button and watching the row
+not grow reads as a broken button, so it answers rather than staying quiet (§6b).
+
+**Schema v7**, following the same tolerance every added table has since `meta`: absence
+reads as the default, so a file written before palettes existed loads with none and
+reading needs no branch on the schema version.
+
+A sabotage worth recording, because it is a mistake that is easy to repeat: the removal
+test took index 0 out of the list, which is the one index where "remove what was asked
+for" and "remove the first" agree. **A test has to pick the case that separates the right
+answer from the plausible one**, and index 0 never does.
+
+### 6c. Merging is the compositor's rule seen from the other side — 2026-08-29
+
+A page is unfinishable without merge down and duplicate, so they land together.
+
+**A merge must produce what the artist was already looking at.** That is the whole
+specification, and it means the merge has to answer exactly as the compositor does about
+opacity, blend and clipping. So `export::merge_tile` sits beside `Composite` and shares
+`blend_over` — the rule the GPU compositor is pinned to. A fourth copy of that arithmetic
+would be a fourth idea of what a stack means, which is what `export::Composite` was
+extracted to prevent in the first place.
+
+**The lower layer's own opacity and blend are deliberately not baked in.** They stay on
+it and go on applying to the merged result, which is exact whenever it is Normal at full
+strength and is what every app does. Baking them would change how the merged layer sits
+against everything *below* it — a bigger lie than the one it fixes. When they are not
+neutral the status line says so, rather than leaving the artist to notice the picture
+shifted (§6b).
+
+**Undo is one entry**, because it is one action: a state with the pixels combined and
+both layers still present never existed. Redo re-runs the composite rather than storing
+an after-image — the undo has already put the upper layer's pixels back, so everything
+the merge needs is on the canvas again. Both snapshots are taken *before* anything
+changes, so a full snapshot pool refuses the merge for free.
+
+**Duplicate is not undoable, and that is consistent rather than lazy**: "Add layer" is
+not either, neither destroys anything, and the way back is to delete the copy — which
+is. A structural addition in the undo stack would make Ctrl+Z walk through structure
+instead of artwork.
+
+#### The sabotage that mattered most
+
+The first version of the merge test spelled the compositing arithmetic out again inside
+the test rather than calling the shared function. Ignoring the blend mode entirely
+*passed*, and so did ignoring the clip and the empty-tile case — because the test was
+checking its own copy of the rule against itself. It proved the duplicate, not the code.
+
+That is §11a's "one definition, split across two lists" wearing a test's clothes, and it
+is worth naming separately: **a test that reimplements the thing it is testing tests
+nothing.** The fixed version calls `export::merge_tile`, the same function the renderer
+calls, and all four sabotages then fail it.
+
+A second lesson from the same test: it had no precondition that the upper layer visibly
+changed the picture. Without one, "the picture is unchanged after the merge" is satisfied
+by a merge that did nothing at all.
+
+### 4q. A selection is a property of the destination — 2026-08-29
+
+Reported plainly: *"if I select, then go to brush tool… the paint goes anywhere. is
+this a general problem for eraser and other tools too? is there a clean way to
+generalize all this behaviour rather than hardcoding stuff."* Yes, yes, and yes. §4k
+listed "confining a brush" as a consumer of the mask from the start; it was the one that
+was never wired up, and the bucket had the same hole.
+
+**The brush does not know what a selection is, and should not.** That is what stops this
+being one patch per tool. Every stroke — brush, eraser, alpha-locked — is the same
+accumulation buffer with a different blend, so there is exactly one place paint becomes
+coverage, and confining it there covers all three at once and cannot leave one behind.
+
+**Applied at accumulation, not at the bake**, which is the decision inside the decision.
+The bake is the tidier place and it is wrong: the in-progress stroke is previewed
+straight out of the accumulation buffer, so masking later would show paint spilling past
+the selection and then snap it away when the pen lifted. A preview that disagrees with
+the result is worse than no confinement.
+
+**The mask is a texture array parallel to the accumulation pool, indexed by the same
+slot.** The per-tile record already carries its accumulation layer, so the shader needs
+no second lookup and the two cannot disagree about which tile is which. Read with
+`textureLoad` rather than a sampler: the mask is canvas resolution and tile aligned, so
+there is nothing to interpolate, and interpolating would soften a selection against
+itself.
+
+**Coverage, not a bit, all the way through.** A half-selected pixel takes half the paint.
+That is the §4k bet paying out — feathered selections give feathered brush edges with no
+code written for it — and it is the property the test pins, because a hard-edged gate
+passes every other assertion.
+
+**The bucket now fills the intersection**, which §4k promised would compose for free and
+does: `Selection::intersected` multiplies coverage rather than taking a minimum, because
+two independent fractions of a pixel compose by multiplying. It also puts the artist's
+selection back afterwards — a bucket keeps no mask of its own, but throwing away one they
+made is not the same thing.
+
+**What is deliberately *not* folded in.** Alpha lock depends on the destination's own
+alpha and clipping on the layer below: they *read* pixels rather than carry them, so they
+are a blend state and a compositor concern respectively, and both are already in the
+right place. Only the selection mask and, later, the layer mask are the same shape — an
+external coverage image — and only those two multiply together. Conflating the four is
+exactly how this would become hardcoded again.
+
+The rule that falls out, and the one to check new code against: **anything that writes to
+a layer goes through that gate.**
+
+A lesson worth keeping from the sabotages. The first test used a 128-pixel page, which is
+one tile — so reading the mask from slot 0 instead of the tile's own slot passed, and so
+did uploading full coverage for a tile the selection never reaches. Both are wrong on any
+canvas bigger than 256 pixels, which is every real one. **A single-tile test cannot see a
+per-tile bug**; the test that matters straddles a boundary.
+
+### 4r. A brush preset is a tool you own — 2026-08-29
+
+Nobody draws with one brush. A page needs a pencil for roughs, an ink pen for line art
+and an eraser with its own size, and re-dialling six sliders between them is the
+difference between a demo and something you would actually draw with. §4p said presets
+were what bitmap tips unblocked; this is them.
+
+**Two things a preset deliberately does not carry.**
+
+- **Your colour.** Picking a pen must not change your ink. Every app keeps these apart
+  because colour changes far more often than tool does.
+- **The tip's pixels.** A bitmap tip is an app resource (§4p), so a preset holds a
+  *reference* — the path, since there is no tip library yet and a path is the name under
+  those circumstances. It resolves exactly as a font family does (§6a): reported when it
+  cannot be found, never silently swapped for something else.
+
+**Everything else is copied wholesale, not field by field.** `BrushPreset` holds a whole
+`Brush`, so a new brush setting is carried by presets the day it is added rather than
+the day somebody remembers to list it. That is §11a.8 — one definition, two lists — and
+copying the struct is how it is avoided. The two exclusions are `#[serde(skip)]` on the
+fields themselves, which is one place rather than two.
+
+**The edge profile rides alongside the brush rather than inside it.** `Tip` is either a
+curve or a bitmap, so a preset using a bitmap would have nowhere to keep its profile, and
+switching it back to a round tip would find the curve gone.
+
+#### JSON, not another SQLite container
+
+The library is `brushes.json` in the OS's per-user data directory. SQLite earns its place
+in `.openpaint` by holding thousands of tiles with random access; there is nothing here
+for it to do. A preset is nested, variable-length data — six response curves, each a
+source and a list of control points — read whole and written whole, and columns cannot
+hold a curve without inventing an encoding. That the file is readable and hand-editable
+is a real feature the day somebody wants to share a brush. Written through a temporary
+file and a rename, because the failure that matters is not "the save did not happen" but
+"the save destroyed what was there".
+
+#### The same test mistake, twice more
+
+Both halves of the library were first written as one function that decided *and* wrote to
+disk, so the tests reimplemented the decision rather than calling it — and a sabotage that
+removed the wrong preset passed. `insert` and `take` are now separate from `save` and
+`remove` for exactly that reason. Recorded here because it is the third time in one day:
+**a test that reimplements the thing it is testing tests nothing**, and the fix is always
+to split the decision out of the side effect rather than to write the decision twice.
+
+### 4p. A brush tip is either a curve or a bitmap — 2026-08-29
+
+The last thing that changes what a brush *is*, and what brush presets have been
+waiting on: a chalk, a bristle brush and a screentone dot are not settings of a
+soft disc, they are a different shape of mark.
+
+`Tip` is the choice, and it sits exactly where the edge profile sat rather than
+alongside it:
+
+- **`Round(Curve)`** — coverage from distance, through §4o's edge profile.
+- **`Stamp(Arc<Stamp>)`** — coverage read from an image.
+
+**Dab geometry is unchanged.** Centre, radius, roundness and angle mean the same
+for both, and a stamp is sampled through the *same* frame transform
+`Dab::distance_to` uses — rotated back by the angle, minor axis stretched to the
+major — so a bitmap tip squashes and turns with the same controls a round one
+does. Without that the two kinds would answer differently to the same sliders.
+The image is mapped across the dab's diameter, so its edge lands on the radius
+and nothing that reasons about a dab's extent changes.
+
+**Hardness applies to `Round` only, and the UI stops offering it.** A stamp
+already carries its own edge — that is most of what it is — so a hardness
+control over the top would be a second, contradictory answer to one question.
+`Tip::falloff()` returning `None` is how the panel knows.
+
+**Coverage, not colour.** One byte per texel. A coloured tip is a different
+feature (a dual brush, or a stamped image), and mixing them would mean deciding
+what happens when a coloured tip meets a brush colour — a question with no good
+answer. The tip says where ink lands; the brush says what colour it is.
+
+#### What looks like ink is ink
+
+Two conventions exist and both are common: a tip drawn black-on-white with no
+transparency (Photoshop's `.abr` tips), and one drawn opaque-on-transparent
+(what exporting from any paint app gives you). Rather than making the artist
+know which they have, an image that uses its alpha is read from alpha and a
+fully opaque one from inverted luminance. Guessing is safe here in a way it
+usually is not: a tip wrong under one rule would be *obviously* wrong — an
+inverted mark — rather than subtly so.
+
+#### A tip is an app resource, not document content
+
+A tool you own, like a font, rather than part of the artwork. Nothing about it
+is written into a `.openpaint` file, which is what keeps a document openable on
+a machine that does not have the tip. When brush *presets* land they will
+reference a tip the same way a text layer references a family — by name, with
+the substitution reported.
+
+#### The cross-check that matters most
+
+The GPU reads the tip through a hardware sampler; the CPU walks the same
+arithmetic by hand. That is the least alike the two rasterizers have ever been —
+not two spellings of one formula but genuinely different machinery — so
+`Stamp::sample` is written to mirror a linear `ClampToEdge` sampler exactly
+(texel centres at `(i + 0.5) / n`), and the cross-check is the only thing
+holding it there. The test tip is deliberately 13x9: not square, not a power of
+two, and not symmetric, so row padding, a transpose and a flip all fail it.
+Sabotages that do: the half-texel offset dropped, the sample transposed, the
+angle ignored, rows uploaded unpadded, the stamped flag never reaching the
+shader, and `set_tip` keeping the placeholder texture.
+
+### 4o. The dab's edge is a curve, not a number — 2026-08-28
+
+Hardness said how much of a dab is solid. Between that core and the rim the
+coverage fell in a straight line, and that line was the same for every brush we
+could ever ship. It is now a `Curve`: normalised distance across the ramp →
+coverage. A straight line is exactly what it was; bowing it out gives a marker
+that holds its ink to the very edge, bowing it in gives an airbrush that is
+mostly haze. Those are different brushes, not different settings of one.
+
+**Hardness stays, and the two are orthogonal.** Hardness says *how much of the
+dab is solid*; the curve says *how the remainder fades*. Folding hardness into
+the curve would have made every soft brush start by dragging the same first
+control point, and would have lost the one parameter modulation can drive.
+
+**It is a `Curve`, deliberately not a `Response`.** Every other curve in the
+brush maps a pen input — pressure, tilt, velocity — onto a parameter, and comes
+with a source picker. This one's x axis is a distance *inside the dab*. No
+source means anything for it, so it is the bare curve and the UI shows it
+without a dropdown. Sharing the `Response` type would have put a control there
+that has no correct setting.
+
+**It belongs to the stroke, not the dab.** A `Dab` is `Copy` GPU instance data;
+a curve is a heap allocation. Every dab of a stroke shares one profile, so it
+travels beside the dab list — `rasterize_dabs(…, falloff)` on the CPU, and a
+uniform on the GPU — and `StrokeOp::Begin` carries a clone so changing the
+brush mid-queue cannot retroactively reshape a stroke already recorded.
+
+The shader cannot evaluate a spline per fragment, so the curve crosses as a
+32-entry lookup table read with linear interpolation. That makes the CPU and
+GPU paths *different arithmetic* for the first time — exact spline against
+sampled table — rather than two spellings of one formula. The cross-check
+therefore pins it directly: a deliberately kinked profile through both paths,
+agreeing within the same 0.01 the rest of the §11a cross-checks use, plus an
+assertion that the shaped render differs from the straight ramp, without which
+"they agree" could just mean neither read the table. Three sabotages fail it:
+shader ignores the table, index scaled by 32 instead of 31, table sampled over
+the wrong span.
+
+Next along this axis is a bitmap tip, which replaces this stage rather than
+extends it — and raises the question this does not answer, of where brush
+textures live and whether a preset embeds or references one.
+
+### 4n. Dabs are ellipses — 2026-08-28
+
+Roundness and angle, which together make a chisel nib: a mark thick across its
+travel and thin along it. That is most of what inked line weight actually *is*,
+and it is the piece that gives `Source::Direction` a home — point angle at it
+with a straight curve and the dab follows the stroke.
+
+**The ellipse is handled by transforming the point, not by a separate
+elliptical falloff.** The sample is rotated back into the dab's frame and its
+minor axis stretched up to the major, so an ellipse becomes a circle and the
+existing falloff needs to know nothing about shape. Two things follow, and both
+are why it is done this way:
+
+- **Hardness means the same at every roundness.** A separate elliptical falloff
+  would have to re-derive what "half way out" means, and would not agree with
+  the round case at the boundary.
+- **Nothing that reasons about a dab's extent changes.** Radius is the *major*
+  axis, so a flattened dab reaches no further than a round one — the pixel
+  bounds, the GPU quad and the tile-touching calculation are all still correct
+  without a line of change.
+
+Angle is **turns** on the brush and **radians** on the dab. Modulation works in
+0–1, so a full turn being 1.0 is what makes "angle follows direction" an
+identity curve rather than a conversion constant; by the time a dab exists the
+value is geometry, and geometry is radians.
+
+The shape transform now exists twice — `Dab::distance_to` and `dab_fs` — which
+is the §11a hazard the rasterization cross-check was built for. Extended with a
+rotated, flattened case at awkward angles: a quarter turn would hide a swapped
+axis and a whole turn would hide a wrong sign, and both sabotages fail it now.
+
+### 4m. Any input can drive any parameter through a curve — 2026-08-28
+
+Asked well: *"just because we cannot see a use case does not mean one does not
+exist"*. Correct, and it changed the plan. The first version hardcoded pressure
+as the input and wired exactly two parameters. That was one instance of a
+pattern shipped in place of the pattern.
+
+**Every modulatable parameter is a `Response`**: a `Source` to read — pressure,
+tilt, velocity, stroke direction, randomness — and a curve mapping it to a
+multiplier. Which is what §4c committed to years of arguing ago: per-dab
+modulation, "each optionally driven by pressure/tilt/velocity through a curve".
+
+**Built before dab shape, deliberately.** Angle wants to follow *direction or
+tilt*, so adding angle first would have meant a "follow stroke direction" flag,
+then a "follow tilt" flag beside it, and then taking both out again. That is the
+"add a pencil *mode* instead of a parameter a pencil is a value of" mistake, and
+the ordering was changed to avoid walking into it.
+
+**And before presets**, which is the harder deadline: presets serialise a brush,
+and once brushes are authored, changing the model means migrating work the
+*artist* made rather than a document format. The free window is while none
+exist.
+
+Decisions inside it:
+
+- **The curve is always a multiplier**, for every parameter. The alternative —
+  scaling some parameters and replacing others — means no artist can predict a
+  curve without remembering which kind they are looking at.
+- **Every source is normalised to 0–1**, so any source can drive any parameter
+  and a curve authored against one reads sensibly against another. `VELOCITY_FULL`
+  and `TILT_FULL` are the scales that make those units mean something; being
+  approximate costs nothing, because any disagreement is expressible in the curve.
+- **Velocity and direction are computed by the brush**, not passed in. They are
+  properties of the *path*, and only the thing walking it knows them. Velocity is
+  distance over the clock, not over sample count — sample rate varies with pen
+  speed, so the two are not the same thing.
+- **The input is redrawn per dab**, not per segment, or a random-driven brush
+  emits rows of identical dabs.
+- **Opacity is still absent**, and that remains a property of the model: it is a
+  per-stroke ceiling, and a ceiling that varied per dab would not be one.
+
+Randomness under undo needs no special handling, which is worth noting because it
+usually does: history stores the **dabs**, not the gesture, so the numbers are
+already drawn by the time anything is recorded and a redo replays rather than
+re-rolls.
+
+### 4m-i. The first cut: pressure to size and flow — superseded above
+
+The first piece of brush depth (§4.2), and the one that makes brush *presets*
+worth having: presets over the parameters we had would have produced six
+slightly different round brushes.
+
+**An inking pen and a pencil are not two sizes of the same dab.** What
+separates them is mostly how they answer pressure — a pen holds its width and
+then opens up, a pencil responds from the lightest touch. Same rasterizer,
+same parameters; only the mapping differs. So the mapping is the thing to make
+editable.
+
+**Control points, monotone cubic (Fritsch–Carlson).** Two properties, neither
+cosmetic. It *passes through* the points, so a curve editor can be trusted.
+And it **cannot overshoot**: a plain cubic spline dips below the lowest point
+and bulges past the highest between widely spaced points, which on a size
+curve reads as pressing harder briefly making a *thinner* line. A straight
+line between two points is the same representation, so "no curve" needs no
+flag — and a flat curve *is* the "pressure does not affect size" switch, which
+is why there is no checkbox that could disagree with it.
+
+**Pressure drives size and flow, not opacity — and that is forced, not
+chosen.** Opacity is a ceiling on the whole stroke (§stroke): it is what stops
+overlapping dabs building past it. A ceiling that changed halfway along a
+stroke would not be a ceiling. Flow is per dab, so it is the parameter
+pressure can honestly drive, and driving it gives the light-touch-faint-mark
+behaviour that pressure-to-opacity is usually reached for.
+
+**Defaults preserve the old feel deliberately**: size is the identity curve
+(what the brush did before), flow is flat. A gentler default size curve
+probably suits most hands, but changing how the existing brush feels is a
+separate decision from making it adjustable, and only one of those was being
+taken.
+
+The curve is general over its *input*, so tilt and velocity are later new
+sources rather than new machinery. Dab shape and textured tips are the
+remaining pieces of §4.2 and are separable from this one.
+
+### 4l. One pointer capture, decided at the press — 2026-08-28
+
+Every tool that took pointer input added another arm to `handle_pen_event`,
+each with its own `if it_is_up { … return }` and its own idea of who owns the
+pointer. They only had to disagree once, and they did — three times in two
+days, all found by the user rather than by us:
+
+1. Painting died entirely: a branch added above `drain_input` returned early,
+   so the pen's `Up` never arrived and `drawing` stayed set forever (§11a.7).
+2. Clicking a panel control cleared the selection: the *press* was refused
+   because the panel owned that pixel, but the *release* still arrived and an
+   empty gesture read as a tap.
+3. It still did, after that fix: the *drag* arrived too, started a gesture from
+   wherever the mouse twitched, and made the release look genuine to the new
+   guard.
+
+Each fix bolted a guard onto one more arm. The arms were the problem.
+
+**A single capture, granted at the press and held until the release.** That is
+what every UI toolkit converged on, and it removes the class by construction
+rather than by vigilance: a drag or a release cannot reach a handler whose
+press was refused, because the capture was never granted. `decide_capture` is
+the only place the question is asked, and its order — modal, then Alt, then
+whichever tool is up, then paint — is the priority order, written once.
+
+Two consequences worth naming as decisions rather than accidents:
+
+- **A stroke in progress is no longer interrupted by a modifier.** Pressing
+  space mid-line used to stop the stroke, because the move arm re-read
+  `nav.is_active()` on every sample. Capture means the stroke keeps its
+  pointer, which is the better behaviour: a modifier should not silently
+  truncate a line.
+- **Alt-drag now samples continuously**, because `Pick` holds the pointer like
+  anything else. That matches Photoshop, and it fell out rather than being
+  added.
+
+The per-gesture guards (`Select::in_progress`) stay. They are not duplicated
+policy: capture decides *dispatch*, and a gesture refusing to be extended
+before it starts is its own invariant. Worth knowing that they are also why
+this refactor changed no behaviour — which made it hard to test, since a
+behavioural test cannot separate "capture routed it correctly" from "the
+handler guarded itself". The test that does distinguish them changes the tool
+state *mid-gesture* and asserts the release still goes to whoever took the
+press; the first version did not, and passed against a sabotage that re-derived
+the owner from current tool state.
+
+### 4k. Selection is a coverage mask, and a bucket is not a tool — 2026-08-28
+
+Prompted by the right challenge: *"isn't bucket just whatever is in the
+selection? why make the bucket do both?"* Yes. I had conflated region-finding
+with filling, and the split is better.
+
+**Three separate things**, and the middle one is where all the difficulty lives:
+
+1. **A mask** — per-pixel coverage over the document. One data structure.
+2. **Producers** — lasso, rectangle, select-all, invert, and later a flood fill
+   from a seed point.
+3. **Consumers** — fill, delete, transform, confining a brush.
+
+So a bucket fill is *find a region, fill it, discard the mask*. The magic wand is
+*find a region, keep the mask*. Same machinery, different front end. Building a
+flood fill inside a bucket tool guarantees a second, subtly different copy the day
+the wand arrives — the mistake `export::Composite` was extracted to undo, and
+`§11a` has that class listed twice already.
+
+It also settles a question that would otherwise have been a special case: with a
+selection active, a bucket click fills the *intersection* of the found region and
+the selection. That composes for free here.
+
+**Coverage, not a bitmask.** One byte per pixel, eight times the memory of a
+boolean on something transient that is already eight times cheaper than a colour
+tile. It buys anti-aliased selection edges, feathering, partial selection and
+soft-edged fills — all of which would mean rewriting every consumer to retrofit.
+And it makes this the **same primitive a layer mask needs**: per-pixel coverage
+attached to a layer instead of to the document. Layer masks are arguably a bigger
+feature than selection for comics, and they should not need a second
+implementation.
+
+**The CPU holds the truth**, which dissolves a problem rather than solving it. The
+canvas needed the whole residency-and-spill machinery of `tile_store.rs` because
+its tiles are the only copy of the artwork. A mask's authoritative copy is ordinary
+memory, so any GPU mirror is a *cache*: rebuildable, and exhausting it cannot
+corrupt anything. It is also where a flood fill wants its data, being inherently
+serial.
+
+**Sequencing, corrected twice by the same conversation.** Alpha lock shipped before
+clipping and should not have (§4j). Then: mask → lasso and rectangle → fill →
+select-all/invert first, and the flood-fill region-finder after. Lasso-only fill is
+*not* the comic workflow — hand-tracing fifty regions you already inked is exactly
+the labour a bucket deletes — but it ships a real capability and builds the
+primitive the flood fill plugs into, so nothing is thrown away.
+
+**Vector layers stay open**, confirmed rather than hoped. The compositor consumes
+tile *slots* and does not care where a tile's pixels came from, so a vector layer
+is one whose tiles are **derived** — a cache re-rasterized when geometry changes —
+not authoritative. Three things preserve that: geometry stored in page-space floats
+(so re-rasterizing at print resolution is free), nothing assuming a layer's tiles
+are the only truth for its pixels, and accepting that `Layer` eventually needs a
+kind. Not now; just not foreclosed.
+
+### 4j. Clipping is the colouring workflow; alpha lock is the shortcut — 2026-08-28
+
+Asked directly, and the answer corrected a sequencing mistake: **artists clip far
+more than they alpha-lock.** Alpha lock confines painting to a layer's own pixels
+and bakes it in — destructive. Clipping masks a *separate* layer by the alpha of
+the one below, so the standard stack works:
+
+```
+line art
+highlights   ← clipped to flats, Screen
+shading      ← clipped to flats, Multiply
+flats        ← the base
+```
+
+None of that is possible with alpha lock: shading painted with the lock on is
+inside the flats layer, so its opacity, blend mode and erasability are gone. Alpha
+lock keeps its place for recolouring line art and one-off tweaks, which is a real
+but much smaller share of the work. It shipped first; it should not have.
+
+**Clipping is a compositor property, not a paint property** — nothing destructive,
+no history involvement, no `PaintMode`. A per-layer flag and a running `base_alpha`:
+while folding bottom-up, an unclipped layer records its contribution, and a
+clipped layer is multiplied by it.
+
+Three decisions inside it, each pinned by a test because each has a plausible
+wrong answer:
+
+1. **A run of consecutive clipped layers shares one base** — the nearest unclipped
+   layer beneath. "Clip to the layer directly below" is indistinguishable until the
+   *second* clipped layer exists, and then it leaks: the first clipped layer is
+   usually solid, so it becomes an unrestricted base for the next.
+2. **A clipped layer with nothing unclipped beneath it shows nothing.** `base_alpha`
+   starts at zero. The opposite default makes it show everything, and no GPU test
+   whose bottom layer is unclipped ever reaches the initial value.
+3. **The mask is the base's *contribution*** — pixel alpha times layer opacity —
+   not its raw pixel alpha. One rule, from which both wanted behaviours fall out
+   rather than being special-cased: hiding the base hides the group, and fading the
+   base fades it. The alternative leaves shading floating over flats that were
+   hidden to look at something underneath.
+
+**It forced an overdue consolidation.** The compositing *loop* had begun to exist
+three times — `composite_fs`, the PNG export, and the eyedropper's sampler — and
+clipping would have meant three separate ideas of what a stack means.
+`export::Composite` is now the single CPU rule, driven by both CPU callers; the
+WGSL copy is unavoidable and stays pinned to it by
+`the_gpu_compositor_matches_the_cpu_reference`. Its `add` must be called for
+*every* layer, hidden and unpainted ones included, or a skipped layer leaves
+`base_alpha` describing the wrong shape — which is why the shader also lost its
+`continue` for hidden layers.
+
+**Format v5** adds `layer.clip_below`, same tolerant read as v4's `lock_alpha`.
+
+### 4i. Alpha lock and the eyedropper — landed 2026-08-28
+
+Two halves of being able to colour, and both landed as *variations of existing
+machinery* rather than new subsystems, which is the test of whether §4a's
+dab-based design was the right shape.
+
+**Alpha lock is a third blend state.** `src * dst.a + dst * (1 - src.a)` —
+source-atop. For the alpha channel that reduces to `dst.a` exactly
+(`src.a*dst.a + dst.a*(1-src.a) == dst.a`), so coverage **cannot** change however
+hard you scrub: no mask, no read of the render target, no second shader. The same
+trick that made the eraser a blend variation (§4a) rather than its own code path,
+and the same payoff: a locked stroke cannot drift from an unlocked one in shape,
+falloff or spacing, because it *is* the same rasterization.
+
+`erase: bool` became `PaintMode { Normal, Erase, LockAlpha }`. An enum because
+exactly one applies: "erase" and "lock alpha" are contradictory instructions — one
+removes coverage, the other forbids coverage from changing — so a state carrying
+both has no defined meaning and should not be constructible. It threads through
+history, because **redo replays dabs** and a redo that used the *current* lock
+state rather than the stroke's would not reproduce the stroke.
+
+**The definition is strict, and that decides the eraser question.** Alpha lock
+means alpha cannot change. Erasing is nothing but a change in alpha. So erasing a
+locked layer is *refused*, with a message, rather than performed as an invisible
+no-op — a tool that silently does nothing reads as a broken app. A looser
+definition ("painting is masked, erasing still works") would make the guarantee
+conditional on which tool you happened to be holding, which is not a guarantee.
+
+**The eyedropper samples the composited image**, folded with `export::blend_over`
+— the same arithmetic as `composite_fs` and already pinned to it by the compositor
+cross-check. So it returns the *displayed* colour by construction rather than by a
+second implementation that resembles one. Over the paper too, since the paper is
+on screen: sampling blank canvas gives the colour visible there, not a transparent
+nothing a picker would have to invent a value for. Bound to Alt rather than a tool
+palette entry, because that is how the tool is used and the palette does not exist
+yet.
+
+It needed `TileStore::snapshot_some`: sampling one pixel wants one tile per layer,
+and reading the whole working set to answer a click would be absurd. The readback
+plumbing `snapshot_all` had is now shared with it, so the copy-alignment reasoning
+exists once.
+
+**Format v4** adds `layer.lock_alpha`. Reading prefers the richer query and falls
+back to one supplying the default in SQL — the same tolerance the v3 `meta` table
+uses, so **absence reads as the default** and reading still needs no branch on the
+schema version. Layers will grow more flags (clipping, position lock); this is the
+pattern each should follow.
+
+### 4f. Latency is measured, not felt — landed 2026-08-28
+
+§4.1 has called input latency the project's top quality axis since the first day,
+and for every day since then **nothing measured it**. `PenSample::time_ms` was a
+field permanently equal to `0.0`. Every judgement about how the app felt —
+including the `POLL_INTERVAL = 4ms` in `main.rs`, whose own comment says "revisit
+with real latency numbers" — was a guess dressed as engineering.
+
+`perf.rs` now records two rolling windows, shown in the panel:
+
+- **stroke latency**, from a pen sample reaching us to the frame containing it
+  being presented;
+- **frame time**, how long producing that frame took.
+
+Two things about this are deliberate and both limit what the numbers mean:
+
+1. **The clock starts when the sample reaches us** (`input::now_ms`), not when the
+   pen touched the tablet. octotablet does expose `FrameTimestamp`; it is not read
+   yet. So the driver's and the OS's share is invisible, as is everything after
+   `present` returns. **These numbers are a lower bound**, and the panel says so
+   rather than letting a flattering figure be mistaken for the truth.
+2. **Only frames that carried a sample count** towards stroke latency. A frame
+   drawn because the UI wanted a repaint has no input in it, and counting it would
+   pull the average towards the cost of doing nothing.
+
+Mean *and* peak, because a mean hides the single long frame, and one stutter
+mid-stroke is precisely what an artist notices.
+
+The point is not that measuring makes anything faster. It is that a claim about
+speed becomes falsifiable, and that the next optimisation gets chosen by evidence
+instead of by whichever one is most fun to build. It also arrives just in time to
+be the instrument for the §2 target (a Surface, integrated graphics), which
+**this project has still never once run on**.
+
+### 4g. The brush ring is drawn by us, and hovering therefore costs a frame
+
+Brush size was invisible until you made a mark, which turns choosing a radius
+into a guess-and-undo loop. So the pointer now carries a ring showing the actual
+size, in screen pixels, tracking zoom — because the question it answers is "how
+big will this be *here*".
+
+Two consequences worth naming, because neither is free:
+
+- **The OS cursor was the cheap route and does not work.** Windows caps cursor
+  bitmaps far below the radii a paint brush reaches, so a large brush would
+  silently stop matching its own cursor. Drawing it ourselves is the only version
+  that stays correct at every size.
+- **Hovering now repaints.** There is no cached composite to draw an overlay over
+  — §4e deferred that cache on purpose — so a moved pointer costs a full canvas
+  composite. Guarded by a half-pixel threshold in `note_pointer`, because a pen
+  resting on a tablet reports poses continuously and would otherwise pin us at
+  full rate forever. The threshold is not tuned for feel; below half a physical
+  pixel the redraw provably cannot change a pixel.
+
+If the §4f frame-time readout says hover repaints hurt on integrated graphics,
+the composite cache is the fix — and now there is a number to justify it with,
+which is exactly the sequencing §4f was for.
+
+Hover reaches us as `PenEvent::Hover`, through the pen seam rather than off
+winit's `CursorMoved`, because a pen hovering over a tablet is not guaranteed to
+produce mouse motion at all — whether Windows synthesises it depends on the
+driver and on what RealTimeStylus consumes. The backend that already knows the
+pose is the one that can answer reliably.
+
+### 4h. Stabilization is a filter in time, and it states its own price — landed 2026-08-28
+
+Hand tremor sits around 8–12 Hz and cheap digitizers quantize on top, so a slowly
+drawn line comes out wobbly however steady the intent. `openpaint-core/src/stabilizer.rs`
+is a one-pole filter chasing the pen: `alpha = 1 - exp(-dt / tau)`.
+
+**`dt` is elapsed time, not "one sample".** This is the decision, and it is why
+§4f's clock had to land first. A fixed alpha per sample — the version almost
+everyone writes — is wrong twice over:
+
+- **It varies with hardware.** A 200 Hz tablet steps through the filter four
+  times as often as a 50 Hz one and converges four times faster. The same gesture
+  would draw differently on two tablets, and the setting would need re-tuning per
+  device.
+- **It varies with drawing speed.** Slow movement means more samples per unit
+  distance, so more smoothing exactly where the artist is being careful — the
+  opposite of what is wanted.
+
+Both vanish when `tau` is a duration. A test pins this by running the same path at
+1 ms and 2 ms report intervals and asserting they agree, *and* by running a
+fixed-alpha filter alongside and asserting it does not — so the tolerance cannot
+be what passes the test.
+
+**The setting is denominated in its own price.** A one-pole filter following
+steady movement settles exactly `tau` behind, so `tau` *is* the added latency, in
+milliseconds. The control is therefore in milliseconds, not a 0–1 strength: an
+abstract strength needs a maximum to scale against, and any such maximum is a
+number somebody made up — the first version of this had exactly that invented
+constant, and it took one question to expose it. Now `MAX_LAG_MS` bounds only how
+far a slider travels, and changing it changes nothing else, precisely because the
+unit is real. A control that spends the top quality axis (§4.1) should spend it in
+units the artist can compare against the §4f readout.
+
+**Ending where the pen ended.** A trailing filter never catches up, so at pen-lift
+the line is short by roughly the lag distance — at full strength and a brisk
+stroke, ~50 px. Left alone that reads as the app losing the end of every line.
+`finish` converges the remainder rather than jumping it, so the approach
+decelerates like the rest of the stroke, then lands exactly on the true endpoint.
+Two tests cover the two halves separately, with the tail suppressed in one, so the
+filter and the correction for it cannot mask each other.
+
+**Default: off.** Deliberately not a guess. How much smoothing an artist needs
+depends on their hand and their digitizer, and this project has measured neither on
+any hardware. Inventing a nonzero constant is what this document exists to prevent;
+the priced slider lets the choice be made with the number visible, and a default
+can be *earned* from real use. Per-brush rather than global, for the same reason
+each tool keeps its own radius: inking wants a lot, sketching wants none.
+
+**A filter defined in time must be *driven* by time.** The first version advanced
+only when a sample arrived, which looks right while the pen is moving and breaks
+the instant it stops: the line freezes short of the cursor, and the next sample
+arrives carrying the whole accumulated `dt`, so `alpha` is near 1 and the line
+snaps forward in one straight segment. Reported from use at high strength and
+speed, which is the only regime where the trailing distance is big enough to see.
+
+`Stabilizer::advance` fixes it, and the event loop calls it for the whole duration
+of a stroke. Two details are load-bearing:
+
+- **The clock advances even when the point does not.** Declining to move it once
+  converged would bank the idle time and spend it on the next sample — the same
+  snap by another route.
+- **Arrival is judged by distance remaining, not by step size.** A heavily
+  smoothed filter takes its *smallest* steps when it still has the furthest to go,
+  so a step-size test stopped it several pixels short of a held pen. Caught by the
+  test, not by inspection.
+
+This also means a stroke in progress keeps the loop awake regardless of what the
+input backend wants, because the line is still moving after the last sample. That
+is demand-driven painting intact, not an exception to it: there genuinely is
+demand.
+
+**Where it lives:** the app's input path (`stroke_start` / `stroke_continue` /
+`stroke_finish`), between the pen and the brush — stabilization conditions input,
+and input is the shell's job. Those three methods exist as a named seam so they can
+be driven headlessly in tests, since every bug found this session lived in a layer
+that had none.
+
 ---
 
 ## 5. Document model — the core differentiator
@@ -126,6 +1607,191 @@ growable dimensions.** This single model yields three products:
 - **Webtoon** = a document with one very tall page.
 - **Print comic** = pages + spreads.
 - **Sketchbook** = many normal pages.
+
+### 5a. Document model, settled 2026-08-28
+
+Agreed in detail, because this is the decision that is expensive to get wrong.
+
+**A page has exact pixel dimensions.** 2480×3508, or whatever. Nothing is
+infinite, and nothing about it is unlike CSP or Photoshop. "Extend ↓ by 500" makes
+it 2480×4008. That is the whole concept.
+
+**One data model, no variants.** `Document { pages }`. A webtoon is *one very
+tall page*; a sketchbook is *many pages*; a print comic is *many pages plus spread
+pairing*. There are deliberately **no** mode-specific code paths — two document
+types would mean two formats, two renderers, and two sets of bugs, which is exactly
+how an app acquires the bloat we are avoiding (§1).
+
+**There is no mode, and no document type.** Everything is always available:
+- **Adding pages is always available.**
+- **Extending in any direction is always possible.**
+- **Upscaling is always available.**
+
+⚠️ **Revised 2026-08-28: `Mode` (Pages / Continuous) was removed.** This section originally
+called it "a pure UI layer" that hid affordances and set defaults. Building the page panel
+showed there was nothing left for it to do, and nothing ever read it:
+- Every affordance it was meant to hide is unconditionally available by the three rules
+  above, which this same section insists on. So it could only ever have decluttered.
+- "Scrolls continuously" lost its meaning the moment this section settled that **a webtoon is
+  one very tall page** — panning a tall page is just panning. The mode was a hedge from when
+  "many pages stacked and scrolled" was still on the table.
+- What it was actually reaching for lives elsewhere: **new-document presets** (a strip versus
+  A4 at 300 DPI) are a creation-time choice, and **strip slicing** is an export option (§7).
+  Neither is a lasting property of a document.
+
+A flag no code reads is worse than no flag, because it implies behaviour that does not exist —
+the panel had a "webtoon" checkbox that changed nothing at all. Removing it makes the claim in
+this section *stronger*: not "one model plus a mode", but **one model, full stop** — nothing in
+the app needs to know what you are making.
+
+This was also the format's first real schema change (v1 → v2, dropping `document.mode` and the
+already-vestigial `page.next_layer_id`), which finally **proved** the migration story instead of
+asserting it: a test builds a v1 file by hand, loads it, saves over it, and checks the tiles
+survived and the dead columns are gone. Verified per §11a.4 — it fails with the migration
+removed.
+
+**One resize primitive:** `Page::resize(rect)` — the target **rectangle** in page
+coordinates. Extend, crop, and drag-to-resize are all just different rectangles, and
+`Page::extend(side, amount)` is a convenience that computes one.
+
+An earlier version took a size plus an "anchor" naming which edges moved, because
+coordinates were re-based at zero and a rectangle could not be named. Once coordinates
+became stable (§5a below), the rectangle became the natural thing to state and the
+anchor had nothing left to contribute — a dragged rectangle already says which edges
+moved. It is also strictly more expressive: it can trim 10 px off the left and 30 off
+the right, which size-plus-anchor cannot express. `Anchor` was deleted.
+
+The extend amount is a **parameter with a default**, stored in settings — never a
+constant in code.
+
+**Pixels are the canvas; DPI is metadata.** "300 DPI A4" is a *preset* that computes
+2480×3508, not a mode the engine knows about. Upscaling is supported (as CSP's
+Change Image Resolution and Photoshop's Image Size both are) but is **lossy in the
+direction people want it** — it cannot invent detail, so line art softens. It is a
+rescue, not a workflow; the real answer to "started too small" is presets that start
+you large enough. Note it also invalidates undo rectangles, so a resolution change
+must transform or clear history.
+
+**Page dimensions are arbitrary pixels.** Deliberately not forced to multiples of the
+tile size: that would leak the implementation into the UX. Sparse tiles handle
+partial edge tiles fine. Tile size stays 256 (already the core constant; matches
+CSP/Krita practice).
+
+**The fixed-size workflow pays nothing for any of this.** Tiles are allocated only
+where paint lands, regardless of mode, so a 2480×3508 page you never resize costs
+exactly what it would in an app with no growth feature at all. `resize()` is simply
+never called. Supporting webtoons imposes no tax on the Photoshop-style user — that
+is a property of the tiled store, not something to be careful about.
+
+**Coordinates are stable; the page origin may be negative.** Revised 2026-08-28 after
+the first implementation proved the point. A page is a *rectangle in a signed
+coordinate space* — an origin plus an extent — not a `w × h` grid pinned at (0, 0).
+Extending leftward or upward moves the **origin**, never the content, which gives one
+invariant:
+
+> **A pixel you painted keeps its coordinate forever.**
+
+The first attempt re-based every coordinate at zero, so extending left shifted every
+pixel's x. That instability then leaked outward and needed a correction at every
+consumer: the camera had to compensate so the drawing didn't appear to lurch sideways,
+undo rectangles had to be rewritten, and every future consumer of coordinates would
+have needed the same. Those corrections were symptoms; the coordinate choice was the
+cause. Fixing the cause **deleted** code — the pixel-shuffling loop in
+`Canvas::resize`, the camera compensation, and the history-shifting machinery — rather
+than adding any.
+
+Costs exactly one subtraction at the GPU boundary, because a texture is always
+zero-based, and that mapping belongs to the renderer (`CanvasRenderer::origin`, and one
+line in the dab shader). Tile coordinates were already `i32` with
+`div_euclid`/`rem_euclid`, so the core needed no new machinery.
+
+None of this is user-facing: a page still has exact pixel dimensions, and "extend down
+by 500" still just makes it taller.
+
+**Painting clips at the page edge — for now.** Photoshop and Krita keep pixels
+outside the canvas (Photoshop's Crop has a "Delete Cropped Pixels" checkbox for
+exactly this); Procreate clips. We clip, because it is the current behaviour, has no
+runaway-allocation risk, and is simpler to reason about.
+Revisited when crop landed, and **clipping stays** — but for a reason that turned out to
+be independent of crop. Painting clips at the page edge so the artist never has to
+wonder whether strokes outside the canvas do anything. That is a *painting* rule. Whether
+already-painted pixels **survive a crop** is a separate question, and the answer is now
+no-loss (§5c). The known cost of clipping stands: a stroke running off the edge stops
+dead at the old boundary if the page is later extended. One bounds check in
+`Canvas::blend_pixel`, cheap to revisit once real usage has an opinion.
+
+### 5c. Crop must not destroy pixels — and undo is not the safety net
+
+Settled 2026-08-28, **reversing** what §5a said hours earlier. The original claim was
+that retaining out-of-page pixels earned nothing, "because a crop is one undo step, and
+undo snapshots the region it is about to lose." That is wrong, and wrong in a way worth
+recording because it is a tempting mistake:
+
+> **Undo is LIFO, so it structurally cannot recover a mistake noticed late.**
+
+An artist who crops, works for two hours, then notices, cannot reach those pixels: the
+snapshot exists, but getting to it means discarding the two hours. This is not a
+history-budget problem and not fixable by pinning the snapshot — the ordering is the
+problem. Two further holes in the same reasoning: the history budget (64 MiB) evicts
+oldest-first, and history does not survive a save at all.
+
+**So crop changes the page rectangle and retains the pixels outside it.** Painting still
+clips to the page, so nothing changes about how drawing feels. Deleting out-of-page
+content becomes one explicit action — **Trim to canvas** — which is the only operation
+that ever discards pixels, and is itself undoable.
+
+**This design has less machinery, not more.** If a crop destroys nothing, undoing one is
+pure geometry: `Op::Resize`'s `before: Option<wgpu::Texture>`, `PageResize::loses_pixels`,
+and the snapshot/restore path for resizes all become dead and get deleted. Same signal as
+the signed-origin change (§5a) — fixing the cause removed code.
+
+**It must land on the tiled canvas, not on today's single texture.** The pixel store is
+currently one page-sized texture. Retaining outside pixels there means sizing it to the
+union of page-and-content — a *bounding box*, so it pays for empty space, and
+crop-narrow-then-extend-the-other-way would make memory grow **because the canvas got
+smaller**, eventually failing the pixel budget. Sparse tiles pay only where paint exists,
+which is the honest version. Non-destructive crop is therefore part of the tiled-canvas
+work (Q13), not a step before it.
+
+⚠️ Until that lands, a crop that loses pixels says so bluntly and does **not** advertise
+Ctrl+Z as a safety net.
+
+### 5b. Crop is a direct-manipulation tool, not a dialog
+
+Settled 2026-08-28, after a numeric "Canvas Size" dialog with a 3×3 anchor grid was
+built and rejected. The dialog was the wrong shape for the job: an anchor grid exists
+only to answer "which edges move?", and on a rectangle you are dragging, the drag
+already answers it. Direct manipulation is also what every reference does — Windows
+Photos, PowerPoint, Photoshop, CSP — so it is what the UX north star (§1a) demands.
+
+**Dragging outward extends; dragging inward crops.** One tool, because `Page::resize`
+takes a rectangle (§5a) and does not care which is larger. Splitting "crop" from
+"extend" would be two tools over one primitive.
+
+**The camera never moves while the tool is up.** No auto-fit, no zoom change, no
+recentering — the rectangle is expressed in page coordinates and re-projected each
+frame, so panning and zooming keep the outline glued to the page instead of fighting
+it. A tool that re-frames the view mid-gesture makes the gesture unaimable.
+
+**Applying goes through the same `apply_page_rect` as everything else**, so a crop is
+undoable and guarded by the same dimension and pixel-budget limits as an extend, with
+no crop-specific path to keep in sync.
+
+**The handles are painted, not egui widgets.** Pen input never reaches egui, which sees
+only the mouse events Windows synthesises from it (OPEN_QUESTIONS Q14) — coalesced and
+lagging, which is the wrong clock for a drag with the very input device this app is for.
+They are also in page space, so they have to move with the canvas's own pan and rotation,
+which no widget in screen space can do. Geometry lives in `crop.rs` in page coordinates, driven
+from the app's own input path, which sees pen and mouse alike; egui only draws the
+outline. Keeping the geometry free of GPU and UI types is also what makes the eight
+drag behaviours and the hit-testing directly testable.
+
+**Grab tolerance is screen-relative, capped per axis.** A screen-pixel radius divided
+by the zoom keeps handles equally easy to aim at at any magnification, but at low zoom
+that radius becomes wider *in page units* than the rectangle itself — at which point
+every press reads as a corner and neither the edges nor the interior can be grabbed.
+Capping the tolerance at a quarter of each side fixes it; the test that pins this was
+confirmed to fail without the cap.
 
 ### Tiling enables everything
 Canvas stored as tiles (~256×256). Tiles allocated **only where paint exists**,
@@ -148,6 +1814,30 @@ lazy-load from an on-disk tile store so a 200-page sketchbook stays light.
      page-add (or auto-add page when one is filled), and thumbnail-grid page
      navigation. Possibly per-page notes/tags to find old studies. No special
      casing — just UX defaults.
+
+### Page management — landed 2026-08-28
+
+Select, add, delete (undoable), reorder, and the Pages/Continuous toggle. The model had been
+ready since §5a; this is the UI catching up, and it stayed cheap exactly because the model was
+already general.
+
+One latent bug fell out of building it, worth recording because it was invisible until pages
+existed: **layer ids were per page**, and `Page::new` always started at 0. The renderer keys
+tiles by layer id alone, so a second page's first layer would have shared tiles with the
+first's. Id allocation moved to `Document`, so ids are unique across the document and a page
+reorder still rewrites nothing.
+
+A related simplification: the layer-id counter is **no longer saved**. One past the highest
+live id is correct on load, because a save discards undo history — and history holding tiles
+keyed to *deleted* layers was the only thing that made reusing an id dangerous.
+
+Switching pages **re-fits the camera**, unlike a resize, which deliberately keeps the zoom. A
+different page is very likely a different size, so keeping the zoom would leave the artist
+looking at empty space; a resize of the page you are working on is the opposite case.
+
+Still missing, in rough order of how much they will be missed: **thumbnails** (the list is
+names for now), **drag to reorder** rather than Up/Down, **spread pairing** for print, and
+export of a whole document (CBZ/PDF, §7).
 
 ### Page management (the under-served area we intend to win)
 Reordering, spreads, templates, thumbnail-grid overview, lazy on-disk loading,
@@ -187,43 +1877,267 @@ Decision: **stay cross-platform-capable by construction, ship Windows first.**
 
 ---
 
-## 7. File format & interop (direction, details TBD)
+## 7. File format & interop
 
-- **Open, documented container**: conceptually a zip of tiles + JSON metadata
-  (same spirit as `.kra` / `.procreate`, which are zips).
+### The native format is a SQLite database, settled 2026-08-28
+
+Reverses this section's original sketch ("a zip of tiles + JSON"). The reason is the one
+thing a zip cannot do: **replace an entry in place.** Every save to a zip rewrites the whole
+archive, so one stroke in a three-hundred-page sketchbook -- the stated core use case (§5) --
+costs a full multi-hundred-megabyte rewrite, and autosave becomes impossible. Autosave is the
+feature that actually protects work, so that is disqualifying rather than merely slow.
+
+What SQLite gives, none of it free otherwise:
+- **Atomicity and crash safety** from transactions, instead of hand-rolled
+  write-temp-and-rename and its edge cases.
+- **Incremental saves** -- only the tiles that changed.
+- **A self-describing schema**, dumpable with any SQLite tool, plus `user_version` for a
+  well-worn migration story.
+- A container whose own file format carries an explicit long-term stability commitment --
+  a stronger longevity guarantee than a convention of ours layered over zip.
+
+CSP's `.clip` is also SQLite, as far as public reverse-engineering shows; Krita and Procreate
+use zips and both have the rewrite problem. Not decisive on its own, but a signal the choice
+survives real documents.
+
+**The cost, stated plainly:** it is the project's first deliberate C dependency (`rusqlite`
+with the bundled amalgamation -- one C file, cross-compiles to Windows without fuss). Tile
+compression is ours to choose rather than free from the zip; deflate via `flate2`'s Rust
+backend, so SQLite remains the only non-Rust dependency. Measured on a real two-layer
+document: 7 tiles, 3.5 MB raw, **90 KB on disk**.
+
+**Decisions inside the format:**
+- **Tiles are keyed by layer *id*, not stack position**, so reordering layers rewrites no
+  tile rows. Same reason the in-memory store keys by id, and it is what keeps saves cheap.
+- **Blend modes and mode are stored by name**, not integer. A file you can read with
+  `sqlite3` and understand is worth a string compare per layer, and a name cannot collide
+  with a code some older file already used. `Blend::code()` stays an integer because the
+  *shader* needs one -- a different concern with a different lifetime.
+- **A per-tile `codec` column.** A better compressor can be introduced later without a
+  schema bump and without rewriting existing files.
+- **Tiles are stored premultiplied `f16`, verbatim.** No conversion on save, so no lossy
+  round trip through the format.
+- **Out-of-page tiles are saved.** That is what makes non-destructive crop (§5c) survive
+  being closed and reopened; without persistence the guarantee lasted only a session.
+- **Undo history is not saved.** A save is a fresh undo baseline -- which is precisely why
+  crop had to be non-destructive rather than "recoverable with Ctrl+Z".
+- **Loading goes to the CPU side of the tile store, not the GPU.** Residency pulls in what
+  the viewport asks for, so opening a large document is fast and memory-bounded for free.
+
+✅ **File dialogs, added 2026-08-28.** Ctrl+N / Ctrl+O / Ctrl+S / Ctrl+Shift+S, with the
+document's name and a `*` for unsaved edits in the title bar, and a guard that *offers to save*
+before anything that would discard them — a dialog whose only choices are "lose your work" and
+"cancel" makes the user save by hand, which is exactly when they forget.
+
+**A dialog is never opened from the event handler that asked for it.** A modal dialog pumps the
+Windows message queue, which dispatches our pending events straight back into us — the Q10c
+hazard. So a request is parked and serviced from `about_to_wait`, the one place winit guarantees
+no foreign frame is on the stack. Exactly the same rule, for exactly the same reason, as
+draining pen input (see the note at the top of `main.rs`).
+
+**Native only where it is unavoidable.** The first version used a native message box for the
+unsaved-changes question and it broke on contact: with no parent window, Windows placed the modal
+*behind* the app — audible, invisible, and blocking, so the app looked frozen. Two changes came
+out of that:
+- File pickers are parented to our window (`set_parent`). A modal with no owner has no z-order
+  relationship to the window it is blocking.
+- **The unsaved-changes question is drawn in-app, in egui.** A file browser cannot be
+  reimplemented; a three-button question can. Every native modal runs its own message loop, which
+  is this project's most expensive recurring bug, so the fewer the better — and one we draw
+  ourselves cannot end up behind the window at all. It also blocks painting while it is up, and
+  answers to Enter and Escape.
+
+The prompt **offers to save**, and only proceeds if the save actually succeeded: a cancelled or
+failed save is not permission to discard the work.
+
+`rfd` is the dependency. Its `xdg-portal` backend is on by default and `gtk3` is off, so Linux
+needs no GTK development packages — which matters for §6's "cross-platform by construction".
+
+- **Open and documented.** The schema is introspectable, which is a better guarantee than a
+  zip full of conventions only our code knows.
 - **PSD import early** — huge for adoption. (Import prioritized; export later.)
 - **PNG import/export.**
 - Webcomic exports: **CBZ / PDF / image-sequence** (with webtoon strip slicing).
 
 ---
 
-## 8. Phased roadmap
+### 7a. Autosave writes ordinary documents — landed 2026-08-28
 
-- **Phase 0 — Vertical slice (prove the feel):** repo scaffold + winit/wgpu
-  render loop + one pressure/tilt brush (via the input abstraction) on a tiled
-  canvas. If this doesn't feel good, nothing else matters. **IN PROGRESS:**
-  - [x] Step 1 — window opens (winit). Verified on Windows.
-  - [x] Step 2 — wgpu renderer clears surface. Verified (RTX 3070 Ti / D3D12).
-  - [x] Step 3 — tiled canvas + stamp-based brush + mouse drawing. Verified.
-  - [x] Step 4 — input abstraction (PenSample/PenEvent + InputBackend trait),
-        mouse as first swappable backend. Behavior-identical refactor.
-  - [x] Step 5 — octotablet backend (Windows Ink) behind the trait; extended
-        trait with a polled path (`poll` + `wants_continuous_poll`) since
-        octotablet is polled, not event-driven. Windows target cross-checked
-        from Linux. AWAITING real-tablet test on Windows.
-  - [ ] Step 6 — assess feel; if inadequate, swap to hand-rolled Windows Ink
-        (WM_POINTER) behind the same trait (prediction + coalesced samples).
-- **Phase 1 — Real engine:** full brush engine; layers + blend modes + masks;
-  undo history; color management (linear-space compositing).
-- **Phase 2 — Document & pages:** the multi-page/growable model; on-disk
-  container; save/load; PSD/PNG import-export.
-- **Phase 3 — Webcomic/sketchbook tooling:** panels, templates, page-management
-  UI, CBZ/PDF export, webtoon slicing/fold guides.
-- **Phase 4 — Pro polish:** Wintab; brush editor; stabilization; transform/
-  selection tools; performance passes; final CSP-like UI.
+Explicit saving protects the work you remembered to save. This protects the hour
+you were absorbed in, and it is the reason §7 chose a database over a zip: a zip
+would have made every autosave a full multi-hundred-megabyte rewrite.
 
-**Discipline:** nail Phase 0's *feel* before broadening. True CSP-quality is a
-multi-year effort; focus beats breadth.
+**A recovery copy is a real `.openpaint` file**, written with the same `save` as
+everything else. No second format to keep in step, and no recovery path that rots
+because nothing else exercises it. Format **v3** adds a `meta` key/value table so
+the copy records which document it belongs to (`autosave.original_path`) and that
+it is a copy at all (`autosave.recovery`). Kept general deliberately — that will
+not be the last thing a document needs to carry which is neither structure nor
+pixels — and additive, so the migration is `CREATE TABLE IF NOT EXISTS`.
+
+**Copies live in the OS per-user data directory, not beside the document.** That
+folder may be read-only, on removable media that is gone, or inside a sync folder
+that would cheerfully propagate a half-written temporary to every other machine.
+It is also not ours to litter.
+
+**A crash is detected by a copy outliving its process.** A copy exists only while
+the document is dirty and is deleted the moment it is not — on save, load, new, and
+`exiting`. So a copy present at startup means that process did not get to clean up.
+`mark_clean` is the single place that transition happens, because the invariant only
+holds if every route through it is the same route.
+
+**Recovery is offered, never applied.** The artist may have moved on, and silently
+replacing what they just opened would be worse than the crash. Accepting loads it
+**dirty and pointed at the original file** — the work in it was never saved, so
+letting the next Ctrl+S write into the recovery directory would leave their real
+file untouched while looking like success.
+
+**Skipped mid-stroke.** A save reads every resident tile back off the GPU, which
+mid-stroke would both hitch the one thing that must never hitch and capture a stroke
+halfway through.
+
+**The interval is 60 s, and the panel reports what a save cost.** Shorter is
+strictly better for the artist; the only thing pushing back is the price. So the
+price is measured and displayed rather than guessed at, the same discipline as §4f —
+and if it turns out to be expensive on a large document, the answer is incremental
+saving (tiles are individually keyed rows) rather than a longer interval.
+
+**Known limitation, recorded rather than hidden:** two instances at once. Each
+writes its own uniquely named copy, but the second to start will offer the first's
+live document. Accepting duplicates work in progress; it destroys nothing. Telling
+"abandoned" from "in use" needs an OS file lock, which is not worth a dependency
+until multiple windows exist.
+
+
+## 8. Roadmap — rewritten 2026-08-29
+
+> The original phases are kept at the bottom for the record. They stopped describing
+> the project some time ago, and a plan nobody can plan against is worse than none.
+
+### What the original ordering got wrong, and why that was mostly right
+
+The phases assumed features arrive in order of grandeur: engine, then documents, then
+comic tooling, then "pro polish". What actually happened is that features arrived when
+they **unblocked** something, and the ordering scrambled accordingly:
+
+- **Stabilization, selection and transform** were Phase 4. They shipped in the first
+  week, because stabilization is part of *feel* (Phase 0's whole purpose) and selection
+  is the primitive the colouring workflow is built on — a bucket, a wand and a confined
+  brush are all one mask (§4k).
+- **Layers, undo, the document format and pages** — Phases 1 and 2 — interleaved
+  completely, because each kept turning out to need the others.
+- **Masks and layer groups** were Phase 1 and have not shipped, because clipping (§4j)
+  covered the workflow they were wanted for and nothing else was blocked on them.
+
+The lesson worth carrying: **order by what is blocked, not by how advanced it sounds.**
+That is also why the list below is grouped by system rather than by phase.
+
+### Done
+
+- **Input.** Pen backend on Windows Ink through octotablet, behind a swappable trait;
+  mouse elsewhere. Pressure and tilt verified on real hardware. One pointer capture
+  decided at the press (§4l). Stabilization defined in time (§4h).
+- **Brush engine.** Dabs emitted by core, rasterized on the GPU (§4a). Elliptical dabs
+  (§4n), a curve for the edge (§4o), bitmap tips (§4p), any input driving any parameter
+  through a curve (§4m), per-stroke flow and opacity accumulation, eraser, alpha lock,
+  and named presets (§4r).
+- **Canvas.** Tiled, linear premultiplied `Rgba16Float` (§4b), a bounded GPU tile pool
+  with CPU spill so document size does not depend on graphics memory (§4d).
+- **Layers.** Opacity, visibility, reorder, delete, duplicate, merge down (§6c), three
+  blend modes, clip-to-below (§4j). Composited in one GPU pass (§4e).
+- **Selection.** Lasso, rectangle, wand, select-all, invert — one coverage mask with
+  many producers and many consumers (§4k). Fill, delete, bucket, and confining every
+  stroke (§4q).
+- **Transform.** Move, scale, rotate, flip, with a grabbable box (§5f) and resampling
+  that keeps a plain move lossless (§5d).
+- **Text.** A layer whose source of truth is its text, not its pixels (§6a), with its own
+  crate for fonts and undo that stores the words rather than the tiles.
+- **Document.** Multi-page, growable, `.openpaint` as SQLite (§7), autosave and crash
+  recovery (§7a), PNG export, a document colour palette (§6d).
+- **Undo.** Everything that changes pixels, bounded by a snapshot pool that refuses an
+  edit it could not reverse rather than performing it.
+
+**An artist can take a page from rough to export today.** That is the bar this section
+existed to reach, and it is reached.
+
+### Phase 0 step 6 → ✅ ANSWERED 2026-08-29: octotablet stays
+
+Step 6 was "assess the feel; if octotablet is not good enough, hand-roll Windows Ink
+(`WM_POINTER`) for prediction and coalesced samples." It had sat unanswered because
+"assess the feel" is a judgement, and nobody had made it. §4f already says latency is
+measured rather than felt; the same rule applies here, so the question was turned into a
+number first (`Perf::rate`) and then answered.
+
+**Measured on the Veikk, drawing:**
+
+| | Normal | Fast |
+| --- | --- | --- |
+| Samples per second | 252 | 241 |
+
+**Nothing is being coalesced away, and the second column is the proof.** A high number
+alone could be a coincidence of hardware; a number that barely moves between normal and
+fast drawing cannot be. Fast motion is exactly when a frame-limited input path collapses
+— it would pin near the refresh rate or fall off a cliff. A four per cent change is the
+pen reporting at its own rate, whatever that rate is.
+
+So `WM_POINTER` would buy **nothing** on the count it was proposed for: we already have
+every sample the device produces. What remains of that idea is *prediction*, which is a
+separate feature justified by the latency figure rather than by this one, and which can
+be added behind the same trait whenever the latency readout says it is worth it.
+
+**The step figure, and a readout bug it exposed.** Page-space distance between samples
+measured 40.6 px mean, 101 px peak — alarming until you notice it scales with zoom, and
+the canvas was zoomed out. `stroke_to` interpolates linearly between samples, so a chord
+deviates from the true curve by roughly `chord² / (8 × curve radius)`: at these numbers
+that is sub-pixel on a gentle curve and a few pixels on a tight one, divided by the zoom
+again on screen. Not a problem, and **not an input problem either** — if faceting ever
+shows up, the fix is curve fitting in `stroke_to`, not a different input API. The readout
+now prints screen pixels and the zoom alongside, because the page figure was right and
+unreadable.
+
+**The input architecture is settled.** Nothing now blocks the UI.
+
+### The frontier is the UI, and it is not polish
+
+Everything above is driven from a debug panel that §3 calls throwaway, and Q4 — what
+draws the real UI — is the least reversible decision left in the project. What the UI
+has to be is now written down in §1b.
+
+This is a *shell replacement*, not a rewrite: the engine knows nothing about buttons, and
+§3's architecture principle exists precisely so this is a swap. That is also what makes
+it cheap to try several designs in parallel branches before committing to one.
+
+### Next, in order of what is blocked
+
+1. ~~Settle Phase 0 step 6~~ — done, above. octotablet stays.
+2. **Design the UI** — the layout first (§1b), then Q4, because the layout constrains the
+   framework more than the reverse. Q14 gets solved properly here rather than twice.
+3. **Build it.**
+4. **The features that need a real UI to be worth building** — layer groups, speech
+   bubbles, a brush editor, panel and frame tools, rulers and perspective guides. Each is
+   as much interaction as engine, and building the interaction half into a throwaway
+   panel means building it twice.
+5. **Render the float on the GPU** (`TODO.md` §3) — the one performance item with a
+   known ceiling rather than a suspicion.
+6. **Everything still deferred**: Wintab, PSD interop, CBZ/PDF export, webtoon slicing,
+   colour management beyond sRGB.
+
+### The original phases, for the record
+
+- **Phase 0 — Vertical slice:** scaffold, render loop, one pressure brush on a tiled
+  canvas. Steps 1–5 done and verified on hardware; step 6 has no verdict (above).
+- **Phase 1 — Real engine:** brush engine, layers, blend modes, masks, undo, linear
+  compositing. Done except **masks**.
+- **Phase 2 — Document & pages:** the page model, container, save/load, import/export.
+  Done except **PSD interop** and **PNG import**.
+- **Phase 3 — Webcomic/sketchbook tooling:** panels, templates, page-management UI,
+  CBZ/PDF, webtoon slicing. Page management partly done; the rest untouched.
+- **Phase 4 — Pro polish:** Wintab, brush editor, stabilization, transform/selection,
+  performance, the CSP-like UI. Stabilization and transform/selection shipped early; the
+  rest untouched.
+
+**Discipline, unchanged and still right:** nail the feel before broadening. True
+CSP-quality is a multi-year effort; focus beats breadth.
 
 ---
 
@@ -249,7 +2163,153 @@ multi-year effort; focus beats breadth.
 - **Webtoon default height behavior → explicit "Extend ↓" button.** Auto-grow
   remains available as an option, not the default.
 
+## 11a. Recurring hazards (check new code against these)
+
+Not bugs — *classes* of bug this codebase has actually produced, most of them more
+than once. Each cost real debugging time, so they are worth reading before adding code
+of the same shape.
+
+### Implicit ordering: "I did the thing, but not in the order the API guarantees"
+
+1. **State changed, but no frame was requested.** Painting is demand-driven, so any
+   state change affecting what's on screen must also ask for a frame. Bit us three
+   times: the egui panel was completely inert (input queued, no frame, so nothing
+   was ever consumed, so no frame was requested — a self-sustaining deadlock); the
+   canvas sat off-centre (a queued re-fit nobody drew); and a stroke wasn't
+   committed on pen-up.
+   **Deliberately NOT fixed with machinery.** A deferred "dirty" flag would add a
+   frame of input latency, and input latency is the project's top quality axis
+   (§4.1). Trading measurable latency for a bug class that review catches is a bad
+   deal. Every current call site is covered; check new ones by hand.
+
+2. **`Queue::write_buffer` is not ordered against draws recorded between writes.**
+   Every buffer write in a submission is applied *before any* command buffer in it
+   executes. Writing a buffer once per batch and drawing in between means all the
+   draws see only the last write. This produced visible gaps in fast strokes —
+   whole batches of dabs silently dropped, worse the faster the stroke because more
+   batches landed per frame.
+   Fixed structurally rather than by guard: `StrokeLayer::upload_dabs` is separate
+   from `stamp_range`, so the frame's data is uploaded once and draws address
+   sub-ranges. If you need per-item data, either upload once and index, or submit
+   between writes.
+
+   **Bit again, twice, during the tiled-canvas work (2026-08-28) — and the same rule
+   covers `write_texture` and render-pass clears, not just `write_buffer`:**
+   - Per-tile uniforms are selected with **dynamic offsets** into one buffer written
+     once per frame. Rewriting one uniform between per-tile passes would have left
+     every pass reading the last tile's values. The stamping and bake records live in
+     two *disjoint regions* of that buffer, so a bake cannot overwrite records the
+     stamps preceding it in the same submission still have to read.
+   - `upload_dirty` allocated a tile, cleared it with a render pass, then uploaded it
+     with `queue.write_texture` — so the clear was applied *after* the upload and wiped
+     it. Fixed by not clearing a tile that is about to be written in full. Caught by
+     the export test, which is the sort of thing that would otherwise have looked like
+     a broken export.
+
+   The general rule: **a queue write and a recorded command are not in the same
+   order you wrote them.** If both touch the same resource, either use disjoint
+   regions, do both through the encoder, or submit in between.
+
+6. **A side effect inside `debug_assert!` does not happen in release.** Written as
+
+   ```rust
+   debug_assert!(self.map.insert(coord, slot).is_none());   // WRONG
+   ```
+
+   the insert runs in debug and **vanishes in release**, because `debug_assert!` does
+   not evaluate its expression there at all. This shipped a build in which the app
+   painted nothing whatsoever: every tile was allocated and then dropped on the floor,
+   while all 178 tests passed — because tests build in debug.
+
+   Fixed by moving the call out of the macro so the assert only inspects a bound value.
+
+   **The guard is `cargo test --workspace --release` in CI**, now run alongside the debug
+   suite. Verified the way §11a.4 demands: with the bug reintroduced, the debug suite
+   passes 90/90 while release fails 7 tests. Any future divergence between profiles has
+   the same chance of being caught.
+
+   `clippy::debug_assert_with_mut_call` is also denied workspace-wide, but **it does not
+   catch this case** — it fires on `&mut` *arguments*, not on a mutating method receiver,
+   and was confirmed silent on the exact line that shipped. It is kept because the shapes
+   it does catch are the same mistake; it is not the reason this cannot recur.
+
+   General rule: **an assertion must not be load-bearing.** If deleting it changes what
+   the program does, it is not an assertion.
+
+7. **An early return that skips a step the function must always take.** Adding a
+   branch near the top of a long procedure reads as local, and is not: everything
+   below it silently stops happening. In `about_to_wait` a "keep waking while a
+   stabilized stroke converges" branch was added *above* `drain_input`, with a
+   `return`. Draining is the only route by which pen movement — and pen *release* —
+   reaches the app, so the first press left `Editor::drawing` set forever, because the
+   `Up` that clears it was still sitting in the backend's queue. One dab appeared and
+   painting never worked again, in that stroke or any later one.
+
+   Two things make this class nastier than it looks. The added code was correct in
+   isolation and its own test passed; and the damage was to a *different* subsystem
+   than the one being edited, so nothing about the change suggested where to look.
+
+   **The fix is structural, not a test.** `about_to_wait` cannot be unit-tested — it
+   needs a live `ActiveEventLoop` — so there is nothing to assert against. Instead the
+   mandatory work now comes first, unconditionally, and the "should we keep waking"
+   decision is reduced to booleans combined at a single exit. There is no longer a
+   place to put an early return that could do this, which is worth more than a test
+   that could.
+
+   General rule: in a procedure whose steps are obligations rather than options, **do
+   the obligations first and branch afterwards** — and if it has more than one
+   `return`, treat that as a smell to justify rather than a convenience.
+
+8. **One definition split across two lists.** Adding `layer_text` to
+   `STRUCTURE_SCHEMA` and not to the `DROP` statements each migration branch carried
+   its own copy of made *every* migration fail with "table already exists" — a break in
+   code that had nothing to do with the feature. The shape to watch for is a
+   declaration and its inverse maintained separately: a schema and its drop list, an
+   enum and a `match` over it written out by hand, a struct and a serializer. Where the
+   compiler cannot pair them, the fix is one list both sides use, not care.
+
+### Verification hazards
+
+3. **Injected input cannot reach RealTimeStylus.** `SetForegroundWindow` is refused
+   to a background process, and pen input arrives via RTS rather than the window's
+   message queue. `PostMessage` reaches winit fine (good for navigation and UI
+   tests) but not the pen path, so **a human drawing is the acceptance test for
+   input-path changes.** Two "features are broken" conclusions during development
+   turned out to be a broken harness, not broken code.
+
+4. **A regression test that has never failed proves nothing.** When fixing a bug,
+   reintroduce it and confirm the new test fails. Done for the stroke-gap fix; it
+   failed by 0.955 at one pixel, which is what made the test trustworthy.
+
+5. **`PostMessage` cannot fake mouse *hover*.** Posted `WM_MOUSEMOVE` reaches winit
+   fine — pan, zoom and wheel all test that way — but Windows' mouse-leave tracking
+   follows the **real** cursor, so `WM_MOUSELEAVE` fires immediately afterwards.
+   egui then receives `PointerMoved` followed at once by `PointerGone`, discards the
+   position, and no widget can ever be hovered or clicked. Symptom: egui reports
+   `pointer_latest_pos() == None` while events are visibly arriving.
+   To drive a widget, move the **real** cursor with `SetCursorPos` first; posted
+   button messages then work. This cost several rebuilds chasing a non-existent bug,
+   twice — the honest default is: **UI interaction is verified by a human**, and only
+   engine-level behaviour is verified by injection.
+
+---
+
 ## 11. Decisions still OPEN
-See `OPEN_QUESTIONS.md`. Notably: Windows build/delivery mechanics (Q2b), final
-UI framework, color-management depth, file-format specifics, and whether to port
-libmypaint vs. build our own brush engine.
+
+See `OPEN_QUESTIONS.md`. Three of the five this section used to list have since been
+answered — the file format (Q6), the brush engine (Q7, build our own), and the Windows
+build loop (Q2b, develop on Windows) — which is why it is worth rewriting rather than
+extending.
+
+What is genuinely still open, in the order it matters:
+
+- **Q4 — what draws the real UI.** The least reversible decision left, and the one
+  everything in §8's "next" list waits behind. Judged against §1b.
+- **Q14 — routing pen input into the UI.** No longer a blocker (it works, by an accident
+  of Windows synthesising mouse messages) but still real, and it should be solved once,
+  as part of Q4.
+- **Q5 — colour-management depth.** sRGB-only today. `Rgba16Float` in memory means the
+  headroom is already there, so this stays deferrable and should stay deferred until
+  someone needs print output.
+- **Q18 — the composite cache**, and Q13's remaining piece: zoomed-out views of a heavily
+  painted document.

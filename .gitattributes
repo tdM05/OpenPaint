@@ -1,0 +1,10 @@
+# Line endings.
+#
+# Code is written on Linux and run on Windows, and this box has
+# core.autocrlf=true, so without this a checkout here would hand `run.sh` a CRLF
+# shebang — which bash rejects outright ("bad interpreter"). Normalize to LF in
+# the repository and on checkout everywhere.
+* text=auto eol=lf
+
+# Except PowerShell, which is conventionally CRLF on Windows.
+*.ps1 text eol=crlf

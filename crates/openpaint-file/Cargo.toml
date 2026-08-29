@@ -1,0 +1,18 @@
+[package]
+name = "openpaint-file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The .openpaint document format: a SQLite container of tiles plus document structure."
+
+[dependencies]
+openpaint-core = { path = "../openpaint-core" }
+# Bundled, so the format does not depend on what SQLite the host happens to have. One C
+# amalgamation file; cross-compiles to Windows without fuss.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Pure-Rust deflate (miniz_oxide), so SQLite stays the only non-Rust dependency.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[lints]
+workspace = true

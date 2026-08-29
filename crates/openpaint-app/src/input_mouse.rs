@@ -27,14 +27,13 @@ impl InputBackend for MouseBackend {
         match event {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
+                let sample = PenSample::at(self.cursor.0, self.cursor.1, 1.0);
                 if self.down {
                     // Mouse gives one sample per event; emit a single-sample
                     // batch. A pen backend would emit many coalesced samples.
-                    out.push(PenEvent::Move(vec![PenSample::at(
-                        self.cursor.0,
-                        self.cursor.1,
-                        1.0,
-                    )]));
+                    out.push(PenEvent::Move(vec![sample]));
+                } else {
+                    out.push(PenEvent::Hover(sample));
                 }
             }
             WindowEvent::MouseInput { state, button, .. } if *button == MouseButton::Left => {

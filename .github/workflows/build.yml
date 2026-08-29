@@ -45,6 +45,12 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # Also in release, because `debug_assert!` and `debug_assert_eq!` disappear there.
+      # A side effect written inside one silently stops happening, which shipped a build
+      # that painted nothing at all while every debug test passed. See DECISIONS 11a.6.
+      - name: Test (release)
+        run: cargo test --workspace --release
+
   # The important one: build the downloadable Windows .exe.
   windows-build:
     name: Build Windows .exe

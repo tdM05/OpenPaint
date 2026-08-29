@@ -7,3 +7,19 @@ repository.workspace = true
 description = "OpenPaint engine core: document model, tiled canvas, brush engine, compositor. UI-agnostic."
 
 [dependencies]
+# Half-precision floats for tile texels. Matches the GPU's Rgba16Float exactly,
+# so tile bytes upload with no conversion (see src/tile.rs).
+half = { version = "2", features = ["bytemuck"] }
+# Zero-copy reinterpretation of tile texels as upload-ready bytes.
+bytemuck = "1"
+# Brush presets are nested, variable-length data -- six response curves, each a source and a list
+# of control points -- read and written whole. That is a document, not a relational set, so it is
+# JSON rather than another SQLite container: columns cannot hold a curve without inventing an
+# encoding, and a preset file being readable and hand-editable is a feature when presets are shared.
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

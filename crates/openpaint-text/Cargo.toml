@@ -1,0 +1,20 @@
+[package]
+name = "openpaint-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenPaint text layout and glyph rasterization. The only crate that knows about fonts."
+
+[dependencies]
+openpaint-core = { path = "../openpaint-core" }
+# Rich-text layout: font matching, shaping, line breaking, alignment. Chosen over cosmic-text for
+# its span model, which is what per-word styling and furigana will need. Confined to this crate --
+# openpaint-core's `TextRenderer` seam is what makes swapping it a contained change.
+parley = "0.11"
+# Glyph outline rasterization. Parley shapes with it too and re-exports it, but naming it here keeps
+# the dependency honest: we call swash directly to turn glyph ids into coverage.
+swash = "0.2"
+
+[lints]
+workspace = true
