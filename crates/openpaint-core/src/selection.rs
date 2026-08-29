@@ -97,23 +97,53 @@ impl Selection {
     /// Select the whole page.
     #[must_use]
     pub fn everything(page: PageRect) -> Self {
-        Self::from_coverage(page, |_, _| 255)
+        let mut build = Builder::default();
+        let run = vec![255_u8; page.w as usize];
+        for y in page.y..page.end().1 {
+            build.write_run(page.x, y, &run);
+        }
+        build.finish()
     }
 
     /// Select an axis-aligned rectangle, clipped to the page.
+    ///
+    /// No supersampling: the rectangle arrives already snapped to whole pixels, so every pixel is
+    /// either wholly in or wholly out and there is no edge to soften.
     #[must_use]
     pub fn from_rect(rect: PageRect, page: PageRect) -> Self {
         let (ex, ey) = rect.end();
-        let (fx, fy) = (rect.x as f32, rect.y as f32);
-        Self::from_shape(page, |px, py| {
-            px >= fx && py >= fy && px < ex as f32 && py < ey as f32
-        })
+        let (page_ex, page_ey) = page.end();
+        let x0 = rect.x.max(page.x);
+        let x1 = ex.min(page_ex);
+        let mut build = Builder::default();
+        if x1 > x0 {
+            let run = vec![255_u8; (x1 - x0) as usize];
+            for y in rect.y.max(page.y)..ey.min(page_ey) {
+                build.write_run(x0, y, &run);
+            }
+        }
+        build.finish()
     }
 
     /// Select the interior of a polygon — the lasso.
     ///
     /// Implicitly closed: the last point joins the first, because a lasso the artist did not quite
     /// close is a lasso they meant to close.
+    ///
+    /// # Scanline, not per-pixel sampling
+    ///
+    /// The first version tested every pixel of the page against every edge, sixteen times over for
+    /// supersampling. On a 2048² page with a two-hundred-point lasso that is over ten billion
+    /// operations, and it froze the app for seconds on release — the freeze was not a slow
+    /// constant, it was the wrong algorithm.
+    ///
+    /// This walks *sample rows* instead: for each one, find where the edges cross it, sort those
+    /// crossings, and fill the spans between alternating pairs. Cost is rows × edges rather than
+    /// pixels × edges × subsamples, and it only visits the polygon's own bounding box.
+    ///
+    /// It is also **more** accurate, not less: coverage across a span is computed as exact overlap
+    /// in x, so only y is sampled. A near-horizontal edge is the one case that benefits from
+    /// sampling, and it gets [`SUBSAMPLES`] rows of it.
     #[must_use]
     pub fn from_polygon(points: &[(f32, f32)], page: PageRect) -> Self {
         if points.len() < 3 {
@@ -121,65 +151,103 @@ impl Selection {
             // degenerate keeps "did that gesture select anything" a question the caller can ask.
             return Self::new();
         }
-        Self::from_shape(page, |px, py| point_in_polygon(px, py, points))
+
+        let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
+        let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
+        for &(x, y) in points {
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+        let (page_ex, page_ey) = page.end();
+        let y0 = (min_y.floor() as i32).max(page.y);
+        let y1 = (max_y.ceil() as i32).min(page_ey);
+        let x0 = (min_x.floor() as i32).max(page.x);
+        let x1 = (max_x.ceil() as i32).min(page_ex);
+        if y0 >= y1 || x0 >= x1 {
+            return Self::new();
+        }
+
+        let width = (x1 - x0) as usize;
+        let mut build = Builder::default();
+        let mut row = vec![0.0_f32; width];
+        let mut diff = vec![0.0_f32; width + 1];
+        let mut out = vec![0_u8; width];
+        let mut crossings: Vec<f32> = Vec::new();
+        // Each sample row contributes this share of a pixel's final coverage.
+        let share = 1.0 / SUBSAMPLES as f32;
+
+        for y in y0..y1 {
+            row.iter_mut().for_each(|c| *c = 0.0);
+            diff.iter_mut().for_each(|c| *c = 0.0);
+            for s in 0..SUBSAMPLES {
+                let sy = y as f32 + (s as f32 + 0.5) * share;
+                crossings.clear();
+                let mut j = points.len() - 1;
+                for i in 0..points.len() {
+                    let (xi, yi) = points[i];
+                    let (xj, yj) = points[j];
+                    // Half-open in y, so a vertex sitting exactly on the sample row is counted
+                    // once rather than twice or never — the classic source of single-pixel holes
+                    // along a horizontal edge.
+                    if (yi > sy) != (yj > sy) {
+                        let t = (sy - yi) / (yj - yi);
+                        crossings.push(xi + t * (xj - xi));
+                    }
+                    j = i;
+                }
+                crossings.sort_unstable_by(f32::total_cmp);
+                // Alternating pairs are the inside spans: the same even-odd rule as a point test,
+                // applied to a whole row at once.
+                for pair in crossings.as_chunks::<2>().0 {
+                    add_span(&mut row, &mut diff, x0, pair[0], pair[1], share);
+                }
+            }
+            // One prefix sum turns the difference array into whole-pixel coverage, to which the
+            // partial ends collected in `row` are added.
+            let mut running = 0.0_f32;
+            for (i, slot) in out.iter_mut().enumerate() {
+                running += diff[i];
+                *slot = ((row[i] + running) * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+            build.write_run(x0, y, &out);
+        }
+        build.finish()
     }
 
     /// Everything on the page this selection does not cover.
+    ///
+    /// Walks tiles rather than pixels: a per-pixel [`Selection::coverage_at`] would do a hash
+    /// lookup for every pixel of the page, which is the same shape of mistake the polygon fill had.
     #[must_use]
     pub fn inverted(&self, page: PageRect) -> Self {
-        Self::from_coverage(page, |x, y| 255 - self.coverage_at(x, y))
-    }
-
-    /// Rasterize a shape into coverage by supersampling.
-    fn from_shape(page: PageRect, inside: impl Fn(f32, f32) -> bool) -> Self {
-        let step = 1.0 / SUBSAMPLES as f32;
-        let offset = step / 2.0;
-        Self::from_coverage(page, |x, y| {
-            let mut hits = 0_u32;
-            for sy in 0..SUBSAMPLES {
-                for sx in 0..SUBSAMPLES {
-                    let px = x as f32 + sx as f32 * step + offset;
-                    let py = y as f32 + sy as f32 * step + offset;
-                    if inside(px, py) {
-                        hits += 1;
-                    }
-                }
-            }
-            // Scaled so a fully covered pixel reads exactly 255 rather than 254.
-            u8::try_from((hits * 255) / (SUBSAMPLES * SUBSAMPLES)).unwrap_or(255)
-        })
-    }
-
-    /// Build from a per-pixel coverage function over the page.
-    ///
-    /// Tiles that end up entirely unselected are dropped, so a selection stays sparse however it
-    /// was produced.
-    fn from_coverage(page: PageRect, coverage: impl Fn(i32, i32) -> u8) -> Self {
         let side = TILE_SIZE as i32;
         let (ex, ey) = page.end();
-        let mut tiles = HashMap::new();
         if page.w == 0 || page.h == 0 {
-            return Self { tiles };
+            return Self::new();
         }
-
         let first = (page.x.div_euclid(side), page.y.div_euclid(side));
         let last = ((ex - 1).div_euclid(side), (ey - 1).div_euclid(side));
+
+        let mut tiles = HashMap::new();
         for ty in first.1..=last.1 {
             for tx in first.0..=last.0 {
+                let source = self.tiles.get(&(tx, ty));
                 let mut tile = vec![0_u8; TILE_TEXELS];
                 let mut any = false;
                 for ly in 0..TILE_SIZE {
                     for lx in 0..TILE_SIZE {
                         let x = tx * side + lx as i32;
                         let y = ty * side + ly as i32;
-                        // Clipped to the page: a selection outside it could never be filled,
-                        // and letting one exist would put coverage where no tile can hold paint.
+                        // Clipped to the page: coverage outside it could never be filled.
                         if !page.contains(x, y) {
                             continue;
                         }
-                        let c = coverage(x, y);
+                        let i = ly * TILE_SIZE + lx;
+                        let c = 255 - source.map_or(0, |t| t[i]);
                         if c > 0 {
-                            tile[ly * TILE_SIZE + lx] = c;
+                            tile[i] = c;
                             any = true;
                         }
                     }
@@ -280,24 +348,96 @@ fn merge_runs(edges: &mut [(i32, i32)], mut emit: impl FnMut(i32, i32, i32)) {
     }
 }
 
-/// Even-odd point-in-polygon, on an implicitly closed path.
-fn point_in_polygon(x: f32, y: f32, points: &[(f32, f32)]) -> bool {
-    let mut inside = false;
-    let mut j = points.len() - 1;
-    for i in 0..points.len() {
-        let (xi, yi) = points[i];
-        let (xj, yj) = points[j];
-        // Half-open in y, so a vertex sitting exactly on the scanline is counted once rather than
-        // twice or never — the classic source of single-pixel holes along a horizontal edge.
-        if (yi > y) != (yj > y) {
-            let t = (y - yi) / (yj - yi);
-            if x < xi + t * (xj - xi) {
-                inside = !inside;
+/// Accumulates coverage into sparse tiles as it is produced.
+///
+/// Keeps the "only touched tiles exist" rule in one place, so every producer stays sparse without
+/// each of them remembering to be.
+#[derive(Default)]
+struct Builder {
+    tiles: HashMap<TileCoord, Vec<u8>>,
+}
+
+impl Builder {
+    /// Write a horizontal run of coverage starting at `(x, y)`.
+    ///
+    /// Resolves a tile once per run rather than once per pixel. Writing pixel by pixel means a hash
+    /// lookup each time -- for select-all on a 2048-square page that is four million lookups, which
+    /// is the same shape of mistake the polygon fill originally had, just quieter.
+    ///
+    /// Zero coverage is skipped rather than stored, which is what keeps a selection sparse.
+    fn write_run(&mut self, x: i32, y: i32, values: &[u8]) {
+        let side = TILE_SIZE as i32;
+        let ty = y.div_euclid(side);
+        let ly = y.rem_euclid(side) as usize;
+
+        let mut written = 0;
+        while written < values.len() {
+            let x_here = x + written as i32;
+            let tx = x_here.div_euclid(side);
+            let lx = x_here.rem_euclid(side) as usize;
+            // How much of this run lands in this tile.
+            let take = (TILE_SIZE - lx).min(values.len() - written);
+            let chunk = &values[written..written + take];
+
+            if chunk.iter().any(|&c| c > 0) {
+                let tile = self
+                    .tiles
+                    .entry((tx, ty))
+                    .or_insert_with(|| vec![0_u8; TILE_TEXELS]);
+                let base = ly * TILE_SIZE + lx;
+                for (slot, &c) in tile[base..base + take].iter_mut().zip(chunk) {
+                    if c > 0 {
+                        *slot = c;
+                    }
+                }
             }
+            written += take;
         }
-        j = i;
     }
-    inside
+
+    fn finish(self) -> Selection {
+        Selection { tiles: self.tiles }
+    }
+}
+
+/// Add a horizontal span's coverage to a row.
+///
+/// The two partially covered pixels at the ends go straight into `row`; everything between them is
+/// a whole pixel and goes into `diff`, a difference array summed once per pixel row afterwards.
+/// That makes a span cost O(1) rather than O(its width) -- which matters because there are
+/// [`SUBSAMPLES`] sample rows per pixel row, and paying the width on every one of them was most of
+/// the time that remained after the scanline rewrite.
+///
+/// Exact overlap at the ends rather than sampling: a pixel the span covers halfway gets exactly
+/// half. Getting the ends right is what lets y be the only axis that needs supersampling at all.
+fn add_span(row: &mut [f32], diff: &mut [f32], x_origin: i32, from: f32, to: f32, weight: f32) {
+    let width = row.len() as f32;
+    let a = (from - x_origin as f32).clamp(0.0, width);
+    let b = (to - x_origin as f32).clamp(0.0, width);
+    if b <= a {
+        return;
+    }
+    let first = a.floor() as usize;
+    let last = b.floor() as usize;
+
+    if first == last {
+        // Entirely inside one pixel.
+        if first < row.len() {
+            row[first] += (b - a) * weight;
+        }
+        return;
+    }
+    if first < row.len() {
+        row[first] += ((first + 1) as f32 - a) * weight;
+    }
+    if last < row.len() {
+        row[last] += (b - last as f32) * weight;
+    }
+    // The whole pixels strictly between the two ends.
+    if last > first + 1 {
+        diff[first + 1] += weight;
+        diff[last] -= weight;
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +446,39 @@ mod tests {
 
     fn page() -> PageRect {
         PageRect::from_size(400, 400)
+    }
+
+    /// A realistic lasso on a realistic page must not take perceptible time.
+    ///
+    /// This is a regression test for a shipped freeze, not a benchmark. The first implementation
+    /// tested every pixel of the page against every edge, sixteen times over — on this input that
+    /// is roughly ten billion operations, and the app locked up for seconds when the pen lifted.
+    ///
+    /// The bound is deliberately loose. It is not trying to measure anything; it is trying to be
+    /// impossible to pass with the wrong *algorithm*, while being impossible to fail on a slow
+    /// machine with the right one. Scanline does this in single-digit milliseconds.
+    #[test]
+    fn a_lasso_on_a_full_page_is_not_slow() {
+        let page = PageRect::from_size(2048, 2048);
+        // A 300-point circle, the shape a freehand lasso actually produces.
+        let points: Vec<(f32, f32)> = (0..300)
+            .map(|i| {
+                let a = i as f32 * std::f32::consts::TAU / 300.0;
+                (1024.0 + 900.0 * a.cos(), 1024.0 + 900.0 * a.sin())
+            })
+            .collect();
+
+        let started = std::time::Instant::now();
+        let sel = Selection::from_polygon(&points, page);
+        let took = started.elapsed();
+
+        assert!(!sel.is_empty(), "the lasso selected nothing");
+        assert_eq!(sel.coverage_at(1024, 1024), 255, "the centre is inside");
+        assert_eq!(sel.coverage_at(20, 20), 0, "the corner is outside");
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "a 300-point lasso on a 2048 page took {took:?}; that is an algorithm problem,              not a slow machine"
+        );
     }
 
     #[test]

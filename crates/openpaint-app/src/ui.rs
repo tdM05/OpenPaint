@@ -928,14 +928,24 @@ impl Ui {
                     egui::pos2(a[0] / ppp, a[1] / ppp),
                     egui::pos2(b[0] / ppp, b[1] / ppp),
                 ];
+                // Dark underneath, white dashes on top: the marching-ants convention, and the
+                // reason it is a convention is that nothing else reads unambiguously over both
+                // white paper and black ink.
+                //
+                // Dashed rather than solid because a solid line at the page border -- which is
+                // exactly where "select all" and "invert" put one -- is indistinguishable from the
+                // page border itself. That was reported as "impossible to tell if it inverted",
+                // and it was a fair complaint about a solid outline.
                 painter.line_segment(
                     seg,
-                    egui::Stroke::new(2.0_f32, egui::Color32::from_black_alpha(140)),
+                    egui::Stroke::new(2.0_f32, egui::Color32::from_black_alpha(190)),
                 );
-                painter.line_segment(
-                    seg,
-                    egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(235)),
-                );
+                painter.extend(egui::Shape::dashed_line(
+                    &seg,
+                    egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
+                    4.0_f32,
+                    4.0_f32,
+                ));
             }
         }
 

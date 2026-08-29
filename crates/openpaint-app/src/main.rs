@@ -818,10 +818,10 @@ impl OpenPaint {
         }
 
         match resolved {
-            Some(selection) => self.set_selection(Some(selection)),
+            Some(selection) => self.set_selection(Some(selection), "Selected"),
             // A gesture that enclosed nothing -- a tap, or a lasso of three coincident points --
             // reads as "deselect", which is what a click on empty space means in every art app.
-            None => self.set_selection(None),
+            None => self.set_selection(None, "Deselected"),
         }
     }
 
@@ -829,15 +829,15 @@ impl OpenPaint {
     ///
     /// The single place the selection changes, so the outline can never be stale: it is derived
     /// from the mask, and deriving it anywhere else would let the two drift.
-    fn set_selection(&mut self, selection: Option<openpaint_core::Selection>) {
+    fn set_selection(&mut self, selection: Option<openpaint_core::Selection>, what: &str) {
         self.selection = selection.map(|mask| {
             let outline = mask.outline();
             ActiveSelection { mask, outline }
         });
-        self.status_message = Some(match self.selection.as_ref() {
-            Some(_) => "Selected".to_owned(),
-            None => "Deselected".to_owned(),
-        });
+        // Named rather than a bare "selected". An outline at the page border looks the same
+        // whether it arrived from select-all or from inverting a lasso, so the message is the only
+        // thing that distinguishes them until the panel grows a proper indicator.
+        self.status_message = Some(what.to_owned());
         self.request_redraw();
     }
 
@@ -867,9 +867,12 @@ impl OpenPaint {
                 self.request_redraw();
             }
             ui::SelectAction::All => {
-                self.set_selection(Some(openpaint_core::Selection::everything(page)))
+                self.set_selection(
+                    Some(openpaint_core::Selection::everything(page)),
+                    "Selected all",
+                );
             }
-            ui::SelectAction::None => self.set_selection(None),
+            ui::SelectAction::None => self.set_selection(None, "Deselected"),
             ui::SelectAction::Invert => {
                 // Inverting nothing selects everything, which is what every art app does and is
                 // more useful than refusing.
@@ -877,7 +880,10 @@ impl OpenPaint {
                     || openpaint_core::Selection::everything(page),
                     |s| s.mask.inverted(page),
                 );
-                self.set_selection((!inverted.is_empty()).then_some(inverted));
+                self.set_selection(
+                    (!inverted.is_empty()).then_some(inverted),
+                    "Inverted the selection",
+                );
             }
         }
     }
@@ -1541,7 +1547,7 @@ impl OpenPaint {
         self.editor.stroke_end();
         self.crop = None;
         // A mask is in page coordinates, so it means nothing once the page it was drawn on is gone.
-        self.set_selection(None);
+        self.set_selection(None, "Deselected");
 
         let tiles: Vec<_> = loaded.tiles.into_iter().collect();
         let pages = loaded.document.page_count();
@@ -1567,7 +1573,7 @@ impl OpenPaint {
         self.editor.stroke_end();
         self.crop = None;
         // A mask is in page coordinates, so it means nothing once the page it was drawn on is gone.
-        self.set_selection(None);
+        self.set_selection(None, "Deselected");
         self.editor
             .replace_document(openpaint_core::Document::new(openpaint_core::Page::new(
                 editor::PAGE_W,
