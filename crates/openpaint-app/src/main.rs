@@ -43,6 +43,7 @@ mod input;
 mod input_mouse;
 #[cfg(target_os = "windows")]
 mod input_pen;
+mod layout;
 mod perf;
 mod presets;
 mod renderer;
