@@ -952,8 +952,8 @@ impl Ui {
                                     .button("Convert to raster layer")
                                     .on_hover_text(
                                         "Keeps the pixels and stops re-deriving them, so the \
-                                         layer can be painted on. This cannot be undone by \
-                                         retyping — the text is gone.",
+                                         layer can be painted on. The text stops existing \
+                                         as text; undo brings it back, retyping does not.",
                                     )
                                     .clicked()
                                 {

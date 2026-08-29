@@ -54,6 +54,15 @@ pub enum HistoryChange {
     },
     /// A restored page was deleted again.
     PageDeleted { index: usize },
+    /// A layer's content was put back to what it was, and the document must adopt it.
+    ///
+    /// Reported rather than applied for the same reason as [`HistoryChange::LayerRestored`]: the
+    /// document lives in the shell. The renderer has already re-derived the pixels, so the shell
+    /// only has to make the document agree with what is on screen.
+    ContentRestored {
+        index: usize,
+        content: openpaint_core::Content,
+    },
     /// Pixels moved back or forward, and the selection has to follow them.
     ///
     /// The selection lives in the shell rather than in history — it is not part of the document —
@@ -380,6 +389,31 @@ impl Renderer {
     /// Register font files that are not installed on the system, returning the families gained.
     pub fn load_font_files(&mut self, paths: &[std::path::PathBuf]) -> Vec<String> {
         self.text.load_font_files(paths)
+    }
+
+    /// Record a change to what a layer is made of, for undo.
+    ///
+    /// No tiles are captured, which is the whole point: the pixels of a text layer follow from its
+    /// block, so an edit costs a string in the stack rather than a snapshot of every tile the
+    /// caption covers. Consecutive edits to the same layer coalesce inside [`History::push`], so
+    /// typing a line is one undo rather than one per keystroke.
+    pub fn record_content_change(
+        &mut self,
+        layer: LayerId,
+        index: usize,
+        before: openpaint_core::Content,
+        after: openpaint_core::Content,
+    ) {
+        if before == after {
+            return;
+        }
+        self.history.push(Op::Content {
+            layer,
+            index,
+            before,
+            after,
+            at: std::time::Instant::now(),
+        });
     }
 
     /// Re-derive a text layer's pixels from its text.
@@ -904,6 +938,12 @@ impl Renderer {
                     _ => HistoryChange::Pixels,
                 }
             }
+            Op::Content {
+                layer,
+                index,
+                before,
+                ..
+            } => self.restore_content(*layer, *index, before),
             Op::Resize { resize } => {
                 self.resize_canvas(resize.inverted(), false);
                 HistoryChange::Geometry { rect: resize.old }
@@ -1017,6 +1057,12 @@ impl Renderer {
                 self.paste(&lifted, offset, layer);
                 HistoryChange::Moved { offset }
             }
+            Op::Content {
+                layer,
+                index,
+                after,
+                ..
+            } => self.restore_content(*layer, *index, after),
             Op::Resize { resize } => {
                 self.resize_canvas(*resize, false);
                 HistoryChange::Geometry { rect: resize.new }
@@ -1042,6 +1088,34 @@ impl Renderer {
         };
         self.history.finish_redo(op);
         change
+    }
+
+    /// Put a layer's content back, and make its pixels agree.
+    ///
+    /// One function for both directions, because undo and redo of a content change differ only in
+    /// which side of the operation they take — which is the shape derived content gives you for
+    /// free, and the reason this needed no snapshot at all.
+    ///
+    /// Re-deriving is what makes it exact. Restoring text re-renders it; restoring `Raster` leaves
+    /// the tiles alone, which is correct — converting to raster never changed a pixel, it only
+    /// stopped them being recomputed.
+    fn restore_content(
+        &mut self,
+        layer: LayerId,
+        index: usize,
+        content: &openpaint_core::Content,
+    ) -> HistoryChange {
+        if let openpaint_core::Content::Text(block) = content {
+            let page = self.canvas_renderer.page();
+            // A layout failure here cannot be reported to the user from inside undo, and refusing
+            // to restore would leave the document and the screen disagreeing. The content still
+            // goes back; the pixels are simply whatever they were.
+            let _ = self.rerender_text_layer(layer, block, page);
+        }
+        HistoryChange::ContentRestored {
+            index,
+            content: content.clone(),
+        }
     }
 
     /// Copy snapshot tiles back into the canvas, allocating fresh pool layers for them.

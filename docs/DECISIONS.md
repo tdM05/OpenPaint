@@ -426,6 +426,28 @@ speech-bubble system is that plus a shape object re-deriving alongside the text.
 history stack instead of a tile snapshot, and undo is exact rather than a
 re-rasterization that has to match.
 
+#### Undo of a text edit is the text, not the pixels
+
+`Op::Content` holds a `Content` on each side and **no tiles at all**. That is
+the payoff of derived content rather than a saving bolted onto it: the pixels
+follow from the block, so undo restores the block and re-derives. A caption
+costs a string in the history stack instead of a snapshot of every tile it
+covers, and the restore is exact rather than a re-rasterization that has to
+match what was there before.
+
+Undo and redo differ only in which side of the operation they take, so they are
+one function. Restoring `Text` re-renders; restoring `Raster` leaves the tiles
+alone, which is correct — converting to raster never changed a pixel, it only
+stopped them being recomputed.
+
+**Consecutive edits coalesce inside `History::push`**, on a 700 ms pause. Not
+per keystroke, which would make Ctrl+Z walk back through a caption a letter at a
+time; not per focus change either, which would make a long caption one
+all-or-nothing entry. The merge keeps the *earlier* `before` and the *later*
+`after`, which is what makes the merged entry describe the whole run. It refuses
+to merge across layers however fast the edits arrive, since the merged entry
+would otherwise restore one layer's words onto another.
+
 #### The font stack is a separate crate, not a module
 
 `openpaint-text` owns parley, swash and fontique; `openpaint-core` owns

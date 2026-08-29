@@ -133,6 +133,26 @@ pub enum Op {
         page: openpaint_core::Page,
         tiles: Vec<(TileKey, Slot)>,
     },
+    /// What a layer is *made of* changed: its text edited, or a text layer converted to raster.
+    ///
+    /// Holds the content on both sides and **no tiles at all**, which is the payoff of derived
+    /// content: the pixels follow from the text, so undo restores the block and re-derives. A
+    /// caption costs a string here rather than a snapshot of every tile it covers, and the result
+    /// is exact rather than a re-rasterization that has to match.
+    Content {
+        layer: LayerId,
+        /// Where the layer sits in the stack. The content lives in the document, which the shell
+        /// owns, so undo reports the change rather than applying it — and the shell needs to know
+        /// which layer, by position, exactly as [`Op::DeleteLayer`] does.
+        index: usize,
+        before: openpaint_core::Content,
+        after: openpaint_core::Content,
+        /// When this was recorded, so a run of keystrokes coalesces into one undo.
+        ///
+        /// Without it every character typed would be its own entry, and Ctrl+Z would walk back
+        /// through a caption one letter at a time — which is not what anyone means by undo.
+        at: std::time::Instant,
+    },
     /// A deleted layer, kept whole so undo can put it back exactly where it was.
     DeleteLayer {
         /// Where it sat in the stack, so undo restores the order and not just the pixels.
@@ -155,7 +175,9 @@ impl Op {
                     TileBefore::Absent => None,
                 })
                 .collect(),
-            Self::Resize { .. } => Vec::new(),
+            // Neither holds a snapshot layer: a resize destroys nothing, and a content change
+            // stores the content itself rather than the pixels it produced.
+            Self::Resize { .. } | Self::Content { .. } => Vec::new(),
             Self::Trim { tiles }
             | Self::DeleteLayer { tiles, .. }
             | Self::DeletePage { tiles, .. } => tiles.into_iter().map(|(_, slot)| slot).collect(),
@@ -164,6 +186,14 @@ impl Op {
 }
 
 /// The undo/redo stacks and the snapshot pool that bounds them.
+/// How long a pause in typing ends one undo entry and begins the next.
+///
+/// Chosen the way editors choose it: long enough that a word typed at speed is one undo, short
+/// enough that stopping to think is a boundary. Not per-keystroke, which would make Ctrl+Z walk
+/// back through a caption one letter at a time; not per-focus-change either, which would make a
+/// long caption a single all-or-nothing entry.
+const TEXT_COALESCE_MS: u128 = 700;
+
 pub struct History {
     pool: TilePool,
     undo: Vec<Op>,
@@ -325,11 +355,43 @@ impl History {
     ///
     /// Clears the redo stack, as any edit after undoing must: the redone future no longer
     /// follows from the present.
+    ///
+    /// Consecutive edits to the same layer's content within [`TEXT_COALESCE_MS`] are folded into
+    /// the one entry, so typing a caption is a single undo rather than one per keystroke. Folding
+    /// keeps the *earlier* `before` and the *later* `after`, which is what makes the merged entry
+    /// describe the whole run.
     pub fn push(&mut self, op: Op) {
         let stale = std::mem::take(&mut self.redo);
         for op in stale {
             self.release(op);
         }
+
+        if let Op::Content {
+            layer,
+            after,
+            at,
+            index,
+            ..
+        } = &op
+        {
+            if let Some(Op::Content {
+                layer: prev_layer,
+                after: prev_after,
+                at: prev_at,
+                index: prev_index,
+                ..
+            }) = self.undo.last_mut()
+            {
+                let same_layer = prev_layer == layer && prev_index == index;
+                let still_typing = at.duration_since(*prev_at).as_millis() < TEXT_COALESCE_MS;
+                if same_layer && still_typing {
+                    prev_after.clone_from(after);
+                    *prev_at = *at;
+                    return;
+                }
+            }
+        }
+
         self.undo.push(op);
     }
 
@@ -387,6 +449,140 @@ mod tests {
                 new: openpaint_core::PageRect::from_size(100, 200),
             },
         }
+    }
+
+    fn text(words: &str) -> openpaint_core::Content {
+        openpaint_core::Content::Text(Box::new(openpaint_core::TextBlock {
+            text: words.into(),
+            ..openpaint_core::TextBlock::default()
+        }))
+    }
+
+    fn edit(at: std::time::Instant, before: &str, after: &str) -> Op {
+        Op::Content {
+            layer: L0,
+            index: 0,
+            before: text(before),
+            after: text(after),
+            at,
+        }
+    }
+
+    /// Typing is one undo, not one per keystroke. Without coalescing, Ctrl+Z would walk back
+    /// through a caption a letter at a time, which is not what anyone means by undo.
+    #[test]
+    fn a_run_of_keystrokes_is_one_undo() {
+        let Some((device, _)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let mut h = history(&device);
+        let start = std::time::Instant::now();
+        h.push(edit(start, "", "H"));
+        h.push(edit(
+            start + std::time::Duration::from_millis(80),
+            "H",
+            "He",
+        ));
+        h.push(edit(
+            start + std::time::Duration::from_millis(160),
+            "He",
+            "Hel",
+        ));
+
+        assert_eq!(h.undo_depth(), 1, "three keystrokes should be one entry");
+        let Some(Op::Content { before, after, .. }) = h.pop_undo() else {
+            panic!("the entry should be a content change");
+        };
+        assert_eq!(
+            before,
+            text(""),
+            "the merged entry keeps the earliest before"
+        );
+        assert_eq!(after, text("Hel"), "and the latest after");
+    }
+
+    /// A pause is a boundary, or a whole caption would be one all-or-nothing entry.
+    #[test]
+    fn a_pause_starts_a_new_undo_entry() {
+        let Some((device, _)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let mut h = history(&device);
+        let start = std::time::Instant::now();
+        h.push(edit(start, "", "Hi"));
+        h.push(edit(
+            start + std::time::Duration::from_millis(TEXT_COALESCE_MS as u64 + 50),
+            "Hi",
+            "Hi there",
+        ));
+        assert_eq!(h.undo_depth(), 2, "a pause should break the run");
+    }
+
+    /// Edits to different layers must never merge, however fast they arrive: the merged entry
+    /// would restore one layer's words onto another.
+    #[test]
+    fn edits_to_different_layers_do_not_merge() {
+        let Some((device, _)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let mut h = history(&device);
+        let start = std::time::Instant::now();
+        h.push(edit(start, "", "a"));
+        h.push(Op::Content {
+            layer: LayerId(1),
+            index: 1,
+            before: text(""),
+            after: text("b"),
+            at: start + std::time::Duration::from_millis(10),
+        });
+        assert_eq!(h.undo_depth(), 2);
+    }
+
+    /// A content change holds no snapshot layers, which is what makes an edit cost a string
+    /// rather than a picture of every tile the caption covers.
+    #[test]
+    fn a_content_change_holds_no_tiles() {
+        let Some((device, _)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let mut h = history(&device);
+        let before = h.bytes_held();
+        h.push(edit(
+            std::time::Instant::now(),
+            "",
+            "a whole paragraph of words",
+        ));
+        assert_eq!(
+            h.bytes_held(),
+            before,
+            "a text edit should not hold snapshot memory"
+        );
+    }
+
+    /// Anything recorded after an undo invalidates the redo stack, content changes included.
+    #[test]
+    fn a_content_change_clears_the_redo_stack() {
+        let Some((device, _)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let mut h = history(&device);
+        let start = std::time::Instant::now();
+        h.push(edit(start, "", "one"));
+        let op = h.pop_undo().expect("an entry");
+        h.finish_undo(op);
+        assert_eq!(h.redo_depth(), 1);
+
+        h.push(edit(
+            start + std::time::Duration::from_millis(2000),
+            "",
+            "another",
+        ));
+        assert_eq!(h.redo_depth(), 0, "the redone future no longer follows");
     }
 
     #[test]

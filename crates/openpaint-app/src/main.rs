@@ -1315,11 +1315,29 @@ impl OpenPaint {
         if *current == block {
             return;
         }
+        let before = openpaint_core::Content::Text(Box::new(current.clone()));
         *current = block;
         self.editor.rename_active_layer_from_text();
+        self.record_content_change(before);
         self.rerender_active_text();
         self.mark_dirty();
         self.request_redraw();
+    }
+
+    /// Record the active layer's content change for undo.
+    ///
+    /// Called *after* the change, reading the new state back off the layer, so there is one place
+    /// that knows what "after" is rather than every caller passing it and one of them eventually
+    /// passing the wrong thing.
+    fn record_content_change(&mut self, before: openpaint_core::Content) {
+        let index = self.editor.active_layer_index();
+        let layer = tile_store::LayerId(self.editor.active_layer_id());
+        let Some(after) = self.editor.layers().get(index).map(|l| l.content().clone()) else {
+            return;
+        };
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.record_content_change(layer, index, before, after);
+        }
     }
 
     /// Add a text layer, or convert one to raster.
@@ -1346,13 +1364,21 @@ impl OpenPaint {
                 self.spawn_file_dialog(FileDialogKind::Fonts, |dialog| dialog.pick_files());
             }
             ui::TextAction::ConvertToRaster => {
+                let before = self
+                    .editor
+                    .layers()
+                    .get(self.editor.active_layer_index())
+                    .map(|l| l.content().clone());
                 if self.editor.convert_active_layer_to_raster() {
+                    if let Some(before) = before {
+                        self.record_content_change(before);
+                    }
                     // Nothing to re-render: the pixels are already the layer's tiles. It simply
                     // stops re-deriving them, which is exactly what makes this one-way.
                     self.font_substituted = None;
                     self.status_message = Some(
-                        "Converted to a raster layer. It can be painted on now, and the text is \
-                         no longer editable."
+                        "Converted to a raster layer. It can be painted on now; the text is \
+                         no longer editable, but undo will bring it back."
                             .to_owned(),
                     );
                     self.mark_dirty();
@@ -1521,6 +1547,15 @@ impl OpenPaint {
                     .document_mut()
                     .active_mut()
                     .restore_layer(index, layer);
+                self.request_redraw();
+            }
+            renderer::HistoryChange::ContentRestored { index, content } => {
+                if let Some(layer) = self.editor.document_mut().active_mut().layer_mut(index) {
+                    layer.set_content(content);
+                }
+                // The palette shows a caption's own words, so it has to follow them back.
+                self.editor.rename_active_layer_from_text();
+                self.font_substituted = None;
                 self.request_redraw();
             }
             renderer::HistoryChange::LayerDeleted { index } => {
@@ -3255,6 +3290,86 @@ mod tests {
             "the line went from {before} dabs to {after} while the pen was held still; it \
              should have kept travelling toward the cursor"
         );
+    }
+
+    /// The document half of undoing a text edit, which is all that is testable without a window:
+    /// the block goes back, and the palette name follows it.
+    ///
+    /// The renderer half — re-deriving the pixels — needs a surface, so it is not reachable here.
+    /// Named rather than left implicit, because that is precisely the seam a bug would hide in.
+    #[test]
+    fn a_content_change_can_be_walked_back_and_forward() {
+        let mut app = OpenPaint::default();
+        app.apply_text_action(ui::TextAction::AddLayer);
+        let index = app.editor.active_layer_index();
+
+        let mut block = app.editor.active_text().cloned().expect("text layer");
+        block.text = "FIRST DRAFT".into();
+        app.apply_text_edit(block.clone());
+        let first = app.editor.active_text().cloned().expect("still text");
+
+        block.text = "SECOND DRAFT".into();
+        app.apply_text_edit(block);
+        assert_eq!(app.editor.active_text().expect("text").text, "SECOND DRAFT");
+
+        // Undo is applied to the document by `apply_history_change`, which is the half that runs
+        // without a renderer.
+        app.apply_history_change(renderer::HistoryChange::ContentRestored {
+            index,
+            content: openpaint_core::Content::Text(Box::new(first)),
+        });
+        assert_eq!(
+            app.editor.active_text().expect("text").text,
+            "FIRST DRAFT",
+            "undo did not put the words back"
+        );
+        assert_eq!(
+            app.editor.layers()[index].name,
+            "FIRST DRAFT",
+            "the layer name should follow the text back"
+        );
+    }
+
+    /// Undoing a conversion has to make the layer a text layer again — and stop accepting paint,
+    /// or the guard would be one undo away from being wrong.
+    #[test]
+    fn undoing_a_conversion_restores_the_text_and_the_guard() {
+        let mut app = OpenPaint::default();
+        app.apply_text_action(ui::TextAction::AddLayer);
+        let index = app.editor.active_layer_index();
+        let before = app.editor.layers()[index].content().clone();
+
+        app.apply_text_action(ui::TextAction::ConvertToRaster);
+        assert!(app.editor.active_layer_accepts_paint());
+
+        app.apply_history_change(renderer::HistoryChange::ContentRestored {
+            index,
+            content: before,
+        });
+        assert!(
+            app.editor.active_text().is_some(),
+            "the text should be back"
+        );
+        assert!(
+            !app.editor.active_layer_accepts_paint(),
+            "and a text layer must refuse paint again"
+        );
+    }
+
+    /// An undo is a change to the document like any other, so the file is out of date after one.
+    #[test]
+    fn restoring_content_marks_the_document_dirty() {
+        let mut app = OpenPaint::default();
+        app.apply_text_action(ui::TextAction::AddLayer);
+        let index = app.editor.active_layer_index();
+        app.mark_clean();
+        assert!(!app.dirty);
+
+        app.apply_history_change(renderer::HistoryChange::ContentRestored {
+            index,
+            content: openpaint_core::Content::Raster,
+        });
+        assert!(app.dirty, "an undo leaves the file behind the document");
     }
 
     /// A text layer's pixels are derived, so nothing may paint them. Checked through every
