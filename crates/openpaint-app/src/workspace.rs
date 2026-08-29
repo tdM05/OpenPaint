@@ -161,6 +161,19 @@ pub struct Workspace {
     drag: PanelDrag,
     /// Where the canvas panel ended up last frame, so the renderer can put the canvas there.
     canvas_rect: Option<Rect>,
+    /// The panel list, and where it is, while it is open.
+    ///
+    /// **It belongs to the workspace and not to any panel, and that is the whole point.** It used
+    /// to live only in the Menu panel -- which is itself closable, so closing the Menu took away
+    /// the only way to bring anything back, including the Menu. A route out of a state cannot be
+    /// reachable only from inside that state.
+    ///
+    /// Reached with a secondary press anywhere, so it needs no panel to exist and no particular
+    /// panel to be open. The Menu still offers it too, because a right-click is not discoverable
+    /// on its own.
+    panel_list: Option<Rect>,
+    /// The list's own half-finished gesture, exactly like any other described panel's.
+    list_input: crate::panel_draw::PanelInput,
 }
 
 impl Default for Workspace {
@@ -171,6 +184,8 @@ impl Default for Workspace {
             theme: load_theme().unwrap_or_default(),
             drag: PanelDrag::default(),
             canvas_rect: None,
+            panel_list: None,
+            list_input: crate::panel_draw::PanelInput::default(),
         }
     }
 }
@@ -250,7 +265,9 @@ impl Workspace {
     /// chrome feel dead. Once it arms, the pointer is spoken for until release.
     #[must_use]
     pub fn busy(&self) -> bool {
-        self.drag.armed()
+        // The open panel list counts: it floats over whatever is beneath, including the canvas,
+        // and a press meant for it must not also start a stroke.
+        self.drag.armed() || self.panel_list.is_some()
     }
 
     /// Abandon a panel drag without applying it.
@@ -258,8 +275,9 @@ impl Workspace {
     /// Escape, and the same promise a transform makes (§5e): a gesture you have thought better of
     /// costs nothing, because nothing has happened to the layout until you let go.
     pub fn cancel_drag(&mut self) -> bool {
-        let was = self.drag.active();
+        let was = self.drag.active() || self.panel_list.is_some();
         self.drag.cancel();
+        self.panel_list = None;
         was
     }
 
@@ -428,56 +446,54 @@ impl Workspace {
             )
         });
 
-        // A gesture with the button no longer down is a release we never saw — the pointer left
-        // the window, the app lost focus, a synthesised event went missing. Without this the grab
-        // stays live and *every* later pointer move keeps rearranging the workspace, which is
-        // indistinguishable from the app having gone mad.
-        if self.drag.active() && !down && !pressed {
-            self.drag.cancel();
-        }
-        // Painting is demand-driven, so a hold with the pointer still would never fire: no events,
-        // no frames, and the timer never read. Reported as the hold "sometimes" not working — it
-        // was whenever the pen was steady enough to stop producing motion.
+        // Painting is demand-driven, so a hold with the pointer still would never fire: no
+        // events, no frames, and the timer never read. Reported as the hold "sometimes" not
+        // working; it was whenever the pen was steady enough to stop producing motion.
         if let Some(left) = self.drag.waiting_ms(now_ms) {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(
                 (left / 1000.0).max(0.008),
             ));
         }
-        let mut preview = None;
-        if let Some(pos) = pointer {
-            let (x, y) = (pos.x, pos.y);
-            if pressed {
-                let target = chrome::target_at(
-                    &placed,
-                    &splitters,
-                    &m,
-                    style_of,
-                    |pl, i| self.measure(ctx, pl.tabs.get(i).copied()),
-                    x,
-                    y,
-                );
-                self.drag.press(&self.layout, &target, x, y, now_ms);
-            } else if released {
-                let outcome = self
-                    .drag
-                    .release(&mut self.layout, &mut self.history, screen, x, y);
-                // A panel let go outside is asked to float; until floating windows exist, put it
-                // back rather than dropping it on the floor. Silently losing a panel would be the
-                // worst possible answer (§6b).
-                match outcome {
-                    Outcome::Floated(panel) => {
-                        // Until floating windows exist, put it back rather than dropping it on the
-                        // floor. Silently losing a panel would be the worst possible answer (§6b).
-                        self.open(panel);
-                        self.remember();
-                    }
-                    Outcome::Moved | Outcome::Resized => self.remember(),
-                    Outcome::Nothing | Outcome::Switched => {}
-                }
-            } else {
-                preview = self.drag.drag(&mut self.layout, screen, x, y, now_ms);
+
+        // Pulled out of `self` before the call: the closure below must not hold a borrow of the
+        // workspace the gesture is about to change.
+        let label = m.label;
+        // The panel list: opened by a secondary press anywhere, closed by a primary press outside
+        // it. Anywhere, because it must not depend on any panel being open -- least of all the one
+        // it used to live in.
+        if ctx.input(|i| i.pointer.secondary_pressed()) {
+            if let Some(pos) = pointer {
+                self.panel_list = Some(self.list_rect(ctx, pos.x, pos.y, screen));
             }
         }
+        let on_list = list_press(self.panel_list, pressed, pointer.map(|q| (q.x, q.y)));
+        if on_list == ListPress::Close {
+            self.panel_list = None;
+        }
+
+        let preview = if on_list == ListPress::Consume {
+            // The list owns this press. A drag already in flight still gets its release, which is
+            // why only the press is withheld and not the whole frame.
+            None
+        } else {
+            self.gesture(
+                screen,
+                crate::panel_drag::pulse(pressed, released, down),
+                pointer.map(|p| (p.x, p.y)),
+                now_ms,
+                |x, y| {
+                    chrome::target_at(
+                        &placed,
+                        &splitters,
+                        &m,
+                        style_of,
+                        |pl, i| measure(ctx, label, pl.tabs.get(i).copied()),
+                        x,
+                        y,
+                    )
+                },
+            )
+        };
 
         // --- draw, from the layout as it now stands ---
         let placed = self.layout.resolve(screen);
@@ -492,7 +508,7 @@ impl Workspace {
         self.canvas_rect = placed.iter().find_map(|slot| {
             (slot.tabs.get(slot.active) == Some(&CANVAS)).then(|| {
                 chrome::panel(slot, &m, style_of(slot), |i| {
-                    self.measure(ctx, slot.tabs.get(i).copied())
+                    measure(ctx, m.label, slot.tabs.get(i).copied())
                 })
                 .content
             })
@@ -525,7 +541,7 @@ impl Workspace {
             };
             let style = style_of(slot);
             let c = chrome::panel(slot, &m, style, |i| {
-                self.measure(ctx, slot.tabs.get(i).copied())
+                measure(ctx, m.label, slot.tabs.get(i).copied())
             });
 
             // The header always; the body only for panels that draw something in it. The canvas
@@ -618,7 +634,7 @@ impl Workspace {
                 Held::Panel { path } => {
                     if let Some(slot) = placed.iter().find(|s| &s.path == path) {
                         let c = chrome::panel(slot, &m, style_of(slot), |i| {
-                            self.measure(ctx, slot.tabs.get(i).copied())
+                            measure(ctx, m.label, slot.tabs.get(i).copied())
                         });
                         painter.rect_filled(to_egui(c.header), m.radius, tint);
                     }
@@ -677,7 +693,7 @@ impl Workspace {
             if let Some((path, _)) = self.layout.find(panel) {
                 if let Some(slot) = placed.iter().find(|s| s.path == path) {
                     let c = chrome::panel(slot, &m, style_of(slot), |i| {
-                        self.measure(ctx, slot.tabs.get(i).copied())
+                        measure(ctx, m.label, slot.tabs.get(i).copied())
                     });
                     painter.rect_filled(
                         to_egui(c.header),
@@ -734,20 +750,196 @@ impl Workspace {
                 );
             }
         }
+
+        // --- the panel list, above everything, drawn by the same descriptor layer as any panel ---
+        if let Some(rect) = self.panel_list {
+            let controls = panel_list_controls(&self.layout);
+            let theme = self.theme;
+            let mut ui = egui::Ui::new(
+                ctx.clone(),
+                egui::LayerId::new(egui::Order::Foreground, egui::Id::new("panel-list")),
+                egui::Id::new("panel-list-ui"),
+                egui::UiBuilder::new().max_rect(to_egui(rect)),
+            );
+            ui.set_clip_rect(to_egui(rect));
+            let frame = ui.painter();
+            frame.rect_filled(to_egui(rect), m.radius, rgb(p.panel));
+            frame.rect_stroke(
+                to_egui(rect),
+                m.radius,
+                egui::Stroke::new(1.0_f32, rgb(p.edge)),
+            );
+            let changes = crate::panel_draw::show(&mut ui, &controls, &theme, &mut self.list_input);
+            for change in changes {
+                match change {
+                    // The list stays open on a toggle: showing three panels should be three taps,
+                    // not three right-clicks.
+                    crate::panel_ui::Change::Toggled(id, _) => self.toggle(PanelId(id)),
+                    other => eprintln!("panel list: unexpected {other:?}"),
+                }
+            }
+        }
     }
 
-    /// Width of a tab's label, measured by the thing that will draw it.
-    fn measure(&self, ctx: &egui::Context, panel: Option<PanelId>) -> f32 {
-        let Some(panel) = panel else {
-            return 0.0;
-        };
-        let font = egui::FontId::proportional(self.theme.metrics.label);
-        ctx.fonts(|f| {
-            f.layout_no_wrap(name_of(panel).to_owned(), font, egui::Color32::WHITE)
-                .size()
-                .x
-        })
+    /// Where the panel list goes when it is opened at a point.
+    ///
+    /// Sized to its own contents and kept inside the window, so opening it near an edge does not
+    /// put half of it out of reach.
+    fn list_rect(&self, ctx: &egui::Context, x: f32, y: f32, screen: Rect) -> Rect {
+        let m = self.theme.metrics;
+        let controls = panel_list_controls(&self.layout);
+        let widest = PANELS
+            .iter()
+            .map(|k| {
+                ctx.fonts(|f| {
+                    f.layout_no_wrap(
+                        k.name.to_owned(),
+                        egui::FontId::proportional(m.body),
+                        egui::Color32::WHITE,
+                    )
+                    .size()
+                    .x
+                })
+            })
+            .fold(0.0_f32, f32::max);
+        // Room for the name, the switch beside it, and the padding either side.
+        let w = (widest + m.row * 1.6 + m.padding * 4.0).min(screen.w);
+        let h = (crate::panel_ui::total_height(&controls, &m) + m.padding * 2.0).min(screen.h);
+        Rect::new(
+            x.min(screen.x + screen.w - w).max(screen.x),
+            y.min(screen.y + screen.h - h).max(screen.y),
+            w,
+            h,
+        )
     }
+
+    /// Advance whatever gesture is in flight by one frame, and report what to draw.
+    ///
+    /// Separated from `show` so it can be driven frame by frame without a window, which is what
+    /// the release bug needed and did not have: every drag test built a target by hand and called
+    /// press/drag/release directly, so none of them ever saw the frame sequence the app produces.
+    ///
+    /// `target_at` is a closure rather than a value because working out what is under the pointer
+    /// costs a text measurement per tab, and only a press needs the answer.
+    fn gesture(
+        &mut self,
+        screen: Rect,
+        pulse: crate::panel_drag::Pulse,
+        pointer: Option<(f32, f32)>,
+        now_ms: f64,
+        target_at: impl FnOnce(f32, f32) -> crate::panel_drag::Target,
+    ) -> Option<crate::panel_drag::Preview> {
+        use crate::panel_drag::Pulse;
+        let Some((x, y)) = pointer else {
+            // Nowhere to press, drop or follow to. A gesture in flight with no pointer is one
+            // whose pointer has gone, whatever this frame claims.
+            self.drag.cancel();
+            return None;
+        };
+        match pulse {
+            Pulse::Press => {
+                let target = target_at(x, y);
+                self.drag.press(&self.layout, &target, x, y, now_ms);
+                None
+            }
+            Pulse::Release => {
+                let outcome = self
+                    .drag
+                    .release(&mut self.layout, &mut self.history, screen, x, y);
+                if saves(&outcome) {
+                    self.remember();
+                }
+                match outcome {
+                    Outcome::Floated(panel) => {
+                        // Until floating windows exist, put it back rather than dropping it on
+                        // the floor. Silently losing a panel would be the worst possible answer
+                        // (DECISIONS 6b).
+                        self.open(panel);
+                    }
+                    Outcome::Moved | Outcome::Resized | Outcome::Nothing | Outcome::Switched => {}
+                }
+                None
+            }
+            Pulse::Track => self.drag.drag(&mut self.layout, screen, x, y, now_ms),
+            Pulse::Lost => {
+                self.drag.cancel();
+                None
+            }
+        }
+    }
+}
+
+/// What a primary press does to the panel list.
+///
+/// Its own answer because it is three rules that have to agree, and burying them in a frame is
+/// how the release bug happened: a press *inside* the list must reach the list and must not also
+/// close it or start a panel drag; a press outside must close it; and with no list open there is
+/// nothing to decide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListPress {
+    /// Nothing to do with the list.
+    Ignore,
+    /// Put the list away.
+    Close,
+    /// The list takes this press, and nothing else sees it.
+    Consume,
+}
+
+#[must_use]
+fn list_press(list: Option<Rect>, pressed: bool, at: Option<(f32, f32)>) -> ListPress {
+    if !pressed {
+        return ListPress::Ignore;
+    }
+    match (list, at) {
+        (Some(r), Some((x, y))) if r.contains(x, y) => ListPress::Consume,
+        (Some(_), _) => ListPress::Close,
+        (None, _) => ListPress::Ignore,
+    }
+}
+
+/// The panel list: one switch per panel this build knows about.
+///
+/// Built from `PANELS` rather than from a hand-written list, so a panel added to the table appears
+/// here without anyone remembering to add it (recurring hazard 11a.8).
+#[must_use]
+fn panel_list_controls(layout: &Layout) -> Vec<crate::panel_ui::Control> {
+    let mut controls = vec![crate::panel_ui::Control::Label {
+        text: "Panels".to_owned(),
+    }];
+    controls.extend(PANELS.iter().map(|k| crate::panel_ui::Control::Toggle {
+        id: k.id.0,
+        text: k.name.to_owned(),
+        on: layout.find(k.id).is_some(),
+    }));
+    controls
+}
+
+/// Whether an outcome changed the arrangement and so needs writing out.
+///
+/// Its own function because the decision and the side effect are two different things, and a test
+/// can only see the decision: a test that called `remember` would be testing the filesystem.
+/// Switching tab deliberately does not count -- which tab you were looking at is not part of the
+/// arrangement, the same reason it is not recorded for undo.
+#[must_use]
+fn saves(outcome: &Outcome) -> bool {
+    match outcome {
+        Outcome::Moved | Outcome::Resized | Outcome::Floated(_) => true,
+        Outcome::Nothing | Outcome::Switched => false,
+    }
+}
+
+/// How wide a panel's name is, for laying its tab out.
+#[must_use]
+fn measure(ctx: &egui::Context, label: f32, panel: Option<PanelId>) -> f32 {
+    let Some(panel) = panel else {
+        return 0.0;
+    };
+    let font = egui::FontId::proportional(label);
+    ctx.fonts(|f| {
+        f.layout_no_wrap(name_of(panel).to_owned(), font, egui::Color32::WHITE)
+            .size()
+            .x
+    })
 }
 
 /// A leaf's header style: compact only when *every* panel in it wants that.
@@ -806,6 +998,365 @@ fn rgb(c: Color) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A workspace with the default arrangement and nothing in flight.
+    ///
+    /// Built directly rather than through `Workspace::new`, which would read whatever the machine
+    /// running the tests happens to have saved.
+    fn bare() -> Workspace {
+        Workspace {
+            layout: default_layout(),
+            history: LayoutHistory::default(),
+            theme: crate::theme::Theme::default(),
+            drag: crate::panel_drag::PanelDrag::default(),
+            canvas_rect: None,
+            panel_list: None,
+            list_input: crate::panel_draw::PanelInput::default(),
+        }
+    }
+
+    /// A press inside the open list belongs to the list: it must not also close it, and it must
+    /// not start a panel drag underneath.
+    ///
+    /// Closing on the press that toggled a switch would make showing three panels three
+    /// right-clicks instead of three taps.
+    #[test]
+    fn a_press_inside_the_panel_list_is_the_lists_own() {
+        let r = Rect::new(100.0, 100.0, 200.0, 300.0);
+        assert_eq!(
+            list_press(Some(r), true, Some((150.0, 150.0))),
+            ListPress::Consume
+        );
+        // Outside puts it away.
+        assert_eq!(
+            list_press(Some(r), true, Some((50.0, 50.0))),
+            ListPress::Close
+        );
+        // A press with the pointer nowhere is still a press somewhere else.
+        assert_eq!(list_press(Some(r), true, None), ListPress::Close);
+        // Hovering over it decides nothing.
+        assert_eq!(
+            list_press(Some(r), false, Some((150.0, 150.0))),
+            ListPress::Ignore
+        );
+        assert_eq!(
+            list_press(None, true, Some((150.0, 150.0))),
+            ListPress::Ignore
+        );
+    }
+
+    /// An open list floats over whatever is beneath it, including the canvas, so the workspace is
+    /// busy while it is up. Otherwise a tap on a switch also lays down a brush dab.
+    #[test]
+    fn an_open_panel_list_holds_the_pointer() {
+        let mut ws = bare();
+        assert!(!ws.busy(), "nothing is happening yet");
+        ws.panel_list = Some(Rect::new(10.0, 10.0, 200.0, 300.0));
+        assert!(
+            ws.busy(),
+            "a press meant for the list must not reach the canvas"
+        );
+        ws.cancel_drag();
+        assert!(!ws.busy(), "and Escape puts it away");
+    }
+
+    /// **There is always a way back, from any state the artist can reach.**
+    ///
+    /// This is the bug that shipped: the tick list that reopens a panel lived inside the Menu
+    /// panel, which is closable like any other. Closing the Menu therefore took away the only way
+    /// to bring anything back, including the Menu itself -- and the arrangement was saved, so
+    /// restarting did not help either. A route out of a state cannot be reachable only from
+    /// inside that state.
+    #[test]
+    fn every_panel_can_be_reopened_even_with_all_of_them_closed() {
+        let mut ws = bare();
+        for kind in PANELS {
+            if ws.is_open(kind.id) {
+                ws.toggle(kind.id);
+            }
+        }
+        for kind in PANELS {
+            assert!(!ws.is_open(kind.id), "{} is still open", kind.name);
+        }
+
+        // The list is built from the workspace, not from a panel, so it still offers everything.
+        let controls = panel_list_controls(&ws.layout);
+        for kind in PANELS {
+            assert!(
+                controls.iter().any(|c| c.id() == Some(kind.id.0)),
+                "{} cannot be reopened",
+                kind.name
+            );
+        }
+
+        // And the switches actually bring them back.
+        for kind in PANELS {
+            ws.toggle(kind.id);
+            assert!(ws.is_open(kind.id), "{} did not come back", kind.name);
+        }
+    }
+
+    /// The list is the panel table, not a copy of it that someone has to remember to update.
+    #[test]
+    fn the_panel_list_offers_every_panel_this_build_has() {
+        let ws = bare();
+        let controls = panel_list_controls(&ws.layout);
+        let switches = controls.iter().filter(|c| c.id().is_some()).count();
+        assert_eq!(switches, PANELS.len());
+        for kind in PANELS {
+            let on = controls.iter().any(|c| {
+                matches!(c, crate::panel_ui::Control::Toggle { id, on, .. }
+                    if *id == kind.id.0 && *on)
+            });
+            assert_eq!(
+                on,
+                ws.is_open(kind.id),
+                "{}'s switch disagrees with the layout",
+                kind.name
+            );
+        }
+    }
+
+    /// **A whole move, driven one frame at a time the way the app drives it.**
+    ///
+    /// This is the test that was missing. Every drag test built a `Target` by hand and called
+    /// press, drag and release in a row, so none of them ever saw the frame sequence a real
+    /// pointer produces: and in that sequence the release frame reports the button *already up*.
+    /// A guard reading "not down" as a lost pointer therefore cancelled every gesture on the exact
+    /// frame it should have been completed, and moving a panel silently did nothing for as long as
+    /// that guard existed.
+    #[test]
+    fn a_move_survives_the_frame_the_pointer_is_released_on() {
+        use crate::panel_drag::{pulse, Pulse, Target, HOLD_MS};
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let mut ws = bare();
+        let brush_before = ws.layout.find(BRUSH).expect("brush").0;
+        let placed = ws.layout.resolve(screen);
+        let brush = placed
+            .iter()
+            .find(|p| p.tabs.contains(&BRUSH))
+            .expect("brush leaf");
+        let chrome = crate::chrome::panel(brush, &ws.theme.metrics, style_of(brush), |_| 46.0);
+        let (px, py) = (
+            chrome.header.x + chrome.header.w / 2.0,
+            chrome.header.y + chrome.header.h / 2.0,
+        );
+        let target = Target::Tab {
+            path: brush.path.clone(),
+            tab: brush.active,
+        };
+        let canvas = placed
+            .iter()
+            .find(|p| p.tabs.contains(&CANVAS))
+            .expect("canvas");
+        let (dx, dy) = (
+            canvas.rect.x + canvas.rect.w / 2.0,
+            canvas.rect.y + canvas.rect.h - 8.0,
+        );
+
+        // Frame 1: the button goes down.
+        ws.gesture(
+            screen,
+            pulse(true, false, true),
+            Some((px, py)),
+            0.0,
+            |_, _| target.clone(),
+        );
+        // Frame 2: still held, still there, past the hold.
+        ws.gesture(
+            screen,
+            pulse(false, false, true),
+            Some((px, py)),
+            HOLD_MS + 1.0,
+            |_, _| unreachable!("only a press asks what is under the pointer"),
+        );
+        assert!(ws.drag.armed(), "the hold should have armed the move");
+        // Frame 3: carried over the canvas.
+        ws.gesture(
+            screen,
+            pulse(false, false, true),
+            Some((dx, dy)),
+            HOLD_MS + 2.0,
+            |_, _| unreachable!(),
+        );
+        // Frame 4: let go. egui reports the release *and* the button already up, together.
+        assert_eq!(pulse(false, true, false), Pulse::Release);
+        ws.gesture(
+            screen,
+            pulse(false, true, false),
+            Some((dx, dy)),
+            HOLD_MS + 3.0,
+            |_, _| unreachable!(),
+        );
+
+        let brush_after = ws.layout.find(BRUSH).expect("brush must still exist").0;
+        assert_ne!(
+            brush_before, brush_after,
+            "the drop did nothing: the panel is exactly where it started"
+        );
+    }
+
+    /// A pointer that goes missing mid-gesture cancels it and leaves the arrangement alone.
+    ///
+    /// Without this the grab stays live and *every* later pointer move keeps rearranging the
+    /// workspace, which is indistinguishable from the app having gone mad.
+    #[test]
+    fn a_lost_pointer_abandons_the_gesture() {
+        use crate::panel_drag::{pulse, Target, HOLD_MS};
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let mut ws = bare();
+        let before = ws.layout.clone();
+        let (path, _) = ws.layout.find(BRUSH).expect("brush");
+        let target = Target::Tab { path, tab: 0 };
+
+        ws.gesture(
+            screen,
+            pulse(true, false, true),
+            Some((10.0, 10.0)),
+            0.0,
+            |_, _| target.clone(),
+        );
+        ws.gesture(
+            screen,
+            pulse(false, false, true),
+            Some((10.0, 10.0)),
+            HOLD_MS + 1.0,
+            |_, _| unreachable!(),
+        );
+        assert!(ws.drag.active(), "there should be a gesture to lose");
+
+        // The button is not down and no release was reported: the pointer is gone.
+        ws.gesture(
+            screen,
+            pulse(false, false, false),
+            Some((700.0, 700.0)),
+            HOLD_MS + 2.0,
+            |_, _| unreachable!(),
+        );
+        assert!(!ws.drag.active(), "the gesture should have been abandoned");
+        assert_eq!(ws.layout, before, "and nothing should have moved");
+    }
+
+    /// A panel let go outside the window comes back rather than being lost.
+    ///
+    /// Floating windows do not exist yet, so there is nowhere for it to go -- and silently losing
+    /// a panel is the worst possible answer (DECISIONS 6b), especially now that the panel holding
+    /// the way to reopen things is itself movable.
+    #[test]
+    fn a_panel_let_go_outside_the_window_comes_back() {
+        use crate::panel_drag::{pulse, Target, HOLD_MS};
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let mut ws = bare();
+        let (path, _) = ws.layout.find(BRUSH).expect("brush");
+        let target = Target::Tab { path, tab: 0 };
+
+        ws.gesture(
+            screen,
+            pulse(true, false, true),
+            Some((10.0, 10.0)),
+            0.0,
+            |_, _| target.clone(),
+        );
+        ws.gesture(
+            screen,
+            pulse(false, false, true),
+            Some((10.0, 10.0)),
+            HOLD_MS + 1.0,
+            |_, _| unreachable!(),
+        );
+        // Well outside the window.
+        let (ox, oy) = (screen.w + 200.0, screen.h + 200.0);
+        ws.gesture(
+            screen,
+            pulse(false, false, true),
+            Some((ox, oy)),
+            HOLD_MS + 2.0,
+            |_, _| unreachable!(),
+        );
+        ws.gesture(
+            screen,
+            pulse(false, true, false),
+            Some((ox, oy)),
+            HOLD_MS + 3.0,
+            |_, _| unreachable!(),
+        );
+        assert!(
+            ws.layout.find(BRUSH).is_some(),
+            "the panel was dropped on the floor"
+        );
+    }
+
+    /// What is worth writing out, and what is not.
+    #[test]
+    fn only_a_changed_arrangement_is_saved() {
+        assert!(saves(&Outcome::Moved));
+        assert!(saves(&Outcome::Resized));
+        assert!(saves(&Outcome::Floated(BRUSH)));
+        assert!(!saves(&Outcome::Nothing));
+        // Which tab you are looking at is not part of the arrangement, the same reason it is not
+        // recorded for undo.
+        assert!(!saves(&Outcome::Switched));
+    }
+
+    /// Press where a pointer would land, wait out the hold, move to another panel, let go.
+    ///
+    /// Every earlier test built a `Target::Tab` by hand and started from there, which skipped
+    /// `chrome::target_at` entirely — the one piece that has to agree with what is drawn. A move
+    /// that stopped working in the app while every drag test stayed green is exactly what that
+    /// gap looks like.
+    #[test]
+    fn a_panel_can_be_moved_from_a_press_on_what_is_drawn() {
+        use crate::panel_drag::{Outcome, PanelDrag, HOLD_MS};
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let mut layout = default_layout();
+        let m = crate::theme::Theme::default().metrics;
+        let measure = |_: &crate::layout::Placed, _: usize| 46.0;
+
+        // Where the Brush panel's header actually is.
+        let placed = layout.resolve(screen);
+        let brush = placed
+            .iter()
+            .find(|p| p.tabs.contains(&BRUSH))
+            .expect("the default layout has a Brush panel");
+        let chrome = crate::chrome::panel(brush, &m, style_of(brush), |i| measure(brush, i));
+        let (px, py) = (
+            chrome.header.x + chrome.header.w / 2.0,
+            chrome.header.y + chrome.header.h / 2.0,
+        );
+
+        let splitters = layout.splitters(screen, m.splitter_grab);
+        let target = crate::chrome::target_at(&placed, &splitters, &m, style_of, measure, px, py);
+        assert!(
+            matches!(target, crate::panel_drag::Target::Tab { .. }),
+            "a press on a drawn header must be a tab: got {target:?}"
+        );
+
+        let mut drag = PanelDrag::default();
+        let mut history = LayoutHistory::default();
+        drag.press(&layout, &target, px, py, 0.0);
+        // Held still past the hold, which is what arms it.
+        drag.drag(&mut layout, screen, px, py, HOLD_MS + 1.0);
+        assert!(drag.armed(), "the hold should have armed the move");
+
+        // Onto the far side of the canvas, which is a different leaf.
+        let canvas = layout
+            .resolve(screen)
+            .into_iter()
+            .find(|p| p.tabs.contains(&CANVAS))
+            .expect("canvas");
+        let (dx, dy) = (
+            canvas.rect.x + canvas.rect.w / 2.0,
+            canvas.rect.y + canvas.rect.h - 8.0,
+        );
+        drag.drag(&mut layout, screen, dx, dy, HOLD_MS + 2.0);
+        let outcome = drag.release(&mut layout, &mut history, screen, dx, dy);
+
+        assert_eq!(outcome, Outcome::Moved, "the drop did nothing");
+        assert!(
+            layout.find(BRUSH).is_some(),
+            "and the panel must still exist"
+        );
+    }
     use super::*;
 
     /// The default layout puts every panel somewhere, and the canvas gets the most room.

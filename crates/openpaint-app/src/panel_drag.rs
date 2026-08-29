@@ -373,6 +373,44 @@ impl PanelDrag {
     }
 }
 
+/// What one frame's pointer state means for a gesture in flight.
+///
+/// **This exists because the two answers used to be written in two places and disagreed.** A
+/// guard cancelled any gesture whose button was not down, and a branch below it completed the
+/// gesture when a release was reported. But egui reports the release and the button-already-up in
+/// the *same* frame, so the guard fired first and every drop landed on a gesture that had just
+/// been thrown away. Resizing still looked fine, because a divider is dragged live and only its
+/// saving happened on release; moving a panel did nothing at all, which is exactly what was
+/// reported. One list cannot disagree with itself (recurring hazard 11a.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pulse {
+    /// The button went down: a gesture may begin.
+    Press,
+    /// The button came up: whatever is in flight must be completed now.
+    Release,
+    /// The button is still down: keep following.
+    Track,
+    /// Not down, and no release was reported. The pointer left the window, the app lost focus, a
+    /// synthesised event went missing. Without noticing this the grab stays live and every later
+    /// pointer move keeps rearranging the workspace.
+    Lost,
+}
+
+/// Read a frame's pointer state. Order matters and is the whole content of this function.
+#[must_use]
+pub fn pulse(pressed: bool, released: bool, down: bool) -> Pulse {
+    if pressed {
+        Pulse::Press
+    } else if released {
+        // Before `down`, which is already false by the time a release is reported.
+        Pulse::Release
+    } else if down {
+        Pulse::Track
+    } else {
+        Pulse::Lost
+    }
+}
+
 /// Whether a drop would change nothing: back onto the leaf it came from, in the centre.
 ///
 /// Worth its own answer rather than letting the move happen and produce an identical tree, because
@@ -383,6 +421,29 @@ fn is_noop(placed: &Placed, panel: PanelId, zone: Zone) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// **A release is a release even though the button is already up.**
+    ///
+    /// egui reports both in the same frame: `primary_released()` is true and `primary_down()` is
+    /// already false. Reading "not down" as a lost pointer therefore threw away every gesture on
+    /// the exact frame it should have been completed.
+    #[test]
+    fn a_release_is_not_mistaken_for_a_lost_pointer() {
+        assert_eq!(pulse(false, true, false), Pulse::Release);
+        // And with the button somehow still reported down, it is still a release.
+        assert_eq!(pulse(false, true, true), Pulse::Release);
+    }
+
+    /// The other three readings, so the order above is pinned from both sides.
+    #[test]
+    fn a_frame_is_read_as_exactly_one_thing() {
+        assert_eq!(pulse(true, false, true), Pulse::Press);
+        assert_eq!(pulse(false, false, true), Pulse::Track);
+        assert_eq!(pulse(false, false, false), Pulse::Lost);
+        // A press and a release coalesced into one frame is a press; the release arrives next
+        // frame as `Lost` at worst, which cancels rather than acting on a half-known gesture.
+        assert_eq!(pulse(true, true, false), Pulse::Press);
+    }
     use super::*;
 
     const CANVAS: PanelId = PanelId(1);
