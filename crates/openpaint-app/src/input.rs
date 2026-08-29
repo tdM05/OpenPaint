@@ -45,10 +45,7 @@ pub struct PenSample {
     pub pressure: f32,
     /// Pen tilt, radians from vertical, as (x, y). Zero when unavailable.
     ///
-    /// Intentionally part of the foundation now though nothing reads it yet:
-    /// the real pen backend fills it, and tilt-driven brushes consume it later.
-    /// Kept here so adding those is "use existing data", not a reshape.
-    #[allow(dead_code)]
+    /// Read by tilt-driven brush modulation, which is what it was reserved for.
     pub tilt: (f32, f32),
     /// When this sample reached us, on the [`now_ms`] clock.
     ///
@@ -85,6 +82,16 @@ impl PenSample {
     /// Shorthand for a backend with no tilt to report.
     pub fn at(x: f64, y: f64, pressure: f32) -> Self {
         Self::new(x, y, pressure, (0.0, 0.0))
+    }
+
+    /// How far the pen is tilted from vertical, in radians.
+    ///
+    /// The magnitude of the two axes. Which *way* it leans is a separate quantity, wanted for dab
+    /// angle rather than for scalar modulation, and it can be added when there is a parameter that
+    /// asks for it.
+    #[must_use]
+    pub fn tilt_from_vertical(&self) -> f32 {
+        self.tilt.0.hypot(self.tilt.1)
     }
 
     /// When this sample arrived, on the [`now_ms`] clock.

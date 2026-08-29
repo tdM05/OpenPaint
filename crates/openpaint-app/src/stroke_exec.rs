@@ -261,8 +261,8 @@ mod tests {
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
         // Frame 1: pen down and a drag, exactly as `handle_pen_event` produces.
-        editor.stroke_begin(400.0, 400.0, 1.0);
-        editor.stroke_to(600.0, 420.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(400.0, 400.0, 1.0));
+        editor.stroke_to(openpaint_core::brush::Sample::at(600.0, 420.0, 1.0));
         run_frame(
             &device,
             &queue,
@@ -276,7 +276,7 @@ mod tests {
         assert!(layer.has_paint(), "nothing accumulated on the first frame");
 
         // Frame 2: more of the same stroke, then pen up.
-        editor.stroke_to(800.0, 500.0, 1.0);
+        editor.stroke_to(openpaint_core::brush::Sample::at(800.0, 500.0, 1.0));
         editor.stroke_end();
         run_frame(
             &device,
@@ -316,7 +316,7 @@ mod tests {
         let mut recording = Vec::new();
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
-        editor.stroke_begin(500.0, 500.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(500.0, 500.0, 1.0));
         editor.stroke_end();
         run_frame(
             &device,
@@ -352,9 +352,9 @@ mod tests {
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
         // Far apart, so each lands in its own tile and one cannot mask the other.
-        editor.stroke_begin(200.0, 200.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(200.0, 200.0, 1.0));
         editor.stroke_end();
-        editor.stroke_begin(1600.0, 1600.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(1600.0, 1600.0, 1.0));
         editor.stroke_end();
         run_frame(
             &device,
@@ -412,8 +412,8 @@ mod tests {
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
         // A short stroke inside one tile, so it certainly fits and certainly lands.
-        editor.stroke_begin(100.0, 100.0, 1.0);
-        editor.stroke_to(150.0, 150.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(100.0, 100.0, 1.0));
+        editor.stroke_to(openpaint_core::brush::Sample::at(150.0, 150.0, 1.0));
         editor.stroke_end();
         run_frame(
             &device,
@@ -436,8 +436,8 @@ mod tests {
         for i in 0..6 {
             canvas.begin_frame();
             let x = 700.0 + i as f32 * 300.0;
-            editor.stroke_begin(x, 700.0, 1.0);
-            editor.stroke_to(x + 40.0, 740.0, 1.0);
+            editor.stroke_begin(openpaint_core::brush::Sample::at(x, 700.0, 1.0));
+            editor.stroke_to(openpaint_core::brush::Sample::at(x + 40.0, 740.0, 1.0));
             editor.stroke_end();
             run_frame(
                 &device,
@@ -502,8 +502,8 @@ mod tests {
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
         // A committed stroke on the left.
-        editor.stroke_begin(300.0, 500.0, 1.0);
-        editor.stroke_to(500.0, 500.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(300.0, 500.0, 1.0));
+        editor.stroke_to(openpaint_core::brush::Sample::at(500.0, 500.0, 1.0));
         editor.stroke_end();
         run_frame(
             &device,
@@ -519,9 +519,9 @@ mod tests {
         // A second stroke still in progress -- no `stroke_end`. It starts *over* the committed
         // one and runs off onto fresh ground, so one run covers both cases: a tile the canvas
         // already has, and a tile it has never had.
-        editor.stroke_begin(400.0, 500.0, 1.0);
-        editor.stroke_to(900.0, 500.0, 1.0);
-        editor.stroke_to(1500.0, 500.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(400.0, 500.0, 1.0));
+        editor.stroke_to(openpaint_core::brush::Sample::at(900.0, 500.0, 1.0));
+        editor.stroke_to(openpaint_core::brush::Sample::at(1500.0, 500.0, 1.0));
         run_frame(
             &device,
             &queue,
@@ -616,8 +616,8 @@ mod tests {
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
         // Two layers with a stroke each, so the save has to keep them apart.
-        editor.stroke_begin(400.0, 400.0, 1.0);
-        editor.stroke_to(700.0, 450.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(400.0, 400.0, 1.0));
+        editor.stroke_to(openpaint_core::brush::Sample::at(700.0, 450.0, 1.0));
         editor.stroke_end();
         let bottom_id = editor.active_layer_id();
         run_frame_on(
@@ -642,8 +642,8 @@ mod tests {
             .opacity = 0.6;
         let top_id = editor.active_layer_id();
         assert_ne!(top_id, bottom_id);
-        editor.stroke_begin(1200.0, 1200.0, 1.0);
-        editor.stroke_to(1500.0, 1250.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(1200.0, 1200.0, 1.0));
+        editor.stroke_to(openpaint_core::brush::Sample::at(1500.0, 1250.0, 1.0));
         editor.stroke_end();
         run_frame_on(
             &device,
@@ -747,8 +747,8 @@ mod tests {
 
         // Bottom layer: paint across the area.
         let bottom = editor.active_layer_id();
-        editor.stroke_begin(400.0, 400.0, 1.0);
-        editor.stroke_to(800.0, 400.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(400.0, 400.0, 1.0));
+        editor.stroke_to(openpaint_core::brush::Sample::at(800.0, 400.0, 1.0));
         editor.stroke_end();
         run_frame_on(
             &device,
@@ -765,8 +765,8 @@ mod tests {
         // Top layer: paint over the same area, then erase part of it.
         editor.document_mut().add_layer();
         let top = editor.active_layer_id();
-        editor.stroke_begin(400.0, 400.0, 1.0);
-        editor.stroke_to(800.0, 400.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(400.0, 400.0, 1.0));
+        editor.stroke_to(openpaint_core::brush::Sample::at(800.0, 400.0, 1.0));
         editor.stroke_end();
         run_frame_on(
             &device,
@@ -796,8 +796,8 @@ mod tests {
         editor.set_tool(crate::editor::Tool::Eraser);
         editor.brush_mut().radius = 40.0;
         editor.brush_mut().hardness = 1.0;
-        editor.stroke_begin(600.0, 400.0, 1.0);
-        editor.stroke_to(620.0, 400.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(600.0, 400.0, 1.0));
+        editor.stroke_to(openpaint_core::brush::Sample::at(620.0, 400.0, 1.0));
         editor.stroke_end();
         run_frame_on(
             &device,
@@ -861,8 +861,8 @@ mod tests {
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
         let id = editor.active_layer_id();
 
-        editor.stroke_begin(400.0, 400.0, 1.0);
-        editor.stroke_to(800.0, 400.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(400.0, 400.0, 1.0));
+        editor.stroke_to(openpaint_core::brush::Sample::at(800.0, 400.0, 1.0));
         editor.stroke_end();
         run_frame_on(
             &device,
@@ -879,8 +879,8 @@ mod tests {
         editor.set_tool(crate::editor::Tool::Eraser);
         editor.brush_mut().radius = 40.0;
         editor.brush_mut().hardness = 1.0;
-        editor.stroke_begin(600.0, 400.0, 1.0);
-        editor.stroke_to(620.0, 400.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(600.0, 400.0, 1.0));
+        editor.stroke_to(openpaint_core::brush::Sample::at(620.0, 400.0, 1.0));
         editor.stroke_end();
         run_frame_on(
             &device,
@@ -984,9 +984,9 @@ mod tests {
                 editor.set_tool(tool);
                 apply(editor.brush_mut());
                 // Pressure varies along the stroke, so the pressure response is in play too.
-                editor.stroke_begin(60.0, 120.0, 0.4);
-                editor.stroke_to(150.0, 170.0, 0.9);
-                editor.stroke_to(240.0, 120.0, 0.6);
+                editor.stroke_begin(openpaint_core::brush::Sample::at(60.0, 120.0, 0.4));
+                editor.stroke_to(openpaint_core::brush::Sample::at(150.0, 170.0, 0.9));
+                editor.stroke_to(openpaint_core::brush::Sample::at(240.0, 120.0, 0.6));
                 editor.stroke_end();
                 run_frame_on(
                     &device,
@@ -1324,8 +1324,8 @@ mod tests {
         editor.brush_mut().radius = 30.0;
         editor.brush_mut().hardness = 1.0;
         editor.brush_mut().set_color_srgb8([0, 0, 255]);
-        editor.stroke_begin(20.0, 100.0, 1.0);
-        editor.stroke_to(180.0, 100.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(20.0, 100.0, 1.0));
+        editor.stroke_to(openpaint_core::brush::Sample::at(180.0, 100.0, 1.0));
         editor.stroke_end();
         run_frame_on(
             &device,
@@ -1392,7 +1392,7 @@ mod tests {
             None,
             "alpha lock forbids changing alpha, and erasing is nothing else"
         );
-        editor.stroke_begin(10.0, 10.0, 1.0);
+        editor.stroke_begin(openpaint_core::brush::Sample::at(10.0, 10.0, 1.0));
         assert!(
             !editor.is_drawing(),
             "a stroke that cannot do anything must not start"

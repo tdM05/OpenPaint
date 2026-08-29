@@ -391,7 +391,53 @@ engine is written:
 On-disk storage format is a **separate, later** decision (Q6) — 16-bit in memory
 does not oblige 16-bit on disk.
 
-### 4m. Pressure drives brushes through curves — landed 2026-08-28
+### 4m. Any input can drive any parameter through a curve — 2026-08-28
+
+Asked well: *"just because we cannot see a use case does not mean one does not
+exist"*. Correct, and it changed the plan. The first version hardcoded pressure
+as the input and wired exactly two parameters. That was one instance of a
+pattern shipped in place of the pattern.
+
+**Every modulatable parameter is a `Response`**: a `Source` to read — pressure,
+tilt, velocity, stroke direction, randomness — and a curve mapping it to a
+multiplier. Which is what §4c committed to years of arguing ago: per-dab
+modulation, "each optionally driven by pressure/tilt/velocity through a curve".
+
+**Built before dab shape, deliberately.** Angle wants to follow *direction or
+tilt*, so adding angle first would have meant a "follow stroke direction" flag,
+then a "follow tilt" flag beside it, and then taking both out again. That is the
+"add a pencil *mode* instead of a parameter a pencil is a value of" mistake, and
+the ordering was changed to avoid walking into it.
+
+**And before presets**, which is the harder deadline: presets serialise a brush,
+and once brushes are authored, changing the model means migrating work the
+*artist* made rather than a document format. The free window is while none
+exist.
+
+Decisions inside it:
+
+- **The curve is always a multiplier**, for every parameter. The alternative —
+  scaling some parameters and replacing others — means no artist can predict a
+  curve without remembering which kind they are looking at.
+- **Every source is normalised to 0–1**, so any source can drive any parameter
+  and a curve authored against one reads sensibly against another. `VELOCITY_FULL`
+  and `TILT_FULL` are the scales that make those units mean something; being
+  approximate costs nothing, because any disagreement is expressible in the curve.
+- **Velocity and direction are computed by the brush**, not passed in. They are
+  properties of the *path*, and only the thing walking it knows them. Velocity is
+  distance over the clock, not over sample count — sample rate varies with pen
+  speed, so the two are not the same thing.
+- **The input is redrawn per dab**, not per segment, or a random-driven brush
+  emits rows of identical dabs.
+- **Opacity is still absent**, and that remains a property of the model: it is a
+  per-stroke ceiling, and a ceiling that varied per dab would not be one.
+
+Randomness under undo needs no special handling, which is worth noting because it
+usually does: history stores the **dabs**, not the gesture, so the numbers are
+already drawn by the time anything is recorded and a redo replays rather than
+re-rolls.
+
+### 4m-i. The first cut: pressure to size and flow — superseded above
 
 The first piece of brush depth (§4.2), and the one that makes brush *presets*
 worth having: presets over the parameters we had would have produced six

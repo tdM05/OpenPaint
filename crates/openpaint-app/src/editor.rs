@@ -355,7 +355,7 @@ impl Editor {
     ///
     /// Does nothing when [`Editor::paint_mode`] has no mode to offer. Checked here as well as by the
     /// caller so that neither layer depends on the other remembering.
-    pub fn stroke_begin(&mut self, cx: f32, cy: f32, pressure: f32) {
+    pub fn stroke_begin(&mut self, at: openpaint_core::brush::Sample) {
         let Some(mode) = self.paint_mode() else {
             return;
         };
@@ -368,29 +368,17 @@ impl Editor {
         });
         self.drawing = true;
         let from = self.dabs.len();
-        self.brushes[self.tool as usize].stroke_begin(
-            &mut self.dabs,
-            &mut self.stroke,
-            cx,
-            cy,
-            pressure,
-        );
+        self.brushes[self.tool as usize].stroke_begin(&mut self.dabs, &mut self.stroke, at);
         self.record_dabs(from);
     }
 
     /// Continue the current stroke to a new canvas-space position.
-    pub fn stroke_to(&mut self, cx: f32, cy: f32, pressure: f32) {
+    pub fn stroke_to(&mut self, at: openpaint_core::brush::Sample) {
         if !self.drawing {
             return;
         }
         let from = self.dabs.len();
-        self.brushes[self.tool as usize].stroke_to(
-            &mut self.dabs,
-            &mut self.stroke,
-            cx,
-            cy,
-            pressure,
-        );
+        self.brushes[self.tool as usize].stroke_to(&mut self.dabs, &mut self.stroke, at);
         self.record_dabs(from);
     }
 
@@ -438,7 +426,7 @@ mod tests {
     #[test]
     fn beginning_a_stroke_queues_begin_and_dabs() {
         let mut e = Editor::new();
-        e.stroke_begin(100.0, 100.0, 1.0);
+        e.stroke_begin(openpaint_core::brush::Sample::at(100.0, 100.0, 1.0));
         assert!(e.is_drawing());
 
         let (ops, dabs) = e.pending_stroke();
@@ -457,7 +445,7 @@ mod tests {
         e.brush_mut().set_color_srgb8([255, 0, 0]);
         let expected = e.brush_mut().color_linear_premul();
 
-        e.stroke_begin(10.0, 10.0, 1.0);
+        e.stroke_begin(openpaint_core::brush::Sample::at(10.0, 10.0, 1.0));
         let (ops, _) = e.pending_stroke();
         match ops.first() {
             Some(StrokeOp::Begin {
@@ -477,7 +465,7 @@ mod tests {
     #[test]
     fn stroke_to_without_begin_queues_nothing() {
         let mut e = Editor::new();
-        e.stroke_to(100.0, 100.0, 1.0);
+        e.stroke_to(openpaint_core::brush::Sample::at(100.0, 100.0, 1.0));
         assert!(!e.is_drawing());
         assert!(!e.has_pending_stroke());
     }
@@ -487,9 +475,9 @@ mod tests {
     #[test]
     fn stroke_ops_index_the_dab_buffer_correctly() {
         let mut e = Editor::new();
-        e.stroke_begin(0.0, 0.0, 1.0);
-        e.stroke_to(100.0, 0.0, 1.0);
-        e.stroke_to(200.0, 0.0, 1.0);
+        e.stroke_begin(openpaint_core::brush::Sample::at(0.0, 0.0, 1.0));
+        e.stroke_to(openpaint_core::brush::Sample::at(100.0, 0.0, 1.0));
+        e.stroke_to(openpaint_core::brush::Sample::at(200.0, 0.0, 1.0));
         e.stroke_end();
 
         let (ops, dabs) = e.pending_stroke();
@@ -515,12 +503,12 @@ mod tests {
     #[test]
     fn ending_a_stroke_queues_end_and_stops_emitting() {
         let mut e = Editor::new();
-        e.stroke_begin(100.0, 100.0, 1.0);
+        e.stroke_begin(openpaint_core::brush::Sample::at(100.0, 100.0, 1.0));
         e.stroke_end();
         assert!(!e.is_drawing());
 
         let before = e.pending_stroke().1.len();
-        e.stroke_to(900.0, 900.0, 1.0);
+        e.stroke_to(openpaint_core::brush::Sample::at(900.0, 900.0, 1.0));
         assert_eq!(
             e.pending_stroke().1.len(),
             before,
@@ -535,8 +523,8 @@ mod tests {
     fn end_queues_a_bare_commit() {
         let mut e = Editor::new();
         e.brush_mut().radius = 10.0;
-        e.stroke_begin(200.0, 300.0, 1.0);
-        e.stroke_to(400.0, 300.0, 1.0);
+        e.stroke_begin(openpaint_core::brush::Sample::at(200.0, 300.0, 1.0));
+        e.stroke_to(openpaint_core::brush::Sample::at(400.0, 300.0, 1.0));
         e.stroke_end();
 
         let (ops, _) = e.pending_stroke();
@@ -558,9 +546,9 @@ mod tests {
     #[test]
     fn two_strokes_produce_two_begins() {
         let mut e = Editor::new();
-        e.stroke_begin(10.0, 10.0, 1.0);
+        e.stroke_begin(openpaint_core::brush::Sample::at(10.0, 10.0, 1.0));
         e.stroke_end();
-        e.stroke_begin(20.0, 20.0, 1.0);
+        e.stroke_begin(openpaint_core::brush::Sample::at(20.0, 20.0, 1.0));
         e.stroke_end();
 
         let (ops, _) = e.pending_stroke();
@@ -576,8 +564,8 @@ mod tests {
     #[test]
     fn clearing_pending_work_empties_both_buffers() {
         let mut e = Editor::new();
-        e.stroke_begin(10.0, 10.0, 1.0);
-        e.stroke_to(50.0, 10.0, 1.0);
+        e.stroke_begin(openpaint_core::brush::Sample::at(10.0, 10.0, 1.0));
+        e.stroke_to(openpaint_core::brush::Sample::at(50.0, 10.0, 1.0));
         assert!(e.has_pending_stroke());
 
         e.clear_pending_stroke();
@@ -591,7 +579,7 @@ mod tests {
     #[test]
     fn off_canvas_coordinates_are_emitted_not_dropped() {
         let mut e = Editor::new();
-        e.stroke_begin(-500.0, -500.0, 1.0);
+        e.stroke_begin(openpaint_core::brush::Sample::at(-500.0, -500.0, 1.0));
         assert_eq!(e.pending_stroke().1.len(), 1);
     }
 

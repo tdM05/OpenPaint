@@ -23,7 +23,7 @@
 
 use crate::editor::Tool;
 use egui::ViewportId;
-use openpaint_core::{Blend, Brush, Curve, Layer};
+use openpaint_core::{Blend, Brush, Curve, Layer, Response, Source};
 use winit::window::Window;
 
 use crate::editor::DEFAULT_EXTEND;
@@ -369,6 +369,26 @@ fn curve_editor(ui: &mut egui::Ui, label: &str, curve: &mut Curve) -> bool {
     changed
 }
 
+/// One brush parameter's modulation: which input drives it, and the curve that maps it.
+///
+/// Built in a loop over [`Brush::responses_mut`] rather than written out per parameter, so adding a
+/// modulatable parameter to the engine makes an editor for it appear rather than needing a second
+/// edit here that is easy to forget.
+fn response_editor(ui: &mut egui::Ui, label: &str, response: &mut Response) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).small().strong());
+        egui::ComboBox::from_id_salt(("modulation-source", label))
+            .selected_text(response.source.label())
+            .width(96.0)
+            .show_ui(ui, |ui| {
+                for source in Source::ALL {
+                    ui.selectable_value(&mut response.source, source, source.label());
+                }
+            });
+    });
+    curve_editor(ui, label, &mut response.curve);
+}
+
 /// Where to draw the brush outline, and how big.
 ///
 /// The size a mark will be is otherwise invisible until you make one, which makes choosing a
@@ -676,7 +696,7 @@ impl Ui {
                             ui.separator();
                             ui.label(
                                 egui::RichText::new(
-                                    "How pressure drives the brush. Drag a point, click to add one, right-click to remove. A flat curve means pressure is ignored.",
+                                    "What drives each parameter, and how. Pick an input, then shape the curve: drag a point, click to add one, right-click to remove. A flat curve means the input is ignored. The slider above is what you get at full input.",
                                 )
                                 .small()
                                 .weak(),
@@ -684,11 +704,12 @@ impl Ui {
                             // Stacked rather than side by side. Side by side put the right-hand
                             // editor's top-right corner under the scroll bar's hover zone, which
                             // floats over the content -- so the one control at (1, 1) could not be
-                            // grabbed. Stacking keeps both editors at the left margin, well clear
+                            // grabbed. Stacking keeps every editor at the left margin, well clear
                             // of it, and leaves room for larger boxes, which are easier to aim at.
-                            curve_editor(ui, "Size vs pressure", &mut brush.size_response);
-                            ui.add_space(2.0);
-                            curve_editor(ui, "Flow vs pressure", &mut brush.flow_response);
+                            for (name, response) in brush.responses_mut() {
+                                response_editor(ui, name, response);
+                                ui.add_space(2.0);
+                            }
 
                             ui.separator();
                             ui.add(egui::Slider::new(&mut brush.flow, 0.0..=1.0).text("Flow"));

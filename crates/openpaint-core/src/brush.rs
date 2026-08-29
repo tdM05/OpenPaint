@@ -32,8 +32,8 @@
 //! its input, so those are new sources rather than new mechanisms.
 
 use crate::color::{opaque_linear_premul_to_srgb8, opaque_srgb8_to_linear_premul};
-use crate::curve::Curve;
 use crate::dab::Dab;
+use crate::modulation::{Input, Noise, Response, Source};
 
 /// Brush parameters. Sizes are in canvas pixels.
 #[derive(Clone)]
@@ -47,18 +47,19 @@ pub struct Brush {
     pub spacing: f32,
     /// How much paint each dab deposits, `0.0..=1.0`.
     pub flow: f32,
-    /// How pressure drives dab size. See [`crate::curve`].
-    ///
-    /// A flat curve is "pressure does not affect size", so there is no separate switch for that.
-    pub size_response: Curve,
-    /// How pressure drives flow — how much paint each dab lays down.
+    /// What drives the radius, and how. See [`crate::modulation`].
+    pub radius_response: Response,
+    /// What drives the flow.
     ///
     /// **Flow rather than opacity, and that is forced by the model rather than chosen.** Opacity is
     /// a ceiling on the *whole stroke* (see [`crate::stroke`]): it is what stops overlapping dabs
     /// from building past it. A ceiling that changed halfway along a stroke would not be a ceiling.
-    /// Flow is per dab, so it is the parameter pressure can honestly drive, and driving it gives the
-    /// light-touch-faint-mark behaviour that pressure-to-opacity is usually reached for.
-    pub flow_response: Curve,
+    /// Flow is the per-dab quantity, so it is the one an input can honestly drive.
+    pub flow_response: Response,
+    /// What drives the edge hardness.
+    pub hardness_response: Response,
+    /// What drives the spacing between dabs.
+    pub spacing_response: Response,
     /// Ceiling the whole stroke may reach, `0.0..=1.0`.
     ///
     /// Per *stroke*, not per dab and not per layer: overlapping dabs build toward
@@ -85,14 +86,15 @@ impl Default for Brush {
             hardness: 0.5,
             spacing: 0.25,
             flow: 1.0,
-            // Identity, which is what the brush did before curves existed: size tracks pressure
-            // exactly. Not necessarily the *best* default -- a slight curve suits most hands -- but
-            // changing the feel of the existing brush is a separate decision from making it
-            // adjustable, and only one of those is being made here.
-            size_response: Curve::linear(),
-            // Flat: flow ignores pressure until asked to. Full flow at every pressure is the
-            // behaviour that was there before.
-            flow_response: Curve::constant(1.0),
+            // Radius follows pressure exactly, which is what the brush did before any of this
+            // existed. Not necessarily the *best* default -- a gentler curve suits most hands --
+            // but changing how the existing brush feels is a separate decision from making it
+            // adjustable, and only one of those is being taken.
+            radius_response: Response::following(Source::Pressure),
+            // The rest ignore their input until asked to, so nothing about the old brush changed.
+            flow_response: Response::fixed(),
+            hardness_response: Response::fixed(),
+            spacing_response: Response::fixed(),
             opacity: 1.0,
             // Off by default, and that is a deliberate refusal to guess. Smoothing buys steadiness
             // with latency (see `stabilizer`), and how much an artist needs depends entirely on
@@ -112,15 +114,22 @@ impl Default for Brush {
 pub struct StrokeState {
     /// Last sample position, and how far we've traveled since the last dab.
     last: Option<(f32, f32)>,
+    /// When that sample arrived, so speed is a distance over a *time* rather than over a sample
+    /// count. Sample rate varies with pen speed on real hardware, so the two are not the same.
+    last_time_ms: f64,
     /// Distance accumulated since the previous stamped dab.
     residual: f32,
+    /// Per-dab noise, for `Source::Random`.
+    noise: Noise,
 }
 
 impl StrokeState {
     pub fn new() -> Self {
         Self {
             last: None,
+            last_time_ms: 0.0,
             residual: 0.0,
+            noise: Noise::default(),
         }
     }
 }
@@ -128,6 +137,48 @@ impl StrokeState {
 impl Default for StrokeState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// One input sample, as the caller has it.
+///
+/// Position, pressure, tilt and a timestamp — everything that comes off a pen. Velocity and heading
+/// are *not* here: they are properties of the path between samples, and the brush is the thing
+/// walking it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Sample {
+    pub x: f32,
+    pub y: f32,
+    pub pressure: f32,
+    /// Tilt from vertical, in radians.
+    pub tilt: f32,
+    pub time_ms: f64,
+}
+
+impl Sample {
+    /// A sample with no tilt and no clock, for callers that have neither.
+    #[must_use]
+    pub fn at(x: f32, y: f32, pressure: f32) -> Self {
+        Self {
+            x,
+            y,
+            pressure,
+            tilt: 0.0,
+            time_ms: 0.0,
+        }
+    }
+}
+
+impl StrokeState {
+    /// Assemble one dab's worth of input, drawing a fresh random value.
+    fn input_for(&mut self, at: Sample, velocity: f32, direction: f32) -> Input {
+        Input {
+            pressure: at.pressure,
+            tilt: at.tilt,
+            velocity,
+            direction,
+            random: self.noise.draw(),
+        }
     }
 }
 
@@ -149,95 +200,121 @@ impl Brush {
         opaque_linear_premul_to_srgb8(self.color_linear_premul)
     }
 
-    /// Effective dab radius for a given pressure in `0.0..=1.0`.
+    /// Effective dab radius for one dab's worth of input.
     ///
     /// Floored at half a pixel so the lightest touch still makes a mark rather than a degenerate
     /// dab: a brush that silently does nothing at low pressure reads as a broken pen.
-    fn radius_for(&self, pressure: f32) -> f32 {
-        (self.radius * self.size_response.at(pressure)).max(0.5)
+    fn radius_for(&self, input: &Input) -> f32 {
+        (self.radius * self.radius_response.factor(input)).max(0.5)
     }
 
-    /// Effective flow for a given pressure.
-    fn flow_for(&self, pressure: f32) -> f32 {
-        (self.flow * self.flow_response.at(pressure)).clamp(0.0, 1.0)
+    /// Effective spacing, as a fraction of diameter.
+    ///
+    /// Clamped to a sane fraction. What actually bounds the dab count is the floor on `step` in
+    /// `stroke_to` — a zero spacing would otherwise ask for infinitely many dabs — so this clamp is
+    /// belt to that braces, keeping the *value* meaningful rather than being the thing that stops
+    /// the loop.
+    fn spacing_for(&self, input: &Input) -> f32 {
+        (self.spacing * self.spacing_response.factor(input)).clamp(0.01, 1.0)
     }
 
-    /// Build one dab at `(cx, cy)` for a given pressure.
-    fn dab_at(&self, cx: f32, cy: f32, pressure: f32) -> Dab {
+    /// Build one dab at `(cx, cy)` from its input.
+    fn dab_at(&self, cx: f32, cy: f32, input: &Input) -> Dab {
         Dab {
             x: cx,
             y: cy,
-            radius: self.radius_for(pressure),
-            hardness: self.hardness,
-            flow: self.flow_for(pressure),
+            radius: self.radius_for(input),
+            hardness: (self.hardness * self.hardness_response.factor(input)).clamp(0.0, 1.0),
+            flow: (self.flow * self.flow_response.factor(input)).clamp(0.0, 1.0),
             color_linear_premul: self.color_linear_premul,
         }
     }
 
+    /// Every modulatable parameter, for a UI to lay out in a loop.
+    ///
+    /// Returned as a list rather than named one at a time so the panel cannot fall behind the
+    /// engine: adding a parameter here makes an editor for it appear, rather than needing a second
+    /// edit somewhere that is easy to forget.
+    pub fn responses_mut(&mut self) -> [(&'static str, &mut Response); 4] {
+        [
+            ("Size", &mut self.radius_response),
+            ("Flow", &mut self.flow_response),
+            ("Hardness", &mut self.hardness_response),
+            ("Spacing", &mut self.spacing_response),
+        ]
+    }
+
     /// Begin a stroke: emit the initial dab at the first sample.
-    pub fn stroke_begin(
-        &self,
-        out: &mut Vec<Dab>,
-        state: &mut StrokeState,
-        x: f32,
-        y: f32,
-        pressure: f32,
-    ) {
-        out.push(self.dab_at(x, y, pressure));
-        state.last = Some((x, y));
+    pub fn stroke_begin(&self, out: &mut Vec<Dab>, state: &mut StrokeState, at: Sample) {
+        // A stroke begins from rest, so there is no speed and no heading yet. Reading either from
+        // a single sample would invent one.
+        let input = state.input_for(at, 0.0, 0.0);
+        out.push(self.dab_at(at.x, at.y, &input));
+        state.last = Some((at.x, at.y));
+        state.last_time_ms = at.time_ms;
         state.residual = 0.0;
     }
 
     /// Continue a stroke to a new sample, emitting evenly spaced dabs along the
     /// segment from the previous sample so speed doesn't create gaps.
-    pub fn stroke_to(
-        &self,
-        out: &mut Vec<Dab>,
-        state: &mut StrokeState,
-        x: f32,
-        y: f32,
-        pressure: f32,
-    ) {
+    pub fn stroke_to(&self, out: &mut Vec<Dab>, state: &mut StrokeState, at: Sample) {
         let Some((px, py)) = state.last else {
-            self.stroke_begin(out, state, x, y, pressure);
+            self.stroke_begin(out, state, at);
             return;
         };
 
-        let radius = self.radius_for(pressure);
-        let step = (radius * 2.0 * self.spacing).max(0.5);
-
-        let dx = x - px;
-        let dy = y - py;
-        let seg_len = (dx * dx + dy * dy).sqrt();
+        let dx = at.x - px;
+        let dy = at.y - py;
+        let seg_len = dx.hypot(dy);
         if seg_len <= f32::EPSILON {
             return;
         }
         let (ux, uy) = (dx / seg_len, dy / seg_len);
 
+        // Both are properties of the *path*, which is why the brush computes them rather than
+        // asking the caller for them. Heading as a fraction of a turn, so a curve mapping it
+        // straight through makes a dab follow the stroke.
+        let dt = (at.time_ms - state.last_time_ms).max(0.0) as f32;
+        let velocity = if dt > 0.0 { seg_len / dt } else { 0.0 };
+        let direction = uy.atan2(ux).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
+
         // Walk along the segment, emitting a dab every `step` pixels, carrying
         // leftover distance in `residual` so spacing is continuous across
         // segments.
+        //
+        // The input is re-drawn per dab, because `Source::Random` has to differ between them --
+        // one draw for the whole segment would make a scattering brush emit rows of identical
+        // dabs.
         let mut traveled = -state.residual;
-        while traveled + step <= seg_len {
+        loop {
+            let input = state.input_for(at, velocity, direction);
+            let step = (self.radius_for(&input) * 2.0 * self.spacing_for(&input)).max(0.5);
+            if traveled + step > seg_len {
+                // Nothing more fits; `traveled` is where the last dab landed, and the remainder
+                // carries into the next segment.
+                break;
+            }
             traveled += step;
-            let t = traveled;
-            out.push(self.dab_at(px + ux * t, py + uy * t, pressure));
+            out.push(self.dab_at(px + ux * traveled, py + uy * traveled, &input));
         }
         state.residual = seg_len - traveled;
-        state.last = Some((x, y));
+        state.last = Some((at.x, at.y));
+        state.last_time_ms = at.time_ms;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::curve::Curve;
+    use crate::modulation::Source;
 
     /// Emit a straight horizontal stroke and return the dabs it produced.
     fn stroke(brush: &Brush, from: f32, to: f32, pressure: f32) -> Vec<Dab> {
         let mut dabs = Vec::new();
         let mut state = StrokeState::new();
-        brush.stroke_begin(&mut dabs, &mut state, from, 0.0, pressure);
-        brush.stroke_to(&mut dabs, &mut state, to, 0.0, pressure);
+        brush.stroke_begin(&mut dabs, &mut state, Sample::at(from, 0.0, pressure));
+        brush.stroke_to(&mut dabs, &mut state, Sample::at(to, 0.0, pressure));
         dabs
     }
 
@@ -245,7 +322,7 @@ mod tests {
     fn beginning_a_stroke_emits_exactly_one_dab() {
         let mut dabs = Vec::new();
         let mut state = StrokeState::new();
-        Brush::default().stroke_begin(&mut dabs, &mut state, 5.0, 7.0, 1.0);
+        Brush::default().stroke_begin(&mut dabs, &mut state, Sample::at(5.0, 7.0, 1.0));
         assert_eq!(dabs.len(), 1);
         assert_eq!((dabs[0].x, dabs[0].y), (5.0, 7.0));
     }
@@ -276,10 +353,10 @@ mod tests {
         let b = Brush::default();
         let mut dabs = Vec::new();
         let mut state = StrokeState::new();
-        b.stroke_begin(&mut dabs, &mut state, 0.0, 0.0, 1.0);
+        b.stroke_begin(&mut dabs, &mut state, Sample::at(0.0, 0.0, 1.0));
         // Ten 10px segments == one 100px segment, as far as spacing goes.
         for i in 1..=10 {
-            b.stroke_to(&mut dabs, &mut state, i as f32 * 10.0, 0.0, 1.0);
+            b.stroke_to(&mut dabs, &mut state, Sample::at(i as f32 * 10.0, 0.0, 1.0));
         }
 
         let one_segment = stroke(&b, 0.0, 100.0, 1.0);
@@ -302,9 +379,9 @@ mod tests {
             ..Brush::default()
         };
         let mut pen = pencil.clone();
-        pencil.size_response =
+        pencil.radius_response.curve =
             Curve::from_points(vec![(0.0, 0.0), (0.2, 0.55), (1.0, 1.0)]).expect("valid");
-        pen.size_response =
+        pen.radius_response.curve =
             Curve::from_points(vec![(0.0, 0.0), (0.7, 0.25), (1.0, 1.0)]).expect("valid");
 
         let light = 0.2_f32;
@@ -343,7 +420,7 @@ mod tests {
             "the default flow curve should ignore pressure"
         );
 
-        brush.flow_response = Curve::linear();
+        brush.flow_response = Response::following(Source::Pressure);
         let faint = stroke(&brush, 0.0, 0.0, 0.25);
         let firm = stroke(&brush, 0.0, 0.0, 1.0);
         assert!(
@@ -363,7 +440,7 @@ mod tests {
     fn a_flat_size_curve_makes_pressure_irrelevant() {
         let brush = Brush {
             radius: 12.0,
-            size_response: Curve::constant(1.0),
+            radius_response: Response::fixed(),
             ..Brush::default()
         };
         for p in [0.05_f32, 0.5, 1.0] {
@@ -373,6 +450,180 @@ mod tests {
                 "pressure {p} changed the radius to {}",
                 dab[0].radius
             );
+        }
+    }
+
+    /// Velocity reaches the dabs, computed from the clock rather than from sample count.
+    ///
+    /// This is the source that gives tapered ink: a fast flick thins the line without the artist
+    /// doing anything. Two identical strokes, differing only in how much time passed, must produce
+    /// different marks -- and a brush that measured speed per *sample* instead of per millisecond
+    /// would call these two identical, because they have the same number of samples.
+    #[test]
+    fn velocity_is_measured_against_the_clock() {
+        let mut brush = Brush {
+            radius: 20.0,
+            ..Brush::default()
+        };
+        // Thinner the faster you go, which is what a taper is.
+        brush.radius_response = Response {
+            source: Source::Velocity,
+            curve: Curve::from_points(vec![(0.0, 1.0), (1.0, 0.1)]).expect("valid"),
+        };
+
+        let run = |dt: f64| {
+            let mut dabs = Vec::new();
+            let mut state = StrokeState::new();
+            brush.stroke_begin(&mut dabs, &mut state, Sample::at(0.0, 0.0, 1.0));
+            brush.stroke_to(
+                &mut dabs,
+                &mut state,
+                Sample {
+                    x: 300.0,
+                    y: 0.0,
+                    pressure: 1.0,
+                    tilt: 0.0,
+                    time_ms: dt,
+                },
+            );
+            // The last dab, well into the segment, where the speed is being felt.
+            dabs.last().expect("dabs").radius
+        };
+
+        let slow = run(1000.0);
+        let fast = run(50.0);
+        assert!(
+            fast < slow * 0.5,
+            "the same distance covered faster should give a thinner line: {fast} vs {slow}"
+        );
+    }
+
+    /// Tilt reaches the dabs.
+    #[test]
+    fn tilt_reaches_the_dabs() {
+        let mut brush = Brush {
+            radius: 20.0,
+            ..Brush::default()
+        };
+        brush.radius_response = Response::following(Source::Tilt);
+
+        let run = |tilt: f32| {
+            let mut dabs = Vec::new();
+            let mut state = StrokeState::new();
+            brush.stroke_begin(
+                &mut dabs,
+                &mut state,
+                Sample {
+                    x: 0.0,
+                    y: 0.0,
+                    pressure: 1.0,
+                    tilt,
+                    time_ms: 0.0,
+                },
+            );
+            dabs[0].radius
+        };
+
+        let upright = run(0.0);
+        let leaning = run(crate::modulation::TILT_FULL);
+        assert!(
+            upright < 1.0,
+            "an upright pen should be at the floor, got {upright}"
+        );
+        assert!(
+            (leaning - 20.0).abs() < 0.1,
+            "a fully leant pen should give the full radius, got {leaning}"
+        );
+    }
+
+    /// Randomness differs *between dabs*, not once per segment.
+    ///
+    /// One draw for a whole segment would make a scattering brush emit rows of identical dabs,
+    /// which looks like a bug and is the easy mistake when the input is assembled outside the loop.
+    #[test]
+    fn randomness_varies_between_dabs_within_a_segment() {
+        let mut brush = Brush {
+            radius: 20.0,
+            ..Brush::default()
+        };
+        brush.radius_response = Response::following(Source::Random);
+
+        let mut dabs = Vec::new();
+        let mut state = StrokeState::new();
+        brush.stroke_begin(&mut dabs, &mut state, Sample::at(0.0, 0.0, 1.0));
+        brush.stroke_to(&mut dabs, &mut state, Sample::at(400.0, 0.0, 1.0));
+
+        assert!(dabs.len() > 8, "not enough dabs to compare: {}", dabs.len());
+        let first = dabs[1].radius;
+        assert!(
+            dabs.iter().skip(1).any(|d| (d.radius - first).abs() > 0.5),
+            "every dab in the segment got the same random value"
+        );
+    }
+
+    /// Hardness answers its response too.
+    ///
+    /// Checked as a *change*, not merely as a value in range: a brush that ignored the response
+    /// entirely would still emit a perfectly legal hardness, which is how this went untested at
+    /// first.
+    #[test]
+    fn hardness_answers_its_response() {
+        let mut brush = Brush {
+            hardness: 1.0,
+            ..Brush::default()
+        };
+        brush.hardness_response = Response::following(Source::Pressure);
+
+        let run = |pressure: f32| {
+            let mut dabs = Vec::new();
+            let mut state = StrokeState::new();
+            brush.stroke_begin(&mut dabs, &mut state, Sample::at(0.0, 0.0, pressure));
+            dabs[0].hardness
+        };
+
+        let light = run(0.25);
+        let firm = run(1.0);
+        assert!(
+            (light - 0.25).abs() < 0.02,
+            "a light touch should soften the edge, got {light}"
+        );
+        assert!(
+            (firm - 1.0).abs() < 0.02,
+            "and a firm one should give the full hardness, got {firm}"
+        );
+    }
+
+    /// Any source can drive any parameter, which is the point of the whole arrangement.
+    #[test]
+    fn any_source_can_drive_any_parameter() {
+        for source in Source::ALL {
+            let mut brush = Brush::default();
+            for (_, response) in brush.responses_mut() {
+                *response = Response::following(source);
+            }
+            let mut dabs = Vec::new();
+            let mut state = StrokeState::new();
+            brush.stroke_begin(&mut dabs, &mut state, Sample::at(0.0, 0.0, 0.5));
+            brush.stroke_to(&mut dabs, &mut state, Sample::at(120.0, 40.0, 0.5));
+
+            assert!(!dabs.is_empty(), "{source:?} produced no dabs at all");
+            for d in &dabs {
+                assert!(
+                    d.radius >= 0.5,
+                    "{source:?} gave a degenerate radius {}",
+                    d.radius
+                );
+                assert!(
+                    (0.0..=1.0).contains(&d.flow),
+                    "{source:?} gave flow {} outside its range",
+                    d.flow
+                );
+                assert!(
+                    (0.0..=1.0).contains(&d.hardness),
+                    "{source:?} gave hardness {} outside its range",
+                    d.hardness
+                );
+            }
         }
     }
 
@@ -401,8 +652,8 @@ mod tests {
         let b = Brush::default();
         let mut dabs = Vec::new();
         let mut state = StrokeState::new();
-        b.stroke_begin(&mut dabs, &mut state, 10.0, 10.0, 1.0);
-        b.stroke_to(&mut dabs, &mut state, 10.0, 10.0, 1.0);
+        b.stroke_begin(&mut dabs, &mut state, Sample::at(10.0, 10.0, 1.0));
+        b.stroke_to(&mut dabs, &mut state, Sample::at(10.0, 10.0, 1.0));
         assert_eq!(dabs.len(), 1);
     }
 
@@ -412,7 +663,7 @@ mod tests {
     fn stroke_to_without_begin_starts_the_stroke() {
         let mut dabs = Vec::new();
         let mut state = StrokeState::new();
-        Brush::default().stroke_to(&mut dabs, &mut state, 3.0, 4.0, 1.0);
+        Brush::default().stroke_to(&mut dabs, &mut state, Sample::at(3.0, 4.0, 1.0));
         assert_eq!(dabs.len(), 1);
         assert_eq!((dabs[0].x, dabs[0].y), (3.0, 4.0));
     }
@@ -433,9 +684,9 @@ mod tests {
         let b = Brush::default();
         let mut dabs = Vec::new();
         let mut state = StrokeState::new();
-        b.stroke_begin(&mut dabs, &mut state, 0.0, 0.0, 1.0);
+        b.stroke_begin(&mut dabs, &mut state, Sample::at(0.0, 0.0, 1.0));
         // (30, 40) is 50 units away, so 50/4 = 12 further dabs.
-        b.stroke_to(&mut dabs, &mut state, 30.0, 40.0, 1.0);
+        b.stroke_to(&mut dabs, &mut state, Sample::at(30.0, 40.0, 1.0));
         assert_eq!(dabs.len(), 13);
         // Consecutive dabs must be one spacing step apart along the diagonal.
         for pair in dabs.windows(2) {

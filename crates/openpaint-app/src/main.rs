@@ -565,7 +565,13 @@ impl OpenPaint {
                     Capture::Move => self.move_press(sample),
                     Capture::Paint => {
                         if let Some((cx, cy)) = self.to_canvas(sample) {
-                            self.stroke_start(cx, cy, sample.pressure, sample.time_ms());
+                            self.stroke_start(
+                                cx,
+                                cy,
+                                sample.pressure,
+                                sample.tilt_from_vertical(),
+                                sample.time_ms(),
+                            );
                             self.note_latency_input(sample);
                             self.request_redraw();
                         }
@@ -614,7 +620,13 @@ impl OpenPaint {
                     Capture::Paint => {
                         for sample in samples {
                             if let Some((cx, cy)) = self.to_canvas(sample) {
-                                self.stroke_continue(cx, cy, sample.pressure, sample.time_ms());
+                                self.stroke_continue(
+                                    cx,
+                                    cy,
+                                    sample.pressure,
+                                    sample.tilt_from_vertical(),
+                                    sample.time_ms(),
+                                );
                             }
                         }
                         // The newest sample in the batch sits at the tip of the stroke, which is
@@ -738,7 +750,7 @@ impl OpenPaint {
     /// These three methods exist as their own seam rather than inline in the event handlers so
     /// they can be tested without a window: the editor is headless, so a test can drive them and
     /// read the dabs back. Every bug this session lived in a layer that had no test.
-    fn stroke_start(&mut self, cx: f32, cy: f32, pressure: f32, t_ms: f64) {
+    fn stroke_start(&mut self, cx: f32, cy: f32, pressure: f32, tilt: f32, t_ms: f64) {
         // Say why nothing is going to happen. `Editor::stroke_begin` refuses this case on its own,
         // so the stroke is safe either way -- but a tool that silently does nothing reads as a bug,
         // and the artist has no way to guess which of two settings is in their way.
@@ -755,13 +767,25 @@ impl OpenPaint {
         self.stabilizer
             .set_lag_ms(self.editor.brush().stabilization_ms);
         let s = self.stabilizer.begin(cx, cy, pressure, t_ms);
-        self.editor.stroke_begin(s.x, s.y, s.pressure);
+        self.editor.stroke_begin(openpaint_core::brush::Sample {
+            x: s.x,
+            y: s.y,
+            pressure: s.pressure,
+            tilt,
+            time_ms: t_ms,
+        });
     }
 
     /// Extend the stroke with another input sample.
-    fn stroke_continue(&mut self, cx: f32, cy: f32, pressure: f32, t_ms: f64) {
+    fn stroke_continue(&mut self, cx: f32, cy: f32, pressure: f32, tilt: f32, t_ms: f64) {
         let s = self.stabilizer.push(cx, cy, pressure, t_ms);
-        self.editor.stroke_to(s.x, s.y, s.pressure);
+        self.editor.stroke_to(openpaint_core::brush::Sample {
+            x: s.x,
+            y: s.y,
+            pressure: s.pressure,
+            tilt,
+            time_ms: t_ms,
+        });
     }
 
     /// Let the smoothed line catch up to the pen with time alone. Returns whether it is still
@@ -778,7 +802,8 @@ impl OpenPaint {
             return false;
         }
         if let Some(s) = self.stabilizer.advance(input::now_ms()) {
-            self.editor.stroke_to(s.x, s.y, s.pressure);
+            self.editor
+                .stroke_to(openpaint_core::brush::Sample::at(s.x, s.y, s.pressure));
             self.request_redraw();
         }
         // Keep ticking for the whole stroke, not only while `advance` reports movement. Once it has
@@ -793,8 +818,20 @@ impl OpenPaint {
     /// its own endpoint — ruining tapers and leaving strokes that should meet apart. The tail is
     /// empty when smoothing is off.
     fn stroke_finish(&mut self) {
+        // The tail is emitted all at once, so it has no clock of its own. Nominal steps keep the
+        // velocity source reading something like the speed the stroke was actually travelling,
+        // rather than zero -- which on a velocity-driven brush would fatten the very end of every
+        // line.
+        let mut t = input::now_ms();
         for s in self.stabilizer.finish() {
-            self.editor.stroke_to(s.x, s.y, s.pressure);
+            t += 4.0;
+            self.editor.stroke_to(openpaint_core::brush::Sample {
+                x: s.x,
+                y: s.y,
+                pressure: s.pressure,
+                tilt: 0.0,
+                time_ms: t,
+            });
         }
         self.editor.stroke_end();
     }
@@ -2924,9 +2961,9 @@ mod tests {
         let mut app = OpenPaint::default();
         app.editor.brush_mut().stabilization_ms = lag_ms;
 
-        app.stroke_start(0.0, 100.0, 1.0, 0.0);
+        app.stroke_start(0.0, 100.0, 1.0, 0.0, 0.0);
         for i in 1..=length {
-            app.stroke_continue(i as f32, 100.0, 1.0, f64::from(i));
+            app.stroke_continue(i as f32, 100.0, 1.0, 0.0, f64::from(i));
         }
         if finish {
             app.stroke_finish();
@@ -3016,8 +3053,8 @@ mod tests {
 
         // One fast flick, as a quick drag looks to the filter, then the pen stops dead.
         let t0 = input::now_ms();
-        app.stroke_start(0.0, 100.0, 1.0, t0);
-        app.stroke_continue(600.0, 100.0, 1.0, t0 + 8.0);
+        app.stroke_start(0.0, 100.0, 1.0, 0.0, t0);
+        app.stroke_continue(600.0, 100.0, 1.0, 0.0, t0 + 8.0);
         let before = app.editor.pending_stroke().1.len();
 
         // Nothing but time passing from here. No samples, no events.
