@@ -128,9 +128,22 @@ verifiable locally, so CI's fmt/clippy steps are **blocking again**.
 
 ## Medium-priority (Phase 1–2)
 
-### Q4. Final UI framework
-Deferred by design. Start with egui debug panels; decide the polished CSP-like
-UI framework later (egui custom-drawn? another Rust UI? something else?).
+### Q4. Final UI framework — ⚠️ NEXT, and now heavily constrained
+Deferred by design while the engine was built. It is now the decision everything else
+waits behind, and DECISIONS §1c has narrowed it considerably: whatever draws the UI has
+to support a **layout tree we own** — arbitrary splits, tabs on every leaf, no panel the
+layout knows the name of — plus five-zone drop overlays, pen input routed to the UI as a
+first-class pointer rather than as Windows' synthesised mouse (Q14), and theming as data
+rather than as code.
+
+That is a demanding list, and it points away from "adopt a toolkit and use its docking"
+towards "own the layout and use the toolkit to draw". The question to ask of each
+candidate is therefore not whether it looks good but **whether it makes a layout tree we
+control easy, or makes a fixed arrangement easy and fights everything else.**
+
+Not yet decided. Open questions inside it: whether to keep drawing the UI on our own wgpu
+surface (which we already do for the canvas), what handles text and layout of widgets,
+and how much is worth writing ourselves.
 
 ### Q5. Color management depth
 Composite in linear space, premultiplied, `Rgba16Float` in memory — settled, see

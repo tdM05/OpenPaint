@@ -76,6 +76,91 @@ That is §4k's mask with many producers and consumers, §4q's one gate every str
 through, §4m's any-input-drives-any-parameter. A layout tree of interchangeable panels is
 the same move applied to the UI.
 
+### 1c. The UI is a layout tree with no exceptions in it — 2026-08-29
+
+The structural half of §1b's third goal, settled before any framework is chosen or
+anything is sketched, because it decides which of those are even possible.
+
+**Every piece of the interface is a panel, and the layout is a tree of splits.** Nodes
+are horizontal or vertical splits with weighted children; leaves hold one or more panels
+as tabs. Sizes are the weights. Stacking is a leaf with several panels. Floating is a
+second tree in a second window.
+
+```
+Split(vertical, [
+  Split(horizontal, [ Leaf[Layers, History] , Leaf[Canvas] , Leaf[Colour] ]),
+  Leaf[Timeline],
+])
+```
+
+That is Unity's structure, and it is the same move the engine makes everywhere: one
+general primitive, the specific behaviours falling out of it rather than being listed.
+§4k's mask with many producers and consumers, §4q's one gate every stroke passes through,
+§4m's any input driving any parameter — and now a layout that does not know what a panel
+*is*.
+
+#### The invariant, which is the whole decision
+
+**The layout must never branch on which panel it holds.** The moment there is an
+`if panel == Toolbar` in the layout code we have rebuilt Photoshop, whose top options bar,
+left toolbar and canvas area are chrome rather than panels — which is exactly the thing
+the author objects to in every drawing app: *"some things like tool bar are fixed and
+different."*
+
+Two consequences taken deliberately, both the author's call:
+
+- **The canvas is a panel.** Document tabs and reference-image-beside-canvas then cost
+  nothing, because they are just a leaf with two panels and a split. It takes the
+  leftover space at startup, but that is a property of the *default layout*, not a rule
+  in the tree.
+- **The menu bar is a panel too.** The obvious objection is that you can then delete your
+  own File menu. The answer is not an exception; it is a general safety net that helps
+  everywhere — see layout undo below. Solving one case with a rule and every other case
+  not at all is the worse trade.
+
+#### Uniform tree, individual panels
+
+The tree knows only "this leaf holds these panels at this weight". What a panel does with
+the size it is given is entirely the panel's business, and that is what makes deferring
+per-panel constraints safe rather than merely convenient.
+
+So a colour panel can later grow "under 200 px I show swatches without labels" and no
+layout code changes — it is a property of the colour panel. A minimum useful size is a
+*hint* the layout may consult, defaulting to no opinion. **For now there are no
+constraints at all**, deliberately: some artists will happily keep a panel tiny, and
+guessing a floor for them is the kind of hardcoding this section exists to avoid.
+
+#### Three things to do better than the case studies
+
+Unity and Blender both get the structure right and share the same three defects.
+
+1. **Layout changes are undoable.** Neither Unity, Blender nor Photoshop can undo a
+   layout mistake; you rebuild it by hand or reload a saved layout and lose everything
+   since. The tree is small, so snapshotting it is free, and this project already has the
+   undo discipline. This is also what makes a movable menu bar safe.
+2. **Drop targets are big.** Both infer intent from the cursor against small regions — a
+   few-pixel edge, a corner widget, the gap between "split left" and "insert as tab". A
+   mouse hunts and hovers before it commits; **a pen arrives already down**, so a
+   mouse-first drop interaction cannot simply be inherited. Instead, a panel being dragged
+   over shows a five-zone overlay: four large edge regions and a large centre, the centre
+   meaning "join as a tab". Aiming at a quarter of a panel works with a pen and is better
+   with a mouse.
+3. **Grabbing is unambiguous without a separate widget.** On a tab, tapping should switch
+   to it and dragging should move it, and a pen gives no hover to tell those apart. The
+   touch idiom settles it: **tap switches, press-and-hold-then-move drags.** No grip
+   widget, no layout-edit mode, and a mouse user who drags immediately sees no difference.
+
+#### What is deliberately taken from Blender and what is not
+
+Taken: the refusal to special-case anything, including the topbar.
+
+Not taken: Blender's areas cannot be *stacked* — each shows one editor chosen from a
+dropdown — so Layers, History and a navigator cannot share one slot and flip between
+them. In a paint app the screen belongs to the canvas, and panels used rarely and never
+together must be able to share space. Also not taken: split-by-corner-drag and
+join-by-dragging-an-edge, which are the most complained-about interactions in Blender
+with a mouse and would be worse with a pen.
+
 ### Explicitly NOT doing
 - **Not building on / forking Krita.** It's GPL, ~1M+ lines of C++/Qt, and its
   bloat *is* the codebase. Its UI is welded to Qt; matching a CSP feel means
