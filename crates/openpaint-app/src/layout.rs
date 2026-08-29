@@ -456,6 +456,35 @@ impl Layout {
             .find_map(|p| p.tabs.iter().position(|q| *q == panel).map(|i| (p.path, i)))
     }
 
+    /// Which panel is tab `tab` of the leaf at `path`.
+    #[must_use]
+    pub fn tab_at(&self, path: &[usize], tab: usize) -> Option<PanelId> {
+        let Node::Leaf { tabs, .. } = self.node(path)? else {
+            return None;
+        };
+        tabs.get(tab).copied()
+    }
+
+    /// Which way the split at `path` divides, if it is a split.
+    #[must_use]
+    pub fn split_axis(&self, path: &[usize]) -> Option<Axis> {
+        match self.node(path)? {
+            Node::Split { axis, .. } => Some(*axis),
+            Node::Leaf { .. } => None,
+        }
+    }
+
+    fn node(&self, path: &[usize]) -> Option<&Node> {
+        let mut node = &self.root;
+        for &i in path {
+            let Node::Split { children, .. } = node else {
+                return None;
+            };
+            node = &children.get(i)?.node;
+        }
+        Some(node)
+    }
+
     /// Show a different tab of the leaf at `path`. Returns whether it could.
     pub fn set_active(&mut self, path: &[usize], tab: usize) -> bool {
         let Some(Node::Leaf { tabs, active }) = self.node_mut(path) else {
