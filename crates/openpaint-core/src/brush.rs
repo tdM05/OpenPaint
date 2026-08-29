@@ -36,7 +36,7 @@ use crate::dab::Dab;
 use crate::modulation::{Input, Noise, Response, Source};
 
 /// Brush parameters. Sizes are in canvas pixels.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Brush {
     /// Dab radius at full pressure, in pixels.
     pub radius: f32,
@@ -77,6 +77,12 @@ pub struct Brush {
     /// **Not a [`Response`].** Neither arm has an x axis a pen input could drive — an edge profile
     /// is a distance within the dab, and a stamp is an image — so a source picker over it would be
     /// an answer to a question that has none. See [`crate::dab::Tip`].
+    ///
+    /// **Not serialized.** A bitmap tip is an app resource (§4p) and its pixels have no business
+    /// being copied into every preset that mentions it — a preset carries a *reference*, and
+    /// `BrushPreset` holds that alongside. What comes back from a file is therefore the default
+    /// round tip, which the caller replaces.
+    #[serde(skip)]
     pub tip: crate::dab::Tip,
     /// Ceiling the whole stroke may reach, `0.0..=1.0`.
     ///
@@ -94,6 +100,11 @@ pub struct Brush {
     /// Stored converted rather than as authored sRGB so the per-pixel inner loop
     /// never pays for a transfer function, and so there is exactly one place the
     /// conversion can be got wrong: [`Brush::set_color_srgb8`].
+    ///
+    /// **Not serialized**, because a preset is a tool and colour is not part of one: picking a pen
+    /// must not change your ink. `BrushPreset::apply_to` puts the current colour back for the same
+    /// reason.
+    #[serde(skip)]
     color_linear_premul: [f32; 4],
 }
 
@@ -223,6 +234,16 @@ impl Brush {
     /// Set the brush color from an authored opaque sRGB value.
     pub fn set_color_srgb8(&mut self, rgb: [u8; 3]) {
         self.color_linear_premul = opaque_srgb8_to_linear_premul(rgb);
+    }
+
+    /// Put a colour back exactly as it was read.
+    ///
+    /// Deliberately narrow, and named for what it is for: [`crate::preset::BrushPreset::apply_to`]
+    /// replaces the whole brush and has to preserve the ink across it. Authoring a colour still
+    /// goes through [`Brush::set_color_srgb8`], which is the one place the transfer function is
+    /// applied — this takes a value that has already been through it.
+    pub fn set_color_linear_premul(&mut self, color: [f32; 4]) {
+        self.color_linear_premul = color;
     }
 
     /// The brush color as linear premultiplied RGBA.

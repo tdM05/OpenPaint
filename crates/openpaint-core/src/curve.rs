@@ -27,7 +27,7 @@
 //! separate representation and no flag.
 
 /// A mapping from an input in `0..=1` to an output in `0..=1`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Curve {
     /// At least two points, sorted by x, all within `0..=1`.
     points: Vec<(f32, f32)>,

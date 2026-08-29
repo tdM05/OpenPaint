@@ -44,6 +44,7 @@ mod input_mouse;
 #[cfg(target_os = "windows")]
 mod input_pen;
 mod perf;
+mod presets;
 mod renderer;
 mod stroke_exec;
 mod stroke_layer;
@@ -150,6 +151,18 @@ struct OpenPaint {
     /// Cached rather than asked for per frame: enumerating the system font set walks every
     /// installed family, which is nothing once and noticeable sixty times a second.
     font_families: Vec<String>,
+    /// Where the loaded bitmap tip came from, so a preset can reference it by path.
+    ///
+    /// The tip itself lives on the brush; this is only its name, and the two can therefore drift —
+    /// the panel's "back to a round tip" sets the brush's tip without knowing this exists. That is
+    /// why `save_brush_preset` asks the *brush* whether it is stamped rather than trusting this to
+    /// be current: the brush is the truth, and this is only how to find the file again.
+    brush_tip_path: Option<std::path::PathBuf>,
+    /// The saved brushes, read once at startup.
+    ///
+    /// An app resource, not document content (§4p): nothing about a preset reaches a `.openpaint`
+    /// file, so a document stays openable on a machine that has never heard of your inking pen.
+    brushes: presets::Library,
     /// The family actually used for the active text layer, when it is not the one asked for.
     ///
     /// Kept so the panel can say so. Silently lettering a page in a substituted face is the
@@ -650,6 +663,8 @@ impl Default for OpenPaint {
             wand: ui::WandSettings::default(),
             kernel: openpaint_core::Kernel::default(),
             font_families: Vec::new(),
+            brush_tip_path: None,
+            brushes: presets::Library::load(),
             font_substituted: None,
             selection: None,
             status_message: None,
@@ -2609,6 +2624,8 @@ impl OpenPaint {
                 let (w, h) = (stamp.width(), stamp.height());
                 self.editor.brush_mut().tip =
                     openpaint_core::dab::Tip::Stamp(std::sync::Arc::new(stamp));
+                // Kept so a preset saved later can name this tip rather than copy it.
+                self.brush_tip_path = Some(path.to_path_buf());
                 self.status_message = Some(format!("Brush tip loaded, {w}x{h}."));
             }
             Err(err) => {
@@ -2618,7 +2635,60 @@ impl OpenPaint {
         self.request_redraw();
     }
 
-    /// Make font files available to this session without installing them.
+    /// Keep the brush as it stands, under a name.
+    ///
+    /// The tip is recorded as a *reference* rather than as pixels — the path it came from, since
+    /// there is no tip library yet and a path is the name under those circumstances. Same shape as
+    /// a text layer naming a font family (§6a), and it resolves the same way: reported when it
+    /// cannot be found, never silently swapped.
+    fn save_brush_preset(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            // The panel disables the button, so this is the belt to that brace -- and it says why
+            // rather than doing nothing, because a button that appears to work and does not is the
+            // worst of the three possibilities (§6b).
+            self.status_message = Some("Give the brush a name before saving it.".to_owned());
+            self.request_redraw();
+            return;
+        }
+        let tip = match self.brush_tip_path.as_ref() {
+            Some(path) if self.editor.brush().tip.is_stamp() => openpaint_core::TipRef::File {
+                path: path.to_string_lossy().into_owned(),
+            },
+            _ => openpaint_core::TipRef::Round,
+        };
+        let preset = openpaint_core::BrushPreset::capture(name, self.editor.brush(), tip);
+        self.status_message = Some(self.brushes.save(preset));
+        self.request_redraw();
+    }
+
+    /// Adopt a saved brush, colour untouched.
+    fn apply_brush_preset(&mut self, index: usize) {
+        let Some(preset) = self.brushes.presets().get(index).cloned() else {
+            return;
+        };
+        preset.apply_to(self.editor.brush_mut());
+        // The tip is resolved here rather than in the engine, because it means touching the
+        // filesystem and uploading a texture. `apply_to` has already put the procedural edge back,
+        // which is the right answer whenever the reference does not resolve.
+        let mut said = format!("Brush \"{}\"", preset.name);
+        self.brush_tip_path = None;
+        match presets::resolve_tip(&preset.tip, read_tip) {
+            presets::Resolved::Round => {}
+            presets::Resolved::Stamp(stamp) => {
+                self.editor.brush_mut().tip =
+                    openpaint_core::dab::Tip::Stamp(std::sync::Arc::new(stamp));
+                if let openpaint_core::TipRef::File { path } = &preset.tip {
+                    self.brush_tip_path = Some(std::path::PathBuf::from(path));
+                }
+            }
+            presets::Resolved::Missing(trouble) => said = trouble,
+        }
+        self.status_message = Some(said);
+        self.request_redraw();
+    }
+
+    /// Make font files available to this session without installing them.    /// Make font files available to this session without installing them.
     ///
     /// Letterers keep collections of fonts they have no wish to add to the system font list, and
     /// asking someone to pollute their OS to letter one page is the wrong trade. Session-scoped
@@ -3183,10 +3253,13 @@ impl OpenPaint {
         // `editor` mutably through `brush_mut`, and a caption is a string and a dozen numbers.
         let mut text_edit = editor.active_text().cloned();
         let font_families = &self.font_families;
+        let brushes = &self.brushes;
+        let brush_trouble = self.brushes.trouble.as_deref();
         let font_substituted = self.font_substituted.clone();
         let mut text_request = None;
         let mut text_changed = false;
         let mut brush_request = None;
+        let mut preset_name = String::new();
         let mut transform_request = None;
         let live_transform = self.dragging.as_ref().map(|d| ui::TransformState {
             transform: d.transform,
@@ -3225,6 +3298,8 @@ impl OpenPaint {
                         select_tool,
                         has_selection,
                         wand: self.wand,
+                        presets: brushes.presets(),
+                        preset_trouble: brush_trouble,
                         font_families,
                         font_substituted: font_substituted.as_deref(),
                         transform: live_transform,
@@ -3245,6 +3320,7 @@ impl OpenPaint {
                 text_request = out.text;
                 text_changed = out.text_changed;
                 brush_request = out.brush;
+                preset_name = out.preset_name;
                 transform_request = out.transform;
                 transform_state = out.transform_state;
                 ui_inset_left = Some(ui.inset_left_px());
@@ -3336,10 +3412,21 @@ impl OpenPaint {
             Some(ui::TransformAction::Cancel) => self.cancel_transform(),
             None => {}
         }
-        if let Some(ui::BrushAction::LoadTip) = brush_request {
-            self.spawn_file_dialog(FileDialogKind::BrushTip, |dialog| {
-                dialog.pick_file().map(|p| vec![p])
-            });
+        match brush_request {
+            Some(ui::BrushAction::LoadTip) => {
+                self.spawn_file_dialog(FileDialogKind::BrushTip, |dialog| {
+                    dialog.pick_file().map(|p| vec![p])
+                });
+            }
+            Some(ui::BrushAction::SavePreset) => self.save_brush_preset(&preset_name),
+            Some(ui::BrushAction::ApplyPreset(i)) => self.apply_brush_preset(i),
+            Some(ui::BrushAction::DeletePreset(i)) => {
+                if let Some(said) = self.brushes.remove(i) {
+                    self.status_message = Some(said);
+                    self.request_redraw();
+                }
+            }
+            None => {}
         }
         if trim_request {
             self.trim_to_page();

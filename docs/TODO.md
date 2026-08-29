@@ -43,7 +43,9 @@ question, and only for the few refusals that risk work.
 | An edit too large to record in history | status line, after the fact | should be *before*, or at least unmissable |
 | Save fails (permissions, disk full) | (unverified) | must be a dialog, never a status line |
 | A font in the document is not installed | reported in the panel | good — this is the model for the rest |
-| A brush tip file will not load | (unverified) | say which file and why |
+| A brush tip file will not load | status line, names the file | good — this is the model |
+| A preset's tip has moved | status line, names it and says what it did instead | good |
+| The brush library will not load | shown in the Brush section | good |
 | Autosave fails | (unverified) | must be visible; silent autosave failure is the worst case here |
 
 **One thing to build before the table can be finished: a single place refusals go.**
@@ -107,6 +109,5 @@ yes.
 - **Speech bubbles** — the author flagged wanting "a good text bubble system later".
   Almost certainly a vector shape plus a text block plus a tail, which is why the text
   layer was built on content-is-truth rather than on pixels.
-- **Brush presets** — unblocked now that a tip can be a bitmap (§4p).
 - **Layer groups** — structural; changes the document model and the compositor.
 - **Marching ants that actually march.** The selection outline is dashed but static.

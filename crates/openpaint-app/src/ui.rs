@@ -152,6 +152,12 @@ pub struct TransformState {
 pub enum BrushAction {
     /// Choose an image to use as the dab's shape.
     LoadTip,
+    /// Save the brush as it stands, under the name in the box.
+    SavePreset,
+    /// Adopt a saved brush.
+    ApplyPreset(usize),
+    /// Forget a saved brush.
+    DeletePreset(usize),
 }
 
 /// What the Text section asked for, beyond editing the block in place.
@@ -259,6 +265,10 @@ pub struct Status<'a> {
     pub perf: crate::perf::PerfSnapshot,
     /// Set while unsaved work from a previous run is waiting to be accepted or thrown away.
     pub recovery: Option<&'a str>,
+    /// The saved brushes, in the order they were added.
+    pub presets: &'a [openpaint_core::BrushPreset],
+    /// Set when the brush library itself is in trouble -- unreadable, or unwritable.
+    pub preset_trouble: Option<&'a str>,
     /// Font families installed on this machine, sorted, for the picker.
     ///
     /// Passed in rather than read here because enumerating them is a font-stack operation and this
@@ -659,6 +669,8 @@ pub struct Outcome {
     pub text: Option<TextAction>,
     /// A brush command.
     pub brush: Option<BrushAction>,
+    /// The name in the preset box, as the panel now holds it.
+    pub preset_name: String,
     /// A transform command.
     pub transform: Option<TransformAction>,
     /// The transform in flight, as the panel now holds it.
@@ -675,6 +687,11 @@ pub struct Ui {
     /// How much an Extend adds. Lives in the UI because it is a user preference; it
     /// will move to settings when those exist (DECISIONS §5a: never a constant).
     extend_amount: u32,
+    /// The name being typed into the brush-saving box.
+    ///
+    /// Held here rather than in the app for the same reason `extend_amount` is: it is a half-typed
+    /// widget value, not state the document or the engine has any use for.
+    preset_name: String,
 }
 
 impl Ui {
@@ -701,6 +718,7 @@ impl Ui {
             renderer,
             occupied: egui::Rect::NOTHING,
             extend_amount: DEFAULT_EXTEND,
+            preset_name: String::new(),
         }
     }
 
@@ -758,6 +776,7 @@ impl Ui {
         let mut page_action = None;
         let mut text_action = None;
         let mut brush_action = None;
+        let mut preset_name = self.preset_name.clone();
         let mut transform_action = None;
         let mut transform_state = status.transform;
         let mut lock_aspect = transform_state.is_some_and(|t| t.lock_aspect);
@@ -884,6 +903,72 @@ impl Ui {
 
                             ui.separator();
                             ui.heading("Brush");
+                            ui.add_space(4.0);
+
+                            // The saved brushes come first, because picking one is the common
+                            // action and dialling sliders is the rare one. Nobody draws a page with
+                            // a single brush, so this is the section that turns a demo into a tool.
+                            if let Some(trouble) = status.preset_trouble {
+                                ui.colored_label(egui::Color32::from_rgb(220, 120, 60), trouble);
+                            }
+                            for (i, p) in status.presets.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button(&p.name)
+                                        .on_hover_text(format!(
+                                            "Size {:.0}, spacing {:.2}{}",
+                                            p.brush.radius,
+                                            p.brush.spacing,
+                                            match &p.tip {
+                                                openpaint_core::TipRef::Round => String::new(),
+                                                openpaint_core::TipRef::File { path } =>
+                                                    format!(", tip {path}"),
+                                            }
+                                        ))
+                                        .clicked()
+                                    {
+                                        brush_action = Some(BrushAction::ApplyPreset(i));
+                                    }
+                                    if ui
+                                        .small_button("\u{d7}")
+                                        .on_hover_text("Forget this brush.")
+                                        .clicked()
+                                    {
+                                        brush_action = Some(BrushAction::DeletePreset(i));
+                                    }
+                                });
+                            }
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut preset_name)
+                                        .hint_text("Name")
+                                        .desired_width(120.0),
+                                );
+                                // Nameless presets are refused here rather than saved and puzzled
+                                // over later: a row with no label is one nobody can pick on purpose.
+                                if ui
+                                    .add_enabled(
+                                        !preset_name.trim().is_empty(),
+                                        egui::Button::new("Save brush"),
+                                    )
+                                    .on_hover_text(
+                                        "Keep these settings under that name. Saving over a name \
+                                         you already used updates it.",
+                                    )
+                                    .on_disabled_hover_text("Give it a name first.")
+                                    .clicked()
+                                {
+                                    brush_action = Some(BrushAction::SavePreset);
+                                }
+                            });
+                            ui.label(
+                                egui::RichText::new(
+                                    "A brush keeps its size, edge, shape and response curves -- \
+                                     but never your colour.",
+                                )
+                                .small()
+                                .weak(),
+                            );
                             ui.add_space(4.0);
 
                             ui.add(
@@ -1773,6 +1858,7 @@ impl Ui {
 
         brush.set_color_srgb8(color_srgb);
         self.extend_amount = extend_amount;
+        self.preset_name.clone_from(&preset_name);
 
         // Record which pixels the *panel* owns, in physical coordinates, for `blocks_point` and
         // for the canvas inset.
@@ -1848,6 +1934,7 @@ impl Ui {
             text_changed,
             text: text_action,
             brush: brush_action,
+            preset_name,
             transform: transform_action,
             transform_state,
         }

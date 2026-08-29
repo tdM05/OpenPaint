@@ -848,6 +848,52 @@ did uploading full coverage for a tile the selection never reaches. Both are wro
 canvas bigger than 256 pixels, which is every real one. **A single-tile test cannot see a
 per-tile bug**; the test that matters straddles a boundary.
 
+### 4r. A brush preset is a tool you own — 2026-08-29
+
+Nobody draws with one brush. A page needs a pencil for roughs, an ink pen for line art
+and an eraser with its own size, and re-dialling six sliders between them is the
+difference between a demo and something you would actually draw with. §4p said presets
+were what bitmap tips unblocked; this is them.
+
+**Two things a preset deliberately does not carry.**
+
+- **Your colour.** Picking a pen must not change your ink. Every app keeps these apart
+  because colour changes far more often than tool does.
+- **The tip's pixels.** A bitmap tip is an app resource (§4p), so a preset holds a
+  *reference* — the path, since there is no tip library yet and a path is the name under
+  those circumstances. It resolves exactly as a font family does (§6a): reported when it
+  cannot be found, never silently swapped for something else.
+
+**Everything else is copied wholesale, not field by field.** `BrushPreset` holds a whole
+`Brush`, so a new brush setting is carried by presets the day it is added rather than
+the day somebody remembers to list it. That is §11a.8 — one definition, two lists — and
+copying the struct is how it is avoided. The two exclusions are `#[serde(skip)]` on the
+fields themselves, which is one place rather than two.
+
+**The edge profile rides alongside the brush rather than inside it.** `Tip` is either a
+curve or a bitmap, so a preset using a bitmap would have nowhere to keep its profile, and
+switching it back to a round tip would find the curve gone.
+
+#### JSON, not another SQLite container
+
+The library is `brushes.json` in the OS's per-user data directory. SQLite earns its place
+in `.openpaint` by holding thousands of tiles with random access; there is nothing here
+for it to do. A preset is nested, variable-length data — six response curves, each a
+source and a list of control points — read whole and written whole, and columns cannot
+hold a curve without inventing an encoding. That the file is readable and hand-editable
+is a real feature the day somebody wants to share a brush. Written through a temporary
+file and a rename, because the failure that matters is not "the save did not happen" but
+"the save destroyed what was there".
+
+#### The same test mistake, twice more
+
+Both halves of the library were first written as one function that decided *and* wrote to
+disk, so the tests reimplemented the decision rather than calling it — and a sabotage that
+removed the wrong preset passed. `insert` and `take` are now separate from `save` and
+`remove` for exactly that reason. Recorded here because it is the third time in one day:
+**a test that reimplements the thing it is testing tests nothing**, and the fix is always
+to split the decision out of the side effect rather than to write the decision twice.
+
 ### 4p. A brush tip is either a curve or a bitmap — 2026-08-29
 
 The last thing that changes what a brush *is*, and what brush presets have been

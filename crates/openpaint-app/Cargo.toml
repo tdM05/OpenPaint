@@ -41,6 +41,8 @@ rfd = "0.17"
 # The OS-designated per-user data directory, for crash-recovery copies. Recovery files must not
 # live next to the document: that folder may be read-only, on removable media, or synced.
 dirs = "6"
+# The brush library is JSON in the data directory -- see `presets.rs` for why not SQLite.
+serde_json = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Native tablet/pen input (Windows Ink) behind our InputBackend trait. Windows-

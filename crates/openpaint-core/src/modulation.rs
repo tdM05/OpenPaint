@@ -48,7 +48,7 @@ pub const TILT_FULL: f32 = std::f32::consts::FRAC_PI_3;
 ///
 /// Every one yields `0.0..=1.0`, so any source can drive any parameter and a curve authored against
 /// one reads sensibly against another.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Source {
     /// How hard the pen is pressed.
     Pressure,
@@ -108,7 +108,7 @@ impl Source {
 }
 
 /// How one parameter answers its input.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Response {
     pub source: Source,
     pub curve: Curve,
