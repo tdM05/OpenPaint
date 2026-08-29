@@ -12,7 +12,7 @@
 
 use crate::layout::Rect;
 use crate::panel_ui::{
-    change_at, clamp_scroll, hit, place, to_fraction, total_height, Change, Control, ControlId,
+    change_at, clamp_scroll, extent, hit, place, to_fraction, Change, Control, ControlId, Flow,
     Placed,
 };
 use crate::theme::Theme;
@@ -54,6 +54,7 @@ pub fn show(
     ui: &mut egui::Ui,
     controls: &[Control],
     theme: &Theme,
+    flow: Flow,
     input: &mut PanelInput,
 ) -> Vec<Change> {
     let m = &theme.metrics;
@@ -64,6 +65,18 @@ pub fn show(
     // has never heard of it. Clamped every frame rather than only when the wheel turns: the list
     // itself changes length when a layer is deleted, and an offset left pointing past the new end
     // would strand the panel showing nothing at all.
+    let content = Rect::new(
+        area.min.x + m.padding,
+        area.min.y + m.padding,
+        (area.width() - m.padding * 2.0).max(0.0),
+        visible,
+    );
+    // Laid out first and scrolled afterwards, so how tall the list is comes from where the
+    // controls actually ended up rather than from a second calculation that could disagree.
+    let text_of = |c: &Control| text_width(ui.ctx(), m.body, c);
+    let laid = place(controls, content, m, flow, text_of);
+    let (_, tall) = extent(&laid, content);
+
     // Only the panel under the pointer takes the wheel. The delta egui reports is the window's,
     // not this panel's, so applying it unconditionally would scroll every described panel on
     // screen at once.
@@ -72,14 +85,9 @@ pub fn show(
     } else {
         0.0
     };
-    input.scroll = clamp_scroll(input.scroll - wheel, total_height(controls, m), visible);
-    let content = Rect::new(
-        area.min.x + m.padding,
-        area.min.y + m.padding - input.scroll,
-        (area.width() - m.padding * 2.0).max(0.0),
-        visible,
-    );
-    let placed = place(controls, content, m);
+    input.scroll = clamp_scroll(input.scroll - wheel, tall, visible);
+    let scrolled = Rect::new(content.x, content.y - input.scroll, content.w, content.h);
+    let placed = place(controls, scrolled, m, flow, text_of);
     let latch = &mut input.latch;
 
     let mut changes = Vec::new();
@@ -125,12 +133,19 @@ pub fn show(
         .and_then(|p| hit(&placed, p.x, p.y).and_then(|(c, _)| c.id()));
     let painter = ui.painter_at(area);
     for p in &placed {
-        draw(&painter, p, theme, hover, *latch);
+        draw(&painter, p, theme, flow, hover, *latch);
     }
     changes
 }
 
-fn draw(painter: &egui::Painter, p: &Placed<'_>, theme: &Theme, hover: Latch, latch: Latch) {
+fn draw(
+    painter: &egui::Painter,
+    p: &Placed<'_>,
+    theme: &Theme,
+    flow: Flow,
+    hover: Latch,
+    latch: Latch,
+) {
     let (pal, m) = (&theme.palette, &theme.metrics);
     let r = p.rect;
     let id = p.control.id();
@@ -155,11 +170,22 @@ fn draw(painter: &egui::Painter, p: &Placed<'_>, theme: &Theme, hover: Latch, la
             );
         }
         Control::Separator => {
-            let y = (r.y + r.h / 2.0).round() + 0.5;
-            painter.line_segment(
-                [egui::pos2(r.x, y), egui::pos2(r.x + r.w, y)],
-                egui::Stroke::new(1.0_f32, color(pal.edge)),
-            );
+            // A rule across a column, and the same rule turned on its side in a row. Which way it
+            // runs is read from the rectangle it was given, so it can never disagree with the
+            // direction the list was laid out in.
+            let across = r.w > r.h;
+            let (a, b) = if across {
+                let x = (r.x + r.w / 2.0).round() + 0.5;
+                (
+                    egui::pos2(x, r.y + m.padding),
+                    egui::pos2(x, r.y + r.h - m.padding),
+                )
+            } else {
+                let y = (r.y + r.h / 2.0).round() + 0.5;
+                (egui::pos2(r.x, y), egui::pos2(r.x + r.w, y))
+            };
+            let _ = flow;
+            painter.line_segment([a, b], egui::Stroke::new(1.0_f32, color(pal.edge)));
         }
         Control::Button { text, .. } => {
             painter.rect_filled(
@@ -270,6 +296,29 @@ fn draw(painter: &egui::Painter, p: &Placed<'_>, theme: &Theme, hover: Latch, la
             );
         }
     }
+}
+
+/// The width of a control's label, measured by the thing that will draw it.
+///
+/// A column never asks, so this costs nothing there.
+fn text_width(ctx: &egui::Context, size: f32, control: &Control) -> f32 {
+    let text = match control {
+        Control::Label { text }
+        | Control::Button { text, .. }
+        | Control::Slider { text, .. }
+        | Control::Toggle { text, .. }
+        | Control::Row { text, .. } => text.as_str(),
+        Control::Separator => return 0.0,
+    };
+    ctx.fonts(|f| {
+        f.layout_no_wrap(
+            text.to_owned(),
+            egui::FontId::proportional(size),
+            egui::Color32::WHITE,
+        )
+        .size()
+        .x
+    })
 }
 
 /// How many decimals a value deserves, from how much room its range gives each step.

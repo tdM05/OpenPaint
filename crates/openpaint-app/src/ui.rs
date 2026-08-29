@@ -639,11 +639,6 @@ struct PanelState<'a> {
     active_layer: usize,
     tool: Tool,
     select_tool: Option<SelectTool>,
-    /// Which panels are currently somewhere in the layout, for the menu's tick list.
-    ///
-    /// Passed in rather than asked of the workspace, because the workspace is borrowed mutably for
-    /// the whole of `show` and the contents callback runs inside it.
-    open_panels: &'a [crate::layout::PanelId],
 }
 
 fn workspace_panel(
@@ -660,7 +655,6 @@ fn workspace_panel(
         active_layer,
         tool,
         select_tool,
-        open_panels: _,
     } = *state;
     use crate::workspace as ws;
     ui.spacing_mut().item_spacing.y = 5.0;
@@ -668,38 +662,48 @@ fn workspace_panel(
 
     match panel {
         ws::MENU => {
-            // Wrapped, not a fixed row: the menu is a panel like any other and can be dragged
-            // anywhere, including somewhere narrow. A row that ran off its own edge would put the
-            // panel list out of reach — which is the one thing the menu must never do, since it is
-            // how a closed panel comes back.
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("OpenPaint").strong());
-                for item in ["File", "Edit", "Layer", "Select", "View"] {
-                    ui.label(item);
-                }
-                ui.menu_button("Panels", |ui| {
-                    ui.label(
-                        egui::RichText::new("Tick to show, untick to put away.")
-                            .small()
-                            .weak(),
-                    );
-                    for kind in crate::workspace::PANELS {
-                        let mut on = state.open_panels.contains(&kind.id);
-                        if ui.checkbox(&mut on, kind.name).changed() {
-                            picked = Some(Picked::TogglePanel(kind.id));
-                        }
-                    }
+            // **A row or a column, never a half-broken row.** The menu is a panel like any other
+            // and can be dragged somewhere narrow; wrapping it onto a second line leaves a ragged
+            // edge and a last line with one item on it, which no arrangement makes look
+            // deliberate. Turning the whole strip on its side does. That is `Flow::Auto`, and it
+            // is a setting on the panel rather than a rule about menus.
+            use crate::panel_ui::{Change, Control};
+            const PANELS_LIST: u32 = 1 << 20;
+
+            let mut controls = vec![Control::Label {
+                text: "OpenPaint".to_owned(),
+            }];
+            // The menus themselves do not exist yet, so they are named rather than offered.
+            // A button that does nothing when pressed is worse than a label that never claimed
+            // it would (DECISIONS 6b).
+            for item in ["File", "Edit", "Layer", "Select", "View"] {
+                controls.push(Control::Label {
+                    text: item.to_owned(),
                 });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(
-                            "F2 old panel  \u{b7}  F3 undo layout  \u{b7}  Ctrl+F3 reset",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                });
+            }
+            controls.push(Control::Separator);
+            controls.push(Control::Button {
+                id: PANELS_LIST,
+                text: "Panels".to_owned(),
             });
+
+            for change in crate::panel_draw::show(
+                ui,
+                &controls,
+                theme,
+                crate::workspace::flow_of(panel),
+                input,
+            ) {
+                picked = match change {
+                    // The list itself belongs to the workspace, not here: this is a second way to
+                    // reach it, because a right-click is not discoverable on its own.
+                    Change::Pressed(PANELS_LIST) => Some(Picked::PanelList),
+                    other => {
+                        eprintln!("menu panel: unexpected {other:?}");
+                        None
+                    }
+                };
+            }
         }
         ws::TOOLS => {
             // A wrapped grid, so the rail works whether it is a column on the left or a strip
@@ -735,7 +739,7 @@ fn workspace_panel(
                         Picked::Paint(t) => select_tool.is_none() && tool == t,
                         Picked::Select(t) => select_tool == Some(t),
                         // Not something the tool rail offers, so never one of its lit buttons.
-                        Picked::TogglePanel(_) | Picked::Layer(_) => false,
+                        Picked::Layer(_) | Picked::PanelList => false,
                     };
                     if ui
                         .add_sized(
@@ -804,7 +808,13 @@ fn workspace_panel(
                     log: false,
                 },
             ];
-            for change in crate::panel_draw::show(ui, &controls, theme, input) {
+            for change in crate::panel_draw::show(
+                ui,
+                &controls,
+                theme,
+                crate::workspace::flow_of(panel),
+                input,
+            ) {
                 match change {
                     Change::Set(SIZE, v) => brush.radius = v,
                     Change::Set(OPACITY, v) => brush.opacity = v,
@@ -874,7 +884,13 @@ fn workspace_panel(
                 });
             }
 
-            for change in crate::panel_draw::show(ui, &controls, theme, input) {
+            for change in crate::panel_draw::show(
+                ui,
+                &controls,
+                theme,
+                crate::workspace::flow_of(panel),
+                input,
+            ) {
                 picked = match change {
                     Change::Chose(index) => {
                         Some(Picked::Layer(LayerAction::Select(index as usize)))
@@ -929,7 +945,13 @@ fn workspace_panel(
             let controls = [crate::panel_ui::Control::Label {
                 text: "Undo history moves here once the old panel is ported.".to_owned(),
             }];
-            for change in crate::panel_draw::show(ui, &controls, theme, input) {
+            for change in crate::panel_draw::show(
+                ui,
+                &controls,
+                theme,
+                crate::workspace::flow_of(panel),
+                input,
+            ) {
                 eprintln!("history panel: unexpected {change:?}");
             }
         }
@@ -943,8 +965,8 @@ fn workspace_panel(
 enum Picked {
     Paint(Tool),
     Select(SelectTool),
-    /// Show a panel, or put it away.
-    TogglePanel(crate::layout::PanelId),
+    /// Open the workspace's panel list.
+    PanelList,
     /// A layer command, from the described Layers panel.
     Layer(LayerAction),
 }
@@ -1194,19 +1216,13 @@ impl Ui {
                     screen.width(),
                     screen.height(),
                 );
-                let open_panels: Vec<crate::layout::PanelId> = crate::workspace::PANELS
-                    .iter()
-                    .filter(|k| ws.is_open(k.id))
-                    .map(|k| k.id)
-                    .collect();
                 let state = PanelState {
                     layers: status.layers,
                     active_layer: status.active_layer,
                     tool: status.tool,
                     select_tool: status.select_tool,
-                    open_panels: &open_panels,
                 };
-                let mut toggled = None;
+                let mut show_panel_list = false;
                 // Copied out because `ws` is borrowed for the whole of `show`, and the panel that
                 // wants the theme runs inside it.
                 let theme = ws.theme;
@@ -1228,13 +1244,13 @@ impl Ui {
                             Picked::Select(t) => select_action = Some(SelectAction::Use(t)),
                             // Not applied here: `ws` is borrowed for the whole of `show`, so the
                             // toggle is remembered and done the moment that borrow ends.
-                            Picked::TogglePanel(id) => toggled = Some(id),
+                            Picked::PanelList => show_panel_list = true,
                             Picked::Layer(a) => layer_action = Some(a),
                         }
                     }
                 });
-                if let Some(id) = toggled {
-                    ws.toggle(id);
+                if show_panel_list {
+                    ws.open_panel_list();
                 }
                 let scale = ctx.pixels_per_point();
                 let canvas = ws.canvas_rect().unwrap_or(crate::layout::Rect::new(

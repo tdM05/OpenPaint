@@ -88,6 +88,57 @@ What the port turned up, worth recording:
   shape designed against a guess. It goes in with the colour wheel, which is the first thing that
   genuinely cannot be described.
 
+## What a panel is, settled
+
+The first plan said an artist would *assemble* a panel from controls. That is wrong, and the
+reason is worth writing down: a button is not an atomic unit. "Merge down" only means anything in
+a Layers panel, sitting beside "Add" and "Duplicate", operating on the layer that panel has
+selected. Dragging it into a Brush panel produces a control with nothing to act on. A panel's
+controls are its vocabulary, not interchangeable parts, and a builder that pretends otherwise
+produces exactly the mess this project exists to avoid.
+
+So: **panels are written, one function each. What is customisable is their settings.**
+
+That is not a retreat from the descriptor layer. It is what the descriptor layer is *for*:
+
+- **The panel decides what controls exist.** Written by hand, per panel, because that is the part
+  that carries meaning.
+- **The engine decides how they are laid out, drawn and hit.** Shared, so there is one visual
+  language and one set of target rules, and so egui can be removed once rather than seven times.
+- **A setting is a property of the engine, offered to every panel.** `Flow` is the first:
+  row, column, or auto. It is not a rule about the menu; the menu just has a different default
+  from the layer list. Adding a setting adds it everywhere at once.
+
+Two levels of setting, then:
+
+| | decided by | example |
+|---|---|---|
+| universal | the engine | direction, density, labels or icons |
+| the panel's own | the panel | colour wheel shape; which tools the rail shows |
+
+Both are data, both are per panel *instance*, both save with the workspace.
+
+### Where the settings live
+
+Not a gear button on every panel: that is a permanent pixel cost for something used twice a year,
+and seven of them is visual noise. Not right-click alone either, because touch has no right-click.
+
+The gesture vocabulary already answers this. Hold-to-edit exists precisely so touch and pen behave
+the same, and Windows itself already teaches hold-as-right-click. So one rule, applied by *what*
+you held:
+
+- hold a **header**, then move --- move the panel (already true)
+- hold a **header**, then let go without moving --- that panel's settings
+- hold the **workspace ground** --- the workspace's own list of panels (already true, as
+  right-click)
+
+Every panel has a header, always, so there is no panel this cannot reach --- which is the mistake
+that put the panel list inside a closable Menu. Right-click stays as the fast path for anyone with
+a pen or mouse.
+
+**Not built yet.** `Flow` ships as a per-panel default from the `PANELS` table; the gesture and the
+per-instance override come next.
+
 ## 1. The descriptor engine — and this is what replaces egui
 
 **A panel is a list of controls, described as data.** Rendering that list is one

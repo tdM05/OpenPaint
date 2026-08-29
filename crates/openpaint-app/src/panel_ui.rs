@@ -32,6 +32,7 @@
 
 use crate::layout::Rect;
 use crate::theme::Metrics;
+use serde::{Deserialize, Serialize};
 
 /// Which control a change refers to.
 ///
@@ -107,6 +108,43 @@ impl Control {
             _ => metrics.row,
         }
     }
+
+    /// How wide this control wants to be when the list runs across rather than down.
+    ///
+    /// `text` is the measured width of its label, which only something with a font can know, so it
+    /// comes in from the caller the same way tab widths do.
+    #[must_use]
+    pub fn width(&self, metrics: &Metrics, text: f32) -> f32 {
+        match self {
+            // A rule between groups, turned on its side.
+            Self::Separator => metrics.padding,
+            Self::Label { .. } => text + metrics.padding,
+            // A slider needs somewhere to slide. Below about six rows it is a button that lies.
+            Self::Slider { .. } => (text + metrics.row * 4.0).max(metrics.row * 6.0),
+            Self::Toggle { .. } => text + metrics.row * 1.6 + metrics.padding * 2.0,
+            Self::Button { .. } | Self::Row { .. } => text + metrics.padding * 2.0,
+        }
+    }
+}
+
+/// Which way a panel's controls run.
+///
+/// **A strip is a row or a column and never a half-broken row.** Wrapping a row of buttons onto a
+/// second line leaves a ragged edge and a last line with one item on it, and no arrangement of a
+/// panel makes that look deliberate. Turning the whole thing on its side does.
+///
+/// This is a *setting*, not a rule about the menu: it belongs to any list of controls, so every
+/// panel gets it without anything being written twice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Flow {
+    /// Down the panel. What a properties panel wants.
+    Column,
+    /// Across it. What a menu bar or a tool strip wants.
+    Row,
+    /// Across if it fits, down if it does not.
+    #[default]
+    Auto,
 }
 
 /// A control and where it sits.
@@ -116,40 +154,76 @@ pub struct Placed<'a> {
     pub rect: Rect,
 }
 
-/// Stack the controls down the panel's content rectangle.
+/// Lay the controls out in the panel's content rectangle, in order.
 ///
-/// Vertical and in order, which is what every panel in the app already is. Anything wanting a grid
-/// can have one when something needs it; inventing one now would be a shape with no user.
+/// Anything wanting a grid can have one when something needs it; inventing one now would be a
+/// shape with no user.
 ///
-/// Controls that run past the bottom are still placed, with rectangles outside the panel. The
-/// caller clips, and a scroll offset is a subtraction from `content.y` — so scrolling needs
-/// nothing here.
+/// Controls that run past the edge are still placed, with rectangles outside the panel. The caller
+/// clips, and a scroll offset is a subtraction from the origin, so scrolling needs nothing here.
+///
+/// `text_of` measures a control's label, which only something with a font can answer. A column
+/// never asks.
 #[must_use]
-pub fn place<'a>(controls: &'a [Control], content: Rect, metrics: &Metrics) -> Vec<Placed<'a>> {
+pub fn place<'a>(
+    controls: &'a [Control],
+    content: Rect,
+    metrics: &Metrics,
+    flow: Flow,
+    text_of: impl Fn(&Control) -> f32,
+) -> Vec<Placed<'a>> {
+    let across = match flow {
+        Flow::Row => true,
+        Flow::Column => false,
+        // The whole point of Auto: it decides once, for the whole list. A per-control decision is
+        // what produces a wrapped row, which is the thing being avoided.
+        Flow::Auto => row_width(controls, metrics, &text_of) <= content.w,
+    };
     let mut out = Vec::with_capacity(controls.len());
-    let mut y = content.y;
+    let (mut x, mut y) = (content.x, content.y);
     for control in controls {
-        let h = control.height(metrics);
-        out.push(Placed {
-            control,
-            rect: Rect::new(content.x, y, content.w, h),
-        });
-        y += h + metrics.gap;
+        let rect = if across {
+            // Everything in a row is one row tall, including the labels and the rules, or the
+            // strip has no baseline to read along.
+            let w = control.width(metrics, text_of(control));
+            let r = Rect::new(x, y, w, metrics.row);
+            x += w + metrics.gap;
+            r
+        } else {
+            let h = control.height(metrics);
+            let r = Rect::new(x, y, content.w, h);
+            y += h + metrics.gap;
+            r
+        };
+        out.push(Placed { control, rect });
     }
     out
 }
 
-/// How tall the whole list is, for deciding whether it needs to scroll.
+/// How wide the controls would be laid end to end.
 #[must_use]
-pub fn total_height(controls: &[Control], metrics: &Metrics) -> f32 {
-    let mut h = 0.0;
-    for (i, control) in controls.iter().enumerate() {
-        h += control.height(metrics);
-        if i + 1 < controls.len() {
-            h += metrics.gap;
-        }
-    }
-    h
+fn row_width(controls: &[Control], metrics: &Metrics, text_of: &impl Fn(&Control) -> f32) -> f32 {
+    let gaps = metrics.gap * (controls.len().saturating_sub(1)) as f32;
+    controls
+        .iter()
+        .map(|c| c.width(metrics, text_of(c)))
+        .sum::<f32>()
+        + gaps
+}
+
+/// How much room the placed controls actually take.
+///
+/// Measured from the rectangles rather than worked out a second time, because a list laid out one
+/// way and measured another is the classic version of one definition living in two places
+/// (recurring hazard 11a.8) — and here it would show up as a panel that scrolls past its own end.
+#[must_use]
+pub fn extent(placed: &[Placed<'_>], origin: Rect) -> (f32, f32) {
+    placed.iter().fold((0.0_f32, 0.0_f32), |(w, h), p| {
+        (
+            w.max(p.rect.x + p.rect.w - origin.x),
+            h.max(p.rect.y + p.rect.h - origin.y),
+        )
+    })
 }
 
 /// Where a list may be scrolled to, given how tall it is and how much of it shows.
@@ -260,6 +334,16 @@ mod tests {
         Rect::new(10.0, 20.0, 200.0, 400.0)
     }
 
+    /// A stand-in for a font: every label the same width, so a test says what it means about
+    /// *layout* rather than about text measurement.
+    fn text(_: &Control) -> f32 {
+        40.0
+    }
+
+    fn column<'a>(controls: &'a [Control]) -> Vec<Placed<'a>> {
+        place(controls, content(), &metrics(), Flow::Column, text)
+    }
+
     fn sliders() -> Vec<Control> {
         vec![
             Control::Label {
@@ -300,7 +384,7 @@ mod tests {
     #[test]
     fn controls_stack_in_order_without_overlapping() {
         let controls = sliders();
-        let placed = place(&controls, content(), &metrics());
+        let placed = column(&controls);
         assert_eq!(placed.len(), controls.len());
 
         for pair in placed.windows(2) {
@@ -336,7 +420,7 @@ mod tests {
     #[test]
     fn a_slider_is_grabbable_anywhere_on_its_row() {
         let controls = sliders();
-        let placed = place(&controls, content(), &metrics());
+        let placed = column(&controls);
         let row = placed[1].rect;
 
         for dy in [1.0, row.h / 2.0, row.h - 1.0] {
@@ -353,7 +437,7 @@ mod tests {
     #[test]
     fn decoration_is_not_a_target() {
         let controls = sliders();
-        let placed = place(&controls, content(), &metrics());
+        let placed = column(&controls);
         for i in [0, 3] {
             let r = placed[i].rect;
             assert!(
@@ -368,7 +452,7 @@ mod tests {
     #[test]
     fn a_press_produces_the_obvious_change() {
         let controls = sliders();
-        let placed = place(&controls, content(), &metrics());
+        let placed = column(&controls);
         let at = |i: usize, x: f32| change_at(placed[i].control, placed[i].rect, x);
 
         assert_eq!(at(4, 20.0), Some(Change::Toggled(3, true)));
@@ -442,20 +526,166 @@ mod tests {
         }
     }
 
-    /// The total height says whether a panel needs to scroll, and agrees with where the last
-    /// control actually ends.
+    /// How much room the list takes is read off the controls, not worked out again.
     #[test]
-    fn the_total_height_matches_where_the_last_control_ends() {
+    fn the_extent_is_where_the_controls_actually_end() {
+        let controls = sliders();
+        let placed = column(&controls);
+        let last = placed.last().expect("controls");
+        let (w, h) = extent(&placed, content());
+        assert!((h - ((last.rect.y + last.rect.h) - content().y)).abs() < 0.001);
+        assert!(
+            (w - content().w).abs() < 0.001,
+            "a column is as wide as its panel"
+        );
+    }
+
+    /// **A strip is a row or a column and never a half-broken row.**
+    ///
+    /// Wrapping onto a second line leaves a ragged edge and a last line with one item on it, and
+    /// no arrangement of a panel makes that look deliberate. So `Auto` decides once, for the whole
+    /// list: across if it fits, down if it does not.
+    #[test]
+    fn auto_turns_the_whole_strip_rather_than_wrapping_it() {
         let controls = sliders();
         let m = metrics();
-        let placed = place(&controls, content(), &m);
-        let last = placed.last().expect("controls");
-        let measured = (last.rect.y + last.rect.h) - content().y;
+        let wide = Rect::new(0.0, 0.0, 4000.0, 300.0);
+        let narrow = Rect::new(0.0, 0.0, 120.0, 300.0);
+
+        let across = place(&controls, wide, &m, Flow::Auto, text);
+        let rows: std::collections::BTreeSet<i32> =
+            across.iter().map(|p| p.rect.y as i32).collect();
+        assert_eq!(rows.len(), 1, "with room to spare it should be one row");
+
+        // And a row it chose is a row that actually fits, gaps included: deciding on the widths
+        // alone puts the last control just past the edge, which is the ragged wrap by another
+        // route.
+        let last = across.last().expect("controls");
         assert!(
-            (measured - total_height(&controls, &m)).abs() < 0.001,
-            "measured {measured}, reported {}",
-            total_height(&controls, &m)
+            last.rect.x + last.rect.w <= wide.x + wide.w + 0.001,
+            "the row it chose runs off the panel"
         );
+
+        let down = place(&controls, narrow, &m, Flow::Auto, text);
+        let columns: std::collections::BTreeSet<i32> =
+            down.iter().map(|p| p.rect.x as i32).collect();
+        assert_eq!(columns.len(), 1, "too narrow, so it should be one column");
+
+        // Exactly wide enough for the controls and not one unit more: the gaps between them still
+        // have to go somewhere, so this must turn rather than overflow by a hair.
+        let bare: f32 = controls.iter().map(|c| c.width(&m, text(c))).sum();
+        let snug = place(
+            &controls,
+            Rect::new(0.0, 0.0, bare, 300.0),
+            &m,
+            Flow::Auto,
+            text,
+        );
+        let cols: std::collections::BTreeSet<i32> = snug.iter().map(|p| p.rect.x as i32).collect();
+        assert_eq!(
+            cols.len(),
+            1,
+            "it fitted the controls but forgot the gaps between them"
+        );
+
+        // The thing being ruled out: something in between.
+        for laid in [&across, &down] {
+            let rows: std::collections::BTreeSet<i32> =
+                laid.iter().map(|p| p.rect.y as i32).collect();
+            let cols: std::collections::BTreeSet<i32> =
+                laid.iter().map(|p| p.rect.x as i32).collect();
+            assert!(
+                rows.len() == 1 || cols.len() == 1,
+                "a wrapped layout: {} rows and {} columns",
+                rows.len(),
+                cols.len()
+            );
+        }
+    }
+
+    /// A row does not overlap itself, and everything in it shares a baseline.
+    #[test]
+    fn a_row_is_one_row_tall_and_runs_left_to_right() {
+        let controls = sliders();
+        let m = metrics();
+        let laid = place(
+            &controls,
+            Rect::new(5.0, 7.0, 4000.0, 300.0),
+            &m,
+            Flow::Row,
+            text,
+        );
+        for p in &laid {
+            assert!(
+                (p.rect.h - m.row).abs() < 0.001,
+                "{:?} is {} tall in a row",
+                p.control,
+                p.rect.h
+            );
+            assert!((p.rect.y - 7.0).abs() < 0.001, "off the baseline");
+        }
+        for pair in laid.windows(2) {
+            assert!(
+                pair[1].rect.x >= pair[0].rect.x + pair[0].rect.w,
+                "controls overlap along the row"
+            );
+        }
+    }
+
+    /// **A slider in a row is wide enough to slide.**
+    ///
+    /// Squeezed to its label it becomes a control with two useful positions, which is a button
+    /// that lies about what it is. Measured in millimetres like every other target in the app: a
+    /// logical unit is 1/96 inch, so the floor is a real distance rather than a number that looked
+    /// right on one screen.
+    #[test]
+    fn a_slider_in_a_row_has_somewhere_to_slide() {
+        const PER_MM: f32 = 96.0 / 25.4;
+        let controls = sliders();
+        let m = metrics();
+        let laid = place(
+            &controls,
+            Rect::new(0.0, 0.0, 4000.0, 300.0),
+            &m,
+            Flow::Row,
+            text,
+        );
+        for p in &laid {
+            if !matches!(p.control, Control::Slider { .. }) {
+                continue;
+            }
+            let mm = p.rect.w / PER_MM;
+            assert!(
+                mm >= 25.0,
+                "a slider {mm:.1} mm wide cannot be set to anything but its ends"
+            );
+        }
+    }
+
+    /// Both directions stay hittable: a control's rectangle is its target either way.
+    #[test]
+    fn a_control_can_be_pressed_in_either_direction() {
+        let controls = sliders();
+        let m = metrics();
+        for flow in [Flow::Row, Flow::Column] {
+            let laid = place(
+                &controls,
+                Rect::new(0.0, 0.0, 4000.0, 300.0),
+                &m,
+                flow,
+                text,
+            );
+            let slider = laid
+                .iter()
+                .find(|p| matches!(p.control, Control::Slider { id: 1, .. }))
+                .expect("the size slider");
+            let r = slider.rect;
+            let found = hit(&laid, r.x + r.w / 2.0, r.y + r.h / 2.0);
+            assert!(
+                matches!(found, Some((Control::Slider { id: 1, .. }, _))),
+                "{flow:?}: the slider is not where it was drawn"
+            );
+        }
     }
 
     /// A list cannot be scrolled past its own end, and one that fits does not scroll at all.
@@ -472,9 +702,9 @@ mod tests {
     /// An empty panel is a valid panel: no controls, no height, nothing to hit.
     #[test]
     fn an_empty_panel_is_fine() {
-        let placed = place(&[], content(), &metrics());
+        let placed = column(&[]);
         assert!(placed.is_empty());
         assert!(hit(&placed, 50.0, 50.0).is_none());
-        assert_eq!(total_height(&[], &metrics()), 0.0);
+        assert_eq!(extent(&placed, content()), (0.0, 0.0));
     }
 }

@@ -30,6 +30,7 @@
 use crate::chrome::{self, HeaderStyle};
 use crate::layout::{Layout, LayoutHistory, PanelId, Rect, Zone};
 use crate::panel_drag::{Held, Outcome, PanelDrag, Preview};
+use crate::panel_ui::Flow;
 use crate::theme::{Color, Theme};
 
 /// A panel the app can show.
@@ -40,6 +41,12 @@ pub struct PanelKind {
     pub id: PanelId,
     pub name: &'static str,
     pub header: HeaderStyle,
+    /// Which way this panel's controls run, until the artist says otherwise.
+    ///
+    /// **A default, not a rule.** It lives beside the name because it is the panel's own business
+    /// which way it reads: a menu is a strip and a layer list is a list, and neither is a fact
+    /// about the layout. When per-panel settings arrive this is what they start from.
+    pub flow: Flow,
 }
 
 /// Every panel, in the order they appear in a menu.
@@ -51,36 +58,43 @@ pub const PANELS: &[PanelKind] = &[
         id: PanelId(0),
         name: "Menu",
         header: HeaderStyle::Compact,
+        flow: Flow::Auto,
     },
     PanelKind {
         id: PanelId(1),
         name: "Tools",
         header: HeaderStyle::Compact,
+        flow: Flow::Auto,
     },
     PanelKind {
         id: PanelId(2),
         name: "Canvas",
         header: HeaderStyle::Named,
+        flow: Flow::Column,
     },
     PanelKind {
         id: PanelId(3),
         name: "Brush",
         header: HeaderStyle::Named,
+        flow: Flow::Column,
     },
     PanelKind {
         id: PanelId(4),
         name: "Layers",
         header: HeaderStyle::Named,
+        flow: Flow::Column,
     },
     PanelKind {
         id: PanelId(5),
         name: "Colour",
         header: HeaderStyle::Named,
+        flow: Flow::Column,
     },
     PanelKind {
         id: PanelId(6),
         name: "History",
         header: HeaderStyle::Named,
+        flow: Flow::Column,
     },
 ];
 
@@ -174,6 +188,8 @@ pub struct Workspace {
     panel_list: Option<Rect>,
     /// The list's own half-finished gesture, exactly like any other described panel's.
     list_input: crate::panel_draw::PanelInput,
+    /// The list has been asked for from somewhere with no pointer position; open it next frame.
+    list_wanted: bool,
 }
 
 impl Default for Workspace {
@@ -186,6 +202,7 @@ impl Default for Workspace {
             canvas_rect: None,
             panel_list: None,
             list_input: crate::panel_draw::PanelInput::default(),
+            list_wanted: false,
         }
     }
 }
@@ -461,6 +478,17 @@ impl Workspace {
         // The panel list: opened by a secondary press anywhere, closed by a primary press outside
         // it. Anywhere, because it must not depend on any panel being open -- least of all the one
         // it used to live in.
+        if std::mem::take(&mut self.list_wanted) {
+            // Centred, because a request with no pointer behind it has nowhere better to go.
+            let mid = self.list_rect(
+                ctx,
+                screen.x + screen.w / 2.0,
+                screen.y + screen.h / 2.0,
+                screen,
+            );
+            self.panel_list =
+                Some(self.list_rect(ctx, mid.x - mid.w / 2.0, mid.y - mid.h / 2.0, screen));
+        }
         if ctx.input(|i| i.pointer.secondary_pressed()) {
             if let Some(pos) = pointer {
                 self.panel_list = Some(self.list_rect(ctx, pos.x, pos.y, screen));
@@ -753,7 +781,7 @@ impl Workspace {
 
         // --- the panel list, above everything, drawn by the same descriptor layer as any panel ---
         if let Some(rect) = self.panel_list {
-            let controls = panel_list_controls(&self.layout);
+            let controls = panel_list_controls(self);
             let theme = self.theme;
             let mut ui = egui::Ui::new(
                 ctx.clone(),
@@ -769,7 +797,13 @@ impl Workspace {
                 m.radius,
                 egui::Stroke::new(1.0_f32, rgb(p.edge)),
             );
-            let changes = crate::panel_draw::show(&mut ui, &controls, &theme, &mut self.list_input);
+            let changes = crate::panel_draw::show(
+                &mut ui,
+                &controls,
+                &theme,
+                Flow::Column,
+                &mut self.list_input,
+            );
             for change in changes {
                 match change {
                     // The list stays open on a toggle: showing three panels should be three taps,
@@ -781,13 +815,22 @@ impl Workspace {
         }
     }
 
+    /// Ask for the panel list without saying where.
+    ///
+    /// For reaching it from a control rather than from a press: there is no pointer position to
+    /// open it at, and no window to measure against until the next frame begins. So it is a
+    /// request, honoured at the top of `show`.
+    pub fn open_panel_list(&mut self) {
+        self.list_wanted = true;
+    }
+
     /// Where the panel list goes when it is opened at a point.
     ///
     /// Sized to its own contents and kept inside the window, so opening it near an edge does not
     /// put half of it out of reach.
     fn list_rect(&self, ctx: &egui::Context, x: f32, y: f32, screen: Rect) -> Rect {
         let m = self.theme.metrics;
-        let controls = panel_list_controls(&self.layout);
+        let controls = panel_list_controls(self);
         let widest = PANELS
             .iter()
             .map(|k| {
@@ -804,7 +847,18 @@ impl Workspace {
             .fold(0.0_f32, f32::max);
         // Room for the name, the switch beside it, and the padding either side.
         let w = (widest + m.row * 1.6 + m.padding * 4.0).min(screen.w);
-        let h = (crate::panel_ui::total_height(&controls, &m) + m.padding * 2.0).min(screen.h);
+        // Measured from where the switches actually land, not from a second sum of the same
+        // heights that could drift out of step with the first.
+        let laid = crate::panel_ui::place(
+            &controls,
+            Rect::new(0.0, 0.0, w, screen.h),
+            &m,
+            Flow::Column,
+            |_| 0.0,
+        );
+        let h = (crate::panel_ui::extent(&laid, Rect::new(0.0, 0.0, w, screen.h)).1
+            + m.padding * 2.0)
+            .min(screen.h);
         Rect::new(
             x.min(screen.x + screen.w - w).max(screen.x),
             y.min(screen.y + screen.h - h).max(screen.y),
@@ -897,19 +951,30 @@ fn list_press(list: Option<Rect>, pressed: bool, at: Option<(f32, f32)>) -> List
     }
 }
 
+/// Which way a panel's controls run.
+///
+/// From the panel table, so nothing branches on which panel it is holding: the answer is a column
+/// in the table, and a panel added tomorrow brings its own.
+#[must_use]
+pub fn flow_of(panel: PanelId) -> Flow {
+    kind(panel).map_or(Flow::Column, |k| k.flow)
+}
+
 /// The panel list: one switch per panel this build knows about.
 ///
 /// Built from `PANELS` rather than from a hand-written list, so a panel added to the table appears
 /// here without anyone remembering to add it (recurring hazard 11a.8).
 #[must_use]
-fn panel_list_controls(layout: &Layout) -> Vec<crate::panel_ui::Control> {
+fn panel_list_controls(ws: &Workspace) -> Vec<crate::panel_ui::Control> {
     let mut controls = vec![crate::panel_ui::Control::Label {
         text: "Panels".to_owned(),
     }];
     controls.extend(PANELS.iter().map(|k| crate::panel_ui::Control::Toggle {
         id: k.id.0,
         text: k.name.to_owned(),
-        on: layout.find(k.id).is_some(),
+        // Asked of the workspace rather than worked out again here, so a switch cannot show a
+        // state the rest of the app disagrees with.
+        on: ws.is_open(k.id),
     }));
     controls
 }
@@ -1012,6 +1077,7 @@ mod tests {
             canvas_rect: None,
             panel_list: None,
             list_input: crate::panel_draw::PanelInput::default(),
+            list_wanted: false,
         }
     }
 
@@ -1080,7 +1146,7 @@ mod tests {
         }
 
         // The list is built from the workspace, not from a panel, so it still offers everything.
-        let controls = panel_list_controls(&ws.layout);
+        let controls = panel_list_controls(&ws);
         for kind in PANELS {
             assert!(
                 controls.iter().any(|c| c.id() == Some(kind.id.0)),
@@ -1096,11 +1162,30 @@ mod tests {
         }
     }
 
+    /// Which way a panel's controls run comes from the panel table, not from one answer given to
+    /// everything.
+    #[test]
+    fn each_panel_brings_its_own_direction() {
+        for kind in PANELS {
+            assert_eq!(flow_of(kind.id), kind.flow, "{} lost its flow", kind.name);
+        }
+        // And the table actually says more than one thing, or the check above proves nothing.
+        let first = PANELS[0].flow;
+        assert!(
+            PANELS.iter().any(|k| k.flow != first),
+            "every panel has the same direction, so this test is vacuous"
+        );
+    }
+
     /// The list is the panel table, not a copy of it that someone has to remember to update.
     #[test]
     fn the_panel_list_offers_every_panel_this_build_has() {
-        let ws = bare();
-        let controls = panel_list_controls(&ws.layout);
+        let mut ws = bare();
+        // With one panel away, so a switch stuck permanently on has something to be wrong about.
+        // The default arrangement has all of them open, and against that fixture it did not.
+        ws.toggle(HISTORY);
+        let ws = ws;
+        let controls = panel_list_controls(&ws);
         let switches = controls.iter().filter(|c| c.id().is_some()).count();
         assert_eq!(switches, PANELS.len());
         for kind in PANELS {
