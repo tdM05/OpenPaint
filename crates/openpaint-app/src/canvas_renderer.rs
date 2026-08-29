@@ -529,6 +529,56 @@ impl CanvasRenderer {
         fold.finish()
     }
 
+    /// One tile of the composited image, as 8-bit sRGB.
+    ///
+    /// What the flood fill reads. A tile at a time rather than a pixel at a time because compositing
+    /// a pixel means touching every layer, and a flood fill asks about the same tile thousands of
+    /// times — the caller caches these, and that is the difference between usable and hopeless.
+    ///
+    /// 8-bit sRGB rather than linear float because that is the space a tolerance means something
+    /// in: "within 20" is a judgement about colours as seen, and the artist sets it.
+    pub fn composited_tile(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        coord: TileCoord,
+        layers: &[openpaint_core::Layer],
+    ) -> Vec<[u8; 3]> {
+        let keys: Vec<TileKey> = layers
+            .iter()
+            .map(|l| TileKey {
+                layer: LayerId(l.id()),
+                coord,
+            })
+            .collect();
+        let tiles: std::collections::HashMap<TileKey, openpaint_core::tile::Tile> = self
+            .store
+            .snapshot_some(device, queue, &keys)
+            .into_iter()
+            .collect();
+
+        let mut out = Vec::with_capacity(TILE_SIZE * TILE_SIZE);
+        for ly in 0..TILE_SIZE {
+            for lx in 0..TILE_SIZE {
+                // The same fold as the screen and the eyedropper, so the wand sees what the artist
+                // sees rather than a fourth opinion about what a stack means.
+                let mut fold = crate::export::Composite::new(Canvas::paper_color());
+                for layer in layers {
+                    let key = TileKey {
+                        layer: LayerId(layer.id()),
+                        coord,
+                    };
+                    let texel = tiles.get(&key).map_or([0.0; 4], |t| t.texel(lx, ly));
+                    fold.add(texel, layer);
+                }
+                out.push(openpaint_core::color::opaque_linear_premul_to_srgb8(
+                    fold.finish(),
+                ));
+            }
+        }
+        out
+    }
+
     /// Replace everything with the tiles of a loaded document.
     ///
     /// They go to the CPU side, not the GPU: residency pulls in what the viewport needs, so
@@ -1024,6 +1074,71 @@ pub(crate) mod tests {
         // "clip to the previous layer" implementation would let blue cover the entire page --
         // including where the base is empty, which is exactly the region checked above. Verified by
         // sabotage per §11a.4: making the mask follow the previous layer fails that assertion.
+    }
+
+    /// The wand reads the composited image, which is the whole point of it for comics.
+    ///
+    /// Line art on one layer, an empty layer beneath it for colour. Referring to the layer being
+    /// filled would find the entire page every time, because that layer is blank — so this puts the
+    /// ink *above* the empty layer and asks the wand to respect it anyway.
+    ///
+    /// Uses `composited_tile`, the same fold the screen and the eyedropper use, so what the wand
+    /// sees cannot be a fourth opinion about what a layer stack means.
+    #[test]
+    fn the_wand_sees_the_composited_image_not_one_layer() {
+        let Some((device, queue)) = crate::test_gpu::try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        const W: u32 = 128;
+        const H: u32 = 128;
+
+        let mut document = openpaint_core::Document::new(openpaint_core::Page::new(W, H));
+        document.add_layer();
+        let doc = document.active();
+        let layers = doc.layers().to_vec();
+
+        let stroke = crate::test_gpu::test_stroke_layer(&device);
+        let mut canvas =
+            CanvasRenderer::new(&device, SURFACE, doc.rect(), 64 * 1024 * 1024, &stroke);
+
+        // Bottom layer: entirely empty, as a flats layer is before you fill it.
+        // Top layer: a black vertical line at x = 64, as inked line art.
+        let mut ink = Canvas::new(W, H);
+        for y in 0..H as i32 {
+            ink.replace_pixel(64, y, [0.0, 0.0, 0.0, 1.0]);
+        }
+        let top = LayerId(layers[1].id());
+        let mut enc = device.create_command_encoder(&Default::default());
+        canvas.upload_dirty(&device, &queue, &mut enc, top, &mut ink);
+        queue.submit(std::iter::once(enc.finish()));
+
+        let mut cache: std::collections::HashMap<TileCoord, Vec<[u8; 3]>> =
+            std::collections::HashMap::new();
+        let region = openpaint_core::region::flood(doc.rect(), (20, 64), 32, 0, |x, y| {
+            let coord = tile_of(x, y);
+            let tile = cache
+                .entry(coord)
+                .or_insert_with(|| canvas.composited_tile(&device, &queue, coord, &layers));
+            let side = TILE_SIZE as i32;
+            tile[y.rem_euclid(side) as usize * TILE_SIZE + x.rem_euclid(side) as usize]
+        });
+
+        assert_eq!(
+            region.coverage_at(20, 64),
+            255,
+            "the wand found nothing at all"
+        );
+        assert_eq!(
+            region.coverage_at(60, 64),
+            255,
+            "it should reach right up to the line"
+        );
+        assert_eq!(
+            region.coverage_at(100, 64),
+            0,
+            "it crossed the ink, so it is reading the empty layer rather than the composite"
+        );
     }
 
     /// The eyedropper must return exactly what is on screen.

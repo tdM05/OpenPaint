@@ -119,6 +119,8 @@ pub enum LayerAction {
 pub enum SelectTool {
     Lasso,
     Rect,
+    /// Click a region of similar colour — the magic wand, and what a bucket uses.
+    Wand,
 }
 
 /// What the selection controls want done.
@@ -133,6 +135,36 @@ pub enum SelectAction {
     Fill,
     /// Clear the selection.
     Clear,
+}
+
+/// How the magic wand behaves.
+///
+/// Lives in the panel rather than the engine because these are preferences, and it is handed back
+/// through [`Outcome`] like every other edit the panel makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WandSettings {
+    /// Largest per-channel difference from the clicked colour still counted as the same region.
+    pub tolerance: u8,
+    /// How far to grow the region afterwards, in pixels, to tuck it under anti-aliased ink.
+    pub expand: u32,
+    /// Fill immediately on click instead of leaving a selection — which is what a bucket is.
+    pub fill_on_click: bool,
+}
+
+impl Default for WandSettings {
+    fn default() -> Self {
+        Self {
+            // A middling tolerance: high enough to climb a soft edge, low enough not to walk
+            // through a grey. Nothing has measured a better starting point, and the control is
+            // right there.
+            tolerance: 32,
+            // Two pixels of growth, which covers the edge ramp a typical soft brush leaves without
+            // visibly bleeding past the far side of a thin line.
+            expand: 2,
+            // A bucket by default, because that is what the tool is reached for.
+            fill_on_click: true,
+        }
+    }
 }
 
 /// What the crop tool should do next.
@@ -182,6 +214,8 @@ pub struct Status<'a> {
     pub select_tool: Option<SelectTool>,
     /// Whether there is a selection to act on.
     pub has_selection: bool,
+    /// Wand settings: colour tolerance, how far to grow the region, and whether a click fills.
+    pub wand: WandSettings,
 }
 
 /// Where to draw the brush outline, and how big.
@@ -219,6 +253,8 @@ pub struct Outcome {
     pub recovery: Option<RecoveryChoice>,
     /// A selection command.
     pub select: Option<SelectAction>,
+    /// Wand settings, as the panel currently holds them.
+    pub wand: WandSettings,
 }
 
 pub struct Ui {
@@ -315,6 +351,7 @@ impl Ui {
         let mut confirm_choice = None;
         let mut recovery_choice = None;
         let mut select_action = None;
+        let mut wand = status.wand;
 
         let mut panel_rect = egui::Rect::NOTHING;
         let output = self.ctx.run(input, |ctx| {
@@ -355,6 +392,7 @@ impl Ui {
                                 for (tool, label) in [
                                     (SelectTool::Lasso, "Lasso"),
                                     (SelectTool::Rect, "Rectangle"),
+                                    (SelectTool::Wand, "Wand"),
                                 ] {
                                     let on = status.select_tool == Some(tool);
                                     if ui.selectable_label(on, label).clicked() {
@@ -381,6 +419,22 @@ impl Ui {
                                     select_action = Some(SelectAction::Invert);
                                 }
                             });
+                            if status.select_tool == Some(SelectTool::Wand) {
+                                ui.add(
+                                    egui::Slider::new(&mut wand.tolerance, 0..=128)
+                                        .text("Tolerance"),
+                                );
+                                ui.add(egui::Slider::new(&mut wand.expand, 0..=8).text("Expand"));
+                                ui.checkbox(&mut wand.fill_on_click, "Fill on click (bucket)");
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Tolerance is how far up an anti-aliased edge still counts as the region; Expand tucks the result under the ink so no pale fringe is left. With Fill off the wand leaves a selection instead.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+
                             ui.horizontal(|ui| {
                                 if ui
                                     .add_enabled(
@@ -1106,6 +1160,7 @@ impl Ui {
             confirm: confirm_choice,
             recovery: recovery_choice,
             select: select_action,
+            wand,
         }
     }
 }

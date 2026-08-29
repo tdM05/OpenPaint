@@ -45,14 +45,16 @@ pub fn flood(
     seed: (i32, i32),
     tolerance: u8,
     expand: u32,
-    sample: impl Fn(i32, i32) -> [u8; 3],
+    // `FnMut` because a real sampler caches: composing a tile from every layer is far too
+    // expensive to redo per pixel, and a flood fill asks about the same tile thousands of times.
+    mut sample: impl FnMut(i32, i32) -> [u8; 3],
 ) -> Selection {
     if !page.contains(seed.0, seed.1) {
         return Selection::new();
     }
     let (w, h) = (page.w as usize, page.h as usize);
     let target = sample(seed.0, seed.1);
-    let matches = |x: i32, y: i32| similar(sample(x, y), target, tolerance);
+    let mut matches = |x: i32, y: i32| similar(sample(x, y), target, tolerance);
 
     // A flat grid over the page rather than a sparse map: a flood fill touches its pixels in
     // scanline order and asks about neighbours constantly, so a hash lookup per query would

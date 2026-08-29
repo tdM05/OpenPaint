@@ -133,6 +133,8 @@ struct OpenPaint {
     /// deliberately not a variant of [`editor::Tool`]: that enum indexes an array of brushes, and a
     /// selection tool has no brush to index.
     select: Option<Select>,
+    /// How the magic wand behaves. Owned here because the panel only edits it.
+    wand: ui::WandSettings,
     /// The document's selection, and the outline it draws.
     ///
     /// The outline is cached beside it because it is derived from the whole mask, which is far too
@@ -257,6 +259,12 @@ enum Select {
         from: Option<(f32, f32)>,
         to: (f32, f32),
     },
+    /// Click to select the region of similar colour under the pointer — the magic wand.
+    ///
+    /// A click rather than a drag, so it carries a point rather than a shape, and it resolves in
+    /// [`OpenPaint::select_release`] where the canvas is reachable. It cannot resolve itself the way
+    /// the others can: a lasso is its own answer, whereas a wand's answer is in the pixels.
+    Wand { at: Option<(f32, f32)> },
 }
 
 impl Select {
@@ -275,6 +283,7 @@ impl Select {
                 *from = Some(p);
                 *to = p;
             }
+            Self::Wand { at } => *at = Some(p),
         }
     }
 
@@ -308,6 +317,9 @@ impl Select {
                 *to = p;
                 true
             }
+            // A wand is aimed, not dragged. Following the pointer would make a slip during the
+            // click silently change which region is found.
+            Self::Wand { .. } => false,
         }
     }
 
@@ -316,6 +328,7 @@ impl Select {
         match self {
             Self::Lasso { points } => points.clear(),
             Self::Rect { from, .. } => *from = None,
+            Self::Wand { at } => *at = None,
         }
     }
 
@@ -328,6 +341,7 @@ impl Select {
         match self {
             Self::Lasso { points } => !points.is_empty(),
             Self::Rect { from, .. } => from.is_some(),
+            Self::Wand { at } => at.is_some(),
         }
     }
 
@@ -344,6 +358,8 @@ impl Select {
                 let sel = openpaint_core::Selection::from_rect(rect, page);
                 (!sel.is_empty()).then_some(sel)
             }
+            // Answered by the caller, which is the only thing that can see the pixels.
+            Self::Wand { .. } => None,
         }
     }
 
@@ -365,6 +381,8 @@ impl Select {
                 let (a, b) = (from, *to);
                 vec![vec![(a.0, a.1), (b.0, a.1), (b.0, b.1), (a.0, b.1)]]
             }),
+            // Nothing to preview: the shape is not known until the pixels are read.
+            Self::Wand { .. } => Vec::new(),
         }
     }
 }
@@ -432,6 +450,7 @@ impl Default for OpenPaint {
             nav: Nav::default(),
             crop: None,
             select: None,
+            wand: ui::WandSettings::default(),
             selection: None,
             status_message: None,
             in_dispatch: false,
@@ -861,7 +880,17 @@ impl OpenPaint {
             return;
         }
         let page = self.editor.page_rect();
-        let resolved = self.select.as_ref().and_then(|s| s.resolve(page));
+        // The wand is the one gesture that cannot answer itself: a lasso *is* its own shape, but a
+        // wand's shape is in the pixels, which only the renderer can read.
+        let wand_seed = match self.select.as_ref() {
+            Some(Select::Wand { at: Some(p) }) => Some(*p),
+            _ => None,
+        };
+        let resolved = match wand_seed {
+            Some(p) => self.wand_region(p),
+            None => self.select.as_ref().and_then(|s| s.resolve(page)),
+        };
+        let filled = wand_seed.is_some() && self.wand.fill_on_click;
 
         // Reset the gesture either way, so the next press starts a fresh shape rather than
         // extending the last one.
@@ -870,11 +899,32 @@ impl OpenPaint {
         }
 
         match resolved {
-            Some(selection) => self.set_selection(Some(selection), "Selected"),
+            Some(selection) => {
+                if filled {
+                    // A bucket: find the region, fill it, keep no mask. The same machinery as the
+                    // wand, which is the entire reason the two were separated.
+                    self.set_selection(Some(selection), "Filled the region");
+                    self.fill_selection();
+                    self.set_selection(None, "Filled the region");
+                } else {
+                    self.set_selection(Some(selection), "Selected");
+                }
+            }
             // A gesture that enclosed nothing -- a tap, or a lasso of three coincident points --
             // reads as "deselect", which is what a click on empty space means in every art app.
             None => self.set_selection(None, "Deselected"),
         }
+    }
+
+    /// The region under a page point, by the wand's current settings.
+    fn wand_region(&mut self, at: (f32, f32)) -> Option<openpaint_core::Selection> {
+        let page = self.editor.page_rect();
+        let seed = (at.0.floor() as i32, at.1.floor() as i32);
+        let settings = self.wand;
+        let layers = self.editor.layers().to_vec();
+        let renderer = self.renderer.as_mut()?;
+        let selection = renderer.wand(page, seed, settings.tolerance, settings.expand, &layers);
+        (!selection.is_empty()).then_some(selection)
     }
 
     /// Replace the selection, recomputing the outline it draws.
@@ -914,6 +964,7 @@ impl OpenPaint {
                             from: None,
                             to: (0.0, 0.0),
                         },
+                        ui::SelectTool::Wand => Select::Wand { at: None },
                     })
                 };
                 self.request_redraw();
@@ -2050,6 +2101,7 @@ impl OpenPaint {
         let select_tool = self.select.as_ref().map(|s| match s {
             Select::Lasso { .. } => ui::SelectTool::Lasso,
             Select::Rect { .. } => ui::SelectTool::Rect,
+            Select::Wand { .. } => ui::SelectTool::Wand,
         });
         let has_selection = self.selection.is_some();
         let perf = self.perf.snapshot();
@@ -2177,6 +2229,7 @@ impl OpenPaint {
                         selection: &selection_overlay,
                         select_tool,
                         has_selection,
+                        wand: self.wand,
                     },
                 );
                 ui_wants_repaint = out.wants_repaint;
@@ -2189,6 +2242,7 @@ impl OpenPaint {
                 confirm_request = out.confirm;
                 recovery_request = out.recovery;
                 select_request = out.select;
+                self.wand = out.wand;
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });

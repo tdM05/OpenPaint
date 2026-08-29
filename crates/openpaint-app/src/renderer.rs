@@ -469,6 +469,37 @@ impl Renderer {
         }
     }
 
+    /// Select the region of similar colour under a page pixel — the magic wand.
+    ///
+    /// Reads the *composited* image, which for comics is the only useful answer: colour goes on an
+    /// empty layer beneath the line art, so referring to the layer being filled would find the
+    /// whole page every time.
+    pub fn wand(
+        &mut self,
+        page: PageRect,
+        seed: (i32, i32),
+        tolerance: u8,
+        expand: u32,
+        layers: &[Layer],
+    ) -> openpaint_core::Selection {
+        // Tiles are composited once and kept: a flood fill asks about the same tile thousands of
+        // times, and each miss costs a readback of every layer.
+        let mut cache: std::collections::HashMap<openpaint_core::tile::TileCoord, Vec<[u8; 3]>> =
+            std::collections::HashMap::new();
+
+        openpaint_core::region::flood(page, seed, tolerance, expand, |x, y| {
+            let coord = crate::canvas_renderer::tile_of(x, y);
+            let tile = cache.entry(coord).or_insert_with(|| {
+                self.canvas_renderer
+                    .composited_tile(&self.device, &self.queue, coord, layers)
+            });
+            let side = openpaint_core::tile::TILE_SIZE as i32;
+            let lx = x.rem_euclid(side) as usize;
+            let ly = y.rem_euclid(side) as usize;
+            tile[ly * openpaint_core::tile::TILE_SIZE + lx]
+        })
+    }
+
     pub fn save_document(
         &mut self,
         document: &openpaint_core::Document,
