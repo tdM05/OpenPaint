@@ -376,6 +376,51 @@ impl Selection {
         bounds
     }
 
+    /// The page-pixel rectangle the coverage *actually* occupies, as `(min_x, min_y, max_x,
+    /// max_y)` with the maxima exclusive.
+    ///
+    /// Tight, unlike [`bounds`], and that is the whole reason it exists. A transform box has to
+    /// hug what is selected: a box snapped out to 256-pixel tiles around a small lasso would sit
+    /// visibly away from the artwork, put its handles somewhere the artist did not select, and —
+    /// worse — put the *pivot* up to half a tile off centre, so rotating would swing the pixels
+    /// instead of turning them in place.
+    ///
+    /// The cost is a scan of the occupied tiles, which is why [`bounds`] is still what the
+    /// resampling loop uses: that one only needs a box it is safe to walk, and it skips empty
+    /// source anyway.
+    ///
+    /// [`bounds`]: Selection::bounds
+    #[must_use]
+    pub fn content_bounds(&self) -> Option<(i32, i32, i32, i32)> {
+        let side = TILE_SIZE as i32;
+        let mut bounds: Option<(i32, i32, i32, i32)> = None;
+        for (coord, tile) in &self.tiles {
+            let (ox, oy) = (coord.0 * side, coord.1 * side);
+            for (ly, row) in tile.as_chunks::<TILE_SIZE>().0.iter().enumerate() {
+                // The first and last covered texel in the row is all a bounding box needs, so the
+                // scan is two searches from the ends rather than a walk of every pixel.
+                let Some(first) = row.iter().position(|&c| c > 0) else {
+                    continue;
+                };
+                let last = row
+                    .iter()
+                    .rposition(|&c| c > 0)
+                    .expect("a row with a first covered texel has a last one");
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_possible_wrap,
+                    reason = "indices within a 256-wide tile"
+                )]
+                let (x0, x1, y) = (ox + first as i32, ox + last as i32 + 1, oy + ly as i32);
+                bounds = Some(match bounds {
+                    None => (x0, y, x1, y + 1),
+                    Some((lx, ly0, hx, hy)) => (lx.min(x0), ly0.min(y), hx.max(x1), hy.max(y + 1)),
+                });
+            }
+        }
+        bounds
+    }
+
     #[must_use]
     pub fn inverted(&self, page: PageRect) -> Self {
         let side = TILE_SIZE as i32;
@@ -1048,5 +1093,40 @@ mod tests {
         );
         assert!(out.is_empty());
         assert!(Selection::new().bounds().is_none());
+    }
+
+    /// The tight bounds hug the coverage, and the tile-aligned ones do not.
+    ///
+    /// Both are wanted, for different jobs, so the test that matters is the one that separates
+    /// them: a small rectangle inside a single tile has to come back as itself, not as the tile.
+    /// A transform box built on the tile-aligned box would hang up to 255 pixels off the artwork
+    /// and put the rotation pivot somewhere the artist never selected.
+    #[test]
+    fn the_tight_bounds_hug_the_coverage_and_the_tile_aligned_ones_do_not() {
+        let page = PageRect::new(0, 0, 1024, 1024);
+        let sel = Selection::from_rect(PageRect::new(300, 100, 40, 20), page);
+
+        assert_eq!(
+            sel.content_bounds(),
+            Some((300, 100, 340, 120)),
+            "the tight box is the rectangle that was selected"
+        );
+        assert_eq!(
+            sel.bounds(),
+            Some((256, 0, 512, 256)),
+            "the tile-aligned box is the tile it landed in, and that is what it is for"
+        );
+        assert!(Selection::new().content_bounds().is_none());
+    }
+
+    /// A selection spanning a tile boundary is one box, not two.
+    ///
+    /// The per-tile scan is the part that could get this wrong: each tile answers in its own local
+    /// coordinates, and forgetting to add the tile origin gives a box around the origin instead.
+    #[test]
+    fn tight_bounds_span_tile_boundaries() {
+        let page = PageRect::new(0, 0, 1024, 1024);
+        let sel = Selection::from_rect(PageRect::new(200, 200, 120, 120), page);
+        assert_eq!(sel.content_bounds(), Some((200, 200, 320, 320)));
     }
 }

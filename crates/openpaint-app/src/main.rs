@@ -51,6 +51,7 @@ mod stroke_layer;
 mod test_gpu;
 mod tile_pool;
 mod tile_store;
+mod transform_box;
 mod ui;
 mod view;
 
@@ -72,11 +73,14 @@ use openpaint_core::{PageRect, Side};
 use renderer::Renderer;
 use view::{View, ROTATE_STEP};
 
-/// How close, in screen pixels, a press must be to grab a crop handle.
+/// How close, in screen pixels, a press must be to grab a handle.
 ///
-/// Screen-relative on purpose: converted to page units by dividing by the zoom, so a
-/// handle is equally easy to hit whether you are at 10% or 800%.
-const CROP_GRAB_PX: f32 = 10.0;
+/// One number for the crop rectangle and for the transform box, because it answers one question --
+/// how big a target a handle is -- and two copies would only ever drift apart (§11a.8).
+///
+/// Screen-relative on purpose: converted to page units by dividing by the zoom, so a handle is
+/// equally easy to hit whether you are at 10% or 800%.
+const GRAB_PX: f32 = 10.0;
 
 /// Extension for the native document format.
 const DOCUMENT_EXTENSION: &str = "openpaint";
@@ -319,6 +323,20 @@ fn to_eight_bit(data: &[u8], depth: png::BitDepth) -> Vec<u8> {
 const FLOAT_LAYER: tile_store::LayerId = tile_store::LayerId(u32::MAX);
 
 /// Pixels in the air between a lift and a put-down.
+/// A gesture in progress on the transform box.
+///
+/// Holds the transform *as it was at the press*, so every frame recomputes the whole thing from
+/// the original rather than nudging the last one. That is what makes a drag out and back exact,
+/// and it is the same reason `crop::Drag` keeps its `start`.
+#[derive(Clone, Copy, Debug)]
+struct Grab {
+    handle: transform_box::Handle,
+    /// Where the press landed, in page coordinates.
+    from: (f32, f32),
+    /// The transform at the moment of the press.
+    start: openpaint_core::Transform,
+}
+
 struct Dragging {
     /// The layer they came from, and will go back to.
     layer: tile_store::LayerId,
@@ -329,8 +347,15 @@ struct Dragging {
     /// What clearing the source overwrote. Held until the put-down so the whole gesture records as
     /// one entry rather than two.
     before: Vec<(openpaint_core::tile::TileCoord, crate::history::TileBefore)>,
-    /// Where the drag began, in page coordinates.
-    from: (f32, f32),
+    /// The untransformed rectangle the transform box is drawn around, tight to what was lifted.
+    rect: transform_box::Rect,
+    /// The handle currently being dragged, and the state the drag started from.
+    ///
+    /// `None` between drags: a transform session outlives any one gesture, so the pointer being up
+    /// is the normal state, not the end of anything.
+    grab: Option<Grab>,
+    /// Whether a corner drag keeps the two axes equal.
+    lock_aspect: bool,
     /// How the pixels are currently placed.
     ///
     /// A whole-pixel translation while only dragging, which takes the exact copy path; scale and
@@ -379,6 +404,12 @@ enum Capture {
     Select,
     /// Dragging the selected pixels.
     Move,
+    /// The transform box: its handles, its rotation ring, and its interior.
+    ///
+    /// Separate from [`Capture::Move`] because the two answer a release differently -- a quick drag
+    /// lands on release, a transform session does not -- and because only this one has handles to
+    /// hit-test before it knows what the drag means.
+    Transform,
     /// Sampling a colour, and *continuing* to sample while the pointer is held — which is what
     /// holding Alt does in Photoshop, and falls out of capture rather than needing a special case.
     Pick,
@@ -651,6 +682,7 @@ impl OpenPaint {
                     Capture::Crop => self.crop_press(sample),
                     Capture::Select => self.select_press(sample),
                     Capture::Move => self.move_press(sample),
+                    Capture::Transform => self.transform_press(sample),
                     Capture::Paint => {
                         if let Some((cx, cy)) = self.to_canvas(sample) {
                             self.stroke_start(
@@ -699,8 +731,9 @@ impl OpenPaint {
                             self.select_drag(sample);
                         }
                     }
-                    Capture::Move => {
-                        // Only the newest: a move is where the pointer *is*, not the path it took.
+                    // Only the newest, for both: a move or a scale is where the pointer *is*, not
+                    // the path it took to get there.
+                    Capture::Move | Capture::Transform => {
                         if let Some(sample) = samples.last() {
                             self.move_drag(sample);
                         }
@@ -735,7 +768,7 @@ impl OpenPaint {
                         }
                     }
                     Capture::Select => self.select_release(),
-                    Capture::Move => self.move_release(),
+                    Capture::Move | Capture::Transform => self.move_release(),
                     // Queues the bake that commits the stroke; demand-driven painting means it
                     // needs a frame requested or it simply never happens.
                     Capture::Paint => {
@@ -771,6 +804,15 @@ impl OpenPaint {
             || self.recovery.is_some()
         {
             return Capture::None;
+        }
+        // A transform in the air is modal, and sits here rather than below the tools for the same
+        // reason a prompt does: it is a thing the artist is *in the middle of*, and every press on
+        // the canvas belongs to it until it is applied or abandoned. Without this the selection
+        // tool that was still armed kept its claim, so pressing on the floating pixels started a
+        // fresh lasso over the top of them -- the transform was unreachable by pointer at all, and
+        // only the panel could drive it.
+        if self.dragging.as_ref().is_some_and(|d| d.persistent) {
+            return Capture::Transform;
         }
         if self.nav.modifiers.alt_key() {
             return Capture::Pick;
@@ -1024,15 +1066,15 @@ impl OpenPaint {
     }
 
     /// How far, in page units, a press may be from a handle to grab it.
-    fn crop_tolerance(&self) -> f32 {
-        CROP_GRAB_PX / self.view.scale().max(f32::MIN_POSITIVE)
+    fn grab_tolerance(&self) -> f32 {
+        GRAB_PX / self.view.scale().max(f32::MIN_POSITIVE)
     }
 
     fn crop_press(&mut self, sample: &PenSample) {
         let Some(p) = self.to_page_unclipped(sample) else {
             return;
         };
-        let tolerance = self.crop_tolerance();
+        let tolerance = self.grab_tolerance();
         if let Some(crop) = self.crop.as_mut() {
             if crop.press(p, tolerance) {
                 self.request_redraw();
@@ -1182,12 +1224,23 @@ impl OpenPaint {
             kernel,
             FLOAT_LAYER,
         );
+        // A quick drag is the transform box with its interior already grabbed. Saying it that way
+        // rather than keeping a second, simpler kind of drag is what lets one `move_drag` serve
+        // both -- and stops the two from ever disagreeing about what a move means.
+        let rect =
+            transform_box::Rect::from_bounds(selection.content_bounds().unwrap_or((0, 0, 0, 0)));
         self.dragging = Some(Dragging {
             layer,
             lifted,
             selection,
             before,
-            from,
+            rect,
+            grab: Some(Grab {
+                handle: transform_box::Handle::Inside,
+                from,
+                start: openpaint_core::Transform::IDENTITY,
+            }),
+            lock_aspect: false,
             transform: openpaint_core::Transform::IDENTITY,
             kernel,
             persistent: false,
@@ -1200,6 +1253,12 @@ impl OpenPaint {
     /// The same lift a drag does, held open. Entered from the panel rather than from the canvas
     /// because a press inside a selection already means "drag it", and overloading that would make
     /// the quick move stop being quick.
+    ///
+    /// **An untested seam, named rather than left implicit.** Lifting needs a renderer, so nothing
+    /// here runs headlessly — a sabotage that builds the box from `Selection::bounds` instead of
+    /// `content_bounds` passes the whole suite. What the tests do cover is that the two bounds
+    /// differ and by how much (`openpaint_core::selection`), and what a box does once it has the
+    /// right rectangle (`transform_box`). The choice made on this line is the gap between them.
     fn begin_transform(&mut self) {
         if self.dragging.is_some() {
             return;
@@ -1219,16 +1278,13 @@ impl OpenPaint {
             self.request_redraw();
             return;
         };
-        // The pivot is the centre of what was lifted, so scaling and rotation happen in place
-        // rather than swinging the artwork away from the page origin.
-        let pivot = lifted.bounds().map_or((0.0, 0.0), |(x0, y0, x1, y1)| {
-            #[expect(clippy::cast_precision_loss, reason = "page coordinates")]
-            {
-                ((x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0)
-            }
-        });
+        // Tight to the coverage, not to the tiles it happens to occupy. Both the box the artist
+        // grabs and the pivot it turns about come from this rectangle, so a tile-aligned one would
+        // hang the handles off the artwork *and* swing the pixels when they should turn in place.
+        let rect =
+            transform_box::Rect::from_bounds(selection.content_bounds().unwrap_or((0, 0, 0, 0)));
         let transform = openpaint_core::Transform {
-            pivot,
+            pivot: rect.centre(),
             ..openpaint_core::Transform::IDENTITY
         };
         renderer.float_at(&lifted, &transform, kernel, FLOAT_LAYER);
@@ -1237,13 +1293,15 @@ impl OpenPaint {
             lifted,
             selection,
             before,
-            from: pivot,
+            rect,
+            grab: None,
+            lock_aspect: false,
             transform,
             kernel,
             persistent: true,
         });
         self.status_message = Some(
-            "Transforming. Drag to move, adjust in the panel, Enter to apply, Esc to cancel."
+            "Transforming. Drag inside to move, a handle to scale, just outside to rotate. Enter applies, Esc cancels."
                 .to_owned(),
         );
         self.request_redraw();
@@ -1291,27 +1349,69 @@ impl OpenPaint {
         self.request_redraw();
     }
 
-    /// Follow the pointer with the floating pixels.
-    fn move_drag(&mut self, sample: &PenSample) {
-        let Some(to) = self.to_page_unclipped(sample) else {
+    /// Take hold of whatever the press landed on: a handle, the interior, or the rotation ring.
+    ///
+    /// A press that misses the box entirely takes hold of nothing, so a stray click beside the
+    /// artwork cannot fling it across the page. It is still *captured* -- the session is modal --
+    /// which is why this ends quietly rather than falling through to whatever tool is armed.
+    fn transform_press(&mut self, sample: &PenSample) {
+        let Some(p) = self.to_page_unclipped(sample) else {
             return;
         };
+        let tolerance = self.grab_tolerance();
         let Some(drag) = self.dragging.as_mut() else {
             return;
         };
-        // Whole pixels: dragging should not resample, so it should not offer to. A transform that
-        // is only a whole-pixel translation still takes the exact copy path.
-        let offset = ((to.0 - drag.from.0).round(), (to.1 - drag.from.1).round());
-        if offset == drag.transform.offset {
-            return;
-        }
-        drag.transform.offset = offset;
-        let (transform, kernel) = (drag.transform, drag.kernel);
-        let lifted = drag.lifted.clone();
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.float_at(&lifted, &transform, kernel, FLOAT_LAYER);
-        }
+        drag.grab = drag
+            .rect
+            .hit_test(p, &drag.transform, tolerance)
+            .map(|handle| Grab {
+                handle,
+                from: p,
+                start: drag.transform,
+            });
         self.request_redraw();
+    }
+
+    /// Follow the pointer with whatever was grabbed.
+    ///
+    /// Split from [`apply_grab`] only because mapping a pen sample to a page point needs a
+    /// renderer to ask how big the window is, which a headless test has not got. Everything that
+    /// could be *wrong* is on the other side of that line.
+    ///
+    /// [`apply_grab`]: OpenPaint::apply_grab
+    fn move_drag(&mut self, sample: &PenSample) {
+        if let Some(to) = self.to_page_unclipped(sample) {
+            self.apply_grab(to);
+        }
+    }
+
+    /// Place the floating pixels for a pointer now at `to`, in page coordinates.
+    ///
+    /// One path for the quick drag and for every handle of the transform box, because a quick drag
+    /// *is* a grab of the interior (see `move_press`).
+    ///
+    /// The new transform comes from the one held **at the press**, not from the current one. That
+    /// is the whole reason [`Grab`] carries `start`: recomputing from the original means a drag
+    /// out and back is exact, where nudging the live transform each frame accumulates a little
+    /// error per sample — and a pen delivers hundreds of them.
+    fn apply_grab(&mut self, to: (f32, f32)) {
+        let Some(drag) = self.dragging.as_ref() else {
+            return;
+        };
+        let Some(grab) = drag.grab else {
+            return;
+        };
+        let transform = transform_box::drag(
+            drag.rect,
+            grab.handle,
+            &grab.start,
+            grab.from,
+            to,
+            drag.lock_aspect,
+        );
+        let kernel = drag.kernel;
+        self.set_transform(transform, kernel);
     }
 
     /// End a quick drag by putting the pixels down.
@@ -1319,7 +1419,10 @@ impl OpenPaint {
     /// A persistent transform ignores this: it is committed by Enter or by the panel, not by
     /// letting go of the pointer, or adjusting a scale would be impossible.
     fn move_release(&mut self) {
-        if self.dragging.as_ref().is_some_and(|d| d.persistent) {
+        if let Some(drag) = self.dragging.as_mut().filter(|d| d.persistent) {
+            // Let go of the handle, not of the session: the next press picks a different one.
+            drag.grab = None;
+            self.request_redraw();
             return;
         }
         self.commit_transform();
@@ -1665,7 +1768,26 @@ impl OpenPaint {
             .collect()
     }
 
-    fn crop_overlay(&self) -> Option<ui::CropOverlay> {
+    /// The transform box in screen space, or `None` when nothing is in the air.
+    ///
+    /// Drawn only for a persistent session. A quick drag is over in the time it takes to let go of
+    /// the button, and flashing a box with handles that cannot be grabbed would suggest an
+    /// interaction that is not on offer.
+    fn transform_overlay(&self) -> Option<ui::HandleBox> {
+        let drag = self.dragging.as_ref().filter(|d| d.persistent)?;
+        let renderer = self.renderer.as_ref()?;
+        let (sw, sh) = renderer.size_px();
+        let to_screen = |(x, y): (f32, f32)| {
+            let (sx, sy) = self.view.canvas_to_screen(x, y, sw, sh);
+            [sx, sy]
+        };
+        Some(ui::HandleBox {
+            corners: drag.rect.corners(&drag.transform).map(to_screen),
+            handles: drag.rect.handles(&drag.transform).map(to_screen),
+        })
+    }
+
+    fn crop_overlay(&self) -> Option<ui::HandleBox> {
         let crop = self.crop.as_ref()?;
         let renderer = self.renderer.as_ref()?;
         let (sw, sh) = renderer.size_px();
@@ -1685,7 +1807,7 @@ impl OpenPaint {
             *slot = to_screen(hx, hy);
         }
 
-        Some(ui::CropOverlay {
+        Some(ui::HandleBox {
             corners: [
                 to_screen(x0, y0),
                 to_screen(x1, y0),
@@ -2786,6 +2908,7 @@ impl OpenPaint {
         // Computed up front, while `self` can still be borrowed immutably: the renderer
         // is taken mutably just below.
         let crop_overlay = self.crop_overlay();
+        let transform_overlay = self.transform_overlay();
         let crop_rect = self.crop.as_ref().map(|c| {
             let r = c.rect();
             (r.x, r.y, r.w, r.h)
@@ -2908,6 +3031,7 @@ impl OpenPaint {
         let live_transform = self.dragging.as_ref().map(|d| ui::TransformState {
             transform: d.transform,
             kernel: d.kernel,
+            lock_aspect: d.lock_aspect,
         });
         let mut transform_state = live_transform;
         let result = renderer.render(xform, visible, &layers, active_index, |gpu| {
@@ -2923,6 +3047,7 @@ impl OpenPaint {
                         message: status_message.as_deref(),
                         page_size,
                         crop: crop_overlay.as_ref(),
+                        transform_box: transform_overlay.as_ref(),
                         crop_rect,
                         residency,
                         spilled,
@@ -3040,6 +3165,9 @@ impl OpenPaint {
             self.apply_text_action(action);
         }
         if let Some(state) = transform_state {
+            if let Some(drag) = self.dragging.as_mut() {
+                drag.lock_aspect = state.lock_aspect;
+            }
             self.set_transform(state.transform, state.kernel);
         }
         match transform_request {
@@ -3643,7 +3771,14 @@ mod tests {
             lifted: openpaint_core::Lifted::default(),
             selection: openpaint_core::Selection::new(),
             before: Vec::new(),
-            from: (0.0, 0.0),
+            rect: transform_box::Rect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 100.0,
+                y1: 100.0,
+            },
+            grab: None,
+            lock_aspect: false,
             transform,
             kernel: openpaint_core::Kernel::default(),
             persistent,
@@ -4004,6 +4139,110 @@ mod tests {
             app.editor.clear_mode(),
             None,
             "clearing is a change in alpha, which is exactly what the lock forbids"
+        );
+    }
+
+    /// A transform in the air owns every press on the canvas, whatever tool is still armed.
+    ///
+    /// **The bug this fixes, reported after the session shipped.** The way you get a selection is
+    /// to draw one, so the lasso is still the active tool when the transform begins — and
+    /// `decide_capture` asked the tool before it asked whether anything was floating. Pressing on
+    /// the floating pixels therefore started a *fresh lasso* across them: every panel control
+    /// worked, and the one gesture everybody reaches for first did not.
+    ///
+    /// Modal, in the same clause as an open prompt, because that is what it is: something the
+    /// artist is in the middle of, which every press belongs to until it is applied or abandoned.
+    #[test]
+    fn a_live_transform_takes_the_pointer_from_the_tool_that_made_the_selection() {
+        let mut app = OpenPaint::default();
+        app.apply_select_action(ui::SelectAction::All);
+        app.apply_select_action(ui::SelectAction::Use(ui::SelectTool::Lasso));
+        let at = PenSample::at(120.0, 90.0, 1.0);
+        assert_eq!(
+            app.decide_capture(&at),
+            Capture::Select,
+            "with no transform in the air the lasso still owns the canvas"
+        );
+
+        app.dragging = Some(session(true, openpaint_core::Transform::IDENTITY));
+        assert_eq!(
+            app.decide_capture(&at),
+            Capture::Transform,
+            "a press during a transform must reach the transform, not start a new selection"
+        );
+    }
+
+    /// A quick drag does not become modal. Only a persistent session claims presses that way, and
+    /// a quick drag has the pointer already — it was granted at the press that began it.
+    #[test]
+    fn a_quick_drag_does_not_make_the_canvas_modal() {
+        let mut app = OpenPaint::default();
+        app.apply_select_action(ui::SelectAction::All);
+        app.apply_select_action(ui::SelectAction::Use(ui::SelectTool::Lasso));
+        app.dragging = Some(session(false, openpaint_core::Transform::IDENTITY));
+        assert_eq!(
+            app.decide_capture(&PenSample::at(120.0, 90.0, 1.0)),
+            Capture::Select
+        );
+    }
+
+    /// Letting go of a handle does not let go of the session, and the next press picks a new one.
+    ///
+    /// The pair matters: a release that cleared the whole session would make scaling impossible,
+    /// and a release that kept the *handle* would leave the box glued to the pointer, so the next
+    /// press somewhere else would carry on scaling from the old grab.
+    #[test]
+    fn releasing_lets_go_of_the_handle_but_not_of_the_session() {
+        let mut app = OpenPaint {
+            dragging: Some(Dragging {
+                grab: Some(Grab {
+                    handle: transform_box::Handle::BottomRight,
+                    from: (100.0, 100.0),
+                    start: openpaint_core::Transform::IDENTITY,
+                }),
+                ..session(true, openpaint_core::Transform::IDENTITY)
+            }),
+            ..OpenPaint::default()
+        };
+
+        app.move_release();
+        let drag = app.dragging.as_ref().expect("the session survives");
+        assert!(drag.grab.is_none(), "the handle was let go of");
+    }
+
+    /// A drag is measured from the press, so passing over the same point twice lands twice in the
+    /// same place.
+    ///
+    /// Pins the wiring rather than the arithmetic — `transform_box::drag` is already proved pure,
+    /// and what this catches is `apply_grab` handing it the *live* transform instead of the one
+    /// held at the press. That sabotage is invisible in a single step and compounds over the
+    /// hundreds of samples a real pen sends, which is exactly the kind of bug that gets blamed on
+    /// the filter.
+    #[test]
+    fn a_drag_is_measured_from_the_press_not_from_the_last_frame() {
+        let mut app = OpenPaint {
+            dragging: Some(Dragging {
+                grab: Some(Grab {
+                    handle: transform_box::Handle::Inside,
+                    from: (50.0, 50.0),
+                    start: openpaint_core::Transform::IDENTITY,
+                }),
+                ..session(true, openpaint_core::Transform::IDENTITY)
+            }),
+            ..OpenPaint::default()
+        };
+
+        app.apply_grab((90.0, 50.0));
+        let once = app.dragging.as_ref().expect("still dragging").transform;
+        assert_eq!(once.offset, (40.0, 0.0));
+
+        // Out to somewhere else, then back over the same point.
+        app.apply_grab((300.0, 220.0));
+        app.apply_grab((90.0, 50.0));
+        let again = app.dragging.as_ref().expect("still dragging").transform;
+        assert_eq!(
+            again.offset, once.offset,
+            "the same pointer position must mean the same placement"
         );
     }
 

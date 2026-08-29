@@ -39,12 +39,17 @@ const PANEL_WIDTH: f32 = 280.0;
 /// A struct rather than more parameters: `render` had already grown to the point of
 /// needing an `allow(too_many_arguments)` once, and that was a signal rather than a
 /// lint to silence.
-/// The crop rectangle in screen space, ready to paint.
+/// A box with eight handles, in screen space, ready to paint.
 ///
-/// Given as points rather than a rect because the canvas can be rotated, so the crop
-/// outline is a parallelogram on screen. Physical pixels; the panel converts to egui's
+/// One type for the crop rectangle and for the transform box. They are the same drawing and
+/// answer the same question -- where is the box, and where can it be grabbed -- so a second copy
+/// would only ever drift out of step with the first (§11a.8). Neither can be on screen while the
+/// other is, so there is no ambiguity about which one a handle belongs to.
+///
+/// Given as points rather than as a rect because the canvas can be rotated and the content can be
+/// too, so on screen the box is a parallelogram. Physical pixels; the panel converts to egui's
 /// logical points itself.
-pub struct CropOverlay {
+pub struct HandleBox {
     /// Corners in page order: top-left, top-right, bottom-right, bottom-left.
     pub corners: [[f32; 2]; 4],
     /// The eight edge and corner handles.
@@ -129,6 +134,12 @@ pub enum TransformAction {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TransformState {
     pub transform: openpaint_core::Transform,
+    /// Whether a corner drag keeps the two axes equal.
+    ///
+    /// Held rather than inferred from the two scales being equal. The derived version turned
+    /// itself off the moment a non-uniform scale was typed in, so the checkbox could not be
+    /// trusted -- and a lock that silently releases is worse than none.
+    pub lock_aspect: bool,
     pub kernel: openpaint_core::Kernel,
 }
 
@@ -219,7 +230,7 @@ pub struct Status<'a> {
     pub message: Option<&'a str>,
     pub page_size: (u32, u32),
     /// Present while the crop tool is active.
-    pub crop: Option<&'a CropOverlay>,
+    pub crop: Option<&'a HandleBox>,
     /// The crop rectangle, for display.
     pub crop_rect: Option<(i32, i32, u32, u32)>,
     /// Resident canvas tiles and pool capacity.
@@ -253,6 +264,8 @@ pub struct Status<'a> {
     pub font_substituted: Option<&'a str>,
     /// Set while a transform is in the air.
     pub transform: Option<TransformState>,
+    /// The transform box on the canvas, present exactly when `transform` is.
+    pub transform_box: Option<&'a HandleBox>,
     /// The filter a transform would use, whether or not one is in flight.
     pub kernel: openpaint_core::Kernel,
     /// What autosave has to report: a line of text, ready to show.
@@ -573,6 +586,32 @@ fn response_editor(ui: &mut egui::Ui, label: &str, response: &mut Response) {
     curve_editor(ui, label, &mut response.curve);
 }
 
+/// Draw a box with its eight handles.
+///
+/// Two strokes for the outline and two fills for each handle, dark under light, because the
+/// overlay has to stay legible over white paper *and* over black ink without knowing which is
+/// underneath it. That is the same reason the selection outline and the brush ring are drawn twice
+/// -- it is the convention, and it is a convention because nothing single-coloured works.
+fn paint_handle_box(painter: &egui::Painter, overlay: &HandleBox, ppp: f32) {
+    let to_point = |p: [f32; 2]| egui::pos2(p[0] / ppp, p[1] / ppp);
+    let pts: Vec<egui::Pos2> = overlay.corners.iter().copied().map(to_point).collect();
+    for (a, b) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
+        painter.line_segment(
+            [pts[a], pts[b]],
+            egui::Stroke::new(3.0_f32, egui::Color32::from_black_alpha(160)),
+        );
+        painter.line_segment(
+            [pts[a], pts[b]],
+            egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
+        );
+    }
+    for h in &overlay.handles {
+        let r = egui::Rect::from_center_size(to_point(*h), egui::vec2(9.0, 9.0));
+        painter.rect_filled(r, 0.0, egui::Color32::from_black_alpha(160));
+        painter.rect_filled(r.shrink(1.5), 0.0, egui::Color32::WHITE);
+    }
+}
+
 /// Where to draw the brush outline, and how big.
 ///
 /// The size a mark will be is otherwise invisible until you make one, which makes choosing a
@@ -717,6 +756,7 @@ impl Ui {
         let mut brush_action = None;
         let mut transform_action = None;
         let mut transform_state = status.transform;
+        let mut lock_aspect = transform_state.is_some_and(|t| t.lock_aspect);
         let mut kernel = status.kernel;
         let mut text_changed = false;
         let mut text = text;
@@ -1022,13 +1062,13 @@ impl Ui {
                                 let t = &mut state.transform;
                                 ui.label(
                                     egui::RichText::new(
-                                        "Drag on the canvas to move. Enter applies, Esc puts it \
-                                         back.",
+                                        "On the canvas: drag inside to move, a handle to scale, \
+                                         just outside to rotate. Enter applies, Esc puts it back.",
                                     )
                                     .small()
                                     .weak(),
                                 );
-                                let mut uniform = (t.scale.0 - t.scale.1).abs() < 1e-4;
+                                let mut uniform = lock_aspect;
                                 ui.horizontal(|ui| {
                                     ui.label("Scale");
                                     let mut x = t.scale.0 * 100.0;
@@ -1053,13 +1093,17 @@ impl Ui {
                                     }
                                     if ui
                                         .checkbox(&mut uniform, "Lock")
-                                        .on_hover_text("Keep the two axes equal.")
+                                        .on_hover_text(
+                                            "Keep the two axes equal, here and when dragging a \
+                                             corner.",
+                                        )
                                         .changed()
                                         && uniform
                                     {
                                         t.scale.1 = t.scale.0;
                                     }
                                 });
+                                lock_aspect = uniform;
                                 let mut degrees = t.rotation.to_degrees();
                                 if ui
                                     .add(
@@ -1088,6 +1132,7 @@ impl Ui {
                                     }
                                 });
                                 state.kernel = kernel;
+                                state.lock_aspect = lock_aspect;
                             } else {
                                 ui.add_enabled_ui(status.has_selection, |ui| {
                                     if ui
@@ -1598,37 +1643,24 @@ impl Ui {
             }
         });
 
-        // Paint the crop outline over the canvas. Deliberately painted, not built from
-        // widgets: egui never sees pen input (Q14), so widget handles would be
+        // Paint the crop rectangle and the transform box over the canvas. Deliberately painted,
+        // not built from widgets: egui never sees pen input (Q14), so widget handles would be
         // mouse-only. Input is handled in the app's own path instead.
-        if let Some(overlay) = status.crop {
-            let ppp = self.ctx.pixels_per_point();
-            let to_point = |p: [f32; 2]| egui::pos2(p[0] / ppp, p[1] / ppp);
+        //
+        // One call each, through one function: the two boxes are the same drawing, and the day
+        // one grew a rotation handle the other would silently not have it.
+        for (id, overlay) in [
+            ("crop-overlay", status.crop),
+            ("transform-box", status.transform_box),
+        ] {
+            let Some(overlay) = overlay else {
+                continue;
+            };
             let painter = self.ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
-                egui::Id::new("crop-overlay"),
+                egui::Id::new(id),
             ));
-
-            // Outline: two strokes, dark under light, so it stays visible over both
-            // white paper and dark artwork.
-            let pts: Vec<egui::Pos2> = overlay.corners.iter().copied().map(to_point).collect();
-            for (a, b) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
-                painter.line_segment(
-                    [pts[a], pts[b]],
-                    egui::Stroke::new(3.0_f32, egui::Color32::from_black_alpha(160)),
-                );
-                painter.line_segment(
-                    [pts[a], pts[b]],
-                    egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
-                );
-            }
-
-            for h in &overlay.handles {
-                let c = to_point(*h);
-                let r = egui::Rect::from_center_size(c, egui::vec2(9.0, 9.0));
-                painter.rect_filled(r, 0.0, egui::Color32::from_black_alpha(160));
-                painter.rect_filled(r.shrink(1.5), 0.0, egui::Color32::WHITE);
-            }
+            paint_handle_box(&painter, overlay, self.ctx.pixels_per_point());
         }
 
         // The selection boundary. Two strokes, dark under light, for the same reason the crop

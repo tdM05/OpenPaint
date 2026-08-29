@@ -3,7 +3,7 @@
 > Living record of what we've agreed on. Update this whenever a decision is
 > made or changed. Anything still undecided lives in `OPEN_QUESTIONS.md`.
 
-Last updated: 2026-08-27
+Last updated: 2026-08-29
 
 ---
 
@@ -556,6 +556,75 @@ badly it is sampled. Evenly spaced thin lines are the case that separates
 them, and the test now measures the *spread* across the output rather than its
 average. Another instance of §11a's rule — a sabotage that does not fail tells
 you about the test.
+
+### 5f. A transform is edited on the canvas, not in a panel — 2026-08-29
+
+Reported the morning after §5e shipped, and the report is worth quoting because it
+names both halves: *"all transforms work, but moving does not… I use lasso to select,
+then try to move by dragging after clicking transform, but then it just lassos again.
+shouldn't it create some transform box just like photoshop or csp?"*
+
+**The bug.** `decide_capture` asked which *tool* was up before it asked whether
+anything was floating. The way you get a selection is to draw one, so the lasso is
+still armed when the transform begins — and every press on the floating pixels started
+a fresh lasso across them. Every panel control worked; the one gesture anybody reaches
+for first did not.
+
+**A transform in the air is modal**, and now sits in the same clause as an open prompt
+rather than below the tools. That is what it *is*: something the artist is in the
+middle of, which every press on the canvas belongs to until it is applied or abandoned.
+The fix is one clause because §4l put the decision in one place — the previous design,
+with a guard per tool, would have needed a guard per tool again.
+
+**The missing half was the box.** A transform reachable only from a panel is a form,
+not a tool. `transform_box.rs` is the eight handles, the rotation ring just outside
+them, and the interior — the same shape as every raster app, because that shape *is*
+how a transform is edited.
+
+Four things in it are decisions rather than mechanics:
+
+1. **The hit test runs in source space.** The pointer is mapped backwards through the
+   transform and tested against the *untransformed* rectangle. Rotation then costs
+   nothing — a rotated box is still grabbed by the corner it came from, not by the one
+   it now resembles on screen — and there is one piece of geometry instead of two that
+   have to agree. The grab tolerance is divided by the scale on the way in, or a
+   selection at 400% would grow its grab zones with it and swallow its own interior.
+
+2. **A drag is a pure function of the transform at the press.** Nothing accumulates, so
+   dragging out and back is exact rather than nearly right. An incremental version
+   passes every other test and drifts a little on each of the hundreds of samples a pen
+   sends — which is the kind of bug that gets blamed on the resampling filter.
+
+3. **Scaling pins the opposite corner without moving the pivot.** The tempting way is
+   to move `Transform::pivot` to the anchor, but the pivot is also what rotation turns
+   about, and rotation must stay about the centre of the box. So the pivot is left alone
+   and the anchor is held by solving for the translation: one line of algebra rather
+   than a second meaning for a field. Under rotation this is the case that separates a
+   real solution from a plausible one — read the scale off the pointer without undoing
+   the rotation first and the box shears instead of scaling.
+
+4. **A quick drag is now the same machinery with the interior already grabbed.** §5e
+   deliberately kept the quick drag separate; a second, simpler kind of drag is exactly
+   how the two would come to disagree about what a move means. One `apply_grab` serves
+   both, and the whole-pixel rounding that keeps a move lossless (§5d) lives in one
+   place.
+
+**The box hugs the coverage, which needed a new primitive.** `Selection::bounds` is
+tile-aligned, and a box snapped out to 256-pixel tiles would hang off the artwork,
+put handles where nothing was selected, and — worse — put the *pivot* up to half a tile
+off centre, so rotating would swing the pixels instead of turning them in place.
+`Selection::content_bounds` is the tight box. Both are kept: the resampling loop only
+needs a rectangle it is safe to walk, and paying for a scan there would be waste.
+
+**One overlay type for the crop rectangle and the transform box.** They are the same
+drawing answering the same question, and §11a.8 is about exactly this — the day one
+grew a handle the other would silently not have it.
+
+A seam that stays untested and is named in the code: `begin_transform` needs a renderer
+to lift, so nothing in it runs headlessly, and a sabotage swapping `content_bounds` for
+`bounds` there passes the whole suite. Thirteen of the fourteen sabotages tried were
+caught; that one is the gap, and it is written above the function rather than left for
+someone to discover.
 
 ### 5e. A transform stays in the air until it is committed — 2026-08-29
 
