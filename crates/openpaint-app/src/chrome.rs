@@ -114,10 +114,19 @@ pub fn panel(
 
 /// What a press at a point means.
 ///
-/// Dividers are tested **before** panels, because a divider's grab width is wider than the gutter
-/// it sits in and therefore overlaps the panels either side. Testing panels first would make a
-/// divider unreachable everywhere except the hairline it draws — which is the bug that makes
-/// splitters in other apps feel like they need to be hunted for.
+/// # Headers, then dividers, then content
+///
+/// Both grab surfaces have to be generous — a divider is a hairline and a header is how a panel is
+/// picked up — and being generous makes them overlap, because a divider's grab width is centred on
+/// the boundary and reaches into the panels either side.
+///
+/// The order settles it without shrinking either. **A header is the panel's own grab surface**, so
+/// it wins where they meet: along the top strip you are picking a panel up, and everywhere below
+/// you are resizing. Two clean rules that meet at a line the artist can see.
+///
+/// The first version had it the other way, so that a divider could be caught anywhere. It could —
+/// including over the first few characters of the neighbouring tab's name, which is precisely
+/// where anyone aiming for that tab would press.
 #[must_use]
 pub fn target_at(
     placed: &[Placed],
@@ -128,6 +137,14 @@ pub fn target_at(
     x: f32,
     y: f32,
 ) -> Target {
+    // Headers first, and every panel's header — not just the one whose slot contains the point,
+    // since a header can reach a little past its own slot once the gutter is taken out.
+    for p in placed {
+        let chrome = panel(p, metrics, style_of(p), |i| measure(p, i));
+        if chrome.header.contains(x, y) {
+            return header_target(p, &chrome, x, y);
+        }
+    }
     for s in splitters {
         if s.rect.contains(x, y) {
             return Target::Splitter {
@@ -136,27 +153,22 @@ pub fn target_at(
             };
         }
     }
-    for p in placed {
-        if !p.rect.contains(x, y) {
-            continue;
-        }
-        let chrome = panel(p, metrics, style_of(p), |i| measure(p, i));
-        if !chrome.header.contains(x, y) {
-            return Target::Elsewhere;
-        }
-        // A compact header has no tabs, but it is still a grab surface — pressing it takes the
-        // panel it belongs to. That is what makes the tool rail movable.
-        let tab = chrome
-            .tabs
-            .iter()
-            .find(|t| t.rect.contains(x, y))
-            .map_or(p.active, |t| t.index);
-        return Target::Tab {
-            path: p.path.clone(),
-            tab,
-        };
-    }
     Target::Elsewhere
+}
+
+/// Which tab of a header was pressed, or the one on show.
+fn header_target(p: &Placed, chrome: &PanelChrome, x: f32, y: f32) -> Target {
+    // A compact header has no tabs, but it is still a grab surface — pressing it takes the panel
+    // it belongs to. That is what makes the tool rail movable.
+    let tab = chrome
+        .tabs
+        .iter()
+        .find(|t| t.rect.contains(x, y))
+        .map_or(p.active, |t| t.index);
+    Target::Tab {
+        path: p.path.clone(),
+        tab,
+    }
 }
 
 /// The five drop regions of a panel, for drawing the overlay while a panel is in the air.
@@ -422,10 +434,8 @@ mod tests {
                 y,
             )
         };
-        // Aimed at the label rather than at the tab's extreme left edge, because the divider's
-        // grab width is centred on the boundary and so claims a margin of the panel beside it.
-        // See `a_divider_takes_a_margin_from_its_neighbour`.
-        let aim = metrics().tab_padding + 2.0;
+        // The extreme left edge is fine now: headers beat dividers, so nothing else reaches it.
+        let aim = 5.0;
         assert_eq!(
             hit(c.tabs[0].rect.x + aim, c.tabs[0].rect.y + 5.0),
             Target::Tab {
@@ -446,33 +456,44 @@ mod tests {
         );
     }
 
-    /// A divider claims a margin of the panel beside it, and that margin is bounded.
+    /// **A header beats a divider where they overlap**, so a generous divider does not eat the
+    /// leading edge of the tab beside it.
     ///
-    /// **A known consequence, stated rather than discovered.** The grab width is centred on the
-    /// boundary, so widening it to something a pen can catch — which it had to be — necessarily
-    /// takes half of that width from each neighbour. The trade is worth making: a divider is two
-    /// units of visible line and needs the margin to be usable at all, while a tab is dozens of
-    /// units wide and can spare its leading edge.
-    ///
-    /// What must not happen is the margin swallowing something whole, so that is what is checked.
+    /// Both targets have to be big — a divider is a hairline, a header is how a panel is picked up
+    /// — and being big makes them overlap. Ordering settles it. Without this the first characters
+    /// of a tab's name are a resize handle, which is exactly where someone aiming for that tab
+    /// presses.
     #[test]
-    fn a_divider_takes_a_margin_from_its_neighbour() {
+    fn a_header_beats_a_divider_where_they_meet() {
         let l = workspace();
         let placed = l.resolve(area());
+        let splitters = l.splitters(area(), metrics().splitter_grab);
         let leaf = placed[1].clone();
         let c = panel(&leaf, &metrics(), HeaderStyle::Named, |_| 40.0);
         let first = c.tabs[0].rect;
 
-        let margin = metrics().splitter_grab / 2.0;
+        // Right at the tab's leading edge, well inside the divider's grab width.
+        let x = first.x + 1.0;
+        let s = &splitters[0];
         assert!(
-            margin < first.w * 0.5,
-            "the divider claims {margin} of a {} tab, which is most of it",
-            first.w
+            s.rect.contains(x, first.y + 4.0),
+            "the sample must be inside the divider's grab, or this proves nothing"
         );
-        // And the label itself is clear of it, which is where anyone actually aims.
-        assert!(
-            metrics().tab_padding + 2.0 > margin,
-            "a tab's label starts inside the divider's margin"
+        assert_eq!(
+            target_at(
+                &placed,
+                &splitters,
+                &metrics(),
+                |_| HeaderStyle::Named,
+                |_, _| 40.0,
+                x,
+                first.y + 4.0
+            ),
+            Target::Tab {
+                path: leaf.path,
+                tab: 0
+            },
+            "a press on a header is the panel's, whatever else reaches that far"
         );
     }
 

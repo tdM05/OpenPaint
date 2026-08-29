@@ -163,8 +163,22 @@ pub struct Metrics {
     pub tab_padding: f32,
     /// Space inside a panel, around its content.
     pub padding: f32,
-    /// How wide a divider is to grab, which is wider than the gutter it sits in.
+    /// How wide a divider is to grab, which is far wider than the gutter it sits in.
+    ///
+    /// **The whole answer to "it looks bad if it is big enough to hit".** The drawn line stays two
+    /// units — a hairline the eye reads as structure — while the target around it is nearly seven
+    /// millimetres. Nothing says the thing you aim at has to be the thing you see, and pretending
+    /// otherwise is what makes dividers everywhere feel like they need hunting for.
+    ///
+    /// The cost is that this is centred on the boundary and so takes half its width from each
+    /// neighbour. Bounded by a test; see `chrome::a_divider_takes_a_margin_from_its_neighbour`.
     pub splitter_grab: f32,
+    /// How thick a divider is drawn when the pointer is near enough to catch it.
+    ///
+    /// The other half of the answer: a target you cannot see is a target you do not trust. At rest
+    /// the gutter is a hairline; approach it and it thickens, which says "this is grabbable" and
+    /// "you have it" without taking a single unit of space at rest.
+    pub splitter_hover: f32,
     /// Corner rounding on panels.
     pub radius: f32,
     /// Text size for panel names and tabs.
@@ -205,7 +219,8 @@ impl Default for Theme {
                 header_compact: 18.0,
                 tab_padding: 12.0,
                 padding: 8.0,
-                splitter_grab: 18.0,
+                splitter_grab: 26.0,
+                splitter_hover: 5.0,
                 radius: 3.0,
                 label: 11.0,
                 body: 12.0,

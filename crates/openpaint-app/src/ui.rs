@@ -624,16 +624,34 @@ fn response_editor(ui: &mut egui::Ui, label: &str, response: &mut Response) {
 /// Deliberately a first pass. These are the controls needed to prove the workspace works — a
 /// slider you can drag, a list you can click, colours you can pick — not the full set, which comes
 /// as the old panel's sections are ported across one at a time.
+/// The read-only state a workspace panel draws from.
+///
+/// A struct for the same reason `Status` is one: `workspace_panel` grew past the argument lint,
+/// and that is a signal rather than a lint to silence. It is also the shape the seam wants — when
+/// the widget layer is replaced, what a panel *needs* is written down in one place.
+struct PanelState<'a> {
+    layers: &'a [Layer],
+    active_layer: usize,
+    tool: Tool,
+    select_tool: Option<SelectTool>,
+}
+
 fn workspace_panel(
     panel: crate::layout::PanelId,
     ui: &mut egui::Ui,
     brush: &mut Brush,
     color_srgb: &mut [u8; 3],
-    layers: &[Layer],
-    active_layer: usize,
-) {
+    state: &PanelState<'_>,
+) -> Option<Picked> {
+    let PanelState {
+        layers,
+        active_layer,
+        tool,
+        select_tool,
+    } = *state;
     use crate::workspace as ws;
     ui.spacing_mut().item_spacing.y = 5.0;
+    let mut picked = None;
 
     match panel {
         ws::MENU => {
@@ -656,17 +674,47 @@ fn workspace_panel(
         ws::TOOLS => {
             // A wrapped grid, so the rail works whether it is a column on the left or a strip
             // along the bottom. Nothing here knows which it currently is.
+            //
+            // Painting tools and selection tools are one row on purpose: to the artist they are
+            // all "what the pen does next", and the fact that one set lives on `Editor` and the
+            // other on `Select` is our bookkeeping, not theirs.
             ui.horizontal_wrapped(|ui| {
-                for (glyph, hint) in [
-                    ("\u{270E}", "Brush"),
-                    ("\u{25CB}", "Ellipse select"),
-                    ("\u{25A1}", "Rectangle select"),
-                    ("\u{2726}", "Wand"),
-                    ("T", "Text"),
-                    ("\u{25E9}", "Gradient"),
+                for (glyph, hint, what) in [
+                    ("\u{270E}", "Brush", Picked::Paint(Tool::Brush)),
+                    ("\u{232B}", "Eraser", Picked::Paint(Tool::Eraser)),
+                    (
+                        "\u{2b1a}",
+                        "Lasso select",
+                        Picked::Select(SelectTool::Lasso),
+                    ),
+                    (
+                        "\u{25A1}",
+                        "Rectangle select",
+                        Picked::Select(SelectTool::Rect),
+                    ),
+                    ("\u{2726}", "Wand", Picked::Select(SelectTool::Wand)),
+                    (
+                        "\u{271B}",
+                        "Move selection",
+                        Picked::Select(SelectTool::Move),
+                    ),
                 ] {
-                    ui.add_sized([26.0, 26.0], egui::Button::new(glyph))
-                        .on_hover_text(hint);
+                    let on = match what {
+                        // A paint tool reads as chosen only when no selection tool is up, since a
+                        // selection tool is what the pen is currently doing.
+                        Picked::Paint(t) => select_tool.is_none() && tool == t,
+                        Picked::Select(t) => select_tool == Some(t),
+                    };
+                    if ui
+                        .add_sized(
+                            [30.0, 30.0],
+                            egui::SelectableLabel::new(on, egui::RichText::new(glyph).size(15.0)),
+                        )
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        picked = Some(what);
+                    }
                 }
             });
         }
@@ -719,6 +767,14 @@ fn workspace_panel(
         }
         _ => {}
     }
+    picked
+}
+
+/// What the tool rail asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Picked {
+    Paint(Tool),
+    Select(SelectTool),
 }
 
 /// Draw a box with its eight handles.
@@ -948,10 +1004,26 @@ impl Ui {
                     screen.width(),
                     screen.height(),
                 );
-                let layers = status.layers;
-                let active_layer = status.active_layer;
+                let state = PanelState {
+                    layers: status.layers,
+                    active_layer: status.active_layer,
+                    tool: status.tool,
+                    select_tool: status.select_tool,
+                };
                 ws.show(ctx, area, |panel, ui| {
-                    workspace_panel(panel, ui, brush, &mut color_srgb, layers, active_layer);
+                    if let Some(picked) =
+                        workspace_panel(panel, ui, brush, &mut color_srgb, &state)
+                    {
+                        match picked {
+                            // Both: choosing a paint tool must also put any selection tool down,
+                            // or the pen would still be lassoing while the rail says Brush.
+                            Picked::Paint(t) => {
+                                tool_action = Some(t);
+                                select_action = Some(SelectAction::None);
+                            }
+                            Picked::Select(t) => select_action = Some(SelectAction::Use(t)),
+                        }
+                    }
                 });
                 let scale = ctx.pixels_per_point();
                 let canvas = ws.canvas_rect().unwrap_or(crate::layout::Rect::new(

@@ -470,6 +470,33 @@ impl Workspace {
             contents(showing, &mut ui);
         }
 
+        // --- the divider under the pointer, thickened so it can be seen as well as caught ---
+        //
+        // Drawn last of the chrome so it sits over the panels either side, and only when the
+        // pointer is close: at rest the gutter is a hairline and the workspace stays quiet.
+        if let Some(pos) = pointer {
+            if preview.is_none() || matches!(preview, Some(Preview::Resizing)) {
+                for s in &splitters {
+                    if !s.rect.contains(pos.x, pos.y) {
+                        continue;
+                    }
+                    // Centred on the boundary, at the *drawn* thickness rather than the grab
+                    // width -- the point is to show where it is, not how big the target is.
+                    let t = m.splitter_hover;
+                    let bar = match s.axis {
+                        crate::layout::Axis::Horizontal => {
+                            Rect::new(s.rect.x + s.rect.w / 2.0 - t / 2.0, s.rect.y, t, s.rect.h)
+                        }
+                        crate::layout::Axis::Vertical => {
+                            Rect::new(s.rect.x, s.rect.y + s.rect.h / 2.0 - t / 2.0, s.rect.w, t)
+                        }
+                    };
+                    painter.rect_filled(to_egui(bar), t / 2.0, rgb(p.state));
+                    break;
+                }
+            }
+        }
+
         // --- the drop overlay, on top of everything ---
         if let Some(Preview::Carrying { panel, over }) = preview {
             let top = ctx.layer_painter(egui::LayerId::new(
