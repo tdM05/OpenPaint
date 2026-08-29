@@ -295,6 +295,87 @@ impl Selection {
     ///
     /// Walks tiles rather than pixels: a per-pixel [`Selection::coverage_at`] would do a hash
     /// lookup for every pixel of the page, which is the same shape of mistake the polygon fill had.
+    /// The same mask rotated, scaled and moved.
+    ///
+    /// The counterpart of [`Selection::shifted`] for a full transform, and it exists for one
+    /// reason: after rotating a selection's *pixels*, an outline still sitting square around them
+    /// describes a selection of something that is no longer there. The mask has to follow what it
+    /// selected.
+    ///
+    /// Resampled through the same filter the pixels use, by treating coverage as alpha. Sharing the
+    /// filter rather than writing a second loop is deliberate — a mask filtered differently from
+    /// the pixels it covers would disagree with them at exactly the soft edges both are there to
+    /// get right.
+    #[must_use]
+    pub fn transformed(
+        &self,
+        transform: &crate::Transform,
+        kernel: crate::Kernel,
+        page: PageRect,
+    ) -> Self {
+        if transform.is_a_plain_move() {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "checked to be a whole number by `is_a_plain_move`"
+            )]
+            return self.shifted(transform.offset.0 as i32, transform.offset.1 as i32, page);
+        }
+        let Some(bounds) = self.bounds() else {
+            return Self::new();
+        };
+        let (min_x, min_y, max_x, max_y) =
+            transform.bounds_of(bounds.0, bounds.1, bounds.2, bounds.3);
+        let (px0, py0) = page.origin();
+        let (px1, py1) = page.end();
+
+        let mut build = Builder::default();
+        crate::transform::resample(
+            transform,
+            kernel,
+            (
+                min_x.max(px0),
+                min_y.max(py0),
+                max_x.min(px1),
+                max_y.min(py1),
+            ),
+            |x, y| [0.0, 0.0, 0.0, f32::from(self.coverage_at(x, y)) / 255.0],
+            |x, y, texel| {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "resample clamps alpha to 0..=1"
+                )]
+                let coverage = (texel[3] * 255.0).round() as u8;
+                if coverage > 0 {
+                    build.write_run(x, y, &[coverage]);
+                }
+            },
+        );
+        build.finish()
+    }
+
+    /// The page-pixel rectangle the mask's tiles cover, as `(min_x, min_y, max_x, max_y)` with the
+    /// maxima exclusive.
+    ///
+    /// Tile-aligned rather than tight to the coverage, matching [`crate::Lifted::bounds`]: the only
+    /// consumer is a resampling loop that skips empty source anyway, and a tight box would mean
+    /// scanning every pixel to find it.
+    #[must_use]
+    pub fn bounds(&self) -> Option<(i32, i32, i32, i32)> {
+        let side = TILE_SIZE as i32;
+        let mut bounds: Option<(i32, i32, i32, i32)> = None;
+        for coord in self.tiles.keys() {
+            let (x, y) = (coord.0 * side, coord.1 * side);
+            bounds = Some(match bounds {
+                None => (x, y, x + side, y + side),
+                Some((lx, ly, hx, hy)) => {
+                    (lx.min(x), ly.min(y), hx.max(x + side), hy.max(y + side))
+                }
+            });
+        }
+        bounds
+    }
+
     #[must_use]
     pub fn inverted(&self, page: PageRect) -> Self {
         let side = TILE_SIZE as i32;
@@ -875,5 +956,97 @@ mod tests {
             checked > 100,
             "found only {checked} partial pixels to check"
         );
+    }
+    /// A whole-pixel move must take the exact path, not the filter: a mask softened on every drag
+    /// would creep outward one anti-aliased pixel at a time.
+    #[test]
+    fn a_whole_pixel_move_of_a_mask_is_exact() {
+        let sel = Selection::from_rect(PageRect::new(100, 100, 60, 40), page());
+        let shifted = sel.shifted(23, -11, page());
+        let transformed = sel.transformed(
+            &crate::Transform::translation(23.0, -11.0),
+            crate::Kernel::Mitchell,
+            page(),
+        );
+        assert_eq!(transformed, shifted);
+    }
+
+    /// The point of the whole thing: after rotating, the mask covers what the pixels now cover.
+    #[test]
+    fn a_rotated_mask_follows_what_it_selected() {
+        // A tall strip, so a turn is visible rather than a symmetry.
+        let sel = Selection::from_rect(PageRect::new(96, 60, 16, 120), page());
+        let t = crate::Transform {
+            pivot: (104.0, 120.0),
+            rotation: std::f32::consts::FRAC_PI_2,
+            ..crate::Transform::IDENTITY
+        };
+        let out = sel.transformed(&t, crate::Kernel::Mitchell, page());
+
+        assert!(
+            out.coverage_at(150, 120) > 200,
+            "the turned strip should reach well right of the pivot"
+        );
+        assert!(out.coverage_at(60, 120) > 200, "and well left of it");
+        assert!(
+            out.coverage_at(104, 170) < 40,
+            "and no longer reach far below it"
+        );
+    }
+
+    /// Scaling a mask up selects more, and down selects less. Catches an inverse applied the wrong
+    /// way round, which otherwise looks plausible.
+    #[test]
+    fn scaling_a_mask_changes_how_much_is_selected() {
+        let sel = Selection::from_rect(PageRect::new(200, 200, 80, 80), page());
+        let selected = |t: &crate::Transform| {
+            sel.transformed(t, crate::Kernel::Mitchell, page())
+                .tiles()
+                .map(|(_, cov)| cov.iter().filter(|&&c| c > 128).count())
+                .sum::<usize>()
+        };
+        let plain = selected(&crate::Transform {
+            pivot: (240.0, 240.0),
+            ..crate::Transform::IDENTITY
+        });
+        let bigger = selected(&crate::Transform {
+            pivot: (240.0, 240.0),
+            scale: (2.0, 2.0),
+            ..crate::Transform::IDENTITY
+        });
+        assert!(
+            bigger > plain * 3,
+            "doubling should roughly quadruple the area: {plain} -> {bigger}"
+        );
+    }
+
+    /// A transformed mask stays on the page, like every other producer.
+    #[test]
+    fn a_transformed_mask_is_clipped_to_the_page() {
+        let sel = Selection::from_rect(PageRect::new(0, 0, 100, 100), page());
+        let t = crate::Transform {
+            offset: (-400.0, -400.0),
+            rotation: 0.3,
+            ..crate::Transform::IDENTITY
+        };
+        let out = sel.transformed(&t, crate::Kernel::Mitchell, page());
+        assert!(
+            out.is_empty(),
+            "a mask moved entirely off the page should select nothing"
+        );
+    }
+
+    #[test]
+    fn transforming_an_empty_mask_gives_an_empty_mask() {
+        let out = Selection::new().transformed(
+            &crate::Transform {
+                rotation: 0.5,
+                ..crate::Transform::IDENTITY
+            },
+            crate::Kernel::Mitchell,
+            page(),
+        );
+        assert!(out.is_empty());
+        assert!(Selection::new().bounds().is_none());
     }
 }

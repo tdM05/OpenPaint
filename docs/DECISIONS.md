@@ -508,6 +508,55 @@ list. `layer_text` was added to `STRUCTURE_SCHEMA` and not to those, and *every*
 migration failed with "table already exists". There is now one `DROP_STRUCTURE`,
 and the branches collapsed into one, since they all did the same thing.
 
+### 5d. Scale and rotate resample; a move must not — 2026-08-29
+
+A whole-pixel move is a copy and is *lossless*. The moment a transform
+rotates or scales, a destination pixel no longer lands on a source pixel and
+its colour has to be reconstructed from the neighbours it falls between —
+which degrades the image, every time it is applied.
+
+So `Transform::is_a_plain_move` is checked first and takes the copy path.
+That is not an optimisation: it is the difference between a move that can be
+repeated a hundred times without damage and one that cannot.
+
+**The filter is a cubic, and the default is Mitchell–Netravali.** Line art is
+the worst case for resampling and it is what this app is for. Nearest
+neighbour turns a rotated ink line into a staircase; bilinear turns it into a
+blur; a cubic is the first that keeps an inked edge looking inked. Every
+*interpolating* cubic overshoots at a hard edge, so the choice is how much:
+Mitchell's negative lobe is about −0.035 against Catmull–Rom's −0.063, which
+buys about half the ringing for a little sharpness. That is the right way
+round for ink, where a dark halo beside a line is exactly the artefact a
+printed page shows off. Catmull–Rom is offered anyway, because it
+*interpolates* — an unmoved pixel comes back exactly, which Mitchell cannot
+promise — and that suits flat colour.
+
+**Minification widens the footprint.** Shrinking is the case a fixed-radius
+filter gets wrong: many source pixels fall into one destination pixel, and
+reading only the nearest few is undersampling, which reads as sparkle and
+broken lines. Scaling the kernel's footprint by the minification factor is
+the standard fix and needs no mip pyramid.
+
+**Filtering premultiplied is why §4b was worth holding.** Interpolating
+straight colour across an edge into transparency mixes in whatever is stored
+in the fully transparent texels, which is a halo around every rotated
+selection. Premultiplied has nothing to leak.
+
+**The mask follows the pixels.** `Selection::transformed` resamples coverage
+through the *same* filter, by treating coverage as alpha. An outline still
+sitting square around rotated pixels would describe a selection of something
+that is no longer there — the same bug undo had before `HistoryChange::Moved`
+existed. Sharing the filter rather than writing a second loop matters because
+a mask filtered differently from the pixels it covers would disagree with them
+at exactly the soft edges both exist to get right.
+
+A sabotage worth recording: removing the footprint widening did **not** fail
+the first minification test, because a checkerboard averages to grey however
+badly it is sampled. Evenly spaced thin lines are the case that separates
+them, and the test now measures the *spread* across the output rather than its
+average. Another instance of §11a's rule — a sabotage that does not fail tells
+you about the test.
+
 ### 4p. A brush tip is either a curve or a bitmap — 2026-08-29
 
 The last thing that changes what a brush *is*, and what brush presets have been

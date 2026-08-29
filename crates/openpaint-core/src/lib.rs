@@ -25,6 +25,7 @@ pub mod stamp;
 pub mod stroke;
 pub mod text;
 pub mod tile;
+pub mod transform;
 
 pub use brush::{Brush, StrokeState};
 pub use canvas::Canvas;
@@ -40,6 +41,7 @@ pub use stabilizer::{Smoothed, Stabilizer};
 pub use stamp::Stamp;
 pub use stroke::StrokePainter;
 pub use text::{TextBlock, TextRenderer};
+pub use transform::{Kernel, Transform};
 
 /// Crate version, surfaced so the app/UI can display it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

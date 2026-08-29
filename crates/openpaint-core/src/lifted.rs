@@ -131,6 +131,86 @@ impl Lifted {
         }
         out
     }
+
+    /// The page-pixel rectangle the lifted pixels occupy, as `(min_x, min_y, max_x, max_y)` with
+    /// the maxima exclusive.
+    ///
+    /// Tile-aligned rather than tight to the ink. A tighter box would mean scanning every texel,
+    /// and the only thing this feeds is a resampling loop that skips transparent source anyway.
+    #[must_use]
+    pub fn bounds(&self) -> Option<(i32, i32, i32, i32)> {
+        let side = TILE_SIZE as i32;
+        let mut bounds: Option<(i32, i32, i32, i32)> = None;
+        for coord in self.tiles.keys() {
+            let (x, y) = (coord.0 * side, coord.1 * side);
+            bounds = Some(match bounds {
+                None => (x, y, x + side, y + side),
+                Some((lx, ly, hx, hy)) => {
+                    (lx.min(x), ly.min(y), hx.max(x + side), hy.max(y + side))
+                }
+            });
+        }
+        bounds
+    }
+
+    /// One texel in page coordinates, transparent outside the lifted pixels.
+    ///
+    /// Transparent rather than clamped: these pixels have a real edge, and repeating it would smear
+    /// the outermost row of a rotated selection outward into a streak.
+    #[must_use]
+    pub fn texel_at(&self, x: i32, y: i32) -> [f32; 4] {
+        let side = TILE_SIZE as i32;
+        let coord = (x.div_euclid(side), y.div_euclid(side));
+        self.tiles.get(&coord).map_or([0.0; 4], |tile| {
+            tile.texel(x.rem_euclid(side) as usize, y.rem_euclid(side) as usize)
+        })
+    }
+
+    /// The same pixels rotated, scaled and moved, back on the tile grid.
+    ///
+    /// The general case of [`Lifted::shifted`], and it delegates to it when it can: a whole-pixel
+    /// move is an exact copy, and resampling one anyway would soften the artwork for nothing. That
+    /// check is not an optimisation — it is the difference between a move that is lossless and one
+    /// that is not.
+    ///
+    /// Anything else goes through [`crate::transform::resample`]. Destination-aligned like
+    /// `shifted`, for the same reason: the consumer gets ordinary tiles at ordinary coordinates and
+    /// never has to read across a tile seam.
+    #[must_use]
+    pub fn transformed(
+        &self,
+        transform: &crate::Transform,
+        kernel: crate::Kernel,
+    ) -> HashMap<TileCoord, Tile> {
+        if transform.is_a_plain_move() {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "checked to be a whole number by `is_a_plain_move`"
+            )]
+            return self.shifted(transform.offset.0 as i32, transform.offset.1 as i32);
+        }
+        let Some((min_x, min_y, max_x, max_y)) = self.bounds() else {
+            return HashMap::new();
+        };
+
+        let side = TILE_SIZE as i32;
+        let mut out: HashMap<TileCoord, Tile> = HashMap::new();
+        crate::transform::resample(
+            transform,
+            kernel,
+            transform.bounds_of(min_x, min_y, max_x, max_y),
+            |x, y| self.texel_at(x, y),
+            |x, y, texel| {
+                let dest = (x.div_euclid(side), y.div_euclid(side));
+                out.entry(dest).or_insert_with(Tile::transparent).set_texel(
+                    x.rem_euclid(side) as usize,
+                    y.rem_euclid(side) as usize,
+                    texel,
+                );
+            },
+        );
+        out
+    }
 }
 
 #[cfg(test)]
@@ -262,5 +342,177 @@ mod tests {
         assert_eq!(at(&a, 300, 300), RED);
         assert_eq!(at(&b, 301, 300), RED);
         assert_eq!(at(&b, 300, 300), [0.0; 4]);
+    }
+    /// A whole-pixel move must not go through the filter, or every drag would soften the artwork
+    /// slightly. This is the difference between a lossless move and a lossy one.
+    #[test]
+    fn a_whole_pixel_move_is_still_an_exact_copy() {
+        let sel = Selection::from_rect(PageRect::new(10, 10, 40, 40), page());
+        let lifted = Lifted::from_layer(&sel, solid);
+
+        let shifted = lifted.shifted(37, -14);
+        let transformed = lifted.transformed(
+            &crate::Transform::translation(37.0, -14.0),
+            crate::Kernel::Mitchell,
+        );
+        assert_eq!(
+            transformed, shifted,
+            "a whole-pixel move should take the copy path, not the filter"
+        );
+    }
+
+    /// A quarter turn is exact on the grid, so it must move the pixels and not blur them.
+    #[test]
+    fn a_quarter_turn_moves_pixels_without_softening_them() {
+        // An L, so a turn is distinguishable from a flip or a transpose.
+        let sel = Selection::from_rect(PageRect::new(20, 20, 8, 24), page());
+        let lifted = Lifted::from_layer(&sel, solid);
+
+        let t = crate::Transform {
+            pivot: (24.0, 32.0),
+            rotation: std::f32::consts::FRAC_PI_2,
+            ..crate::Transform::IDENTITY
+        };
+        let out = lifted.transformed(&t, crate::Kernel::Mitchell);
+
+        // The 8x24 strip about (24, 32) becomes a 24x8 one: reaching about 12px either side of
+        // the pivot in x and about 4 in y. Checked well inside those spans rather than at their
+        // edges, since the boundary pixel is a matter of half-pixel rounding rather than of the
+        // transform being right.
+        assert!(
+            at(&out, 33, 32)[3] > 0.9,
+            "the turned strip should reach well right of the pivot"
+        );
+        assert!(at(&out, 15, 32)[3] > 0.9, "and well left of it");
+        assert!(
+            at(&out, 24, 42)[3] < 0.1,
+            "and no longer reach far below it"
+        );
+        assert!(at(&out, 24, 22)[3] < 0.1, "nor far above");
+    }
+
+    /// Rotating must not leak a halo into the transparent surround. That is the failure
+    /// premultiplied colour exists to prevent, so it is worth pinning rather than assuming.
+    #[test]
+    fn rotating_leaves_no_halo_around_the_edge() {
+        let sel = Selection::from_rect(PageRect::new(30, 30, 40, 40), page());
+        // Bright red, so a halo would be obvious in the colour channels.
+        let lifted = Lifted::from_layer(&sel, |_| Some(Tile::filled(RED)));
+
+        let t = crate::Transform {
+            pivot: (50.0, 50.0),
+            rotation: 0.4,
+            ..crate::Transform::IDENTITY
+        };
+        let out = lifted.transformed(&t, crate::Kernel::Mitchell);
+
+        for (coord, tile) in &out {
+            for ly in 0..TILE_SIZE {
+                for lx in 0..TILE_SIZE {
+                    let t = tile.texel(lx, ly);
+                    let _ = coord;
+                    assert!(
+                        t[0] <= t[3] + 1e-3 && t[1] <= t[3] + 1e-3 && t[2] <= t[3] + 1e-3,
+                        "a channel exceeded alpha at ({lx}, {ly}): {t:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Scaling up should cover more page than it started with, and scaling down less. Cheap, and
+    /// it catches an inverse transform applied the wrong way round — which otherwise looks
+    /// plausible until someone drags a handle.
+    #[test]
+    fn scaling_changes_how_much_page_is_covered() {
+        let sel = Selection::from_rect(PageRect::new(40, 40, 40, 40), page());
+        let lifted = Lifted::from_layer(&sel, solid);
+        let covered = |t: &crate::Transform| {
+            lifted
+                .transformed(t, crate::Kernel::Mitchell)
+                .values()
+                .map(|tile| {
+                    (0..TILE_SIZE)
+                        .flat_map(|y| (0..TILE_SIZE).map(move |x| (x, y)))
+                        .filter(|(x, y)| tile.texel(*x, *y)[3] > 0.5)
+                        .count()
+                })
+                .sum::<usize>()
+        };
+
+        let plain = covered(&crate::Transform {
+            pivot: (60.0, 60.0),
+            ..crate::Transform::IDENTITY
+        });
+        let bigger = covered(&crate::Transform {
+            pivot: (60.0, 60.0),
+            scale: (2.0, 2.0),
+            ..crate::Transform::IDENTITY
+        });
+        let smaller = covered(&crate::Transform {
+            pivot: (60.0, 60.0),
+            scale: (0.5, 0.5),
+            ..crate::Transform::IDENTITY
+        });
+
+        assert!(
+            bigger > plain * 3,
+            "doubling should roughly quadruple the area: {plain} -> {bigger}"
+        );
+        assert!(
+            smaller < plain / 3,
+            "halving should roughly quarter it: {plain} -> {smaller}"
+        );
+    }
+
+    /// Transforming nothing produces nothing, rather than an empty tile holding residency.
+    #[test]
+    fn transforming_nothing_produces_nothing() {
+        let lifted = Lifted::default();
+        assert!(lifted
+            .transformed(
+                &crate::Transform {
+                    rotation: 0.5,
+                    ..crate::Transform::IDENTITY
+                },
+                crate::Kernel::Mitchell
+            )
+            .is_empty());
+    }
+
+    /// The bounds have to cover every tile the lift touched, since that is what the resampler
+    /// reads from.
+    #[test]
+    fn bounds_cover_every_lifted_tile() {
+        let sel = Selection::from_rect(PageRect::new(100, 100, 400, 300), page());
+        let lifted = Lifted::from_layer(&sel, solid);
+        let (min_x, min_y, max_x, max_y) = lifted.bounds().expect("something was lifted");
+        for (coord, _) in lifted.tiles() {
+            let (x, y) = (coord.0 * TILE_SIZE as i32, coord.1 * TILE_SIZE as i32);
+            assert!(
+                x >= min_x && y >= min_y,
+                "tile {coord:?} starts before the bounds"
+            );
+            assert!(
+                x + TILE_SIZE as i32 <= max_x && y + TILE_SIZE as i32 <= max_y,
+                "tile {coord:?} ends after the bounds"
+            );
+        }
+        assert!(Lifted::default().bounds().is_none());
+    }
+
+    /// Reading outside the lifted pixels gives transparency, not the nearest edge. Clamping would
+    /// smear the outermost row of a rotated selection outward into a streak.
+    #[test]
+    fn reading_outside_the_lift_is_transparent() {
+        let sel = Selection::from_rect(PageRect::new(10, 10, 20, 20), page());
+        let lifted = Lifted::from_layer(&sel, solid);
+        assert!(lifted.texel_at(15, 15)[3] > 0.9, "inside");
+        assert_eq!(lifted.texel_at(-500, -500), [0.0; 4], "far outside");
+        assert_eq!(
+            lifted.texel_at(5000, 5000),
+            [0.0; 4],
+            "far outside the other way"
+        );
     }
 }
