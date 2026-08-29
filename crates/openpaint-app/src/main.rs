@@ -898,6 +898,20 @@ impl OpenPaint {
             self.request_redraw();
             return;
         }
+        // A selection confines what the stroke may touch, and is fixed at the press for the same
+        // reason strength is: it is what the artist chose when they started the line.
+        //
+        // Set even when there is no selection, because lifting the confinement is as much a change
+        // as applying one -- and forgetting that is how a stroke stays trapped inside a selection
+        // that was cleared two gestures ago.
+        //
+        // An untested seam, named rather than left implicit: there is no renderer headlessly, so a
+        // sabotage that only ever applies a confinement and never lifts one passes the whole suite.
+        // What is covered is `StrokeLayer::confine_to` on both edges; this line is the gap.
+        let confine = self.selection.as_ref().map(|s| s.mask.clone());
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.confine_strokes_to(confine);
+        }
         // Strength is read once, at the press. Dragging the slider mid-stroke must not change the
         // filter under a line already being drawn.
         self.stabilizer
@@ -1193,9 +1207,29 @@ impl OpenPaint {
                 if filled {
                     // A bucket: find the region, fill it, keep no mask. The same machinery as the
                     // wand, which is the entire reason the two were separated.
-                    self.set_selection(Some(selection), "Filled the region");
+                    //
+                    // Confined by any selection already up, which §4k promised would compose for
+                    // free and does: the region found is intersected with the mask rather than
+                    // replacing it. Without this a bucket click was the one way to put paint
+                    // outside a selection, which is the same gap the brush had.
+                    let region = match self.selection.as_ref() {
+                        Some(active) => selection.intersected(&active.mask),
+                        None => selection,
+                    };
+                    if region.is_empty() {
+                        self.status_message = Some(
+                            "That region is entirely outside the selection, so nothing was filled."
+                                .to_owned(),
+                        );
+                        self.request_redraw();
+                        return;
+                    }
+                    let restore = self.selection.as_ref().map(|s| s.mask.clone());
+                    self.set_selection(Some(region), "Filled the region");
                     self.fill_selection();
-                    self.set_selection(None, "Filled the region");
+                    // Back to the selection the artist had, not to nothing: a bucket keeps no mask
+                    // of its own, but it must not throw away one they made.
+                    self.set_selection(restore, "Filled the region");
                 } else {
                     self.set_selection(Some(selection), "Selected");
                 }

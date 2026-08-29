@@ -877,6 +877,14 @@ impl Renderer {
         self.canvas_renderer.residency()
     }
 
+    /// Confine strokes to `selection`, or lift the confinement with `None`.
+    ///
+    /// Set at the press rather than read while painting, because a selection cannot change
+    /// mid-stroke — pointer capture decided the owner of the gesture before it began (§4l).
+    pub fn confine_strokes_to(&mut self, selection: Option<openpaint_core::Selection>) {
+        self.stroke_layer.confine_to(&self.queue, selection);
+    }
+
     /// Take the "a stroke could not be recorded" flag, if it was set.
     pub fn take_unrecordable(&mut self) -> bool {
         std::mem::take(&mut self.unrecordable)

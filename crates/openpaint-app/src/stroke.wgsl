@@ -70,7 +70,7 @@ struct Xform {
     y_row: vec4<f32>,
     page: vec4<f32>,
     // x = tile size, y = 1 when the tip is a bitmap and the stamp texture should be read
-    // instead of the edge profile.
+    // instead of the edge profile, z = 1 when a selection is confining the stroke.
     params: vec4<f32>,
     // The dab's edge profile, sampled across the ramp from the solid core to the rim. A lookup
     // table because a fragment shader cannot evaluate a spline, and per *stroke* rather than per
@@ -89,6 +89,10 @@ struct Xform {
 // pipeline and a second bind group layout for a branch that costs nothing taken.
 @group(2) @binding(1) var stamp: texture_2d<f32>;
 @group(2) @binding(2) var stamp_samp: sampler;
+// The selection confining this stroke, one layer per accumulation tile and indexed the same way.
+// Always bound, for the same reason the stamp always is: an optional binding would mean a second
+// pipeline for a branch that costs nothing taken.
+@group(2) @binding(3) var confine: texture_2d_array<f32>;
 
 // Read the edge profile at `t`, the fraction of the way across the ramp.
 //
@@ -215,7 +219,23 @@ fn dab_fs(in: DabOut) -> @location(0) vec4<f32> {
             coverage = falloff_at((dist - inner) / (in.radius - inner));
         }
     }
-    let deposit = coverage * clamp(in.flow, 0.0, 1.0);
+    // Confine to the selection *here*, while the paint is still coverage in the accumulation
+    // buffer, rather than at the bake. Two reasons, and the second is the important one:
+    //
+    //  - the in-progress stroke is previewed straight out of accumulation, so masking any later
+    //    would show paint spilling outside the selection and then snap it away when the pen lifts;
+    //  - the eraser and the alpha-locked brush are the same accumulation with a different blend,
+    //    so confining once here confines all three and cannot leave one of them behind.
+    //
+    // `textureLoad` rather than a sample: the mask is exactly canvas resolution and aligned to
+    // this tile, so there is nothing to interpolate and interpolating would soften the edge of the
+    // selection against itself.
+    var gate = 1.0;
+    if (xf.params.z > 0.5) {
+        let texel = vec2<i32>(i32(in.pos.x), i32(in.pos.y));
+        gate = textureLoad(confine, texel, i32(tp.layer.x), 0).r;
+    }
+    let deposit = coverage * clamp(in.flow, 0.0, 1.0) * gate;
     // Same value in every channel: the target is single-channel, and writing it to .a as
     // well keeps the blend valid whichever factor a pipeline picks.
     return vec4<f32>(deposit, deposit, deposit, deposit);

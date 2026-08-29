@@ -206,6 +206,7 @@ fn make_xform_group(
     xform_buf: &wgpu::Buffer,
     stamp: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
+    confine: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("stroke-xform-bg"),
@@ -223,7 +224,35 @@ fn make_xform_group(
                 binding: 2,
                 resource: wgpu::BindingResource::Sampler(sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(confine),
+            },
         ],
+    })
+}
+
+/// The array holding the selection that confines a stroke: one tile per accumulation slot.
+///
+/// `R8Unorm` because it is coverage, which is what a selection is (§4k) — a byte per pixel, so a
+/// feathered selection gives a feathered brush edge rather than a stair-stepped one.
+///
+/// Parallel to the accumulation pool and indexed by the same slot, so the shader needs no second
+/// lookup: the tile record already carries its accumulation layer, and that *is* the mask layer.
+fn confine_texture(device: &wgpu::Device, layers: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("stroke-confine"),
+        size: wgpu::Extent3d {
+            width: TILE_SIZE as u32,
+            height: TILE_SIZE as u32,
+            depth_or_array_layers: layers.max(1),
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
     })
 }
 
@@ -289,6 +318,15 @@ pub struct StrokeLayer {
     /// Kept so the group can be rebuilt when the tip changes.
     xform_layout: wgpu::BindGroupLayout,
     stamp_sampler: wgpu::Sampler,
+    /// One mask tile per accumulation slot, holding the selection that confines the stroke.
+    confine: wgpu::Texture,
+    confine_view: wgpu::TextureView,
+    /// The selection strokes are confined to, or `None` when the whole layer is fair game.
+    ///
+    /// Held for the length of a stroke rather than read per frame: a selection cannot change
+    /// mid-stroke — pointer capture (§4l) sees to that — and re-uploading an unchanged mask every
+    /// frame would be the same waste the transform was just cured of (§5g).
+    confine_to: Option<openpaint_core::Selection>,
     /// Whether the bound tip is a bitmap, which is what tells the shader which branch to take.
     stamped: bool,
     paint_buf: wgpu::Buffer,
@@ -448,6 +486,19 @@ impl StrokeLayer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        // Read with `textureLoad`, which needs no sampler and does no filtering --
+                        // the mask is canvas resolution and tile aligned, so there is nothing to
+                        // interpolate.
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         // A round brush still binds a texture -- a 1x1 -- rather than leaving the slot empty. An
@@ -466,12 +517,18 @@ impl StrokeLayer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let confine = confine_texture(device, pool.capacity());
+        let confine_view = confine.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
         let xform_group = make_xform_group(
             device,
             &xform_layout,
             &xform_buf,
             &stamp_view,
             &stamp_sampler,
+            &confine_view,
         );
 
         // The dab pass renders *into* the accumulation array, so it must not also have it
@@ -682,6 +739,9 @@ impl StrokeLayer {
             tile_group,
             xform_group,
             xform_layout,
+            confine,
+            confine_view,
+            confine_to: None,
             stamp_sampler,
             stamped: false,
             paint_buf,
@@ -835,11 +895,86 @@ impl StrokeLayer {
                 params: [
                     TILE_SIZE as f32,
                     f32::from(u8::from(self.stamped)),
-                    0.0,
+                    f32::from(u8::from(self.confine_to.is_some())),
                     0.0,
                 ],
                 falloff: self.falloff,
             }),
+        );
+    }
+
+    /// Confine every stroke from now on to `selection`, or to nothing at all.
+    ///
+    /// **A selection is a property of the destination, not a feature of a tool** (§4k), which is
+    /// why this is set once here rather than consulted by the brush, the eraser and the
+    /// alpha-locked brush separately. All three are the same accumulation with a different blend,
+    /// so one gate covers them and none can be forgotten.
+    ///
+    /// Takes the mask by value because it is held for the stroke: see `confine_to`.
+    pub fn confine_to(
+        &mut self,
+        queue: &wgpu::Queue,
+        selection: Option<openpaint_core::Selection>,
+    ) {
+        if self.confine_to == selection {
+            return;
+        }
+        self.confine_to = selection;
+        // Tiles already allocated carry a stale mask, and there is no stroke in progress to
+        // protect: the confinement is set at the press, before any tile exists.
+        self.write_frame(queue);
+    }
+
+    /// Whether a selection is confining strokes.
+    #[cfg(test)]
+    #[must_use]
+    pub fn is_confined(&self) -> bool {
+        self.confine_to.is_some()
+    }
+
+    /// Upload the confining mask for a freshly allocated accumulation tile.
+    ///
+    /// Through the queue rather than the encoder, and that is safe here where it was not for a
+    /// fill (§11a.2): nothing in the encoder writes this texture, so there is no clear for the
+    /// write to land in front of. A slot is not reused within a stroke, so this happens once per
+    /// tile per stroke rather than per frame.
+    ///
+    /// A tile the selection does not reach uploads zeros, which is the honest answer — the
+    /// selection covers nothing there, so nothing may be painted there.
+    fn upload_confinement(&self, queue: &wgpu::Queue, coord: TileCoord, layer: u32) {
+        let Some(selection) = self.confine_to.as_ref() else {
+            return;
+        };
+        let empty;
+        let coverage = match selection.coverage_tile(coord) {
+            Some(c) => c,
+            None => {
+                empty = vec![0_u8; TILE_SIZE * TILE_SIZE];
+                &empty
+            }
+        };
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.confine,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            coverage,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(TILE_SIZE as u32),
+                rows_per_image: Some(TILE_SIZE as u32),
+            },
+            wgpu::Extent3d {
+                width: TILE_SIZE as u32,
+                height: TILE_SIZE as u32,
+                depth_or_array_layers: 1,
+            },
         );
     }
 
@@ -870,6 +1005,7 @@ impl StrokeLayer {
                     &self.xform_buf,
                     &view,
                     &self.stamp_sampler,
+                    &self.confine_view,
                 );
                 self.stamped = true;
             }
@@ -942,6 +1078,8 @@ impl StrokeLayer {
                 // Outside `debug_assert!`, which does not evaluate its expression in a
                 // release build -- see DECISIONS 11a.6. This exact line, written the other
                 // way, shipped a build that painted nothing at all.
+                // Before the map takes the slot, while it is still nameable.
+                self.upload_confinement(queue, coord, slot.layer());
                 let displaced = self.map.insert(coord, slot);
                 debug_assert!(displaced.is_none(), "accum tile {coord:?} already mapped");
                 if let Some(slot) = displaced {
@@ -1422,6 +1560,199 @@ mod tests {
                 None => [0.0; 4],
             })
             .collect()
+    }
+
+    /// Paint the same dabs with a selection confining them, and read the layer back.
+    ///
+    /// Deliberately the *whole* pipeline — allocate, stamp, bake — rather than a shortcut, because
+    /// the mask is uploaded when an accumulation tile is allocated and read when a dab is stamped,
+    /// and a test that skipped either would prove nothing about the order of the two.
+    fn gpu_render_confined(
+        dabs: &[Dab],
+        selection: Option<&openpaint_core::Selection>,
+    ) -> Vec<[f32; 4]> {
+        let (device, queue) = try_device().expect("checked by caller");
+
+        let page = openpaint_core::PageRect::from_size(SIZE, SIZE);
+        let mut layer = test_stroke_layer(&device);
+        let mut canvas = test_canvas(&device, page, &layer);
+
+        layer.set_page(&queue, page);
+        layer.set_tip(&device, &queue, &openpaint_core::dab::Tip::default());
+        layer.set_paint(&queue, BLACK, 1.0, crate::editor::PaintMode::Normal);
+        layer.confine_to(&queue, selection.cloned());
+        layer.upload_dabs(&device, &queue, dabs);
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        layer.begin_stroke();
+        let tiles = layer.prepare_tiles(&queue, &mut encoder, dabs, page);
+        for index in 0..tiles {
+            layer.stamp_range(&mut encoder, index, 0, dabs.len());
+        }
+        layer.bake(&device, &queue, &mut encoder, &mut canvas, L0);
+        queue.submit(std::iter::once(encoder.finish()));
+
+        readback_page(&device, &queue, &canvas, L0)
+    }
+
+    /// A brush stops at the edge of a selection, and a partly selected pixel takes partly.
+    ///
+    /// **The gap this closes:** a selection confined the bucket and the transform but not the
+    /// brush, so selecting a region and shading inside it — which is the colouring workflow —
+    /// painted straight over everything. §4k listed "confining a brush" as a consumer of the mask
+    /// from the start; it was the one that was never wired up.
+    ///
+    /// Three properties, and the third is why a selection is a byte per pixel rather than a bit
+    /// (§4k): half coverage must take half the paint. A boolean mask cannot say that, and a
+    /// hard-edged answer would make feathering pointless before it exists.
+    #[test]
+    fn a_selection_confines_the_brush_and_softens_at_its_edge() {
+        let Some(_) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let page = openpaint_core::PageRect::from_size(SIZE, SIZE);
+        let mut selection = openpaint_core::Selection::from_rect(
+            openpaint_core::PageRect::new(0, 0, 64, SIZE),
+            page,
+        );
+        // One column at half coverage, inside the selection, so full and partial are tested at once.
+        selection.set_coverage(40, 64, 128);
+
+        // A dab wide enough to straddle the selection's edge by a long way, so "it stopped" cannot
+        // be confused with "it never reached".
+        let dabs = [dab(64.0, 64.0, 50.0, 1.0, 1.0)];
+        let free = gpu_render_confined(&dabs, None);
+        let confined = gpu_render_confined(&dabs, Some(&selection));
+        let at = |v: &[[f32; 4]], x: usize, y: usize| v[y * SIZE as usize + x];
+
+        assert!(
+            at(&free, 90, 64)[3] > 0.5,
+            "the unconfined dab should reach x=90: {:?}",
+            at(&free, 90, 64)
+        );
+        assert!(
+            at(&confined, 90, 64)[3] < 0.01,
+            "paint escaped the selection: {:?}",
+            at(&confined, 90, 64)
+        );
+        assert!(
+            at(&confined, 30, 64)[3] > 0.5,
+            "inside the selection is unpainted: {:?}",
+            at(&confined, 30, 64)
+        );
+
+        // Half-covered means half the paint, not none and not all.
+        let solid = at(&confined, 39, 64)[3];
+        let half = at(&confined, 40, 64)[3];
+        assert!(
+            half > 0.2 * solid && half < 0.8 * solid,
+            "a half-selected pixel took {half} against a solid {solid}; coverage is not a bit"
+        );
+    }
+
+    /// The mask is per tile, and every tile reads its own.
+    ///
+    /// **The case the single-tile test could not see, and sabotages proved it.** With one tile
+    /// there is one accumulation slot, so reading the mask from slot 0 instead of from the tile's
+    /// own slot passes, and so does uploading full coverage for a tile the selection never
+    /// reaches. Both are wrong in the ordinary case — a stroke crossing a tile boundary — and both
+    /// would spill paint outside the selection on any canvas bigger than 256 pixels.
+    ///
+    /// So: a page two tiles wide, a selection living entirely in the left one, and a dab straddling
+    /// the boundary. The right tile must come back empty.
+    #[test]
+    fn every_tile_reads_its_own_mask() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let side = openpaint_core::tile::TILE_SIZE as u32;
+        let page = openpaint_core::PageRect::from_size(side * 2, side);
+
+        // Selected: a band inside the *left* tile only. The right tile is untouched by the
+        // selection, so it has no coverage tile at all — which is exactly the case that decides
+        // whether an absent tile means "all" or "none".
+        let selection = openpaint_core::Selection::from_rect(
+            openpaint_core::PageRect::new(0, 0, 200, side as i32 as u32),
+            page,
+        );
+
+        let mut layer = test_stroke_layer(&device);
+        let mut canvas = test_canvas(&device, page, &layer);
+        // Centred on the boundary and wide enough to reach well into both tiles.
+        let dabs = [dab(side as f32, side as f32 / 2.0, 100.0, 1.0, 1.0)];
+
+        layer.set_page(&queue, page);
+        layer.set_tip(&device, &queue, &openpaint_core::dab::Tip::default());
+        layer.set_paint(&queue, BLACK, 1.0, crate::editor::PaintMode::Normal);
+        layer.confine_to(&queue, Some(selection));
+        layer.upload_dabs(&device, &queue, &dabs);
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        layer.begin_stroke();
+        let tiles = layer.prepare_tiles(&queue, &mut encoder, &dabs, page);
+        assert!(tiles >= 2, "the dab should straddle two tiles, got {tiles}");
+        for index in 0..tiles {
+            layer.stamp_range(&mut encoder, index, 0, dabs.len());
+        }
+        layer.bake(&device, &queue, &mut encoder, &mut canvas, L0);
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let left = crate::test_gpu::readback_tile(&device, &queue, &canvas, L0, (0, 0))
+            .expect("the left tile was painted");
+        let at = |t: &[[f32; 4]], x: usize, y: usize| t[y * openpaint_core::tile::TILE_SIZE + x];
+        assert!(
+            at(&left, 190, 128)[3] > 0.5,
+            "inside the selection is unpainted: {:?}",
+            at(&left, 190, 128)
+        );
+        assert!(
+            at(&left, 230, 128)[3] < 0.01,
+            "paint escaped the selection within its own tile: {:?}",
+            at(&left, 230, 128)
+        );
+
+        // The right tile is outside the selection entirely. Absent coverage means none, not all.
+        if let Some(right) = crate::test_gpu::readback_tile(&device, &queue, &canvas, L0, (1, 0)) {
+            for x in [10, 40, 80] {
+                assert!(
+                    at(&right, x, 128)[3] < 0.01,
+                    "paint reached a tile the selection never touched, at x={x}: {:?}",
+                    at(&right, x, 128)
+                );
+            }
+        }
+    }
+
+    /// Lifting the confinement lifts it. The state is held across strokes, so the release is as
+    /// much a change as the application — and forgetting it leaves a brush trapped inside a
+    /// selection that was cleared two gestures ago.
+    #[test]
+    fn clearing_the_selection_frees_the_brush_again() {
+        let Some(_) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let page = openpaint_core::PageRect::from_size(SIZE, SIZE);
+        let selection = openpaint_core::Selection::from_rect(
+            openpaint_core::PageRect::new(0, 0, 64, SIZE),
+            page,
+        );
+        let dabs = [dab(64.0, 64.0, 50.0, 1.0, 1.0)];
+
+        let (device, queue) = try_device().expect("checked above");
+        let mut layer = test_stroke_layer(&device);
+        layer.confine_to(&queue, Some(selection));
+        assert!(layer.is_confined());
+        layer.confine_to(&queue, None);
+        assert!(!layer.is_confined(), "the confinement was not lifted");
+
+        let after = gpu_render_confined(&dabs, None);
+        assert!(
+            after[64 * SIZE as usize + 90][3] > 0.5,
+            "the brush is still trapped after the selection was cleared"
+        );
     }
 
     /// A tip with obvious structure: a plus sign, off-centre, at an odd size.

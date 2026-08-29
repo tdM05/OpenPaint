@@ -421,6 +421,45 @@ impl Selection {
         bounds
     }
 
+    /// The overlap of two masks: coverage where both have it.
+    ///
+    /// Multiplied rather than min-ed, because coverage is a fraction of a pixel and two
+    /// independent fractions compose by multiplying. Half-selected inside a half-selected region is
+    /// a quarter, which is what a soft edge crossing another soft edge looks like.
+    ///
+    /// Only the tiles this mask has are walked: anything the other has and this does not is
+    /// coverage on one side only, and the intersection is empty there by definition.
+    #[must_use]
+    pub fn intersected(&self, other: &Self) -> Self {
+        let mut build = Builder::default();
+        for (coord, tile) in &self.tiles {
+            let Some(mask) = other.tiles.get(coord) else {
+                continue;
+            };
+            for ly in 0..TILE_SIZE {
+                let row: Vec<u8> = (0..TILE_SIZE)
+                    .map(|lx| {
+                        let i = ly * TILE_SIZE + lx;
+                        // Rounded, so full coverage through full coverage survives as full rather
+                        // than decaying to 254 and leaving a ghost edge on every fill.
+                        let product = u32::from(tile[i]) * u32::from(mask[i]);
+                        ((product + 127) / 255) as u8
+                    })
+                    .collect();
+                if row.iter().any(|&c| c > 0) {
+                    let (x, y) = (coord.0 * TILE_SIZE as i32, coord.1 * TILE_SIZE as i32);
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_possible_wrap,
+                        reason = "an index within a 256-wide tile"
+                    )]
+                    build.write_run(x, y + ly as i32, &row);
+                }
+            }
+        }
+        build.finish()
+    }
+
     #[must_use]
     pub fn inverted(&self, page: PageRect) -> Self {
         let side = TILE_SIZE as i32;
@@ -956,6 +995,51 @@ mod tests {
         assert_eq!(sel.coverage_at(399, 399), 255);
         assert_eq!(sel.coverage_at(400, 0), 0);
         assert_eq!(sel.tiles().count(), 4, "400px is two tiles each way");
+    }
+
+    /// A bucket inside a selection fills the overlap, not the whole region it found.
+    ///
+    /// The composition §4k promised was free, made actual. Coverage multiplies rather than taking
+    /// a minimum, because two independent fractions of a pixel compose that way — a soft edge
+    /// crossing another soft edge is softer than either.
+    #[test]
+    fn intersecting_keeps_only_the_overlap() {
+        let page = PageRect::from_size(512, 512);
+        let left = Selection::from_rect(PageRect::new(0, 0, 200, 200), page);
+        let right = Selection::from_rect(PageRect::new(100, 0, 200, 200), page);
+        let both = left.intersected(&right);
+
+        assert_eq!(
+            both.coverage_at(150, 100),
+            255,
+            "the overlap is fully selected"
+        );
+        assert_eq!(
+            both.coverage_at(50, 100),
+            0,
+            "only the left mask reaches here"
+        );
+        assert_eq!(
+            both.coverage_at(250, 100),
+            0,
+            "only the right mask reaches here"
+        );
+
+        // Two half-covered pixels make a quarter, which a minimum could not express.
+        let mut soft_a = Selection::from_rect(PageRect::new(0, 0, 10, 10), page);
+        let mut soft_b = Selection::from_rect(PageRect::new(0, 0, 10, 10), page);
+        soft_a.set_coverage(5, 5, 128);
+        soft_b.set_coverage(5, 5, 128);
+        let soft = soft_a.intersected(&soft_b);
+        let c = soft.coverage_at(5, 5);
+        assert!(
+            (60..=70).contains(&c),
+            "half through half should be a quarter, got {c}"
+        );
+
+        // Disjoint masks intersect to nothing at all, rather than to empty tiles.
+        let far = Selection::from_rect(PageRect::new(400, 400, 50, 50), page);
+        assert!(left.intersected(&far).is_empty());
     }
 
     #[test]

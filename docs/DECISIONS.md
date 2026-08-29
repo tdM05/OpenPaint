@@ -750,6 +750,59 @@ the state changes below — so a sabotage that wrongly marked the document dirty
 on cancel *passed*, because the line was unreachable in the test. Obligations
 first, then branch. That hazard has now bitten three times.
 
+### 4q. A selection is a property of the destination — 2026-08-29
+
+Reported plainly: *"if I select, then go to brush tool… the paint goes anywhere. is
+this a general problem for eraser and other tools too? is there a clean way to
+generalize all this behaviour rather than hardcoding stuff."* Yes, yes, and yes. §4k
+listed "confining a brush" as a consumer of the mask from the start; it was the one that
+was never wired up, and the bucket had the same hole.
+
+**The brush does not know what a selection is, and should not.** That is what stops this
+being one patch per tool. Every stroke — brush, eraser, alpha-locked — is the same
+accumulation buffer with a different blend, so there is exactly one place paint becomes
+coverage, and confining it there covers all three at once and cannot leave one behind.
+
+**Applied at accumulation, not at the bake**, which is the decision inside the decision.
+The bake is the tidier place and it is wrong: the in-progress stroke is previewed
+straight out of the accumulation buffer, so masking later would show paint spilling past
+the selection and then snap it away when the pen lifted. A preview that disagrees with
+the result is worse than no confinement.
+
+**The mask is a texture array parallel to the accumulation pool, indexed by the same
+slot.** The per-tile record already carries its accumulation layer, so the shader needs
+no second lookup and the two cannot disagree about which tile is which. Read with
+`textureLoad` rather than a sampler: the mask is canvas resolution and tile aligned, so
+there is nothing to interpolate, and interpolating would soften a selection against
+itself.
+
+**Coverage, not a bit, all the way through.** A half-selected pixel takes half the paint.
+That is the §4k bet paying out — feathered selections give feathered brush edges with no
+code written for it — and it is the property the test pins, because a hard-edged gate
+passes every other assertion.
+
+**The bucket now fills the intersection**, which §4k promised would compose for free and
+does: `Selection::intersected` multiplies coverage rather than taking a minimum, because
+two independent fractions of a pixel compose by multiplying. It also puts the artist's
+selection back afterwards — a bucket keeps no mask of its own, but throwing away one they
+made is not the same thing.
+
+**What is deliberately *not* folded in.** Alpha lock depends on the destination's own
+alpha and clipping on the layer below: they *read* pixels rather than carry them, so they
+are a blend state and a compositor concern respectively, and both are already in the
+right place. Only the selection mask and, later, the layer mask are the same shape — an
+external coverage image — and only those two multiply together. Conflating the four is
+exactly how this would become hardcoded again.
+
+The rule that falls out, and the one to check new code against: **anything that writes to
+a layer goes through that gate.**
+
+A lesson worth keeping from the sabotages. The first test used a 128-pixel page, which is
+one tile — so reading the mask from slot 0 instead of the tile's own slot passed, and so
+did uploading full coverage for a tile the selection never reaches. Both are wrong on any
+canvas bigger than 256 pixels, which is every real one. **A single-tile test cannot see a
+per-tile bug**; the test that matters straddles a boundary.
+
 ### 4p. A brush tip is either a curve or a bitmap — 2026-08-29
 
 The last thing that changes what a brush *is*, and what brush presets have been
