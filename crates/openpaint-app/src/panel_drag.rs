@@ -4,32 +4,32 @@
 //! tree is pure geometry and this is a state machine with a clock in it, and because the tree has
 //! to stay testable without inventing a gesture to reach it.
 //!
-//! # Hold, *then* move — and a tap is only ever a tap
+//! # One rule for every layout gesture: hold, then move
 //!
-//! Pressing a tab is ambiguous: it could mean "show me that one" or "I am taking this somewhere".
-//! A mouse disambiguates by hovering first; **a pen arrives already down** and offers no such
-//! warning (§1c).
+//! Nothing rearranges the workspace until the pointer has been held still on it for [`HOLD_MS`].
+//! Moving a panel, resizing a divider — both, the same way. Proposed by the author after two
+//! rounds of the alternative, and it is a better design than what it replaced for three separate
+//! reasons:
 //!
-//! The first version treated movement past [`SLOP`] *or* a hold past [`HOLD_MS`] as a drag, and
-//! that was wrong in practice: a pen tap drifts a little and takes a moment, so ordinary taps kept
-//! becoming accidental moves. Reported as *"sometimes you just wanna use a tab but then it starts
-//! moving the editor"*, and it is worth naming why the code drifted from the design — §1c said
-//! "press-and-hold-then-move drags" and the implementation said "hold **or** move", which is a
-//! different rule that reads almost the same.
+//! - **Accidents stop.** A plain drag can no longer move anything, so a stroke that happens to
+//!   start on a header or near a seam does nothing at all. That was the recurring complaint, twice.
+//! - **Targets can be as big as they need to be.** This is the part worth dwelling on. A grab
+//!   surface only matters *after* the hold, so making it generous costs nothing — and the whole
+//!   class of conflicts between a divider's grab width and its neighbour's tab simply evaporates,
+//!   because the two are never live at the same moment.
+//! - **Touch and pen behave identically.** The interaction is "touch, then the UI appears", never
+//!   "hover, then the UI appears". A finger has no hover; the hold works the same for both.
 //!
-//! So, precisely:
+//! Holding still is the price, and it is the right one: rearranging a workspace is rare and
+//! deliberate, while drawing on it is constant.
 //!
-//! - **Held past [`HOLD_MS`]** — the panel *arms*. It has not moved yet; it is loose.
-//! - **Moved after arming** — it follows the pointer.
-//! - **Released before arming, having barely moved** — a tap. Switches tabs and nothing else.
-//! - **Released before arming, having moved** — nothing at all, because a stray swipe across a
-//!   header meant neither thing.
+//! **Straying cancels.** Wander past [`SLOP`] before the hold completes and the gesture is over —
+//! the pointer has to *stay* there, which is what makes this the same idiom as a press-and-hold
+//! anywhere else, and what stops a slow stroke from arming halfway along.
 //!
-//! Movement alone therefore never starts a drag. That costs a mouse user a fifth of a second
-//! before a panel comes loose, which is the right trade for an app whose primary input is a pen.
-//!
-//! A tap must leave no trace — in particular it must not push anything onto the layout's undo
-//! stack, or Ctrl+Z would start walking back through tab selections.
+//! A tap on a tab still switches to it, and must leave no trace — in particular it must not push
+//! anything onto the layout's undo stack, or Ctrl+Z would start walking back through tab
+//! selections.
 //!
 //! # Why the drop target is remembered by panel, not by path
 //!
@@ -45,18 +45,18 @@
 
 use crate::layout::{Axis, Layout, LayoutHistory, PanelId, Path, Placed, Rect, Zone};
 
-/// How far a pointer may wander and still count as a tap, in logical units.
+/// How far the pointer may wander during the hold before the gesture is abandoned.
 ///
-/// Generous, because a pen resting on glass drifts and a hand shakes. This no longer decides
-/// whether something is a *drag* — only whether a release was a tap or nothing.
+/// Generous, because a pen resting on glass drifts and a hand shakes — but not so generous that a
+/// deliberate stroke across a header reads as someone holding still.
 pub const SLOP: f32 = 9.0;
 
-/// How long a press must be held before the panel comes loose, in milliseconds.
+/// How long the pointer must be held still before anything becomes editable, in milliseconds.
 ///
-/// The touch convention, shortened a little: it is now the *only* way to start a drag, so it sits
-/// on the path of everything rather than being one of two routes. Long enough that no ordinary tab
-/// tap reaches it, short enough that picking a panel up does not feel like waiting.
-pub const HOLD_MS: f64 = 200.0;
+/// The press-and-hold convention, and now the *only* way to start any layout gesture. Long enough
+/// that no ordinary tap or stroke reaches it, short enough that rearranging does not feel like
+/// waiting for permission.
+pub const HOLD_MS: f64 = 320.0;
 
 /// What the pointer went down on. The caller decides this, because it drew the chrome and is the
 /// only thing that knows where a tab ends and a header begins.
@@ -70,17 +70,33 @@ pub enum Target {
     Elsewhere,
 }
 
+/// What the pointer is held on, so the caller can show the wait on the right thing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Held {
+    Panel { path: Path },
+    Divider { path: Path, index: usize },
+}
+
 /// What a gesture in progress wants drawn.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Preview {
+    /// Held on something, waiting out the hold. Nothing has changed yet.
+    ///
+    /// Carried so the caller can show the wait: a hold with no feedback is indistinguishable from
+    /// a dead control, which is exactly how the first version felt to use.
+    Waiting {
+        /// Zero at the press, one when it arms.
+        progress: f32,
+        on: Held,
+    },
     /// A panel is in the air. `over` is the drop it would land in, or `None` when the pointer is
     /// outside the workspace and letting go would float it.
     Carrying {
         panel: PanelId,
         over: Option<Landing>,
     },
-    /// A divider is being dragged; the layout has already moved with it.
-    Resizing,
+    /// A divider is armed, and the layout is following the pointer.
+    Resizing { path: Path, index: usize },
 }
 
 /// The drop a release would perform, and the rectangle to light up for it.
@@ -109,27 +125,37 @@ pub enum Outcome {
     Floated(PanelId),
 }
 
+/// What a grab is for.
 #[derive(Clone, Debug)]
-enum Grab {
+enum Kind {
     Tab {
         panel: PanelId,
         tab: usize,
         path: Path,
-        press: (f32, f32),
-        press_ms: f64,
-        /// Whether the panel has come loose. Set by time alone — see the module note.
-        armed: bool,
-        /// Whether the pointer has wandered past [`SLOP`] since the press.
-        ///
-        /// Only decides whether a release that never armed was a tap or nothing at all.
-        strayed: bool,
     },
     Splitter {
         path: Path,
         index: usize,
         axis: Axis,
-        last: (f32, f32),
     },
+}
+
+/// One press, and everything that has happened to it since.
+///
+/// A single shape for both kinds rather than one per kind, because the arming is now *identical*
+/// for both and only what happens afterwards differs. Two copies of the hold logic would be two
+/// places for it to drift, which is the same hazard as everything else in §11a.8.
+#[derive(Clone, Debug)]
+struct Grab {
+    kind: Kind,
+    press: (f32, f32),
+    press_ms: f64,
+    /// Set once the hold completes. Only then does anything move.
+    armed: bool,
+    /// Set if the pointer wandered before arming, which abandons the gesture for good.
+    strayed: bool,
+    /// Where the pointer was last, for the incremental divider drag.
+    last: (f32, f32),
 }
 
 /// The panel-dragging state machine.
@@ -139,66 +165,73 @@ pub struct PanelDrag {
 }
 
 impl PanelDrag {
-    /// Whether a gesture is in progress.
+    /// Whether a gesture is in progress, armed or still waiting.
     #[must_use]
     pub fn active(&self) -> bool {
         self.grab.is_some()
     }
 
-    /// Whether a press is waiting to arm, and how long is left.
+    /// Whether something is actually moving, so the caller knows the pointer is spoken for.
+    ///
+    /// Distinct from [`PanelDrag::active`] on purpose: a press that is merely *waiting* has taken
+    /// nothing, and treating it as busy would make the first fifth of a second of every press feel
+    /// dead.
+    #[must_use]
+    pub fn armed(&self) -> bool {
+        self.grab.as_ref().is_some_and(|g| g.armed)
+    }
+
+    /// How long until the hold completes, if one is waiting.
     ///
     /// **Painting is demand-driven**, so a hold that nobody asks to draw simply never fires: with
     /// the pointer still, no events arrive, no frame is drawn, and the timer is never read. The
-    /// caller uses this to keep frames coming until the panel comes loose. Same trap as every
-    /// other timed thing in this app — see `Stabilizer` and the note on `request_redraw`.
+    /// caller uses this to keep frames coming until it arms.
     #[must_use]
     pub fn waiting_ms(&self, now_ms: f64) -> Option<f64> {
-        match self.grab {
-            Some(Grab::Tab {
-                press_ms,
-                armed: false,
-                ..
-            }) => Some((HOLD_MS - (now_ms - press_ms)).max(0.0)),
-            _ => None,
-        }
+        self.grab.as_ref().and_then(|g| {
+            (!g.armed && !g.strayed).then(|| (HOLD_MS - (now_ms - g.press_ms)).max(0.0))
+        })
     }
 
     /// Begin a gesture. Returns whether this module took the pointer.
     ///
-    /// A press on anything but a tab or a divider is declined, so the panel's own content sees it
-    /// — the same shape as [`crate::Capture`], and for the same reason: one decision at the press,
-    /// held to the release.
+    /// A press on anything but a tab or a divider is declined, so the panel's own content sees it.
+    /// Taking the pointer here does **not** mean anything will happen to the layout — that needs
+    /// the hold.
     pub fn press(&mut self, layout: &Layout, target: &Target, x: f32, y: f32, now_ms: f64) -> bool {
-        self.grab = match target {
-            // A target naming a tab or a split that is not there is declined rather than trusted:
-            // the caller hit-tested against a layout, and nothing guarantees it was this one.
-            Target::Tab { path, tab } => layout.tab_at(path, *tab).map(|panel| Grab::Tab {
+        // A target naming a tab or a split that is not there is declined rather than trusted: the
+        // caller hit-tested against a layout, and nothing guarantees it was this one.
+        let kind = match target {
+            Target::Tab { path, tab } => layout.tab_at(path, *tab).map(|panel| Kind::Tab {
                 panel,
                 tab: *tab,
                 path: path.clone(),
-                press: (x, y),
-                press_ms: now_ms,
-                armed: false,
-                strayed: false,
             }),
             Target::Splitter { path, index } => {
-                layout.split_axis(path).map(|axis| Grab::Splitter {
+                layout.split_axis(path).map(|axis| Kind::Splitter {
                     path: path.clone(),
                     index: *index,
                     axis,
-                    last: (x, y),
                 })
             }
             Target::Elsewhere => None,
         };
+        self.grab = kind.map(|kind| Grab {
+            kind,
+            press: (x, y),
+            press_ms: now_ms,
+            armed: false,
+            strayed: false,
+            last: (x, y),
+        });
         self.grab.is_some()
     }
 
-    /// Continue a gesture. A divider moves the layout as it goes; a panel only previews.
+    /// Continue a gesture.
     ///
-    /// Resizing applies live because the artist is watching the thing they are sizing. A move does
-    /// not, because a panel that rearranged the workspace on the way past every drop zone would be
-    /// unusable — and because a preview costs nothing to abandon.
+    /// Nothing moves until the hold completes. A divider then resizes live, because the artist is
+    /// watching the thing they are sizing; a panel only previews, because one that rearranged the
+    /// workspace on the way past every drop zone would be unusable.
     pub fn drag(
         &mut self,
         layout: &mut Layout,
@@ -207,15 +240,42 @@ impl PanelDrag {
         y: f32,
         now_ms: f64,
     ) -> Option<Preview> {
-        match self.grab.as_mut()? {
-            Grab::Splitter {
-                path,
-                index,
-                axis,
-                last,
-            } => {
-                let (dx, dy) = (x - last.0, y - last.1);
-                *last = (x, y);
+        let grab = self.grab.as_mut()?;
+        if !grab.armed {
+            // Wandering before the hold completes abandons it: this was a stroke that happened to
+            // start on some chrome, not a rearrangement. Latched, so it cannot come back to life
+            // by holding still somewhere else.
+            grab.strayed = grab.strayed || (x - grab.press.0).hypot(y - grab.press.1) >= SLOP;
+            if grab.strayed {
+                return None;
+            }
+            if now_ms - grab.press_ms < HOLD_MS {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a fraction of a fixed millisecond window"
+                )]
+                let progress = ((now_ms - grab.press_ms) / HOLD_MS).clamp(0.0, 1.0) as f32;
+                return Some(Preview::Waiting {
+                    progress,
+                    on: match &grab.kind {
+                        Kind::Tab { path, .. } => Held::Panel { path: path.clone() },
+                        Kind::Splitter { path, index, .. } => Held::Divider {
+                            path: path.clone(),
+                            index: *index,
+                        },
+                    },
+                });
+            }
+            grab.armed = true;
+            // Movement counts from *here*, not from the press: the pointer drifts a few units
+            // during the hold, and counting that would make everything jump the instant it arms.
+            grab.last = (x, y);
+        }
+
+        match &grab.kind {
+            Kind::Splitter { path, index, axis } => {
+                let (dx, dy) = (x - grab.last.0, y - grab.last.1);
+                grab.last = (x, y);
                 let extent = match axis {
                     Axis::Horizontal => area.w,
                     Axis::Vertical => area.h,
@@ -227,23 +287,12 @@ impl PanelDrag {
                     } / extent;
                     layout.drag_splitter(path, *index, delta);
                 }
-                Some(Preview::Resizing)
+                Some(Preview::Resizing {
+                    path: path.clone(),
+                    index: *index,
+                })
             }
-            Grab::Tab {
-                panel,
-                press,
-                press_ms,
-                armed,
-                strayed,
-                ..
-            } => {
-                *strayed = *strayed || (x - press.0).hypot(y - press.1) >= SLOP;
-                // Time alone arms it. Movement is deliberately *not* a trigger: that is the whole
-                // correction, and re-adding an `|| moved` here brings the accidental drags back.
-                *armed = *armed || (now_ms - *press_ms) >= HOLD_MS;
-                if !*armed {
-                    return None;
-                }
+            Kind::Tab { panel, .. } => {
                 let panel = *panel;
                 let over = layout.leaf_at(area, x, y).map(|placed| Landing {
                     zone: Layout::zone_at(placed.rect, x, y),
@@ -269,28 +318,23 @@ impl PanelDrag {
         let Some(grab) = self.grab.take() else {
             return Outcome::Nothing;
         };
-        match grab {
-            Grab::Splitter { .. } => Outcome::Resized,
-            Grab::Tab {
-                panel,
-                tab,
-                path,
-                armed,
-                strayed,
-                ..
-            } => {
-                if !armed {
-                    if strayed {
-                        // A swipe across a header that never became a drag. It meant neither
-                        // thing, so it does neither — switching tabs here is how a stray stroke
-                        // ends up changing what you are looking at.
-                        return Outcome::Nothing;
-                    }
-                    // A tap. Deliberately not recorded: Ctrl+Z must walk back through arrangement,
-                    // not through which tab you were looking at.
+        if !grab.armed {
+            // Never armed. A still press on a tab is a tap and switches to it; anything else — a
+            // stray swipe, or a press on a divider that went nowhere — asked for nothing.
+            return match grab.kind {
+                Kind::Tab { tab, path, .. } if !grab.strayed => {
+                    // Deliberately not recorded: Ctrl+Z must walk back through arrangement, not
+                    // through which tab you were looking at.
                     layout.set_active(&path, tab);
-                    return Outcome::Switched;
+                    Outcome::Switched
                 }
+                _ => Outcome::Nothing,
+            };
+        }
+
+        match grab.kind {
+            Kind::Splitter { .. } => Outcome::Resized,
+            Kind::Tab { panel, .. } => {
                 let Some(placed) = layout.leaf_at(area, x, y) else {
                     return Outcome::Floated(panel);
                 };
@@ -301,11 +345,9 @@ impl PanelDrag {
                 // Anchor the target to a panel rather than to its path: the removal below can
                 // collapse a leaf and shift every path after it. See the module note.
                 //
-                // Finding no anchor is also the answer to the last no-op case, which is why
-                // `is_noop` does not repeat it: if the only panel in the target leaf is the one
-                // being dragged, splitting that leaf would put the panel beside itself. A sabotage
-                // proved a clause saying so in `is_noop` was unreachable, and one place deciding
-                // beats two that agree by luck.
+                // Finding no anchor is also the answer to the last no-op case: if the only panel
+                // in the target leaf is the one being dragged, splitting that leaf would put the
+                // panel beside itself.
                 let Some(anchor) = placed.tabs.iter().copied().find(|p| *p != panel) else {
                     return Outcome::Nothing;
                 };
@@ -335,9 +377,6 @@ impl PanelDrag {
 ///
 /// Worth its own answer rather than letting the move happen and produce an identical tree, because
 /// an undo entry that restores what is already there reads as a broken Ctrl+Z.
-///
-/// The *other* no-op — a lone panel dropped on the edge of its own leaf — is decided at the anchor
-/// lookup in `release` rather than repeated here. See the note there.
 fn is_noop(placed: &Placed, panel: PanelId, zone: Zone) -> bool {
     placed.tabs.contains(&panel) && zone == Zone::Center
 }
@@ -369,6 +408,11 @@ mod tests {
         }
     }
 
+    /// Hold still until it arms, which every gesture now has to do.
+    fn arm(d: &mut PanelDrag, l: &mut Layout, x: f32, y: f32) {
+        d.drag(l, area(), x, y, HOLD_MS + 1.0);
+    }
+
     /// A quick press and release on a tab shows it — and records nothing, because Ctrl+Z must walk
     /// back through arrangement rather than through which tab you last looked at.
     #[test]
@@ -379,8 +423,7 @@ mod tests {
 
         assert_eq!(l.resolve(area())[1].active, 1, "History is showing");
         assert!(d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0));
-        // A little wobble, well inside the slop, and released promptly.
-        assert_eq!(d.drag(&mut l, area(), 702.0, 11.0, 40.0), None);
+        d.drag(&mut l, area(), 702.0, 11.0, 40.0);
         assert_eq!(
             d.release(&mut l, &mut h, area(), 702.0, 11.0),
             Outcome::Switched
@@ -390,107 +433,160 @@ mod tests {
         assert_eq!(h.depth(), (0, 0), "a tap is not an undoable edit");
     }
 
-    /// **Movement alone never starts a drag**, however far it goes.
+    /// **Movement alone never starts a drag**, however far it goes and however long it takes.
     ///
-    /// The correction that this whole module was rewritten for. The first version treated a move
-    /// past the slop as a drag, and ordinary pen taps — which drift — kept becoming accidental
-    /// panel moves. A test asserting the old rule passed the whole time, which is why it is
-    /// replaced rather than relaxed.
+    /// The rule the whole module is built on. A plain drag across a header does nothing, so a
+    /// stroke that happens to begin on some chrome cannot rearrange the workspace.
     #[test]
     fn movement_alone_never_starts_a_drag() {
         let mut l = workspace();
+        let before = l.clone();
         let mut d = PanelDrag::default();
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
 
-        // Right across the window, well inside the hold time.
-        for x in [710.0, 760.0, 900.0, 400.0] {
+        // Right across the window, and well past the hold time.
+        for (x, t) in [(710.0, 20.0), (760.0, 60.0), (900.0, 400.0), (400.0, 900.0)] {
             assert_eq!(
-                d.drag(&mut l, area(), x, 300.0, 40.0),
+                d.drag(&mut l, area(), x, 300.0, t),
                 None,
-                "moving to {x} before the hold must not lift anything"
+                "moving to {x} at {t} ms must not lift anything"
             );
         }
+        assert_eq!(l, before, "and nothing about the layout changed");
     }
 
-    /// A swipe across a header that never armed does neither thing: it does not move a panel, and
-    /// it does not switch tabs either. A stray stroke must not change what you are looking at.
+    /// **A divider obeys the same rule**, which is the half that had been missing: resizing used
+    /// to happen on any drag, so a stroke near a seam rearranged the workspace under the pen.
     #[test]
-    fn a_stray_swipe_does_nothing_at_all() {
+    fn a_divider_also_needs_the_hold() {
+        let mut l = workspace();
+        let before = l.resolve(area())[0].rect.w;
+        let mut d = PanelDrag::default();
+        let s = l.splitters(area(), 26.0)[0].clone();
+
+        d.press(
+            &l,
+            &Target::Splitter {
+                path: s.path.clone(),
+                index: s.index,
+            },
+            s.rect.x,
+            400.0,
+            0.0,
+        );
+        // Dragged straight away: nothing moves, and it can never arm because it strayed.
+        d.drag(&mut l, area(), s.rect.x + 120.0, 400.0, 30.0);
+        d.drag(&mut l, area(), s.rect.x + 120.0, 400.0, 5000.0);
+        assert!(
+            (l.resolve(area())[0].rect.w - before).abs() < 0.01,
+            "a divider must not resize without the hold"
+        );
+    }
+
+    /// Once the hold completes, a divider resizes live and by the distance dragged.
+    #[test]
+    fn an_armed_divider_follows_the_pointer() {
+        let mut l = workspace();
+        let mut h = LayoutHistory::default();
+        let before = l.resolve(area())[0].rect.w;
+        let mut d = PanelDrag::default();
+        let s = l.splitters(area(), 26.0)[0].clone();
+
+        d.press(
+            &l,
+            &Target::Splitter {
+                path: s.path.clone(),
+                index: s.index,
+            },
+            s.rect.x,
+            400.0,
+            0.0,
+        );
+        arm(&mut d, &mut l, s.rect.x, 400.0);
+        for step in 1..=3_u8 {
+            d.drag(
+                &mut l,
+                area(),
+                40.0_f32.mul_add(f32::from(step), s.rect.x),
+                400.0,
+                20.0_f64.mul_add(f64::from(step), HOLD_MS),
+            );
+        }
+        let after = l.resolve(area())[0].rect.w;
+        assert!(
+            (after - (before + 120.0)).abs() < 2.0,
+            "the panel should have followed the divider 120 units, went {before} to {after}"
+        );
+        assert_eq!(
+            d.release(&mut l, &mut h, area(), s.rect.x + 120.0, 400.0),
+            Outcome::Resized
+        );
+    }
+
+    /// Straying during the hold abandons the gesture, and it cannot arm later.
+    ///
+    /// "Hold and keep it there" has to mean *there*, or a slow drag across a header would arm
+    /// halfway along and start carrying a panel nobody picked up.
+    #[test]
+    fn straying_during_the_hold_abandons_it() {
         let mut l = workspace();
         let mut h = LayoutHistory::default();
         let mut d = PanelDrag::default();
-        let before = l.clone();
 
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
-        d.drag(&mut l, area(), 780.0, 12.0, 30.0);
+        d.drag(&mut l, area(), 700.0 + SLOP + 1.0, 10.0, 20.0);
+        // Now hold still for ages: it must not come back to life.
+        assert_eq!(d.drag(&mut l, area(), 760.0, 10.0, 5000.0), None);
+        assert_eq!(d.waiting_ms(5000.0), None, "and it is not waiting either");
         assert_eq!(
-            d.release(&mut l, &mut h, area(), 780.0, 12.0),
-            Outcome::Nothing
+            d.release(&mut l, &mut h, area(), 760.0, 10.0),
+            Outcome::Nothing,
+            "not a tap either -- it went somewhere"
         );
-        assert_eq!(l, before, "the tab on show did not change either");
-        assert_eq!(h.depth(), (0, 0));
     }
 
-    /// Once armed, movement carries the panel — which is the other half of the rule.
+    /// The wait is reported so the caller can show it. A hold with no feedback is
+    /// indistinguishable from a dead control, which is how the first version felt.
     #[test]
-    fn movement_after_arming_carries_the_panel() {
+    fn the_wait_is_visible_before_anything_moves() {
         let mut l = workspace();
         let mut d = PanelDrag::default();
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
 
-        assert!(d.drag(&mut l, area(), 700.0, 10.0, HOLD_MS + 1.0).is_some());
-        let preview = d
-            .drag(&mut l, area(), 400.0, 400.0, HOLD_MS + 20.0)
-            .expect("armed, so it follows");
-        assert!(matches!(preview, Preview::Carrying { panel: LAYERS, .. }));
+        let Some(Preview::Waiting { progress, on }) = d.drag(&mut l, area(), 700.0, 10.0, 80.0)
+        else {
+            panic!("a press should report that it is waiting");
+        };
+        assert!(
+            (0.2..0.3).contains(&progress),
+            "80 of 320 ms is about a quarter, got {progress}"
+        );
+        assert_eq!(on, Held::Panel { path: vec![1] });
     }
 
-    /// A press waiting to arm asks for frames, because painting is demand-driven and a hold that
-    /// nobody draws never fires. Reported as "tap and hold sometimes does not show the menu" — it
-    /// was not sometimes, it was whenever the pointer was still enough to stop producing events.
+    /// A waiting press asks for the frames that let it fire, and stops once it has.
     #[test]
-    fn a_waiting_press_asks_for_the_frames_that_let_it_fire() {
+    fn a_waiting_press_asks_for_frames() {
         let l = workspace();
         let mut d = PanelDrag::default();
         assert_eq!(d.waiting_ms(0.0), None, "nothing is waiting yet");
 
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
         let left = d.waiting_ms(50.0).expect("a press is waiting");
-        assert!(
-            (left - (HOLD_MS - 50.0)).abs() < 0.001,
-            "it should report the time left, got {left}"
-        );
+        assert!((left - (HOLD_MS - 50.0)).abs() < 0.001, "got {left}");
+        assert!(!d.armed(), "and nothing is moving yet");
 
         let mut l2 = workspace();
-        d.drag(&mut l2, area(), 700.0, 10.0, HOLD_MS + 1.0);
+        arm(&mut d, &mut l2, 700.0, 10.0);
         assert_eq!(d.waiting_ms(HOLD_MS + 1.0), None, "armed, so nothing waits");
-    }
-
-    /// Holding still lifts too, so a pen user sees the panel come loose *before* deciding where to
-    /// take it. Without this the only way to know a drag has begun is to have already moved.
-    #[test]
-    fn holding_still_lifts_the_panel_without_moving() {
-        let mut l = workspace();
-        let mut d = PanelDrag::default();
-        d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
-
-        assert_eq!(d.drag(&mut l, area(), 700.0, 10.0, HOLD_MS - 50.0), None);
-        let preview = d
-            .drag(&mut l, area(), 700.0, 10.0, HOLD_MS + 1.0)
-            .expect("held long enough");
-        assert!(matches!(preview, Preview::Carrying { .. }));
+        assert!(d.armed());
     }
 
     /// **The ordering hazard.** Applying a move removes the panel first, and removing can collapse
     /// a leaf and shift every path after it — so a path captured before the removal can name a
-    /// different node, or nothing. The target is anchored to a panel id instead, which no amount
-    /// of collapsing can invalidate.
-    ///
-    /// This is the case that exposes it: dragging the *only* panel out of a leaf, so that leaf
-    /// disappears and the split around it dissolves, into a target that sits after it.
+    /// different node, or nothing. The target is anchored to a panel id instead.
     #[test]
     fn a_move_survives_the_tree_collapsing_under_it() {
-        // Three across; take the first one and drop it on the last.
         let mut l = Layout::single(CANVAS);
         l.insert(&[], Zone::Right, LAYERS);
         l.insert(&[1], Zone::Right, HISTORY);
@@ -502,14 +598,14 @@ mod tests {
         let target = placed[2].rect;
 
         d.press(&l, &tab(&[0], 0), 10.0, 10.0, 0.0);
-        d.drag(&mut l, area(), 500.0, 400.0, 300.0);
+        arm(&mut d, &mut l, 10.0, 10.0);
         let drop = (target.x + target.w / 2.0, target.y + target.h / 2.0);
+        d.drag(&mut l, area(), drop.0, drop.1, HOLD_MS + 40.0);
         assert_eq!(
             d.release(&mut l, &mut h, area(), drop.0, drop.1),
             Outcome::Moved
         );
 
-        // Canvas must be stacked with History, not lost and not put somewhere arbitrary.
         let (path, _) = l.find(CANVAS).expect("the canvas is still in the layout");
         let placed = l.resolve(area());
         let leaf = placed.iter().find(|p| p.path == path).expect("its leaf");
@@ -530,25 +626,23 @@ mod tests {
 
         let canvas_rect = l.resolve(area())[0].rect;
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
-        d.drag(&mut l, area(), 400.0, 400.0, 300.0);
-        // Near the bottom edge of the canvas panel.
+        arm(&mut d, &mut l, 700.0, 10.0);
         let drop = (
             canvas_rect.x + canvas_rect.w / 2.0,
             canvas_rect.y + canvas_rect.h * 0.95,
         );
+        d.drag(&mut l, area(), drop.0, drop.1, HOLD_MS + 40.0);
         assert_eq!(
             d.release(&mut l, &mut h, area(), drop.0, drop.1),
             Outcome::Moved
         );
 
         let (path, _) = l.find(LAYERS).expect("layers moved, not vanished");
-        let canvas_path = l.find(CANVAS).expect("canvas is there").0;
-        assert_ne!(path, canvas_path, "they are in different leaves");
+        assert_ne!(path, l.find(CANVAS).expect("canvas is there").0);
         assert_eq!(h.depth().0, 1, "and the move is undoable");
     }
 
-    /// Dropping a panel back where it came from changes nothing and records nothing. An undo entry
-    /// that restores what is already there reads as a broken Ctrl+Z.
+    /// Dropping a panel back where it came from changes nothing and records nothing.
     #[test]
     fn dropping_a_panel_back_home_is_not_an_edit() {
         let mut l = workspace();
@@ -558,7 +652,7 @@ mod tests {
 
         let home = l.resolve(area())[1].rect;
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
-        d.drag(&mut l, area(), 800.0, 400.0, 300.0);
+        arm(&mut d, &mut l, 700.0, 10.0);
         let drop = (home.x + home.w / 2.0, home.y + home.h / 2.0);
         assert_eq!(
             d.release(&mut l, &mut h, area(), drop.0, drop.1),
@@ -568,7 +662,7 @@ mod tests {
         assert_eq!(h.depth(), (0, 0));
     }
 
-    /// A lone panel dropped on its own leaf's edge would be split away from itself. Nothing to do.
+    /// A lone panel dropped on its own leaf's edge would be split away from itself.
     #[test]
     fn a_lone_panel_cannot_split_its_own_leaf() {
         let mut l = Layout::single(CANVAS);
@@ -576,7 +670,7 @@ mod tests {
         let mut d = PanelDrag::default();
 
         d.press(&l, &tab(&[], 0), 10.0, 10.0, 0.0);
-        d.drag(&mut l, area(), 400.0, 400.0, 300.0);
+        arm(&mut d, &mut l, 10.0, 10.0);
         assert_eq!(
             d.release(&mut l, &mut h, area(), 990.0, 400.0),
             Outcome::Nothing
@@ -584,8 +678,7 @@ mod tests {
         assert_eq!(l, Layout::single(CANVAS));
     }
 
-    /// Let go outside the workspace and the panel wants its own window. Reported rather than
-    /// performed, because whose window it is belongs to the shell.
+    /// Let go outside the workspace and the panel wants its own window.
     #[test]
     fn letting_go_outside_asks_to_float() {
         let mut l = workspace();
@@ -593,7 +686,7 @@ mod tests {
         let mut d = PanelDrag::default();
 
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
-        d.drag(&mut l, area(), 400.0, 400.0, 300.0);
+        arm(&mut d, &mut l, 700.0, 10.0);
         assert_eq!(
             d.release(&mut l, &mut h, area(), -50.0, 400.0),
             Outcome::Floated(LAYERS)
@@ -601,53 +694,7 @@ mod tests {
         assert_eq!(h.depth(), (0, 0), "nothing has happened to the layout yet");
     }
 
-    /// A divider resizes live, because the artist is watching the thing they are sizing.
-    #[test]
-    fn a_divider_resizes_as_it_is_dragged() {
-        let mut l = workspace();
-        let mut h = LayoutHistory::default();
-        let mut d = PanelDrag::default();
-        let before = l.resolve(area())[0].rect.w;
-
-        let splitter = l.splitters(area(), 8.0)[0].clone();
-        assert!(d.press(
-            &l,
-            &Target::Splitter {
-                path: splitter.path.clone(),
-                index: splitter.index
-            },
-            splitter.rect.x,
-            400.0,
-            0.0
-        ));
-        // Three steps, and the total must be the distance dragged -- not once, and not loosely.
-        // A single drag cannot tell an incremental delta from one measured against the press, and
-        // a loose bound cannot tell "followed the pointer" from "shot to the end of its range".
-        for step in 1..=3_u8 {
-            assert_eq!(
-                d.drag(
-                    &mut l,
-                    area(),
-                    splitter.rect.x + 40.0 * f32::from(step),
-                    400.0,
-                    16.0 * f64::from(step)
-                ),
-                Some(Preview::Resizing)
-            );
-        }
-        let after = l.resolve(area())[0].rect.w;
-        assert!(
-            (after - (before + 120.0)).abs() < 2.0,
-            "the panel should have followed the divider exactly 120 units, went from {before} to              {after}"
-        );
-        assert_eq!(
-            d.release(&mut l, &mut h, area(), splitter.rect.x + 120.0, 400.0),
-            Outcome::Resized
-        );
-    }
-
-    /// A press on a panel's content is declined, so the panel itself sees it — one decision at the
-    /// press, held to the release, exactly as `Capture` does for the canvas.
+    /// A press on a panel's content is declined, so the panel itself sees it.
     #[test]
     fn a_press_on_content_is_not_ours() {
         let l = workspace();
@@ -665,7 +712,7 @@ mod tests {
         let mut d = PanelDrag::default();
 
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
-        d.drag(&mut l, area(), 400.0, 400.0, 300.0);
+        arm(&mut d, &mut l, 700.0, 10.0);
         d.cancel();
 
         assert!(!d.active());

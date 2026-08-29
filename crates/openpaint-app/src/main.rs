@@ -853,6 +853,9 @@ impl OpenPaint {
     /// the better behaviour — a modifier should not silently truncate a stroke in progress.
     fn decide_capture(&mut self, sample: &PenSample) -> Capture {
         if self.ui_blocks_point(sample.x, sample.y)
+            // A panel or divider in the artist's hand owns the pointer wherever it goes -- one
+            // carried over the canvas must not also paint on it.
+            || (self.workspace_mode && self.workspace.busy())
             || self.nav.is_active()
             || self.pending_confirm.is_some()
             || self.recovery.is_some()

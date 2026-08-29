@@ -29,7 +29,7 @@
 
 use crate::chrome::{self, HeaderStyle};
 use crate::layout::{Layout, LayoutHistory, PanelId, Rect, Zone};
-use crate::panel_drag::{Outcome, PanelDrag, Preview};
+use crate::panel_drag::{Held, Outcome, PanelDrag, Preview};
 use crate::theme::{Color, Theme};
 
 /// A panel the app can show.
@@ -187,17 +187,14 @@ impl Workspace {
         self.canvas_rect
     }
 
-    /// Whether a panel gesture owns the pointer, so the canvas should not also act on it.
+    /// Whether a panel gesture owns the pointer, so the canvas must not also act on it.
     ///
-    /// Unused while the workspace only covers the pointer egui already routes; it is what the
-    /// canvas will ask once pen input is routed to the UI directly (Q14).
-    #[expect(
-        dead_code,
-        reason = "wanted when pen input reaches the UI without synthesis"
-    )]
+    /// **Armed, not merely active.** A press that is only waiting out the hold has taken nothing
+    /// yet, and treating it as busy would make the first third of a second of every press on
+    /// chrome feel dead. Once it arms, the pointer is spoken for until release.
     #[must_use]
     pub fn busy(&self) -> bool {
-        self.drag.active()
+        self.drag.armed()
     }
 
     /// Abandon a panel drag without applying it.
@@ -312,14 +309,23 @@ impl Workspace {
         let splitters = self.layout.splitters(screen, m.splitter_grab);
 
         // --- input, before drawing, so the drop overlay reflects this frame's pointer ---
-        let (pointer, pressed, released, now_ms) = ctx.input(|i| {
+        let (pointer, pressed, released, down, now_ms) = ctx.input(|i| {
             (
                 i.pointer.interact_pos(),
                 i.pointer.primary_pressed(),
                 i.pointer.primary_released(),
+                i.pointer.primary_down(),
                 i.time * 1000.0,
             )
         });
+
+        // A gesture with the button no longer down is a release we never saw — the pointer left
+        // the window, the app lost focus, a synthesised event went missing. Without this the grab
+        // stays live and *every* later pointer move keeps rearranging the workspace, which is
+        // indistinguishable from the app having gone mad.
+        if self.drag.active() && !down && !pressed {
+            self.drag.cancel();
+        }
         // Painting is demand-driven, so a hold with the pointer still would never fire: no events,
         // no frames, and the timer never read. Reported as the hold "sometimes" not working — it
         // was whenever the pen was steady enough to stop producing motion.
@@ -470,30 +476,70 @@ impl Workspace {
             contents(showing, &mut ui);
         }
 
+        // --- the wait, drawn on the thing being held ---
+        //
+        // The whole gesture now begins with a hold, so it *must* be visible: a hold with no
+        // feedback is indistinguishable from a dead control, which is how this felt before. The
+        // mark grows with the wait, so the artist can see it coming rather than guessing.
+        if let Some(Preview::Waiting { progress, on }) = &preview {
+            let alpha = (140.0 * progress).clamp(0.0, 140.0) as u8;
+            let tint = egui::Color32::from_rgba_unmultiplied(
+                p.state.0[0],
+                p.state.0[1],
+                p.state.0[2],
+                alpha,
+            );
+            match on {
+                Held::Panel { path } => {
+                    if let Some(slot) = placed.iter().find(|s| &s.path == path) {
+                        let c = chrome::panel(slot, &m, style_of(slot), |i| {
+                            self.measure(ctx, slot.tabs.get(i).copied())
+                        });
+                        painter.rect_filled(to_egui(c.header), m.radius, tint);
+                    }
+                }
+                Held::Divider { path, index } => {
+                    if let Some(s) = splitters
+                        .iter()
+                        .find(|s| &s.path == path && s.index == *index)
+                    {
+                        // Grows from the hairline to the full grab width as the hold completes,
+                        // so the target you are about to get is the thing you watch appear.
+                        let t = m.splitter_hover.mul_add(*progress, m.gutter);
+                        painter.rect_filled(to_egui(centred(s.rect, s.axis, t)), t / 2.0, tint);
+                    }
+                }
+            }
+        }
+
         // --- the divider under the pointer, thickened so it can be seen as well as caught ---
         //
         // Drawn last of the chrome so it sits over the panels either side, and only when the
         // pointer is close: at rest the gutter is a hairline and the workspace stays quiet.
         if let Some(pos) = pointer {
-            if preview.is_none() || matches!(preview, Some(Preview::Resizing)) {
+            if preview.is_none() || matches!(preview, Some(Preview::Resizing { .. })) {
                 for s in &splitters {
                     if !s.rect.contains(pos.x, pos.y) {
                         continue;
                     }
-                    // Centred on the boundary, at the *drawn* thickness rather than the grab
-                    // width -- the point is to show where it is, not how big the target is.
+                    // At the *drawn* thickness rather than the grab width: the point is to show
+                    // where it is, not how big the target is. A hint for a pen, which hovers; a
+                    // finger gets nothing here and does not need to, because the hold is what
+                    // actually starts the gesture.
                     let t = m.splitter_hover;
-                    let bar = match s.axis {
-                        crate::layout::Axis::Horizontal => {
-                            Rect::new(s.rect.x + s.rect.w / 2.0 - t / 2.0, s.rect.y, t, s.rect.h)
-                        }
-                        crate::layout::Axis::Vertical => {
-                            Rect::new(s.rect.x, s.rect.y + s.rect.h / 2.0 - t / 2.0, s.rect.w, t)
-                        }
-                    };
-                    painter.rect_filled(to_egui(bar), t / 2.0, rgb(p.state));
+                    painter.rect_filled(to_egui(centred(s.rect, s.axis, t)), t / 2.0, rgb(p.edge));
                     break;
                 }
+            }
+        }
+
+        if let Some(Preview::Resizing { path, index }) = &preview {
+            if let Some(s) = splitters
+                .iter()
+                .find(|s| &s.path == path && s.index == *index)
+            {
+                let t = m.splitter_hover;
+                painter.rect_filled(to_egui(centred(s.rect, s.axis, t)), t / 2.0, rgb(p.state));
             }
         }
 
@@ -599,6 +645,21 @@ fn style_of(slot: &crate::layout::Placed) -> HeaderStyle {
 #[must_use]
 fn name_of(panel: PanelId) -> &'static str {
     kind(panel).map_or("Panel", |k| k.name)
+}
+
+/// A bar of thickness `t` down the middle of a divider's grab region.
+///
+/// One helper for the hover hint, the wait and the armed state, so the three cannot disagree about
+/// where the divider actually is.
+fn centred(rect: Rect, axis: crate::layout::Axis, t: f32) -> Rect {
+    match axis {
+        crate::layout::Axis::Horizontal => {
+            Rect::new(rect.x + rect.w / 2.0 - t / 2.0, rect.y, t, rect.h)
+        }
+        crate::layout::Axis::Vertical => {
+            Rect::new(rect.x, rect.y + rect.h / 2.0 - t / 2.0, rect.w, t)
+        }
+    }
 }
 
 fn to_egui(r: Rect) -> egui::Rect {
