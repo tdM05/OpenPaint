@@ -133,6 +133,8 @@ struct OpenPaint {
     /// deliberately not a variant of [`editor::Tool`]: that enum indexes an array of brushes, and a
     /// selection tool has no brush to index.
     select: Option<Select>,
+    /// Who owns the pointer right now. See [`Capture`].
+    capture: Capture,
     /// How the magic wand behaves. Owned here because the panel only edits it.
     wand: ui::WandSettings,
     /// The document's selection, and the outline it draws.
@@ -234,6 +236,40 @@ enum Dialog {
     Quit {
         confirmed: bool,
     },
+}
+
+/// Who owns the pointer between a press and its release.
+///
+/// **Decided once, at the press, and held until the release.** That is pointer capture, the model
+/// every UI toolkit settled on, and adopting it removes a class of bug by construction rather than
+/// by vigilance: a drag or a release can no longer reach a handler whose *press* was refused,
+/// because the capture was never granted.
+///
+/// That class had produced three bugs in two days, all reported rather than caught:
+///
+/// - painting died entirely, because an early return skipped draining input (§11a.7);
+/// - clicking a panel control cleared the selection, because the press was refused but the release
+///   still arrived and read as a tap;
+/// - and then it *still* cleared it, because the drag arrived too and started a gesture, which made
+///   the release look genuine to the guard added for the previous fix.
+///
+/// Each fix was a guard bolted onto one more arm. The arms were the problem: every tool added
+/// another `if it_is_up { … return }` with its own idea of who owns the pointer, and they only had
+/// to disagree once. There is one decision now, in [`OpenPaint::decide_capture`], and everything
+/// else obeys it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Capture {
+    /// Nobody. The press was refused, so its drag and release are ignored too.
+    None,
+    /// A stroke on the canvas.
+    Paint,
+    /// The crop rectangle.
+    Crop,
+    /// A selection gesture.
+    Select,
+    /// Sampling a colour, and *continuing* to sample while the pointer is held — which is what
+    /// holding Alt does in Photoshop, and falls out of capture rather than needing a special case.
+    Pick,
 }
 
 /// The selection, and the outline it draws.
@@ -450,6 +486,7 @@ impl Default for OpenPaint {
             nav: Nav::default(),
             crop: None,
             select: None,
+            capture: Capture::None,
             wand: ui::WandSettings::default(),
             selection: None,
             status_message: None,
@@ -478,48 +515,30 @@ impl OpenPaint {
     fn handle_pen_event(&mut self, event: &PenEvent) {
         match event {
             PenEvent::Down(sample) => {
-                // Before the guards below: a press that lands on the UI is still the pointer
-                // telling us where it is, and the zoom anchor and the ring both want that.
+                // Before anything else: a press that lands on the UI is still the pointer telling
+                // us where it is, and the zoom anchor and the brush ring both want that.
                 self.note_pointer(sample.x, sample.y);
-                // Don't paint underneath the UI. This check is needed for the pen
-                // specifically, because pen input never reaches egui and so egui's
-                // own pointer capture cannot exclude it (OPEN_QUESTIONS Q14).
-                if self.ui_blocks_point(sample.x, sample.y)
-                    || self.nav.is_active()
-                    || self.pending_confirm.is_some()
-                    || self.recovery.is_some()
-                {
-                    return;
-                }
-                // Alt turns any press into a colour sample, which is how every art app does it and
-                // is far more used than a tool-palette entry would be. It gets a place in the tool
-                // palette too once there is one — the modifier is the workflow, the palette entry
-                // is discoverability, and only one of them is reachable today.
-                if self.nav.modifiers.alt_key() {
-                    self.sample_color(sample);
-                    return;
-                }
-                // The crop tool consumes input entirely: no painting while it is up.
-                if self.crop.is_some() {
-                    self.crop_press(sample);
-                    return;
-                }
-                if self.select.is_some() {
-                    self.select_press(sample);
-                    return;
-                }
-                if let Some((cx, cy)) = self.to_canvas(sample) {
-                    self.stroke_start(cx, cy, sample.pressure, sample.time_ms());
-                    self.note_latency_input(sample);
-                    self.request_redraw();
+                self.capture = self.decide_capture(sample);
+                match self.capture {
+                    Capture::None => {}
+                    Capture::Pick => self.sample_color(sample),
+                    Capture::Crop => self.crop_press(sample),
+                    Capture::Select => self.select_press(sample),
+                    Capture::Paint => {
+                        if let Some((cx, cy)) = self.to_canvas(sample) {
+                            self.stroke_start(cx, cy, sample.pressure, sample.time_ms());
+                            self.note_latency_input(sample);
+                            self.request_redraw();
+                        }
+                    }
                 }
             }
             PenEvent::Hover(sample) => {
-                // The brush ring follows the pointer, so a hover is a real visible change and
-                // does need a frame -- but only when the pointer actually moved. Pens report
-                // poses continuously, including while resting perfectly still, so repainting on
-                // every one would turn a pen left on the tablet into a permanent full-rate
-                // repaint and defeat the whole demand-driven design.
+                // The brush ring follows the pointer, so a hover is a real visible change and does
+                // need a frame -- but only when the pointer actually moved. Pens report poses
+                // continuously, including while resting perfectly still, so repainting on every one
+                // would turn a pen left on the tablet into a permanent full-rate repaint and defeat
+                // the whole demand-driven design.
                 if self.note_pointer(sample.x, sample.y) {
                     self.request_redraw();
                 }
@@ -528,51 +547,95 @@ impl OpenPaint {
                 if let Some(sample) = samples.last() {
                     self.note_pointer(sample.x, sample.y);
                 }
-                if self.crop.is_some() {
-                    if let Some(sample) = samples.last() {
-                        self.crop_drag(sample);
+                match self.capture {
+                    Capture::None => {}
+                    Capture::Pick => {
+                        if let Some(sample) = samples.last() {
+                            self.sample_color(sample);
+                        }
                     }
-                    return;
-                }
-                if self.select.is_some() {
-                    // Every sample, not just the last: a lasso *is* the path the pen took, so
-                    // dropping the intermediate ones would cut corners off the shape.
-                    for sample in samples {
-                        self.select_drag(sample);
+                    Capture::Crop => {
+                        if let Some(sample) = samples.last() {
+                            self.crop_drag(sample);
+                        }
                     }
-                    return;
-                }
-                if !self.editor.is_drawing() || self.nav.is_active() {
-                    return;
-                }
-                for sample in samples {
-                    if let Some((cx, cy)) = self.to_canvas(sample) {
-                        self.stroke_continue(cx, cy, sample.pressure, sample.time_ms());
+                    Capture::Select => {
+                        // Every sample, not just the last: a lasso *is* the path the pen took, so
+                        // dropping the intermediate ones would cut corners off the shape.
+                        for sample in samples {
+                            self.select_drag(sample);
+                        }
+                    }
+                    Capture::Paint => {
+                        for sample in samples {
+                            if let Some((cx, cy)) = self.to_canvas(sample) {
+                                self.stroke_continue(cx, cy, sample.pressure, sample.time_ms());
+                            }
+                        }
+                        // The newest sample in the batch sits at the tip of the stroke, which is
+                        // the pixel the artist is watching, so it is the one whose latency matters.
+                        if let Some(sample) = samples.last() {
+                            self.note_latency_input(sample);
+                        }
+                        self.request_redraw();
                     }
                 }
-                // The newest sample in the batch is the one at the tip of the stroke, which is
-                // the pixel the artist is actually watching, so it is the one whose latency
-                // matters. Older samples in the same batch are already historical.
-                if let Some(sample) = samples.last() {
-                    self.note_latency_input(sample);
-                }
-                self.request_redraw();
             }
             PenEvent::Up => {
-                if let Some(crop) = self.crop.as_mut() {
-                    crop.release();
-                    return;
+                match self.capture {
+                    Capture::None | Capture::Pick => {}
+                    Capture::Crop => {
+                        if let Some(crop) = self.crop.as_mut() {
+                            crop.release();
+                        }
+                    }
+                    Capture::Select => self.select_release(),
+                    // Queues the bake that commits the stroke; demand-driven painting means it
+                    // needs a frame requested or it simply never happens.
+                    Capture::Paint => {
+                        self.stroke_finish();
+                        self.request_redraw();
+                    }
                 }
-                if self.select.is_some() {
-                    self.select_release();
-                    return;
-                }
-                // Queues the bake that commits the stroke; demand-driven painting
-                // means it needs a frame requested or it simply never happens.
-                self.stroke_finish();
-                self.request_redraw();
+                self.capture = Capture::None;
             }
         }
+    }
+
+    /// Decide who owns the pointer for this press. **The only place that decision is made.**
+    ///
+    /// Order is the priority order, and each step is a claim on the pointer that the ones below it
+    /// never get to see:
+    ///
+    /// 1. Anything modal — the panel under the pointer, a prompt, an active pan. The panel check is
+    ///    needed for the *pen* in particular, because pen input bypasses winit and egui's own
+    ///    pointer capture never sees it (OPEN_QUESTIONS Q14).
+    /// 2. Alt, which samples a colour. A modifier rather than a palette entry because that is how
+    ///    the tool is used, and the palette does not exist yet.
+    /// 3. Whichever tool is up, each of which consumes input entirely.
+    /// 4. Otherwise, paint.
+    ///
+    /// A consequence worth naming: once a stroke has begun, pressing space no longer stops it
+    /// mid-line, because the capture was already granted. That is what capture *means*, and it is
+    /// the better behaviour — a modifier should not silently truncate a stroke in progress.
+    fn decide_capture(&mut self, sample: &PenSample) -> Capture {
+        if self.ui_blocks_point(sample.x, sample.y)
+            || self.nav.is_active()
+            || self.pending_confirm.is_some()
+            || self.recovery.is_some()
+        {
+            return Capture::None;
+        }
+        if self.nav.modifiers.alt_key() {
+            return Capture::Pick;
+        }
+        if self.crop.is_some() {
+            return Capture::Crop;
+        }
+        if self.select.is_some() {
+            return Capture::Select;
+        }
+        Capture::Paint
     }
 
     /// Map a pen sample from window pixels to canvas pixels.
@@ -2947,6 +3010,111 @@ mod tests {
             None,
             "clearing is a change in alpha, which is exactly what the lock forbids"
         );
+    }
+
+    /// The whole point of capture: a press that was refused owns nothing afterwards.
+    ///
+    /// Driven through the real event handler rather than the pieces, because the bug was never in
+    /// the pieces — each handler was fine on its own. It was that a drag and a release could reach
+    /// a handler whose press had been turned away.
+    #[test]
+    fn a_refused_press_owns_neither_the_drag_nor_the_release() {
+        let mut app = OpenPaint::default();
+        app.apply_select_action(ui::SelectAction::All);
+        app.apply_select_action(ui::SelectAction::Use(ui::SelectTool::Lasso));
+
+        // A prompt is up, so nothing may claim the pointer.
+        app.pending_confirm = Some(Confirm {
+            then: Dialog::Quit { confirmed: true },
+            what: "quit",
+        });
+
+        app.handle_pen_event(&PenEvent::Down(PenSample::at(120.0, 40.0, 1.0)));
+        assert_eq!(
+            app.capture,
+            Capture::None,
+            "the press should have been refused"
+        );
+
+        app.handle_pen_event(&PenEvent::Move(vec![PenSample::at(140.0, 60.0, 1.0)]));
+        app.handle_pen_event(&PenEvent::Up);
+        assert!(
+            app.selection.is_some(),
+            "the drag or the release acted despite the press being refused"
+        );
+        assert!(
+            !app.editor.is_drawing(),
+            "and nothing started painting either"
+        );
+    }
+
+    /// Capture is decided once and *held*: the release goes to whoever took the press.
+    ///
+    /// Distinguishing this from "each handler guards itself" needs the tool state to *change*
+    /// mid-gesture, because while it stays put the two are indistinguishable — which is why the
+    /// first version of this test passed even with the release arm re-deriving the owner from the
+    /// current tools. Here the crop tool appears after the press: capture still routes the release
+    /// to the selection that took it, and a re-deriving version hands it to crop instead, leaving
+    /// the selection untouched.
+    #[test]
+    fn capture_is_held_for_the_whole_press() {
+        let mut app = OpenPaint::default();
+        app.apply_select_action(ui::SelectAction::All);
+        app.apply_select_action(ui::SelectAction::Use(ui::SelectTool::Lasso));
+        assert!(app.selection.is_some());
+
+        app.handle_pen_event(&PenEvent::Down(PenSample::at(50.0, 50.0, 1.0)));
+        assert_eq!(
+            app.capture,
+            Capture::Select,
+            "the press should claim select"
+        );
+
+        // The press is granted, but mapping window pixels to the page needs a renderer, so drive
+        // the gesture's own state directly. What is under test is the dispatch, not the mapping.
+        if let Some(Select::Lasso { points }) = app.select.as_mut() {
+            points.push((50.0, 50.0));
+        }
+
+        // Another tool appears mid-gesture. The pointer is already spoken for.
+        app.crop = Some(crop::Crop::new(app.editor.page_rect()));
+
+        app.handle_pen_event(&PenEvent::Up);
+        assert!(
+            app.selection.is_none(),
+            "the release went to the crop tool instead of the gesture that took the press"
+        );
+        assert_eq!(
+            app.capture,
+            Capture::None,
+            "the release must clear the capture whatever it found"
+        );
+    }
+
+    /// Each tool claims the pointer in a fixed order, and the ones below never see the press.
+    #[test]
+    fn the_tools_claim_the_pointer_in_order() {
+        let mut app = OpenPaint::default();
+        let at = PenSample::at(50.0, 50.0, 1.0);
+
+        // Nothing up: painting.
+        assert_eq!(app.decide_capture(&at), Capture::Paint);
+
+        // A selection tool outranks painting.
+        app.apply_select_action(ui::SelectAction::Use(ui::SelectTool::Lasso));
+        assert_eq!(app.decide_capture(&at), Capture::Select);
+
+        // Crop outranks that, and arming it puts the selection tool away anyway.
+        app.crop = Some(crop::Crop::new(app.editor.page_rect()));
+        app.select = None;
+        assert_eq!(app.decide_capture(&at), Capture::Crop);
+
+        // A prompt outranks everything.
+        app.pending_confirm = Some(Confirm {
+            then: Dialog::Quit { confirmed: true },
+            what: "quit",
+        });
+        assert_eq!(app.decide_capture(&at), Capture::None);
     }
 
     /// Clicking a panel control must not disturb the selection — the *whole* click.

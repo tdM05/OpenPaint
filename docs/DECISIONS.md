@@ -391,6 +391,52 @@ engine is written:
 On-disk storage format is a **separate, later** decision (Q6) — 16-bit in memory
 does not oblige 16-bit on disk.
 
+### 4l. One pointer capture, decided at the press — 2026-08-28
+
+Every tool that took pointer input added another arm to `handle_pen_event`,
+each with its own `if it_is_up { … return }` and its own idea of who owns the
+pointer. They only had to disagree once, and they did — three times in two
+days, all found by the user rather than by us:
+
+1. Painting died entirely: a branch added above `drain_input` returned early,
+   so the pen's `Up` never arrived and `drawing` stayed set forever (§11a.7).
+2. Clicking a panel control cleared the selection: the *press* was refused
+   because the panel owned that pixel, but the *release* still arrived and an
+   empty gesture read as a tap.
+3. It still did, after that fix: the *drag* arrived too, started a gesture from
+   wherever the mouse twitched, and made the release look genuine to the new
+   guard.
+
+Each fix bolted a guard onto one more arm. The arms were the problem.
+
+**A single capture, granted at the press and held until the release.** That is
+what every UI toolkit converged on, and it removes the class by construction
+rather than by vigilance: a drag or a release cannot reach a handler whose
+press was refused, because the capture was never granted. `decide_capture` is
+the only place the question is asked, and its order — modal, then Alt, then
+whichever tool is up, then paint — is the priority order, written once.
+
+Two consequences worth naming as decisions rather than accidents:
+
+- **A stroke in progress is no longer interrupted by a modifier.** Pressing
+  space mid-line used to stop the stroke, because the move arm re-read
+  `nav.is_active()` on every sample. Capture means the stroke keeps its
+  pointer, which is the better behaviour: a modifier should not silently
+  truncate a line.
+- **Alt-drag now samples continuously**, because `Pick` holds the pointer like
+  anything else. That matches Photoshop, and it fell out rather than being
+  added.
+
+The per-gesture guards (`Select::in_progress`) stay. They are not duplicated
+policy: capture decides *dispatch*, and a gesture refusing to be extended
+before it starts is its own invariant. Worth knowing that they are also why
+this refactor changed no behaviour — which made it hard to test, since a
+behavioural test cannot separate "capture routed it correctly" from "the
+handler guarded itself". The test that does distinguish them changes the tool
+state *mid-gesture* and asserts the release still goes to whoever took the
+press; the first version did not, and passed against a sabotage that re-derived
+the owner from current tool state.
+
 ### 4k. Selection is a coverage mask, and a bucket is not a tool — 2026-08-28
 
 Prompted by the right challenge: *"isn't bucket just whatever is in the
