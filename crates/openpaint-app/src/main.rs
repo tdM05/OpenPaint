@@ -260,6 +260,18 @@ enum Select {
 }
 
 impl Select {
+    /// Whether a gesture is actually under way.
+    ///
+    /// A press on the canvas starts one; a press the UI swallowed does not. The distinction
+    /// matters because a *release* arrives either way — clicking a panel control produces a `Down`
+    /// this app ignores and an `Up` it cannot tell apart from lifting the pen off the canvas.
+    fn in_progress(&self) -> bool {
+        match self {
+            Self::Lasso { points } => !points.is_empty(),
+            Self::Rect { from, .. } => from.is_some(),
+        }
+    }
+
     /// What the gesture would select, or `None` if it is not a shape yet.
     fn resolve(&self, page: PageRect) -> Option<openpaint_core::Selection> {
         match self {
@@ -802,7 +814,19 @@ impl OpenPaint {
     }
 
     /// Finish it, and make the mask.
+    ///
+    /// Does nothing unless a gesture was actually under way. Without that guard, clicking *any*
+    /// panel control while a selection tool is armed cleared the selection: the press is discarded
+    /// because the UI owns that pixel, but the release still arrives here, and an empty gesture
+    /// reads as a tap — which deselects. Picking a colour with a selection active is exactly the
+    /// case that found it.
+    ///
+    /// The tap-to-deselect behaviour itself is right and stays; the bug was counting a release that
+    /// began nowhere as a tap.
     fn select_release(&mut self) {
+        if !self.select.as_ref().is_some_and(Select::in_progress) {
+            return;
+        }
         let page = self.editor.page_rect();
         let resolved = self.select.as_ref().and_then(|s| s.resolve(page));
 
@@ -2837,6 +2861,38 @@ mod tests {
             app.editor.clear_mode(),
             None,
             "clearing is a change in alpha, which is exactly what the lock forbids"
+        );
+    }
+
+    /// A release that never began on the canvas must not touch the selection.
+    ///
+    /// The reported bug: with a selection tool armed, clicking the colour swatch — or any other
+    /// control — made the selection vanish. The press is discarded because the panel owns that
+    /// pixel, but the release still reaches the canvas handlers, where an empty gesture used to
+    /// read as a tap and therefore as "deselect".
+    #[test]
+    fn clicking_the_panel_does_not_clear_the_selection() {
+        let mut app = OpenPaint::default();
+        app.apply_select_action(ui::SelectAction::All);
+        app.apply_select_action(ui::SelectAction::Use(ui::SelectTool::Lasso));
+        assert!(app.selection.is_some());
+
+        // No press ever reached the canvas, so this is somebody else's release.
+        app.select_release();
+        assert!(
+            app.selection.is_some(),
+            "a release with no gesture behind it cleared the selection"
+        );
+
+        // A press on the canvas followed by a release, though, is a tap -- and a tap still
+        // deselects, which is what it means everywhere else.
+        if let Some(Select::Lasso { points }) = app.select.as_mut() {
+            points.push((10.0, 10.0));
+        }
+        app.select_release();
+        assert!(
+            app.selection.is_none(),
+            "a real tap on the canvas should still deselect"
         );
     }
 
