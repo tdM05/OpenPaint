@@ -732,6 +732,16 @@ impl Ui {
                             }
 
                             ui.separator();
+                            ui.label(
+                                egui::RichText::new(
+                                    "The dab's edge profile: how coverage falls from the solid core out to the rim. Not driven by anything -- its axis is distance within the dab, not an input. A straight line is the plain ramp; bowing it out makes a marker, bowing it in makes an airbrush.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            curve_editor(ui, "Edge profile", &mut brush.falloff);
+
+                            ui.separator();
                             ui.add(egui::Slider::new(&mut brush.flow, 0.0..=1.0).text("Flow"));
                             ui.add(egui::Slider::new(&mut brush.opacity, 0.0..=1.0).text("Opacity"));
                             ui.label(

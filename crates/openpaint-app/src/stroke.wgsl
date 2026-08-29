@@ -70,6 +70,11 @@ struct Xform {
     y_row: vec4<f32>,
     page: vec4<f32>,
     params: vec4<f32>,  // x = tile size
+    // The dab's edge profile, sampled across the ramp from the solid core to the rim. A lookup
+    // table because a fragment shader cannot evaluate a spline, and per *stroke* rather than per
+    // dab because every dab of a stroke shares one -- which is also why it rides here rather than
+    // in the instance data.
+    falloff: array<vec4<f32>, 8>,
 };
 
 @group(0) @binding(0) var<uniform> paint: Paint;
@@ -77,6 +82,21 @@ struct Xform {
 @group(0) @binding(2) var accum_samp: sampler;
 @group(1) @binding(0) var<uniform> tp: TileParams;
 @group(2) @binding(0) var<uniform> xf: Xform;
+
+// Read the edge profile at `t`, the fraction of the way across the ramp.
+//
+// Linear between samples. Mirrors `Curve::at` closely enough that the rasterization cross-check
+// holds: the curve itself is smooth, and thirty-two samples of it read linearly differ from the
+// spline by far less than the accumulation buffer can record.
+fn falloff_at(t: f32) -> f32 {
+    let x = clamp(t, 0.0, 1.0) * 31.0;
+    let i0 = u32(floor(x));
+    let i1 = min(i0 + 1u, 31u);
+    let frac = x - f32(i0);
+    let a = xf.falloff[i0 / 4u][i0 % 4u];
+    let b = xf.falloff[i1 / 4u][i1 % 4u];
+    return mix(a, b, frac);
+}
 
 // Two triangles over the unit square, (0,0) at the top-left in page space.
 fn quad(vid: u32) -> vec2<f32> {
@@ -168,7 +188,7 @@ fn dab_fs(in: DabOut) -> @location(0) vec4<f32> {
     } else if (dist >= in.radius) {
         coverage = 0.0;
     } else {
-        coverage = 1.0 - (dist - inner) / (in.radius - inner);
+        coverage = falloff_at((dist - inner) / (in.radius - inner));
     }
     let deposit = coverage * clamp(in.flow, 0.0, 1.0);
     // Same value in every channel: the target is single-channel, and writing it to .a as

@@ -135,6 +135,17 @@ struct TileParamsRecord {
 }
 
 /// Matching `Xform` in stroke.wgsl.
+/// Sample a curve into the shader's lookup table.
+fn sample_falloff(curve: &openpaint_core::Curve) -> [[f32; 4]; 8] {
+    let mut out = [[0.0_f32; 4]; 8];
+    for i in 0..openpaint_core::dab::FALLOFF_SAMPLES {
+        #[allow(clippy::cast_precision_loss)]
+        let t = i as f32 / (openpaint_core::dab::FALLOFF_SAMPLES - 1) as f32;
+        out[i / 4][i % 4] = curve.at(t);
+    }
+    out
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct XformUniform {
@@ -142,12 +153,21 @@ struct XformUniform {
     y_row: [f32; 4],
     page: [f32; 4],
     params: [f32; 4],
+    /// The edge profile as a lookup table, in `vec4`-sized rows because that is what a uniform
+    /// array must be aligned to.
+    falloff: [[f32; 4]; 8],
 }
 
 pub struct StrokeLayer {
     pool: TilePool,
     /// Accumulation tiles for the stroke in progress.
     map: TileMap,
+    /// The current stroke's edge profile, already sampled for the shader.
+    ///
+    /// Held here rather than recomputed per frame because it changes only when the brush does, and
+    /// sampling a spline thirty-two times per frame to produce the same numbers would be work for
+    /// nothing.
+    falloff: [[f32; 4]; 8],
     /// Tiles in this frame's stamping records, in record order.
     stamp_records: Vec<TileCoord>,
     dab_pipeline: wgpu::RenderPipeline,
@@ -298,7 +318,9 @@ impl StrokeLayer {
 
         let xform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("stroke-xform-bgl"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, false)],
+            // Both stages: the vertex shader places the quad, and the fragment shader reads the
+            // edge profile out of the same uniform.
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, false)],
         });
         let xform_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("stroke-xform-bg"),
@@ -523,6 +545,7 @@ impl StrokeLayer {
             instance_capacity,
             paint: ([0.0; 4], 1.0),
             mode: crate::editor::PaintMode::Normal,
+            falloff: sample_falloff(&openpaint_core::dab::linear_falloff()),
             frame: (
                 PageToNdc {
                     x_row: [0.0; 3],
@@ -664,8 +687,18 @@ impl StrokeLayer {
                 y_row: [xform.y_row[0], xform.y_row[1], xform.y_row[2], 0.0],
                 page: [page.x as f32, page.y as f32, ex as f32, ey as f32],
                 params: [TILE_SIZE as f32, 0.0, 0.0, 0.0],
+                falloff: self.falloff,
             }),
         );
+    }
+
+    /// Set the dab edge profile for the stroke about to be drawn.
+    ///
+    /// Sampled into a table here, once, rather than evaluated per fragment: a shader cannot walk a
+    /// spline, and every dab of a stroke shares one profile anyway.
+    pub fn set_falloff(&mut self, queue: &wgpu::Queue, falloff: &openpaint_core::Curve) {
+        self.falloff = sample_falloff(falloff);
+        self.write_frame(queue);
     }
 
     /// Update the stroke colour and opacity used when compositing.
@@ -1133,9 +1166,32 @@ mod tests {
         gpu_render_batched(dabs, opacity, 1)
     }
 
+    /// As `gpu_render`, with an explicit dab edge profile.
+    fn gpu_render_with(
+        dabs: &[Dab],
+        opacity: f32,
+        falloff: &openpaint_core::Curve,
+    ) -> Vec<[f32; 4]> {
+        gpu_render_inner(dabs, opacity, 1, falloff)
+    }
+
     /// As `gpu_render`, but stamping the dabs in `batches` separate draw calls within one
     /// frame -- which is what a fast stroke produces.
     fn gpu_render_batched(dabs: &[Dab], opacity: f32, batches: usize) -> Vec<[f32; 4]> {
+        gpu_render_inner(
+            dabs,
+            opacity,
+            batches,
+            &openpaint_core::dab::linear_falloff(),
+        )
+    }
+
+    fn gpu_render_inner(
+        dabs: &[Dab],
+        opacity: f32,
+        batches: usize,
+        falloff: &openpaint_core::Curve,
+    ) -> Vec<[f32; 4]> {
         let (device, queue) = try_device().expect("checked by caller");
 
         let page = openpaint_core::PageRect::from_size(SIZE, SIZE);
@@ -1145,6 +1201,7 @@ mod tests {
         // Every uniform written once, before the single submission -- the ordering rule
         // this module exists to respect.
         layer.set_page(&queue, page);
+        layer.set_falloff(&queue, falloff);
         layer.set_paint(&queue, BLACK, opacity, crate::editor::PaintMode::Normal);
         layer.upload_dabs(&device, &queue, dabs);
 
@@ -1171,10 +1228,18 @@ mod tests {
 
     /// Rasterize the same dabs through the CPU reference implementation.
     fn cpu_render(dabs: &[Dab], opacity: f32) -> Vec<[f32; 4]> {
+        cpu_render_with(dabs, opacity, &openpaint_core::dab::linear_falloff())
+    }
+
+    fn cpu_render_with(
+        dabs: &[Dab],
+        opacity: f32,
+        falloff: &openpaint_core::Curve,
+    ) -> Vec<[f32; 4]> {
         let mut canvas = Canvas::new(SIZE, SIZE);
         let mut painter = StrokePainter::new();
         painter.begin();
-        painter.add_dabs(&canvas, dabs);
+        painter.add_dabs(&canvas, dabs, falloff);
         painter.composite(&mut canvas, BLACK, opacity);
 
         (0..SIZE)
@@ -1186,6 +1251,61 @@ mod tests {
                 None => [0.0; 4],
             })
             .collect()
+    }
+
+    /// A shaped edge profile, through both rasterizers.
+    ///
+    /// The shader cannot walk a spline, so it reads a thirty-two entry table with linear
+    /// interpolation while the CPU evaluates the curve exactly. They are therefore *not* the same
+    /// arithmetic -- which is precisely why this needs pinning: the table has to be fine enough
+    /// that the difference stays under what the accumulation buffer can record.
+    ///
+    /// Deliberately a curve with real shape in it. A gentle one would pass whatever the table
+    /// resolution, and prove nothing about it.
+    #[test]
+    fn gpu_shaped_falloff_matches_the_cpu_reference() {
+        let Some(_) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+
+        let profile = openpaint_core::Curve::from_points(vec![
+            (0.0, 1.0),
+            (0.15, 0.95),
+            (0.5, 0.35),
+            (0.8, 0.08),
+            (1.0, 0.0),
+        ])
+        .expect("valid profile");
+
+        // Soft dabs, so most of each one *is* the ramp being tested.
+        let dabs = [
+            dab(48.0, 64.0, 22.0, 0.0, 1.0),
+            dab(80.0, 64.0, 22.0, 0.2, 1.0),
+        ];
+
+        let gpu = gpu_render_with(&dabs, 1.0, &profile);
+        let cpu = cpu_render_with(&dabs, 1.0, &profile);
+
+        assert!(any_paint(&gpu), "GPU produced no paint at all");
+        let (worst, at) = max_difference(&gpu, &cpu);
+        assert!(
+            worst < 0.01,
+            "GPU and CPU disagree by {worst} at pixel {at} ({}, {}); gpu {:?} cpu {:?}",
+            at as u32 % SIZE,
+            at as u32 / SIZE,
+            gpu[at],
+            cpu[at]
+        );
+
+        // And the profile has to actually change the picture, or the agreement above is only
+        // two renderers ignoring it together.
+        let plain = gpu_render(&dabs, 1.0);
+        let (shaped_vs_plain, _) = max_difference(&gpu, &plain);
+        assert!(
+            shaped_vs_plain > 0.1,
+            "the shaped profile rendered the same as the straight ramp, so neither used it"
+        );
     }
 
     /// The elliptical dab, through both rasterizers.
@@ -1390,7 +1510,7 @@ mod tests {
         let mut reference = Canvas::new(W, H);
         let mut painter = StrokePainter::new();
         painter.begin();
-        painter.add_dabs(&reference, &dabs);
+        painter.add_dabs(&reference, &dabs, &openpaint_core::dab::linear_falloff());
         painter.composite(&mut reference, BLACK, 1.0);
 
         let cpu: Vec<[f32; 4]> = (0..H)

@@ -37,11 +37,30 @@
 //!
 //! See DECISIONS §4a and §4c.
 
+use crate::curve::Curve;
+
 /// The narrowest a dab may be, as a fraction of its radius.
 ///
 /// Not zero: roundness divides, and a dab with no width would cover nothing anywhere while costing
 /// the same to rasterize. A fiftieth of the major axis is already a hairline at any usable size.
 pub const MIN_ROUNDNESS: f32 = 0.02;
+
+/// How many points the edge profile is sampled at when handed to the GPU.
+///
+/// The shader cannot evaluate a spline per fragment, so the curve arrives as a lookup table. Thirty
+/// two samples across a ramp that is rarely more than a few dozen pixels wide, read with linear
+/// interpolation between entries, is finer than the `f16` accumulation buffer can record — which is
+/// the bar worth meeting, rather than any particular smoothness.
+pub const FALLOFF_SAMPLES: usize = 32;
+
+/// The default edge profile: a straight ramp from full coverage at the core to none at the rim.
+///
+/// Exactly what the falloff was before it was a curve, so making it adjustable changed no existing
+/// brush.
+#[must_use]
+pub fn linear_falloff() -> Curve {
+    Curve::from_points(vec![(0.0, 1.0), (1.0, 0.0)]).expect("a two-point ramp is a valid curve")
+}
 
 /// One stamp of the brush tip: pure data, no pixels, no canvas, no GPU.
 ///
@@ -105,8 +124,8 @@ impl Dab {
     /// specific tuned curve, not linear, so this is a placeholder that is
     /// correct-shaped but not yet correct-valued.
     #[must_use]
-    pub fn coverage_at(&self, px: f32, py: f32) -> f32 {
-        self.coverage_at_distance(self.distance_to(px, py))
+    pub fn coverage_at(&self, px: f32, py: f32, falloff: &Curve) -> f32 {
+        self.coverage_at_distance(self.distance_to(px, py), falloff)
     }
 
     /// Distance from the centre, measured in the dab's own frame.
@@ -128,19 +147,31 @@ impl Dab {
     }
 
     /// Coverage as a function of distance from the dab center.
+    ///
+    /// `falloff` is the *edge profile*: it maps how far across the ramp a point is, from the edge
+    /// of the solid core to the radius, onto how much coverage is left there.
+    ///
+    /// **Not modulation.** Its x axis is a distance within the dab, not a pen input, so it is a
+    /// plain [`Curve`] rather than a [`crate::Response`] — nothing about pressure or velocity can
+    /// or should reach it. Confusing the two would put a source dropdown on a control where no
+    /// source means anything.
+    ///
+    /// It is a parameter of the *stroke* rather than of the dab, which is why it arrives as an
+    /// argument: every dab in a stroke shares one, and a `Dab` is `Copy` GPU instance data with no
+    /// room for a curve.
     #[must_use]
-    pub fn coverage_at_distance(&self, dist: f32) -> f32 {
+    pub fn coverage_at_distance(&self, dist: f32, falloff: &Curve) -> f32 {
         // Radius of the solid core, outside which coverage ramps to zero.
         // hardness=1 -> core fills the dab (hard edge, still AA'd at the rim);
         // hardness=0 -> no core, so falloff starts at the very center (softest).
         let inner = (self.radius * self.hardness).max(0.0);
         if dist <= inner {
-            1.0
-        } else if dist >= self.radius {
-            0.0
-        } else {
-            1.0 - (dist - inner) / (self.radius - inner)
+            return 1.0;
         }
+        if dist >= self.radius {
+            return 0.0;
+        }
+        falloff.at((dist - inner) / (self.radius - inner))
     }
 
     /// Inclusive pixel bounds this dab can touch, as `(min_x, min_y, max_x, max_y)`.
@@ -175,9 +206,9 @@ mod tests {
     #[test]
     fn coverage_is_full_at_center_and_zero_outside() {
         let d = dab(10.0, 0.5);
-        assert_eq!(d.coverage_at_distance(0.0), 1.0);
-        assert_eq!(d.coverage_at_distance(10.0), 0.0);
-        assert_eq!(d.coverage_at_distance(50.0), 0.0);
+        assert_eq!(d.coverage_at_distance(0.0, &linear_falloff()), 1.0);
+        assert_eq!(d.coverage_at_distance(10.0, &linear_falloff()), 0.0);
+        assert_eq!(d.coverage_at_distance(50.0, &linear_falloff()), 0.0);
     }
 
     #[test]
@@ -185,7 +216,7 @@ mod tests {
         for hardness in [0.0, 0.25, 0.5, 0.75, 1.0] {
             let d = dab(10.0, hardness);
             for i in 0..=200 {
-                let c = d.coverage_at_distance(i as f32 * 0.1);
+                let c = d.coverage_at_distance(i as f32 * 0.1, &linear_falloff());
                 assert!((0.0..=1.0).contains(&c), "hardness {hardness} dist {i}");
             }
         }
@@ -199,10 +230,10 @@ mod tests {
         let hard = dab(10.0, 1.0);
         let soft = dab(10.0, 0.0);
         // Hard: still fully covered near the rim.
-        assert_eq!(hard.coverage_at_distance(9.0), 1.0);
+        assert_eq!(hard.coverage_at_distance(9.0, &linear_falloff()), 1.0);
         // Soft: already falling off close to the center.
-        assert!(soft.coverage_at_distance(5.0) < 0.6);
-        assert!(soft.coverage_at_distance(9.0) < 0.2);
+        assert!(soft.coverage_at_distance(5.0, &linear_falloff()) < 0.6);
+        assert!(soft.coverage_at_distance(9.0, &linear_falloff()) < 0.2);
     }
 
     /// Coverage at a given distance must rise with hardness, at every radius.
@@ -210,7 +241,7 @@ mod tests {
     fn higher_hardness_means_more_coverage_everywhere() {
         let mut prev = -1.0;
         for h in [0.0, 0.25, 0.5, 0.75, 1.0] {
-            let c = dab(10.0, h).coverage_at_distance(6.0);
+            let c = dab(10.0, h).coverage_at_distance(6.0, &linear_falloff());
             assert!(c >= prev, "hardness {h} gave less coverage than the last");
             prev = c;
         }
@@ -221,7 +252,7 @@ mod tests {
         let d = dab(10.0, 0.6);
         let mut prev = f32::INFINITY;
         for i in 0..=100 {
-            let c = d.coverage_at_distance(i as f32 * 0.1);
+            let c = d.coverage_at_distance(i as f32 * 0.1, &linear_falloff());
             assert!(c <= prev + 1e-6, "not monotonic at {i}");
             prev = c;
         }
@@ -235,11 +266,20 @@ mod tests {
             ..dab(20.0, 1.0)
         };
         // Unrotated, the major axis runs along x.
-        assert!(d.coverage_at(19.0, 0.0) > 0.9, "along the major axis");
-        assert!(d.coverage_at(21.0, 0.0) < 0.01, "and stops at the radius");
-        assert!(d.coverage_at(0.0, 4.0) > 0.9, "across the minor axis");
         assert!(
-            d.coverage_at(0.0, 6.0) < 0.01,
+            d.coverage_at(19.0, 0.0, &linear_falloff()) > 0.9,
+            "along the major axis"
+        );
+        assert!(
+            d.coverage_at(21.0, 0.0, &linear_falloff()) < 0.01,
+            "and stops at the radius"
+        );
+        assert!(
+            d.coverage_at(0.0, 4.0, &linear_falloff()) > 0.9,
+            "across the minor axis"
+        );
+        assert!(
+            d.coverage_at(0.0, 6.0, &linear_falloff()) < 0.01,
             "the minor axis should end at a quarter of the radius"
         );
     }
@@ -256,9 +296,13 @@ mod tests {
             ..flat
         };
 
-        assert!(flat.coverage_at(15.0, 0.0) > 0.9 && flat.coverage_at(0.0, 15.0) < 0.01);
         assert!(
-            turned.coverage_at(0.0, 15.0) > 0.9 && turned.coverage_at(15.0, 0.0) < 0.01,
+            flat.coverage_at(15.0, 0.0, &linear_falloff()) > 0.9
+                && flat.coverage_at(0.0, 15.0, &linear_falloff()) < 0.01
+        );
+        assert!(
+            turned.coverage_at(0.0, 15.0, &linear_falloff()) > 0.9
+                && turned.coverage_at(15.0, 0.0, &linear_falloff()) < 0.01,
             "a quarter turn should swap the axes"
         );
     }
@@ -274,7 +318,10 @@ mod tests {
         };
         for (x, y) in [(5.0_f32, 0.0_f32), (0.0, 5.0), (9.0, 9.0), (14.0, 3.0)] {
             assert!(
-                (plain.coverage_at(x, y) - turned.coverage_at(x, y)).abs() < 1e-4,
+                (plain.coverage_at(x, y, &linear_falloff())
+                    - turned.coverage_at(x, y, &linear_falloff()))
+                .abs()
+                    < 1e-4,
                 "rotating a circle changed it at ({x}, {y})"
             );
         }
@@ -291,12 +338,18 @@ mod tests {
         };
         // Halfway out along each dab's own major axis, the falloff should have progressed equally.
         assert!(
-            (round.coverage_at(15.0, 0.0) - flat.coverage_at(15.0, 0.0)).abs() < 1e-4,
+            (round.coverage_at(15.0, 0.0, &linear_falloff())
+                - flat.coverage_at(15.0, 0.0, &linear_falloff()))
+            .abs()
+                < 1e-4,
             "the falloff differs along the major axis"
         );
         // And equally at the matching fraction across the minor.
         assert!(
-            (round.coverage_at(0.0, 15.0) - flat.coverage_at(0.0, 15.0 * 0.25)).abs() < 1e-4,
+            (round.coverage_at(0.0, 15.0, &linear_falloff())
+                - flat.coverage_at(0.0, 15.0 * 0.25, &linear_falloff()))
+            .abs()
+                < 1e-4,
             "the falloff differs across the minor axis"
         );
     }
@@ -318,7 +371,7 @@ mod tests {
                         let outside = x < min_x || y < min_y || x > max_x || y > max_y;
                         if outside {
                             assert_eq!(
-                                d.coverage_at(x as f32, y as f32),
+                                d.coverage_at(x as f32, y as f32, &linear_falloff()),
                                 0.0,
                                 "roundness {roundness} angle {angle} covered ({x}, {y}), \
                                  which is outside its own bounds"
@@ -334,7 +387,12 @@ mod tests {
     fn coverage_at_matches_coverage_at_distance() {
         let d = dab(10.0, 0.5);
         // (3,4) is distance 5 from the origin.
-        assert!((d.coverage_at(3.0, 4.0) - d.coverage_at_distance(5.0)).abs() < 1e-6);
+        assert!(
+            (d.coverage_at(3.0, 4.0, &linear_falloff())
+                - d.coverage_at_distance(5.0, &linear_falloff()))
+            .abs()
+                < 1e-6
+        );
     }
 
     #[test]

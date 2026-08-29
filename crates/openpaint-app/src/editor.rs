@@ -45,7 +45,10 @@ pub const DEFAULT_EXTEND: u32 = 512;
 ///
 /// An ordered list rather than flags, because a single frame can legitimately
 /// contain a whole stroke: a quick tap produces `Begin`, `Dabs`, `End` together.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// No longer `Copy`: a stroke carries its edge profile, and a curve owns its control points.
+/// Ops are produced a handful per frame and consumed immediately, so cloning one is immaterial
+/// beside the dabs they index.
+#[derive(Clone, Debug, PartialEq)]
 pub enum StrokeOp {
     /// Start a stroke, clearing accumulation. Carries the paint to use, captured
     /// at stroke start so changing the colour mid-stroke can't produce a two-tone
@@ -58,6 +61,11 @@ pub enum StrokeOp {
         /// Captured at stroke start like the colour, and for the same reason: switching tool
         /// mid-stroke would otherwise produce a stroke that is half paint and half hole.
         mode: PaintMode,
+        /// The dab edge profile for this stroke.
+        ///
+        /// Carried with the stroke rather than read from the brush when it executes, for the same
+        /// reason as the colour: the brush can change between queueing and drawing.
+        falloff: openpaint_core::Curve,
     },
     /// Stamp dabs `[start, start + len)` of the accompanying dab buffer.
     Dabs { start: usize, len: usize },
@@ -365,6 +373,7 @@ impl Editor {
             color_linear_premul: self.brush().color_linear_premul(),
             opacity: self.brush().opacity,
             mode,
+            falloff: self.brush().falloff.clone(),
         });
         self.drawing = true;
         let from = self.dabs.len();

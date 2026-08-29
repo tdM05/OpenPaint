@@ -26,7 +26,7 @@ use crate::dab::Dab;
 /// every overlap instead of building toward the stroke's opacity ceiling. This
 /// remains useful for single isolated dabs and as the simplest expression of the
 /// coverage/blend math for tests to check against.
-pub fn rasterize_dab(canvas: &mut Canvas, dab: &Dab) {
+pub fn rasterize_dab(canvas: &mut Canvas, dab: &Dab, falloff: &crate::Curve) {
     if dab.radius <= 0.0 || dab.color_linear_premul[3] <= 0.0 {
         return;
     }
@@ -36,7 +36,7 @@ pub fn rasterize_dab(canvas: &mut Canvas, dab: &Dab) {
     for y in min_y..=max_y {
         for x in min_x..=max_x {
             // Sample at the pixel center.
-            let coverage = dab.coverage_at(x as f32 + 0.5, y as f32 + 0.5);
+            let coverage = dab.coverage_at(x as f32 + 0.5, y as f32 + 0.5, falloff);
             if coverage > 0.0 {
                 // Premultiplied, so coverage scales all four channels.
                 let amount = coverage * dab.flow.clamp(0.0, 1.0);
@@ -50,15 +50,16 @@ pub fn rasterize_dab(canvas: &mut Canvas, dab: &Dab) {
 ///
 /// Order matters and must be preserved: dabs composite over one another, so
 /// this cannot be reordered or parallelized naively.
-pub fn rasterize_dabs(canvas: &mut Canvas, dabs: &[Dab]) {
+pub fn rasterize_dabs(canvas: &mut Canvas, dabs: &[Dab], falloff: &crate::Curve) {
     for dab in dabs {
-        rasterize_dab(canvas, dab);
+        rasterize_dab(canvas, dab, falloff);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dab::linear_falloff;
     use crate::tile::TILE_SIZE;
 
     fn black_dab(x: f32, y: f32, radius: f32, hardness: f32) -> Dab {
@@ -77,14 +78,22 @@ mod tests {
     #[test]
     fn a_dab_paints_something() {
         let mut c = Canvas::new(256, 256);
-        rasterize_dab(&mut c, &black_dab(128.0, 128.0, 8.0, 0.5));
+        rasterize_dab(
+            &mut c,
+            &black_dab(128.0, 128.0, 8.0, 0.5),
+            &linear_falloff(),
+        );
         assert_eq!(c.tiles().count(), 1);
     }
 
     #[test]
     fn a_zero_radius_dab_paints_nothing() {
         let mut c = Canvas::new(256, 256);
-        rasterize_dab(&mut c, &black_dab(128.0, 128.0, 0.0, 0.5));
+        rasterize_dab(
+            &mut c,
+            &black_dab(128.0, 128.0, 0.0, 0.5),
+            &linear_falloff(),
+        );
         assert_eq!(c.tiles().count(), 0);
     }
 
@@ -93,7 +102,7 @@ mod tests {
         let mut c = Canvas::new(256, 256);
         let mut d = black_dab(128.0, 128.0, 8.0, 0.5);
         d.color_linear_premul = [0.0; 4];
-        rasterize_dab(&mut c, &d);
+        rasterize_dab(&mut c, &d, &linear_falloff());
         assert_eq!(c.tiles().count(), 0);
     }
 
@@ -102,7 +111,11 @@ mod tests {
     #[test]
     fn a_hard_dab_center_is_fully_opaque_paint() {
         let mut c = Canvas::new(256, 256);
-        rasterize_dab(&mut c, &black_dab(100.5, 100.5, 8.0, 0.0));
+        rasterize_dab(
+            &mut c,
+            &black_dab(100.5, 100.5, 8.0, 0.0),
+            &linear_falloff(),
+        );
         let tile = c.tile((0, 0)).expect("tile allocated");
         assert_eq!(tile.texel(100, 100), [0.0, 0.0, 0.0, 1.0]);
     }
@@ -112,7 +125,11 @@ mod tests {
     #[test]
     fn a_dab_does_not_paint_outside_its_radius() {
         let mut c = Canvas::new(256, 256);
-        rasterize_dab(&mut c, &black_dab(100.5, 100.5, 8.0, 0.0));
+        rasterize_dab(
+            &mut c,
+            &black_dab(100.5, 100.5, 8.0, 0.0),
+            &linear_falloff(),
+        );
         let tile = c.tile((0, 0)).expect("tile allocated");
         // 12px away, well beyond radius 8.
         assert_eq!(tile.texel(112, 100), [0.0; 4]);
@@ -122,17 +139,25 @@ mod tests {
     fn a_dab_spanning_a_tile_seam_touches_both_tiles() {
         let mut c = Canvas::new(1024, 1024);
         // Centered exactly on the boundary between tile column 0 and 1.
-        rasterize_dab(&mut c, &black_dab(TILE_SIZE as f32, 100.0, 8.0, 0.5));
+        rasterize_dab(
+            &mut c,
+            &black_dab(TILE_SIZE as f32, 100.0, 8.0, 0.5),
+            &linear_falloff(),
+        );
         assert_eq!(c.tiles().count(), 2);
     }
 
     #[test]
     fn dabs_off_canvas_are_clipped_not_panicking() {
         let mut c = Canvas::new(64, 64);
-        rasterize_dab(&mut c, &black_dab(-50.0, -50.0, 8.0, 0.5));
+        rasterize_dab(
+            &mut c,
+            &black_dab(-50.0, -50.0, 8.0, 0.5),
+            &linear_falloff(),
+        );
         assert_eq!(c.tiles().count(), 0);
         // Straddling the origin should paint only the in-bounds part.
-        rasterize_dab(&mut c, &black_dab(0.0, 0.0, 8.0, 0.5));
+        rasterize_dab(&mut c, &black_dab(0.0, 0.0, 8.0, 0.5), &linear_falloff());
         assert_eq!(c.tiles().count(), 1);
     }
 
@@ -145,11 +170,11 @@ mod tests {
         ];
 
         let mut batched = Canvas::new(256, 256);
-        rasterize_dabs(&mut batched, &dabs);
+        rasterize_dabs(&mut batched, &dabs, &linear_falloff());
 
         let mut individually = Canvas::new(256, 256);
         for d in &dabs {
-            rasterize_dab(&mut individually, d);
+            rasterize_dab(&mut individually, d, &linear_falloff());
         }
 
         let a = batched.tile((0, 0)).expect("tile");

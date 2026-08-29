@@ -103,7 +103,7 @@ impl StrokePainter {
 
     /// Accumulate one dab's paint, snapshotting any tile it touches for the first
     /// time.
-    pub fn add_dab(&mut self, canvas: &Canvas, dab: &Dab) {
+    pub fn add_dab(&mut self, canvas: &Canvas, dab: &Dab, falloff: &crate::Curve) {
         if dab.radius <= 0.0 || dab.flow <= 0.0 {
             return;
         }
@@ -115,7 +115,7 @@ impl StrokePainter {
                 if x < 0 || y < 0 || x >= canvas.width() as i32 || y >= canvas.height() as i32 {
                     continue;
                 }
-                let coverage = dab.coverage_at(x as f32 + 0.5, y as f32 + 0.5);
+                let coverage = dab.coverage_at(x as f32 + 0.5, y as f32 + 0.5, falloff);
                 if coverage <= 0.0 {
                     continue;
                 }
@@ -150,9 +150,9 @@ impl StrokePainter {
     }
 
     /// Accumulate a batch of dabs, in order.
-    pub fn add_dabs(&mut self, canvas: &Canvas, dabs: &[Dab]) {
+    pub fn add_dabs(&mut self, canvas: &Canvas, dabs: &[Dab], falloff: &crate::Curve) {
         for dab in dabs {
-            self.add_dab(canvas, dab);
+            self.add_dab(canvas, dab, falloff);
         }
     }
 
@@ -191,6 +191,7 @@ impl StrokePainter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dab::linear_falloff;
 
     const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
@@ -231,7 +232,7 @@ mod tests {
         let mut painter = StrokePainter::new();
         painter.begin();
         for _ in 0..dab_count {
-            painter.add_dab(&canvas, &dab_at(100.5, 100.5, flow));
+            painter.add_dab(&canvas, &dab_at(100.5, 100.5, flow), &linear_falloff());
         }
         painter.composite(&mut canvas, BLACK, opacity);
         paint_amount(&canvas, 100, 100)
@@ -291,14 +292,14 @@ mod tests {
 
         painter.begin();
         for _ in 0..50 {
-            painter.add_dab(&canvas, &dab_at(100.5, 100.5, 0.1));
+            painter.add_dab(&canvas, &dab_at(100.5, 100.5, 0.1), &linear_falloff());
         }
         painter.composite(&mut canvas, BLACK, 0.5);
         let after_first = paint_amount(&canvas, 100, 100);
 
         painter.begin();
         for _ in 0..50 {
-            painter.add_dab(&canvas, &dab_at(100.5, 100.5, 0.1));
+            painter.add_dab(&canvas, &dab_at(100.5, 100.5, 0.1), &linear_falloff());
         }
         painter.composite(&mut canvas, BLACK, 0.5);
         let after_second = paint_amount(&canvas, 100, 100);
@@ -321,14 +322,14 @@ mod tests {
         let mut p = StrokePainter::new();
         p.begin();
         for d in &dabs {
-            p.add_dab(&incremental, d);
+            p.add_dab(&incremental, d, &linear_falloff());
             p.composite(&mut incremental, BLACK, 0.7);
         }
 
         let mut at_end = Canvas::new(256, 256);
         let mut q = StrokePainter::new();
         q.begin();
-        q.add_dabs(&at_end, &dabs);
+        q.add_dabs(&at_end, &dabs, &linear_falloff());
         q.composite(&mut at_end, BLACK, 0.7);
 
         let a = incremental.tile((0, 0)).expect("tile");
@@ -345,7 +346,7 @@ mod tests {
         let mut canvas = Canvas::new(256, 256);
         let mut painter = StrokePainter::new();
         painter.begin();
-        painter.add_dab(&canvas, &dab_at(100.5, 100.5, 0.0));
+        painter.add_dab(&canvas, &dab_at(100.5, 100.5, 0.0), &linear_falloff());
         painter.composite(&mut canvas, BLACK, 1.0);
         assert!(painter.is_empty());
         assert_eq!(canvas.tiles().count(), 0);
@@ -361,7 +362,7 @@ mod tests {
         let canvas = Canvas::new(256, 256);
         let mut painter = StrokePainter::new();
         painter.begin();
-        painter.add_dab(&canvas, &dab_at(100.5, 100.5, 1.0));
+        painter.add_dab(&canvas, &dab_at(100.5, 100.5, 1.0), &linear_falloff());
         assert!(!painter.is_empty());
         painter.begin();
         assert!(painter.is_empty());
@@ -373,7 +374,11 @@ mod tests {
         let canvas = Canvas::new(1024, 1024);
         let mut painter = StrokePainter::new();
         painter.begin();
-        painter.add_dab(&canvas, &dab_at(TILE_SIZE as f32, 100.0, 1.0));
+        painter.add_dab(
+            &canvas,
+            &dab_at(TILE_SIZE as f32, 100.0, 1.0),
+            &linear_falloff(),
+        );
         assert_eq!(painter.touched_tiles().count(), 2);
     }
 }

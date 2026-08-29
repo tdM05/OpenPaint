@@ -391,6 +391,48 @@ engine is written:
 On-disk storage format is a **separate, later** decision (Q6) — 16-bit in memory
 does not oblige 16-bit on disk.
 
+### 4o. The dab's edge is a curve, not a number — 2026-08-28
+
+Hardness said how much of a dab is solid. Between that core and the rim the
+coverage fell in a straight line, and that line was the same for every brush we
+could ever ship. It is now a `Curve`: normalised distance across the ramp →
+coverage. A straight line is exactly what it was; bowing it out gives a marker
+that holds its ink to the very edge, bowing it in gives an airbrush that is
+mostly haze. Those are different brushes, not different settings of one.
+
+**Hardness stays, and the two are orthogonal.** Hardness says *how much of the
+dab is solid*; the curve says *how the remainder fades*. Folding hardness into
+the curve would have made every soft brush start by dragging the same first
+control point, and would have lost the one parameter modulation can drive.
+
+**It is a `Curve`, deliberately not a `Response`.** Every other curve in the
+brush maps a pen input — pressure, tilt, velocity — onto a parameter, and comes
+with a source picker. This one's x axis is a distance *inside the dab*. No
+source means anything for it, so it is the bare curve and the UI shows it
+without a dropdown. Sharing the `Response` type would have put a control there
+that has no correct setting.
+
+**It belongs to the stroke, not the dab.** A `Dab` is `Copy` GPU instance data;
+a curve is a heap allocation. Every dab of a stroke shares one profile, so it
+travels beside the dab list — `rasterize_dabs(…, falloff)` on the CPU, and a
+uniform on the GPU — and `StrokeOp::Begin` carries a clone so changing the
+brush mid-queue cannot retroactively reshape a stroke already recorded.
+
+The shader cannot evaluate a spline per fragment, so the curve crosses as a
+32-entry lookup table read with linear interpolation. That makes the CPU and
+GPU paths *different arithmetic* for the first time — exact spline against
+sampled table — rather than two spellings of one formula. The cross-check
+therefore pins it directly: a deliberately kinked profile through both paths,
+agreeing within the same 0.01 the rest of the §11a cross-checks use, plus an
+assertion that the shaped render differs from the straight ramp, without which
+"they agree" could just mean neither read the table. Three sabotages fail it:
+shader ignores the table, index scaled by 32 instead of 31, table sampled over
+the wrong span.
+
+Next along this axis is a bitmap tip, which replaces this stage rather than
+extends it — and raises the question this does not answer, of where brush
+textures live and whether a preset embeds or references one.
+
 ### 4n. Dabs are ellipses — 2026-08-28
 
 Roundness and angle, which together make a chisel nib: a mark thick across its
