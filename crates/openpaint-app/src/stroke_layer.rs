@@ -186,7 +186,12 @@ impl StrokeLayer {
             ACCUM_FORMAT,
             capacity,
             ACCUM_BYTES_PER_TEXEL,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            // COPY_DST because a fill writes coverage straight into these tiles rather than
+            // rendering dabs into them -- the one path that produces accumulation without a
+            // render pass.
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
         );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -687,8 +692,22 @@ impl StrokeLayer {
         page: PageRect,
     ) -> u32 {
         let touched = tiles_touched(dabs, page);
+        self.prepare_tiles_at(queue, encoder, &touched)
+    }
+
+    /// Make sure each of `touched` has an accumulation layer, and publish the stamping records.
+    ///
+    /// Split out from [`StrokeLayer::prepare_tiles`] so a fill can use it: a fill knows its tiles
+    /// from a selection mask rather than from dabs, but wants the identical allocate-clear-publish
+    /// sequence, and duplicating that is how the two would drift.
+    fn prepare_tiles_at(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        touched: &[TileCoord],
+    ) -> u32 {
         let mut coords = Vec::with_capacity(touched.len());
-        for coord in touched {
+        for &coord in touched {
             if !self.map.contains(coord) {
                 let Some(slot) = self.pool.alloc() else {
                     self.exhausted = true;
@@ -710,6 +729,114 @@ impl StrokeLayer {
         }
         self.stamp_records = self.publish(queue, &coords, Region::Stamp);
         self.stamp_records.len() as u32
+    }
+
+    /// Load a selection mask straight into the accumulation buffer, as a fill.
+    ///
+    /// **A fill is a stroke whose coverage came from a mask instead of from dabs.** Everything
+    /// after this point is identical: the same accumulation buffer, the same bake, and therefore
+    /// the same blend modes — so a fill honours alpha lock and erasing for free, and undo records it
+    /// exactly as it records a stroke. No fill pipeline exists, and none should: a second path to
+    /// the canvas is a second path that can disagree with the first.
+    ///
+    /// Coverage is written as it is, so a feathered or anti-aliased selection fills softly. That is
+    /// the payoff for a mask being a byte per pixel rather than a bit.
+    ///
+    /// # Written through the encoder, not through the queue
+    ///
+    /// The obvious implementation is `Queue::write_texture`, and it silently does nothing.
+    /// `prepare_tiles_at` records a *clear* of each freshly allocated tile into `encoder`, and a
+    /// queue write is executed before any command buffer submitted after it — so the clear lands
+    /// on top of the coverage and the fill vanishes. That is DECISIONS §11a.2 exactly, and it cost
+    /// a debugging round here despite being written down.
+    ///
+    /// Staging through a buffer copied inside the same encoder puts both operations on one
+    /// timeline, where the order is the order they were recorded in. Skipping the clear instead
+    /// would also work today — a fill writes every texel — and would break the moment anything else
+    /// touches these tiles in the same encoder.
+    pub fn fill_from_mask(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        selection: &openpaint_core::Selection,
+        page: PageRect,
+    ) {
+        let touched: Vec<TileCoord> = selection
+            .tiles()
+            .map(|(coord, _)| *coord)
+            .filter(|c| crate::canvas_renderer::tile_intersects(*c, page))
+            .collect();
+        if touched.is_empty() {
+            return;
+        }
+        self.prepare_tiles_at(queue, encoder, &touched);
+
+        // One staging buffer for the whole fill: a tile is 128 KiB at this format, and a row is
+        // 512 bytes, so tiles pack end to end with no padding and the 256-byte copy alignment is
+        // satisfied by construction.
+        let per_tile = TILE_SIZE * TILE_SIZE;
+        let mut staged: Vec<half::f16> = Vec::with_capacity(touched.len() * per_tile);
+        let mut layers: Vec<u32> = Vec::with_capacity(touched.len());
+        for coord in &touched {
+            let Some(layer) = self.map.slot(*coord).map(crate::tile_pool::Slot::layer) else {
+                // No accumulation layer: the pool was exhausted, which `prepare_tiles_at` has
+                // already recorded. Skipping the tile loses paint there rather than writing it
+                // into somebody else's.
+                continue;
+            };
+            let coverage = selection
+                .coverage_tile(*coord)
+                .expect("touched tiles exist");
+            staged.extend(
+                coverage
+                    .iter()
+                    .map(|&c| half::f16::from_f32(f32::from(c) / 255.0)),
+            );
+            layers.push(layer);
+        }
+        if layers.is_empty() {
+            return;
+        }
+
+        let buffer = wgpu::util::DeviceExt::create_buffer_init(
+            device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("fill-coverage"),
+                contents: bytemuck::cast_slice(&staged),
+                usage: wgpu::BufferUsages::COPY_SRC,
+            },
+        );
+        for (i, layer) in layers.iter().enumerate() {
+            encoder.copy_buffer_to_texture(
+                wgpu::ImageCopyBuffer {
+                    buffer: &buffer,
+                    layout: wgpu::ImageDataLayout {
+                        offset: (i * per_tile * 2) as u64,
+                        bytes_per_row: Some(TILE_SIZE as u32 * 2),
+                        rows_per_image: Some(TILE_SIZE as u32),
+                    },
+                },
+                wgpu::ImageCopyTexture {
+                    texture: self.pool.texture(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: *layer,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: TILE_SIZE as u32,
+                    height: TILE_SIZE as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        // Or `bake` decides there is nothing to do: the flag exists because stamping sets it, and
+        // this is stamping by another route.
+        self.dirty = true;
     }
 
     /// Write one uniform record per tile into `region`, returning the tiles in record

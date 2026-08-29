@@ -73,20 +73,38 @@ pub enum TileBefore {
     Absent,
 }
 
+/// Where an operation's coverage came from.
+///
+/// A stroke and a fill differ in exactly this and nothing else: both end up as coverage in the
+/// accumulation buffer, baked through the same blend. Two `Op` variants would have shared five
+/// fields out of six and drifted apart at the first change to any of them, so what varies is a
+/// field rather than a variant.
+pub enum PaintSource {
+    /// Dabs stamped along a stroke.
+    Dabs(Vec<Dab>),
+    /// A selection mask, loaded straight into the accumulation buffer.
+    ///
+    /// Kept whole rather than re-derived. The gesture that produced it may be long gone — a flood
+    /// fill or an inversion has no gesture at all — so a redo has nothing to recompute *from*, and
+    /// the mask is the only honest record.
+    Mask(Box<openpaint_core::Selection>),
+}
+
 /// One undoable operation.
 pub enum Op {
-    Stroke {
+    /// Paint put on a layer, however it got there.
+    Paint {
         /// Which layer it was painted on. Undo has to put the pixels back where they came
         /// from, and the active layer may well have changed since.
         layer: LayerId,
-        /// Every tile the stroke wrote, as it was beforehand.
+        /// Every tile it wrote, as it was beforehand.
         before: Vec<(TileCoord, TileBefore)>,
-        /// Everything needed to reproduce the stroke for redo.
-        dabs: Vec<Dab>,
+        /// What produced the coverage, so redo can produce it again.
+        source: PaintSource,
         color_linear_premul: [f32; 4],
         opacity: f32,
-        /// How it was applied. Redo replays the dabs, so without this an erase would be
-        /// redone as a black stroke.
+        /// How it was applied. Redo reproduces the coverage, so without this an erase would
+        /// be redone as a black stroke.
         mode: crate::editor::PaintMode,
     },
     /// Geometry only. Nothing is saved because nothing is destroyed (DECISIONS §5c).
@@ -112,7 +130,7 @@ impl Op {
     /// Snapshot layers this operation holds, for release on eviction.
     fn into_slots(self) -> Vec<Slot> {
         match self {
-            Self::Stroke { before, .. } => before
+            Self::Paint { before, .. } => before
                 .into_iter()
                 .filter_map(|(_, b)| match b {
                     TileBefore::Content(slot) => Some(slot),
@@ -313,10 +331,10 @@ mod tests {
     const L0: LayerId = LayerId(0);
 
     fn stroke_op(before: Vec<(TileCoord, TileBefore)>) -> Op {
-        Op::Stroke {
+        Op::Paint {
             layer: L0,
             before,
-            dabs: Vec::new(),
+            source: PaintSource::Dabs(Vec::new()),
             color_linear_premul: [0.0; 4],
             opacity: 1.0,
             mode: crate::editor::PaintMode::Normal,

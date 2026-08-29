@@ -870,6 +870,7 @@ impl OpenPaint {
                 );
             }
             ui::SelectAction::None => self.set_selection(None, "Deselected"),
+            ui::SelectAction::Fill => self.fill_selection(),
             ui::SelectAction::Invert => {
                 // Inverting nothing selects everything, which is what every art app does and is
                 // more useful than refusing.
@@ -883,6 +884,45 @@ impl OpenPaint {
                 );
             }
         }
+    }
+
+    /// Fill the selection with the brush colour, on the active layer.
+    fn fill_selection(&mut self) {
+        let Some(selection) = self.selection.as_ref().map(|s| s.mask.clone()) else {
+            self.status_message = Some("Nothing is selected".to_owned());
+            self.request_redraw();
+            return;
+        };
+        // The same guard a stroke gets: erasing an alpha-locked layer cannot do anything, so say so
+        // rather than appearing to work.
+        let Some(mode) = self.editor.paint_mode() else {
+            self.status_message = Some(
+                "This layer's alpha is locked, so filling cannot erase. Unlock it, or paint."
+                    .to_owned(),
+            );
+            self.request_redraw();
+            return;
+        };
+
+        let brush = *self.editor.brush();
+        let layer = tile_store::LayerId(self.editor.active_layer_id());
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let recorded = renderer.fill_selection(
+            &selection,
+            layer,
+            brush.color_linear_premul(),
+            brush.opacity,
+            mode,
+        );
+        self.status_message = Some(if recorded {
+            "Filled the selection".to_owned()
+        } else {
+            "That fill was too large to record; it cannot be undone".to_owned()
+        });
+        self.mark_dirty();
+        self.request_redraw();
     }
 
     /// The selection and any in-progress gesture, in screen space, ready to draw.
@@ -1681,6 +1721,10 @@ impl OpenPaint {
                     }
                     "d" | "D" => {
                         self.apply_select_action(ui::SelectAction::None);
+                        return true;
+                    }
+                    "f" | "F" => {
+                        self.apply_select_action(ui::SelectAction::Fill);
                         return true;
                     }
                     // Ctrl+Shift+I, the binding every art app uses for invert-selection.

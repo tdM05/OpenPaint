@@ -84,6 +84,15 @@ impl Selection {
         self.tiles.iter()
     }
 
+    /// One tile's coverage, if this selection touches it.
+    ///
+    /// For a consumer that already knows which tiles it wants — a fill stages them straight into
+    /// the GPU — and would otherwise pay a hash lookup per pixel to read them one at a time.
+    #[must_use]
+    pub fn coverage_tile(&self, coord: TileCoord) -> Option<&[u8]> {
+        self.tiles.get(&coord).map(Vec::as_slice)
+    }
+
     /// How selected a page pixel is, from 0 to 255.
     #[must_use]
     pub fn coverage_at(&self, x: i32, y: i32) -> u8 {
@@ -92,6 +101,19 @@ impl Selection {
         let lx = x.rem_euclid(side) as usize;
         let ly = y.rem_euclid(side) as usize;
         self.tiles.get(&coord).map_or(0, |t| t[ly * TILE_SIZE + lx])
+    }
+
+    /// Set one pixel's coverage directly.
+    ///
+    /// The primitive a mask brush needs -- painting into a selection is what Quick Mask is, and a
+    /// layer mask is edited the same way. Public rather than test-only because it is a real
+    /// operation on a mask that happens to have arrived early, as the one convenient way to build
+    /// partial coverage before feathering exists.
+    pub fn set_coverage(&mut self, x: i32, y: i32, coverage: u8) {
+        let mut build = Builder::default();
+        std::mem::swap(&mut build.tiles, &mut self.tiles);
+        build.write_run(x, y, &[coverage]);
+        self.tiles = build.tiles;
     }
 
     /// Select the whole page.

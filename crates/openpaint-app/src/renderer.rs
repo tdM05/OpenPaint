@@ -23,7 +23,7 @@ use winit::window::Window;
 
 use crate::canvas_renderer::{CanvasRenderer, CANVAS_FORMAT};
 use crate::editor::StrokeOp;
-use crate::history::{History, Op, TileBefore};
+use crate::history::{History, Op, PaintSource, TileBefore};
 use crate::stroke_exec::StrokeExec;
 use crate::stroke_layer::StrokeLayer;
 use crate::tile_pool::{Slot, TilePool};
@@ -406,6 +406,69 @@ impl Renderer {
             .sample_page_pixel(&self.device, &self.queue, x, y, layers)
     }
 
+    /// Fill a selection on `layer`, undoably.
+    ///
+    /// The same shape as `StrokeExec::commit`, and deliberately so: snapshot what is about to be
+    /// overwritten, produce the coverage, bake, record. Only the middle step differs, which is the
+    /// whole argument for a fill not having a pipeline of its own — it inherits erasing, alpha lock
+    /// and clipping because it is the same bake.
+    ///
+    /// Returns whether the fill could be recorded for undo. A fill that cannot be reverted is
+    /// refused rather than performed, for the same reason a stroke is: an undo that produces a
+    /// state which never existed is worse than a fill that did not happen.
+    pub fn fill_selection(
+        &mut self,
+        selection: &openpaint_core::Selection,
+        layer: LayerId,
+        color_linear_premul: [f32; 4],
+        opacity: f32,
+        mode: crate::editor::PaintMode,
+    ) -> bool {
+        let page = self.canvas_renderer.page();
+        self.stroke_layer.set_page(&self.queue, page);
+        self.stroke_layer
+            .set_paint(&self.queue, color_linear_premul, opacity, mode);
+
+        let mut encoder = self.new_stroke_encoder();
+        self.stroke_layer.begin_stroke();
+        self.stroke_layer
+            .fill_from_mask(&self.device, &self.queue, &mut encoder, selection, page);
+
+        let tiles = self.stroke_layer.tiles_to_bake(page);
+        if tiles.is_empty() {
+            self.queue.submit(std::iter::once(encoder.finish()));
+            return true;
+        }
+
+        // Before baking: this is the pre-fill image undo restores.
+        let before =
+            self.history
+                .snapshot_tiles(&mut encoder, &self.canvas_renderer, layer, &tiles);
+        self.stroke_layer.bake(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &mut self.canvas_renderer,
+            layer,
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        match before {
+            Some(before) => {
+                self.history.push(Op::Paint {
+                    layer,
+                    before,
+                    source: PaintSource::Mask(Box::new(selection.clone())),
+                    color_linear_premul,
+                    opacity,
+                    mode,
+                });
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn save_document(
         &mut self,
         document: &openpaint_core::Document,
@@ -532,7 +595,7 @@ impl Renderer {
             return HistoryChange::None;
         };
         let change = match &op {
-            Op::Stroke { layer, before, .. } => {
+            Op::Paint { layer, before, .. } => {
                 let mut encoder = self.new_stroke_encoder();
                 for (coord, was) in before {
                     match was {
@@ -600,32 +663,46 @@ impl Renderer {
             return HistoryChange::None;
         };
         let change = match &op {
-            Op::Stroke {
+            Op::Paint {
                 layer,
-                dabs,
+                source,
                 color_linear_premul,
                 opacity,
                 mode,
                 ..
             } => {
-                // Replayed rather than restored from an after-image: half the memory, and
-                // re-rasterizing is the cheap direction now that dabs are stamped on the
-                // GPU.
+                // Reproduced rather than restored from an after-image: half the memory, and
+                // re-rasterizing is the cheap direction now that coverage is produced on the
+                // GPU. Only the *source* of the coverage differs between a stroke and a fill;
+                // everything from `bake` onward is one path.
                 let page = self.canvas_renderer.page();
                 self.stroke_layer.set_page(&self.queue, page);
                 self.stroke_layer
                     .set_paint(&self.queue, *color_linear_premul, *opacity, *mode);
-                self.stroke_layer
-                    .upload_dabs(&self.device, &self.queue, dabs);
 
                 let mut encoder = self.new_stroke_encoder();
                 self.stroke_layer.begin_stroke();
-                let tiles = self
-                    .stroke_layer
-                    .prepare_tiles(&self.queue, &mut encoder, dabs, page);
-                for index in 0..tiles {
-                    self.stroke_layer
-                        .stamp_range(&mut encoder, index, 0, dabs.len());
+                match source {
+                    PaintSource::Dabs(dabs) => {
+                        self.stroke_layer
+                            .upload_dabs(&self.device, &self.queue, dabs);
+                        let tiles =
+                            self.stroke_layer
+                                .prepare_tiles(&self.queue, &mut encoder, dabs, page);
+                        for index in 0..tiles {
+                            self.stroke_layer
+                                .stamp_range(&mut encoder, index, 0, dabs.len());
+                        }
+                    }
+                    PaintSource::Mask(mask) => {
+                        self.stroke_layer.fill_from_mask(
+                            &self.device,
+                            &self.queue,
+                            &mut encoder,
+                            mask,
+                            page,
+                        );
+                    }
                 }
                 self.stroke_layer.bake(
                     &self.device,

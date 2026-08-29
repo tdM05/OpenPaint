@@ -129,6 +129,8 @@ pub enum SelectAction {
     All,
     None,
     Invert,
+    /// Fill the selection with the brush colour.
+    Fill,
 }
 
 /// What the crop tool should do next.
@@ -377,9 +379,18 @@ impl Ui {
                                     select_action = Some(SelectAction::Invert);
                                 }
                             });
+                            if ui
+                                .add_enabled(
+                                    status.has_selection,
+                                    egui::Button::new("Fill with brush colour"),
+                                )
+                                .clicked()
+                            {
+                                select_action = Some(SelectAction::Fill);
+                            }
                             ui.label(
                                 egui::RichText::new(
-                                    "Ctrl+A selects everything, Ctrl+D deselects,                                      Ctrl+Shift+I inverts. A selection is a mask: fill, and                                      later the bucket and transform, all act through it.",
+                                    "Ctrl+A selects everything, Ctrl+D deselects, Ctrl+Shift+I inverts, Ctrl+F fills. A fill is a stroke whose coverage came from the mask, so it honours erase, alpha lock and clipping, and undoes like one.",
                                 )
                                 .small()
                                 .weak(),

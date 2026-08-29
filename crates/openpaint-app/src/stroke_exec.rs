@@ -142,10 +142,10 @@ impl StrokeExec<'_> {
         match before {
             Some(before) => {
                 let (color_linear_premul, opacity, mode) = *self.recording_paint;
-                self.history.push(Op::Stroke {
+                self.history.push(Op::Paint {
                     layer: self.layer,
                     before,
-                    dabs: std::mem::take(self.recording),
+                    source: crate::history::PaintSource::Dabs(std::mem::take(self.recording)),
                     color_linear_premul,
                     opacity,
                     mode,
@@ -182,6 +182,9 @@ fn segments(ops: &[StrokeOp]) -> Vec<&[StrokeOp]> {
 
 #[cfg(test)]
 mod tests {
+    /// Opaque red, premultiplied.
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+
     use super::*;
     use openpaint_core::Canvas;
 
@@ -893,7 +896,7 @@ mod tests {
         // The op history recorded it; replaying must reproduce a hole, not a stroke.
         let op = history.pop_undo().expect("the erase was recorded");
         match &op {
-            Op::Stroke { mode, .. } => assert_eq!(
+            Op::Paint { mode, .. } => assert_eq!(
                 *mode,
                 crate::editor::PaintMode::Erase,
                 "the erase was recorded as paint"
@@ -1040,6 +1043,75 @@ mod tests {
                 "the stroke painted nothing, so the test proved nothing"
             );
         }
+    }
+
+    /// A fill lands inside the mask, stops at its edge, and follows its coverage.
+    ///
+    /// Three properties, and the third is the reason a selection is a byte per pixel rather than a
+    /// bit: a partially selected pixel must fill partially. A boolean mask could not express that,
+    /// and a fill that hard-edged every selection would make feathering pointless before it exists.
+    #[test]
+    fn a_fill_covers_the_mask_and_stops_at_its_edge() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        const SIDE: u32 = 200;
+
+        let mut editor = Editor::new();
+        editor.resize_page(openpaint_core::PageRect::from_size(SIDE, SIDE));
+        let page = editor.page_rect();
+        let layer = test_stroke_layer(&device);
+        let mut canvas = test_canvas(&device, page, &layer);
+        let mut stroke = test_stroke_layer(&device);
+        let mut history = History::new(&device);
+        let id = LayerId(editor.active_layer_id());
+
+        // A rectangle, then a manual half-coverage stripe down one column of it, so the same fill
+        // exercises full and partial coverage at once.
+        let mut selection = openpaint_core::Selection::from_rect(
+            openpaint_core::PageRect::new(50, 50, 100, 100),
+            page,
+        );
+        selection.set_coverage(120, 100, 128);
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        stroke.set_page(&queue, page);
+        stroke.set_paint(&queue, RED, 1.0, crate::editor::PaintMode::Normal);
+        stroke.begin_stroke();
+        stroke.fill_from_mask(&device, &queue, &mut encoder, &selection, page);
+        let tiles = stroke.tiles_to_bake(page);
+        let before = history.snapshot_tiles(&mut encoder, &canvas, id, &tiles);
+        stroke.bake(&device, &queue, &mut encoder, &mut canvas, id);
+        queue.submit(std::iter::once(encoder.finish()));
+        assert!(before.is_some(), "the fill should have been recordable");
+
+        let after = crate::test_gpu::readback_tile(&device, &queue, &canvas, id, (0, 0))
+            .expect("the filled layer should be resident");
+        let at = |x: usize, y: usize| after[y * openpaint_core::tile::TILE_SIZE + x];
+
+        assert!(
+            at(100, 100)[3] > 0.99,
+            "the middle of the selection is unfilled: {:?}",
+            at(100, 100)
+        );
+        assert!(
+            at(40, 100)[3] < 0.01,
+            "paint escaped the selection: {:?}",
+            at(40, 100)
+        );
+        assert!(
+            at(160, 100)[3] < 0.01,
+            "paint escaped the other side: {:?}",
+            at(160, 100)
+        );
+
+        let partial = at(120, 100)[3];
+        assert!(
+            (partial - 0.5).abs() < 0.02,
+            "a half-selected pixel filled at {partial} instead of about half; coverage is being \
+             treated as a boolean"
+        );
     }
 
     /// Alpha lock means alpha cannot change. Not "mostly", not "except at the edges".
