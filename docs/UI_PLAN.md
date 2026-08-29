@@ -69,7 +69,26 @@ Cheap, and each closes a gap that makes the workspace feel like a demo.
   — the tool rail already does. Worth solving once in the chrome rather than per
   panel, since any panel can end up any shape.
 
-### 1. The descriptor engine — and this is what replaces egui
+### Progress
+
+**Step 0 is done** (persistence, open/close, wrapping headers) and **stage 1 of the descriptor
+engine is in**: `panel_ui.rs` holds the vocabulary and every decision worth being wrong about,
+`panel_draw.rs` turns it into pixels using egui only as a surface to paint on. Brush, Layers and
+History are described rather than drawn. Colour and Tools are not yet, and Canvas never will be.
+
+What the port turned up, worth recording:
+
+- **A row needs to be able to hold more than one target.** A layer row wants to be chosen *and*
+  have its visibility flipped, and `Control::Row` can only be chosen. For now visibility is a
+  `Toggle` below the list acting on the active layer, and the chip on each row shows the state.
+  The fix is a row that carries trailing controls, not a special layer row.
+- **Scrolling belongs to the renderer, not the layout.** It is a subtraction from where the list
+  starts, so `place` never heard of it and did not have to change.
+- **`Custom` was cut before it shipped.** Nothing needed it yet, and a variant with no user is a
+  shape designed against a guess. It goes in with the colour wheel, which is the first thing that
+  genuinely cannot be described.
+
+## 1. The descriptor engine — and this is what replaces egui
 
 **A panel is a list of controls, described as data.** Rendering that list is one
 function; that function *is* our widget layer.

@@ -185,6 +185,19 @@ pub struct Metrics {
     pub label: f32,
     /// Text size for ordinary content.
     pub body: f32,
+    /// How tall one interactive control is: a button, a slider, a row in a list.
+    ///
+    /// Every one of them, not each sized to its ink. A column of controls then has a single rhythm
+    /// and a single target size, which is what makes a panel predictable to aim at — and a slider
+    /// whose track is three units tall is still a whole row to catch.
+    ///
+    /// Held above the 4 mm floor by the same test as the dividers and headers.
+    pub row: f32,
+    /// The space between two controls stacked in a panel.
+    ///
+    /// Small on purpose: grouping is a separator's job, not a gap's. Rows that drift apart read as
+    /// unrelated, and a panel of twenty controls cannot afford the room.
+    pub gap: f32,
 }
 
 /// A complete look.
@@ -224,6 +237,8 @@ impl Default for Theme {
                 radius: 3.0,
                 label: 11.0,
                 body: 12.0,
+                row: 22.0,
+                gap: 3.0,
             },
         }
     }
@@ -381,6 +396,7 @@ mod tests {
             ("a full header", m.header),
             ("a compact header", m.header_compact),
             ("a divider's grab width", m.splitter_grab),
+            ("a control row", m.row),
         ] {
             let mm = units / PER_MM;
             assert!(

@@ -46,6 +46,8 @@ mod input_mouse;
 mod input_pen;
 mod layout;
 mod panel_drag;
+mod panel_draw;
+mod panel_ui;
 mod perf;
 mod presets;
 mod renderer;

@@ -652,6 +652,8 @@ fn workspace_panel(
     brush: &mut Brush,
     color_srgb: &mut [u8; 3],
     state: &PanelState<'_>,
+    theme: &crate::theme::Theme,
+    input: &mut crate::panel_draw::PanelInput,
 ) -> Option<Picked> {
     let PanelState {
         layers,
@@ -733,7 +735,7 @@ fn workspace_panel(
                         Picked::Paint(t) => select_tool.is_none() && tool == t,
                         Picked::Select(t) => select_tool == Some(t),
                         // Not something the tool rail offers, so never one of its lit buttons.
-                        Picked::TogglePanel(_) => false,
+                        Picked::TogglePanel(_) | Picked::Layer(_) => false,
                     };
                     if ui
                         .add_sized(
@@ -749,35 +751,168 @@ fn workspace_panel(
             });
         }
         ws::BRUSH => {
-            ui.add(
-                egui::Slider::new(&mut brush.radius, 0.5..=400.0)
-                    .logarithmic(true)
-                    .text("Size"),
-            );
-            ui.add(egui::Slider::new(&mut brush.opacity, 0.0..=1.0).text("Opacity"));
-            ui.add(egui::Slider::new(&mut brush.hardness, 0.0..=1.0).text("Hardness"));
-            ui.add(egui::Slider::new(&mut brush.spacing, 0.01..=1.0).text("Spacing"));
+            // **The first panel described rather than drawn.** Nothing below says what a slider
+            // looks like or how a drag becomes a number; it says what the controls *are* and what
+            // they currently hold, and applies what comes back.
+            //
+            // The reason this one went first: it is four sliders and nothing else, so if the
+            // descriptor layer could not carry it there would be no point carrying on — and it is
+            // small enough that finding out costs an afternoon rather than a rewrite.
+            use crate::panel_ui::{Change, Control};
+            const SIZE: u32 = 0;
+            const OPACITY: u32 = 1;
+            const HARDNESS: u32 = 2;
+            const SPACING: u32 = 3;
+
+            let controls = vec![
+                Control::Slider {
+                    id: SIZE,
+                    text: "Size".to_owned(),
+                    value: brush.radius,
+                    min: 0.5,
+                    max: 400.0,
+                    unit: "px",
+                    // Logarithmic, because one step at radius 4 should feel like one step at
+                    // radius 40 — which is what a paint app means by size.
+                    log: true,
+                },
+                Control::Slider {
+                    id: OPACITY,
+                    text: "Opacity".to_owned(),
+                    value: brush.opacity,
+                    min: 0.0,
+                    max: 1.0,
+                    unit: "",
+                    log: false,
+                },
+                Control::Slider {
+                    id: HARDNESS,
+                    text: "Hardness".to_owned(),
+                    value: brush.hardness,
+                    min: 0.0,
+                    max: 1.0,
+                    unit: "",
+                    log: false,
+                },
+                Control::Slider {
+                    id: SPACING,
+                    text: "Spacing".to_owned(),
+                    value: brush.spacing,
+                    min: 0.01,
+                    max: 1.0,
+                    unit: "",
+                    log: false,
+                },
+            ];
+            for change in crate::panel_draw::show(ui, &controls, theme, input) {
+                match change {
+                    Change::Set(SIZE, v) => brush.radius = v,
+                    Change::Set(OPACITY, v) => brush.opacity = v,
+                    Change::Set(HARDNESS, v) => brush.hardness = v,
+                    Change::Set(SPACING, v) => brush.spacing = v,
+                    // Not a catch-all out of laziness: an id this panel did not put in its own
+                    // list is a bug in the renderer, and swallowing it would be exactly the kind
+                    // of silence §6b forbids.
+                    other => eprintln!("brush panel: unexpected {other:?}"),
+                }
+            }
         }
         ws::LAYERS => {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    // Top of the list is the top of the stack, which is how every layers panel
-                    // reads and the opposite of how the document stores it.
-                    for (index, layer) in layers.iter().enumerate().rev() {
-                        let shown = index == active_layer;
-                        ui.horizontal(|ui| {
-                            ui.label(if layer.visible {
-                                "\u{25CF}"
-                            } else {
-                                "\u{25CB}"
-                            });
-                            // Selecting a layer from here comes with the port of the layers
-                            // section; for now it shows which is active.
-                            let _ = ui.selectable_label(shown, &layer.name);
-                        });
-                    }
+            // The second panel described rather than drawn, and the one that exercises the rest of
+            // the vocabulary: a list, a pair of switches, and commands.
+            use crate::panel_ui::{Change, Control};
+            // Rows are numbered by layer index, so the ids above them start where no document
+            // could reach. A row and a button sharing an id would be a silent mis-hit.
+            const FIRST_COMMAND: u32 = 1 << 20;
+            const VISIBLE: u32 = FIRST_COMMAND;
+            const LOCK_ALPHA: u32 = FIRST_COMMAND + 1;
+            const ADD: u32 = FIRST_COMMAND + 2;
+            const DUPLICATE: u32 = FIRST_COMMAND + 3;
+            const MERGE_DOWN: u32 = FIRST_COMMAND + 4;
+            const DELETE: u32 = FIRST_COMMAND + 5;
+
+            let mut controls = Vec::new();
+            // Top of the list is the top of the stack, which is how every layers panel reads and
+            // the opposite of how the document stores it.
+            for (index, layer) in layers.iter().enumerate().rev() {
+                controls.push(Control::Row {
+                    id: u32::try_from(index).unwrap_or(u32::MAX),
+                    text: layer.name.clone(),
+                    selected: index == active_layer,
+                    // A hidden layer's chip goes dark rather than the row changing colour:
+                    // visibility is a property of the layer, not of whether it is chosen, and
+                    // conflating the two is how a panel starts lying about its state.
+                    swatch: Some(if layer.visible {
+                        [0xC6, 0xCC, 0xD3]
+                    } else {
+                        [0x3A, 0x3F, 0x46]
+                    }),
                 });
+            }
+            let active = layers.get(active_layer);
+            controls.push(Control::Separator);
+            controls.push(Control::Toggle {
+                id: VISIBLE,
+                text: "Visible".to_owned(),
+                on: active.is_some_and(|l| l.visible),
+            });
+            controls.push(Control::Toggle {
+                id: LOCK_ALPHA,
+                text: "Lock alpha".to_owned(),
+                on: active.is_some_and(|l| l.lock_alpha),
+            });
+            controls.push(Control::Separator);
+            for (id, text) in [
+                (ADD, "Add"),
+                (DUPLICATE, "Duplicate"),
+                (MERGE_DOWN, "Merge down"),
+                (DELETE, "Delete"),
+            ] {
+                controls.push(Control::Button {
+                    id,
+                    text: text.to_owned(),
+                });
+            }
+
+            for change in crate::panel_draw::show(ui, &controls, theme, input) {
+                picked = match change {
+                    Change::Chose(index) => {
+                        Some(Picked::Layer(LayerAction::Select(index as usize)))
+                    }
+                    Change::Toggled(VISIBLE, visible) => {
+                        Some(Picked::Layer(LayerAction::SetVisible {
+                            index: active_layer,
+                            visible,
+                        }))
+                    }
+                    Change::Toggled(LOCK_ALPHA, lock) => {
+                        Some(Picked::Layer(LayerAction::SetLockAlpha {
+                            index: active_layer,
+                            lock,
+                        }))
+                    }
+                    Change::Pressed(ADD) => Some(Picked::Layer(LayerAction::Add)),
+                    Change::Pressed(DUPLICATE) => {
+                        Some(Picked::Layer(LayerAction::Duplicate(active_layer)))
+                    }
+                    Change::Pressed(MERGE_DOWN) => {
+                        Some(Picked::Layer(LayerAction::MergeDown(active_layer)))
+                    }
+                    // Deleting the last layer would leave a document with nothing to paint on, so
+                    // the command is refused out loud rather than quietly doing nothing (§6b).
+                    Change::Pressed(DELETE) if layers.len() > 1 => {
+                        Some(Picked::Layer(LayerAction::Delete(active_layer)))
+                    }
+                    Change::Pressed(DELETE) => {
+                        eprintln!("layers: a document needs at least one layer");
+                        None
+                    }
+                    other => {
+                        eprintln!("layers panel: unexpected {other:?}");
+                        None
+                    }
+                };
+            }
         }
         ws::COLOUR => {
             ui.horizontal(|ui| {
@@ -789,24 +924,29 @@ fn workspace_panel(
             });
         }
         ws::HISTORY => {
-            ui.label(
-                egui::RichText::new("Undo history moves here once the old panel is ported.")
-                    .small()
-                    .weak(),
-            );
+            // A described placeholder rather than a drawn one, so the day this panel gets its
+            // real list there is no egui left in it to remove first.
+            let controls = [crate::panel_ui::Control::Label {
+                text: "Undo history moves here once the old panel is ported.".to_owned(),
+            }];
+            for change in crate::panel_draw::show(ui, &controls, theme, input) {
+                eprintln!("history panel: unexpected {change:?}");
+            }
         }
         _ => {}
     }
     picked
 }
 
-/// What the tool rail asked for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a workspace panel asked for.
+#[derive(Clone, Debug, PartialEq)]
 enum Picked {
     Paint(Tool),
     Select(SelectTool),
     /// Show a panel, or put it away.
     TogglePanel(crate::layout::PanelId),
+    /// A layer command, from the described Layers panel.
+    Layer(LayerAction),
 }
 
 /// Draw a box with its eight handles.
@@ -919,6 +1059,12 @@ pub struct Ui {
     /// Held here rather than in the app for the same reason `extend_amount` is: it is a half-typed
     /// widget value, not state the document or the engine has any use for.
     preset_name: String,
+    /// Each described panel's half-finished gesture: what it is holding, how far it is scrolled.
+    ///
+    /// Per panel, because two of them can be on screen at once and a list scrolled in one has
+    /// nothing to say about the other. Keyed by panel id rather than by position, so rearranging
+    /// the workspace does not shuffle the offsets between panels.
+    panel_input: std::collections::HashMap<u32, crate::panel_draw::PanelInput>,
 }
 
 impl Ui {
@@ -948,6 +1094,7 @@ impl Ui {
             workspace_canvas: None,
             extend_amount: DEFAULT_EXTEND,
             preset_name: String::new(),
+            panel_input: std::collections::HashMap::new(),
         }
     }
 
@@ -1032,6 +1179,9 @@ impl Ui {
         let mut panel_rect = egui::Rect::NOTHING;
         let mut panel_canvas: Option<(f32, f32, f32, f32)> = None;
         let mut workspace_canvas_px: Option<(f32, f32, f32, f32)> = None;
+        // Taken for the duration of the frame because `self.ctx.run` has `self` borrowed, and put
+        // back the moment it does not.
+        let mut panel_input = std::mem::take(&mut self.panel_input);
         let output = self.ctx.run(input, |ctx| {
             // The panel workspace, when it is switched on. Drawn *instead of* the side panel
             // rather than beside it: they are two answers to the same question, and showing both
@@ -1057,9 +1207,12 @@ impl Ui {
                     open_panels: &open_panels,
                 };
                 let mut toggled = None;
+                // Copied out because `ws` is borrowed for the whole of `show`, and the panel that
+                // wants the theme runs inside it.
+                let theme = ws.theme;
                 ws.show(ctx, area, |panel, ui| {
                     if let Some(picked) =
-                        workspace_panel(panel, ui, brush, &mut color_srgb, &state)
+                        workspace_panel(panel, ui, brush, &mut color_srgb, &state, &theme, panel_input.entry(panel.0).or_default())
                     {
                         match picked {
                             // Both: choosing a paint tool must also put any selection tool down,
@@ -1076,6 +1229,7 @@ impl Ui {
                             // Not applied here: `ws` is borrowed for the whole of `show`, so the
                             // toggle is remembered and done the moment that borrow ends.
                             Picked::TogglePanel(id) => toggled = Some(id),
+                            Picked::Layer(a) => layer_action = Some(a),
                         }
                     }
                 });
@@ -2269,6 +2423,7 @@ impl Ui {
         // everything egui drew, so a centred floating window -- the unsaved-changes prompt --
         // made it span half the screen and shoved the canvas sideways. The inset means "how much
         // of the left edge the panel covers", and only the panel can answer that.
+        self.panel_input = panel_input;
         let scale = self.ctx.pixels_per_point();
         let used = panel_rect;
         self.occupied = egui::Rect::from_min_max(
