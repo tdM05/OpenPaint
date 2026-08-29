@@ -169,6 +169,19 @@ impl Sample {
     }
 }
 
+/// A seed for one stroke's noise, from where and when it started.
+///
+/// Position and clock mixed together: position alone repeats if you start two strokes at the same
+/// place, and the clock alone is coarse enough that two strokes in the same millisecond would
+/// match. Neither is a strong hash and neither needs to be — this only has to differ between
+/// strokes a person could draw.
+fn seed_from(at: Sample) -> u32 {
+    let bits = at.x.to_bits() ^ at.y.to_bits().rotate_left(16);
+    #[allow(clippy::cast_possible_truncation)]
+    let clock = (at.time_ms * 1000.0) as u64 as u32;
+    bits ^ clock.rotate_left(8)
+}
+
 impl StrokeState {
     /// Assemble one dab's worth of input, drawing a fresh random value.
     fn input_for(&mut self, at: Sample, velocity: f32, direction: f32) -> Input {
@@ -246,6 +259,12 @@ impl Brush {
 
     /// Begin a stroke: emit the initial dab at the first sample.
     pub fn stroke_begin(&self, out: &mut Vec<Dab>, state: &mut StrokeState, at: Sample) {
+        // Seed from where and when the stroke began, so two strokes do not draw the same numbers.
+        // The default seed is a constant, which made every stroke speckle *identically* -- the
+        // patterning randomness exists to avoid. Reproducibility is not lost by this: history
+        // stores the dabs, so a redo replays what was drawn rather than re-rolling.
+        state.noise = Noise::new(seed_from(at));
+
         // A stroke begins from rest, so there is no speed and no heading yet. Reading either from
         // a single sample would invent one.
         let input = state.input_for(at, 0.0, 0.0);
@@ -534,6 +553,57 @@ mod tests {
             (leaning - 20.0).abs() < 0.1,
             "a fully leant pen should give the full radius, got {leaning}"
         );
+    }
+
+    /// Two strokes must not draw the same random numbers.
+    ///
+    /// The seed was a constant, so every stroke speckled identically -- draw the same line twice
+    /// and get the same dabs, which is the patterning randomness exists to avoid. Found by being
+    /// asked what the seed was.
+    #[test]
+    fn two_strokes_do_not_share_their_randomness() {
+        let mut brush = Brush {
+            radius: 20.0,
+            ..Brush::default()
+        };
+        brush.radius_response = Response::following(Source::Random);
+
+        let run = |x: f32, t: f64| {
+            let mut dabs = Vec::new();
+            let mut state = StrokeState::new();
+            let start = Sample {
+                x,
+                y: 0.0,
+                pressure: 1.0,
+                tilt: 0.0,
+                time_ms: t,
+            };
+            brush.stroke_begin(&mut dabs, &mut state, start);
+            brush.stroke_to(
+                &mut dabs,
+                &mut state,
+                Sample {
+                    x: x + 300.0,
+                    ..start
+                },
+            );
+            dabs.iter().map(|d| d.radius).collect::<Vec<_>>()
+        };
+
+        // Different place, same instant.
+        assert_ne!(
+            run(0.0, 5.0),
+            run(50.0, 5.0),
+            "position did not reach the seed"
+        );
+        // Same place, different instant.
+        assert_ne!(
+            run(0.0, 5.0),
+            run(0.0, 9.0),
+            "the clock did not reach the seed"
+        );
+        // And the same stroke twice is still the same, which is what makes a brush reproducible.
+        assert_eq!(run(0.0, 5.0), run(0.0, 5.0));
     }
 
     /// Randomness differs *between dabs*, not once per segment.
