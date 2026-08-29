@@ -72,12 +72,12 @@ pub struct Brush {
     pub angle: f32,
     /// What drives the angle.
     pub angle_response: Response,
-    /// The dab's edge profile: how coverage falls from the solid core to the rim.
+    /// What the dab's coverage comes from: a procedural edge, or a bitmap.
     ///
-    /// **Not a [`Response`].** Its x axis is a distance *within the dab*, not a pen input, so no
-    /// source means anything for it — and giving it a source picker would invite an answer to a
-    /// question that has none. See [`crate::dab::Dab::coverage_at_distance`].
-    pub falloff: crate::Curve,
+    /// **Not a [`Response`].** Neither arm has an x axis a pen input could drive — an edge profile
+    /// is a distance within the dab, and a stamp is an image — so a source picker over it would be
+    /// an answer to a question that has none. See [`crate::dab::Tip`].
+    pub tip: crate::dab::Tip,
     /// Ceiling the whole stroke may reach, `0.0..=1.0`.
     ///
     /// Per *stroke*, not per dab and not per layer: overlapping dabs build toward
@@ -118,7 +118,7 @@ impl Default for Brush {
             roundness_response: Response::fixed(),
             angle: 0.0,
             angle_response: Response::fixed(),
-            falloff: crate::dab::linear_falloff(),
+            tip: crate::dab::Tip::default(),
             opacity: 1.0,
             // Off by default, and that is a deliberate refusal to guess. Smoothing buys steadiness
             // with latency (see `stabilizer`), and how much an artist needs depends entirely on

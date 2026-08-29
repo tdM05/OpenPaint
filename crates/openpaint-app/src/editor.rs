@@ -61,11 +61,11 @@ pub enum StrokeOp {
         /// Captured at stroke start like the colour, and for the same reason: switching tool
         /// mid-stroke would otherwise produce a stroke that is half paint and half hole.
         mode: PaintMode,
-        /// The dab edge profile for this stroke.
+        /// The tip this stroke draws with: a procedural edge, or a bitmap.
         ///
         /// Carried with the stroke rather than read from the brush when it executes, for the same
         /// reason as the colour: the brush can change between queueing and drawing.
-        falloff: openpaint_core::Curve,
+        tip: openpaint_core::dab::Tip,
     },
     /// Stamp dabs `[start, start + len)` of the accompanying dab buffer.
     Dabs { start: usize, len: usize },
@@ -459,7 +459,7 @@ impl Editor {
             color_linear_premul: self.brush().color_linear_premul(),
             opacity: self.brush().opacity,
             mode,
-            falloff: self.brush().falloff.clone(),
+            tip: self.brush().tip.clone(),
         });
         self.drawing = true;
         let from = self.dabs.len();

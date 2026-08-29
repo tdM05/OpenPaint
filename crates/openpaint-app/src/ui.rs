@@ -114,6 +114,13 @@ pub enum LayerAction {
     SetBlend { index: usize, blend: Blend },
 }
 
+/// What the Brush section asked for, beyond editing the brush in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrushAction {
+    /// Choose an image to use as the dab's shape.
+    LoadTip,
+}
+
 /// What the Text section asked for, beyond editing the block in place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextAction {
@@ -585,6 +592,8 @@ pub struct Outcome {
     pub text_changed: bool,
     /// A text command.
     pub text: Option<TextAction>,
+    /// A brush command.
+    pub brush: Option<BrushAction>,
 }
 
 pub struct Ui {
@@ -679,6 +688,7 @@ impl Ui {
         let mut layer_action = None;
         let mut page_action = None;
         let mut text_action = None;
+        let mut brush_action = None;
         let mut text_changed = false;
         let mut text = text;
         let mut tool_action = None;
@@ -896,13 +906,52 @@ impl Ui {
 
                             ui.separator();
                             ui.label(
-                                egui::RichText::new(
-                                    "The dab's edge profile: how coverage falls from the solid core out to the rim. Not driven by anything -- its axis is distance within the dab, not an input. A straight line is the plain ramp; bowing it out makes a marker, bowing it in makes an airbrush.",
-                                )
-                                .small()
-                                .weak(),
+                                egui::RichText::new("Tip").strong(),
                             );
-                            curve_editor(ui, "Edge profile", &mut brush.falloff);
+                            if let Some(stamp) = brush.tip.stamp() {
+                                ui.label(format!(
+                                    "Bitmap, {}x{}",
+                                    stamp.width(),
+                                    stamp.height()
+                                ));
+                                ui.label(
+                                    egui::RichText::new(
+                                        "A bitmap tip carries its own edge, so hardness and the \
+                                         edge profile do not apply to it.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                if ui.button("Back to a round tip").clicked() {
+                                    brush.tip = openpaint_core::dab::Tip::default();
+                                }
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "The dab's edge profile: how coverage falls from the \
+                                         solid core out to the rim. Not driven by anything -- its \
+                                         axis is distance within the dab, not an input. A \
+                                         straight line is the plain ramp; bowing it out makes a \
+                                         marker, bowing it in makes an airbrush.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                if let Some(falloff) = brush.tip.falloff_mut() {
+                                    curve_editor(ui, "Edge profile", falloff);
+                                }
+                            }
+                            if ui
+                                .button("Load brush tip\u{2026}")
+                                .on_hover_text(
+                                    "A PNG of the mark a single dab makes. Drawn on transparent \
+                                     or drawn in black on white -- either way, what looks like \
+                                     ink is ink.",
+                                )
+                                .clicked()
+                            {
+                                brush_action = Some(BrushAction::LoadTip);
+                            }
 
                             ui.separator();
                             ui.add(egui::Slider::new(&mut brush.flow, 0.0..=1.0).text("Flow"));
@@ -1598,6 +1647,7 @@ impl Ui {
             wand,
             text_changed,
             text: text_action,
+            brush: brush_action,
         }
     }
 }

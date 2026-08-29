@@ -79,12 +79,12 @@ impl StrokeExec<'_> {
             color_linear_premul,
             opacity,
             mode,
-            falloff,
+            tip,
         }) = ops.first()
         {
             self.recording.clear();
             *self.recording_paint = (*color_linear_premul, *opacity, *mode);
-            self.stroke.set_falloff(self.queue, falloff);
+            self.stroke.set_tip(self.device, self.queue, tip);
             self.stroke
                 .set_paint(self.queue, *color_linear_premul, *opacity, *mode);
             self.stroke.begin_stroke();
@@ -200,7 +200,7 @@ mod tests {
             color_linear_premul: [0.0; 4],
             opacity: 1.0,
             mode: crate::editor::PaintMode::Normal,
-            falloff: openpaint_core::dab::linear_falloff(),
+            tip: openpaint_core::dab::Tip::default(),
         }
     }
 

@@ -220,6 +220,8 @@ enum FileDialogKind {
     Open,
     /// Font files to make available without installing them system-wide.
     Fonts,
+    /// An image to use as the brush's dab shape.
+    BrushTip,
 }
 
 impl FileDialogKind {
@@ -228,6 +230,7 @@ impl FileDialogKind {
         match self {
             Self::Save | Self::Open => ("OpenPaint document", &[DOCUMENT_EXTENSION]),
             Self::Fonts => ("Font", &["ttf", "otf", "ttc", "otc"]),
+            Self::BrushTip => ("Image", &["png"]),
         }
     }
 }
@@ -262,6 +265,49 @@ enum Dialog {
     Quit {
         confirmed: bool,
     },
+}
+
+/// Read a PNG into a brush tip.
+///
+/// PNG only, and deliberately: `png` is already a dependency for export, one format keeps the
+/// dependency surface small, and every tool an artist would export a tip from writes PNG. Decoded
+/// to RGBA8 so [`openpaint_core::Stamp::from_rgba`] can decide for itself which channel carries the
+/// mark, rather than this having to know.
+fn read_tip(path: &std::path::Path) -> Result<openpaint_core::Stamp, String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+    // Expand palettes, 1/2/4-bit greyscale and tRNS into plain 8-bit RGBA, so one path below
+    // handles every PNG rather than a match over colour types that would miss one.
+    decoder.set_transformations(png::Transformations::ALPHA | png::Transformations::EXPAND);
+    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
+    let mut buf = vec![0; reader.output_buffer_size().ok_or("image is too large")?];
+    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
+
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => to_eight_bit(&buf[..info.buffer_size()], info.bit_depth),
+        png::ColorType::GrayscaleAlpha => {
+            let g = to_eight_bit(&buf[..info.buffer_size()], info.bit_depth);
+            g.as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|p| [p[0], p[0], p[0], p[1]])
+                .collect()
+        }
+        other => return Err(format!("unsupported PNG colour type {other:?}")),
+    };
+    openpaint_core::Stamp::from_rgba(info.width, info.height, &rgba).map_err(|e| e.to_string())
+}
+
+/// Narrow 16-bit samples to 8, leaving 8-bit data alone.
+///
+/// A tip is one byte of coverage per texel, so the extra precision has nowhere to go. Taking the
+/// high byte is the correct narrowing for PNG's big-endian samples.
+fn to_eight_bit(data: &[u8], depth: png::BitDepth) -> Vec<u8> {
+    if depth == png::BitDepth::Sixteen {
+        data.as_chunks::<2>().0.iter().map(|p| p[0]).collect()
+    } else {
+        data.to_vec()
+    }
 }
 
 /// The layer the floating pixels of a transform live on while a drag is in progress.
@@ -2114,6 +2160,7 @@ impl OpenPaint {
         let first = answer.as_mut().and_then(|paths| paths.first().cloned());
 
         match (kind, first) {
+            (FileDialogKind::BrushTip, Some(path)) => self.load_brush_tip(&path),
             (FileDialogKind::Fonts, Some(_)) => {
                 let paths = answer.unwrap_or_default();
                 self.load_font_files(&paths);
@@ -2137,6 +2184,27 @@ impl OpenPaint {
                 self.request_redraw();
             }
         }
+    }
+
+    /// Read a PNG and make it the brush's dab shape.
+    ///
+    /// A tip is an *app resource*, not document content — a tool you own, like a font, rather than
+    /// part of the artwork. So this changes the brush and nothing else: no schema, no dirty flag,
+    /// nothing written into the file. That is also what keeps a document openable on a machine that
+    /// does not have the tip.
+    fn load_brush_tip(&mut self, path: &std::path::Path) {
+        match read_tip(path) {
+            Ok(stamp) => {
+                let (w, h) = (stamp.width(), stamp.height());
+                self.editor.brush_mut().tip =
+                    openpaint_core::dab::Tip::Stamp(std::sync::Arc::new(stamp));
+                self.status_message = Some(format!("Brush tip loaded, {w}x{h}."));
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Could not use that image as a tip: {err}"));
+            }
+        }
+        self.request_redraw();
     }
 
     /// Make font files available to this session without installing them.
@@ -2672,6 +2740,7 @@ impl OpenPaint {
         let font_substituted = self.font_substituted.clone();
         let mut text_request = None;
         let mut text_changed = false;
+        let mut brush_request = None;
         let result = renderer.render(xform, visible, &layers, active_index, |gpu| {
             if let Some(ui) = ui {
                 let out = ui.render(
@@ -2719,6 +2788,7 @@ impl OpenPaint {
                 self.wand = out.wand;
                 text_request = out.text;
                 text_changed = out.text_changed;
+                brush_request = out.brush;
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
@@ -2795,6 +2865,11 @@ impl OpenPaint {
         }
         if let Some(action) = text_request {
             self.apply_text_action(action);
+        }
+        if let Some(ui::BrushAction::LoadTip) = brush_request {
+            self.spawn_file_dialog(FileDialogKind::BrushTip, |dialog| {
+                dialog.pick_file().map(|p| vec![p])
+            });
         }
         if trim_request {
             self.trim_to_page();

@@ -122,6 +122,111 @@ struct PaintUniform {
     opacity: [f32; 4],
 }
 
+/// Upload a brush tip as an `R8Unorm` texture, or a 1x1 placeholder when there is none.
+///
+/// A placeholder rather than an unbound slot: wgpu has no null resource, and making the binding
+/// optional would mean a second pipeline and a second layout for a branch the shader already takes
+/// for free.
+fn upload_stamp(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    stamp: &openpaint_core::Stamp,
+) -> wgpu::TextureView {
+    let (width, height) = (stamp.width(), stamp.height());
+    let data = stamp.coverage();
+    let texture = stamp_texture(device, width, height);
+    // `write_texture` requires rows padded to 256 bytes, and a tip is rarely a multiple of that,
+    // so narrow tips are padded here rather than being silently skewed.
+    let padded = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let row = width;
+    let padded_row = row.div_ceil(padded) * padded;
+    let mut staged = vec![0_u8; (padded_row * height) as usize];
+    for y in 0..height {
+        let src = (y * row) as usize;
+        let dst = (y * padded_row) as usize;
+        staged[dst..dst + row as usize].copy_from_slice(&data[src..src + row as usize]);
+    }
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &staged,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(padded_row),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// The texture a brush tip lives in: one channel, because a tip is coverage and not colour.
+fn stamp_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("brush-tip"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+/// A 1x1 stand-in bound while the tip is a round brush.
+///
+/// Bound rather than left empty because wgpu has no null resource, and making the binding optional
+/// would mean a second pipeline and a second layout for a branch the shader already takes for free.
+/// Left unwritten: wgpu zero-initializes, and the shader only samples this slot when the tip is a
+/// stamp — at which point a real texture has been bound alongside the flag that says so, in the one
+/// function that sets either.
+fn placeholder_stamp(device: &wgpu::Device) -> wgpu::TextureView {
+    stamp_texture(device, 1, 1).create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Build the group holding the camera uniform and the bound tip.
+///
+/// Rebuilt rather than mutated when the tip changes: a bind group is immutable once created.
+fn make_xform_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    xform_buf: &wgpu::Buffer,
+    stamp: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("stroke-xform-bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: xform_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(stamp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
 /// Matching `TileParams` in stroke.wgsl.
 ///
 /// Padding up to `TILE_PARAMS_STRIDE` is added when records are packed, not carried as a
@@ -181,6 +286,11 @@ pub struct StrokeLayer {
     empty_group: wgpu::BindGroup,
     tile_group: wgpu::BindGroup,
     xform_group: wgpu::BindGroup,
+    /// Kept so the group can be rebuilt when the tip changes.
+    xform_layout: wgpu::BindGroupLayout,
+    stamp_sampler: wgpu::Sampler,
+    /// Whether the bound tip is a bitmap, which is what tells the shader which branch to take.
+    stamped: bool,
     paint_buf: wgpu::Buffer,
     tile_buf: wgpu::Buffer,
     xform_buf: wgpu::Buffer,
@@ -318,18 +428,51 @@ impl StrokeLayer {
 
         let xform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("stroke-xform-bgl"),
-            // Both stages: the vertex shader places the quad, and the fragment shader reads the
-            // edge profile out of the same uniform.
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, false)],
+            entries: &[
+                // Both stages: the vertex shader places the quad, and the fragment shader reads
+                // the edge profile out of the same uniform.
+                uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
-        let xform_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("stroke-xform-bg"),
-            layout: &xform_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: xform_buf.as_entire_binding(),
-            }],
+        // A round brush still binds a texture -- a 1x1 -- rather than leaving the slot empty. An
+        // optional binding would mean a second pipeline and a second layout for a branch that
+        // costs nothing taken, and wgpu has no null resource anyway.
+        let stamp_view = placeholder_stamp(device);
+        let stamp_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("stroke-stamp-sampler"),
+            // Clamped, not repeated: wrapping would put the far side of a tip against its near
+            // side, which reads as a seam around every dab. Linear, and `Stamp::sample` mirrors it
+            // exactly so the cross-check can hold the two together.
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
         });
+        let xform_group = make_xform_group(
+            device,
+            &xform_layout,
+            &xform_buf,
+            &stamp_view,
+            &stamp_sampler,
+        );
 
         // The dab pass renders *into* the accumulation array, so it must not also have it
         // bound as a sampled texture -- a colour target is an exclusive usage within a pass,
@@ -538,6 +681,9 @@ impl StrokeLayer {
             empty_group,
             tile_group,
             xform_group,
+            xform_layout,
+            stamp_sampler,
+            stamped: false,
             paint_buf,
             tile_buf,
             xform_buf,
@@ -686,18 +832,48 @@ impl StrokeLayer {
                 x_row: [xform.x_row[0], xform.x_row[1], xform.x_row[2], 0.0],
                 y_row: [xform.y_row[0], xform.y_row[1], xform.y_row[2], 0.0],
                 page: [page.x as f32, page.y as f32, ex as f32, ey as f32],
-                params: [TILE_SIZE as f32, 0.0, 0.0, 0.0],
+                params: [
+                    TILE_SIZE as f32,
+                    f32::from(u8::from(self.stamped)),
+                    0.0,
+                    0.0,
+                ],
                 falloff: self.falloff,
             }),
         );
     }
 
-    /// Set the dab edge profile for the stroke about to be drawn.
+    /// Set the tip for the stroke about to be drawn.
     ///
-    /// Sampled into a table here, once, rather than evaluated per fragment: a shader cannot walk a
-    /// spline, and every dab of a stroke shares one profile anyway.
-    pub fn set_falloff(&mut self, queue: &wgpu::Queue, falloff: &openpaint_core::Curve) {
-        self.falloff = sample_falloff(falloff);
+    /// Both arms are per *stroke*, not per dab: every dab of a stroke shares one tip, so an edge
+    /// profile is sampled into a table once here rather than walked per fragment (a shader cannot
+    /// evaluate a spline), and a stamp is uploaded once rather than per instance.
+    ///
+    /// Uploading the texture rebuilds the bind group, which is why the layout and sampler are held
+    /// — a texture view cannot be swapped inside an existing group.
+    pub fn set_tip(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tip: &openpaint_core::dab::Tip,
+    ) {
+        match tip {
+            openpaint_core::dab::Tip::Round(falloff) => {
+                self.falloff = sample_falloff(falloff);
+                self.stamped = false;
+            }
+            openpaint_core::dab::Tip::Stamp(stamp) => {
+                let view = upload_stamp(device, queue, stamp);
+                self.xform_group = make_xform_group(
+                    device,
+                    &self.xform_layout,
+                    &self.xform_buf,
+                    &view,
+                    &self.stamp_sampler,
+                );
+                self.stamped = true;
+            }
+        }
         self.write_frame(queue);
     }
 
@@ -1170,27 +1346,22 @@ mod tests {
     fn gpu_render_with(
         dabs: &[Dab],
         opacity: f32,
-        falloff: &openpaint_core::Curve,
+        tip: &openpaint_core::dab::Tip,
     ) -> Vec<[f32; 4]> {
-        gpu_render_inner(dabs, opacity, 1, falloff)
+        gpu_render_inner(dabs, opacity, 1, tip)
     }
 
     /// As `gpu_render`, but stamping the dabs in `batches` separate draw calls within one
     /// frame -- which is what a fast stroke produces.
     fn gpu_render_batched(dabs: &[Dab], opacity: f32, batches: usize) -> Vec<[f32; 4]> {
-        gpu_render_inner(
-            dabs,
-            opacity,
-            batches,
-            &openpaint_core::dab::linear_falloff(),
-        )
+        gpu_render_inner(dabs, opacity, batches, &openpaint_core::dab::Tip::default())
     }
 
     fn gpu_render_inner(
         dabs: &[Dab],
         opacity: f32,
         batches: usize,
-        falloff: &openpaint_core::Curve,
+        tip: &openpaint_core::dab::Tip,
     ) -> Vec<[f32; 4]> {
         let (device, queue) = try_device().expect("checked by caller");
 
@@ -1201,7 +1372,7 @@ mod tests {
         // Every uniform written once, before the single submission -- the ordering rule
         // this module exists to respect.
         layer.set_page(&queue, page);
-        layer.set_falloff(&queue, falloff);
+        layer.set_tip(&device, &queue, tip);
         layer.set_paint(&queue, BLACK, opacity, crate::editor::PaintMode::Normal);
         layer.upload_dabs(&device, &queue, dabs);
 
@@ -1228,18 +1399,18 @@ mod tests {
 
     /// Rasterize the same dabs through the CPU reference implementation.
     fn cpu_render(dabs: &[Dab], opacity: f32) -> Vec<[f32; 4]> {
-        cpu_render_with(dabs, opacity, &openpaint_core::dab::linear_falloff())
+        cpu_render_with(dabs, opacity, &openpaint_core::dab::Tip::default())
     }
 
     fn cpu_render_with(
         dabs: &[Dab],
         opacity: f32,
-        falloff: &openpaint_core::Curve,
+        tip: &openpaint_core::dab::Tip,
     ) -> Vec<[f32; 4]> {
         let mut canvas = Canvas::new(SIZE, SIZE);
         let mut painter = StrokePainter::new();
         painter.begin();
-        painter.add_dabs(&canvas, dabs, falloff);
+        painter.add_dabs(&canvas, dabs, tip);
         painter.composite(&mut canvas, BLACK, opacity);
 
         (0..SIZE)
@@ -1251,6 +1422,131 @@ mod tests {
                 None => [0.0; 4],
             })
             .collect()
+    }
+
+    /// A tip with obvious structure: a plus sign, off-centre, at an odd size.
+    ///
+    /// Deliberately not square and not a power of two, because the row-padding `write_texture`
+    /// demands is per row — a tip whose width happens to be a multiple of 256 would hide a skew
+    /// that every real tip would show. Deliberately not symmetric either, so a flip or a transpose
+    /// cannot pass.
+    fn cross_stamp() -> openpaint_core::Stamp {
+        const W: u32 = 13;
+        const H: u32 = 9;
+        let mut data = vec![0_u8; (W * H) as usize];
+        for x in 0..W {
+            data[(3 * W + x) as usize] = 255;
+        }
+        for y in 0..H {
+            data[(y * W + 4) as usize] = 255;
+        }
+        // One soft corner, so the test covers interpolated values and not only 0 and 255.
+        data[(W + 10) as usize] = 128;
+        data[(W + 11) as usize] = 200;
+        openpaint_core::Stamp::new(W, H, data).expect("valid stamp")
+    }
+
+    /// A bitmap tip, through both rasterizers.
+    ///
+    /// The pair that matters most of the three cross-checks, because the two sides are the least
+    /// alike: the GPU reads the tip through a hardware sampler while the CPU walks the same
+    /// arithmetic by hand. `Stamp::sample` is written to mirror a linear `ClampToEdge` sampler
+    /// exactly — texel centres at `(i + 0.5) / n` — and this is the only thing holding it there.
+    #[test]
+    fn a_stamped_tip_matches_the_cpu_reference() {
+        let Some(_) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let tip = openpaint_core::dab::Tip::Stamp(std::sync::Arc::new(cross_stamp()));
+
+        // Large enough that many page pixels fall inside one texel, which is where a sampling
+        // convention that is off by half a texel shows up.
+        let dabs = [dab(64.0, 64.0, 40.0, 1.0, 1.0)];
+        let gpu = gpu_render_with(&dabs, 1.0, &tip);
+        let cpu = cpu_render_with(&dabs, 1.0, &tip);
+
+        assert!(any_paint(&gpu), "the stamp produced no paint at all");
+        let (worst, at) = max_difference(&gpu, &cpu);
+        assert!(
+            worst < 0.01,
+            "GPU and CPU disagree by {worst} at pixel {at} ({}, {}); gpu {:?} cpu {:?}",
+            at as u32 % SIZE,
+            at as u32 / SIZE,
+            gpu[at],
+            cpu[at]
+        );
+    }
+
+    /// The stamp has to be *used*, not merely tolerated: a round dab and a cross-shaped one are
+    /// very different pictures, and agreement between two renderers that both ignored the tip
+    /// would prove nothing.
+    #[test]
+    fn a_stamped_tip_does_not_look_like_a_round_one() {
+        let Some(_) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let dabs = [dab(64.0, 64.0, 40.0, 1.0, 1.0)];
+        let stamped = gpu_render_with(
+            &dabs,
+            1.0,
+            &openpaint_core::dab::Tip::Stamp(std::sync::Arc::new(cross_stamp())),
+        );
+        let round = gpu_render(&dabs, 1.0);
+        let (difference, _) = max_difference(&stamped, &round);
+        assert!(
+            difference > 0.5,
+            "the stamped dab rendered almost identically to a round one, so the tip was ignored"
+        );
+
+        // And specifically: the corners of the dab's square are empty in the cross but covered by
+        // a hard round dab's... no — a round dab does *not* cover its square's corners. Check
+        // instead where the two genuinely differ: off the cross's arms but well inside the disc.
+        let off_arm = (64 + 14) as usize + (64 + 14) as usize * SIZE as usize;
+        assert!(
+            round[off_arm][3] > 0.9,
+            "a hard round dab should cover a point 14px from its centre"
+        );
+        assert!(
+            stamped[off_arm][3] < 0.1,
+            "and the cross should not, since nothing is drawn there in the tip"
+        );
+    }
+
+    /// Roundness and angle are dab geometry, not tip geometry, so a stamp has to turn with them.
+    /// If it did not, the two kinds of tip would answer differently to the same controls.
+    #[test]
+    fn a_stamped_tip_turns_with_the_dab() {
+        let Some(_) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let stamp = std::sync::Arc::new(cross_stamp());
+        let tip = openpaint_core::dab::Tip::Stamp(stamp);
+
+        let upright = [dab(64.0, 64.0, 40.0, 1.0, 1.0)];
+        let turned = [Dab {
+            angle: std::f32::consts::FRAC_PI_2,
+            ..upright[0]
+        }];
+
+        let a = gpu_render_with(&upright, 1.0, &tip);
+        let b = gpu_render_with(&turned, 1.0, &tip);
+        let (difference, _) = max_difference(&a, &b);
+        assert!(
+            difference > 0.5,
+            "rotating the dab did not rotate the stamp"
+        );
+
+        // And the CPU agrees about the turned one too, which is what pins the shared frame
+        // transform rather than just the sampling.
+        let cpu = cpu_render_with(&turned, 1.0, &tip);
+        let (worst, at) = max_difference(&b, &cpu);
+        assert!(
+            worst < 0.01,
+            "a rotated stamp disagrees by {worst} at pixel {at}"
+        );
     }
 
     /// A shaped edge profile, through both rasterizers.
@@ -1284,8 +1580,16 @@ mod tests {
             dab(80.0, 64.0, 22.0, 0.2, 1.0),
         ];
 
-        let gpu = gpu_render_with(&dabs, 1.0, &profile);
-        let cpu = cpu_render_with(&dabs, 1.0, &profile);
+        let gpu = gpu_render_with(
+            &dabs,
+            1.0,
+            &openpaint_core::dab::Tip::Round(profile.clone()),
+        );
+        let cpu = cpu_render_with(
+            &dabs,
+            1.0,
+            &openpaint_core::dab::Tip::Round(profile.clone()),
+        );
 
         assert!(any_paint(&gpu), "GPU produced no paint at all");
         let (worst, at) = max_difference(&gpu, &cpu);
@@ -1510,7 +1814,7 @@ mod tests {
         let mut reference = Canvas::new(W, H);
         let mut painter = StrokePainter::new();
         painter.begin();
-        painter.add_dabs(&reference, &dabs, &openpaint_core::dab::linear_falloff());
+        painter.add_dabs(&reference, &dabs, &openpaint_core::dab::Tip::default());
         painter.composite(&mut reference, BLACK, 1.0);
 
         let cpu: Vec<[f32; 4]> = (0..H)

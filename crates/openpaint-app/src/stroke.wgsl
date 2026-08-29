@@ -69,7 +69,9 @@ struct Xform {
     x_row: vec4<f32>,
     y_row: vec4<f32>,
     page: vec4<f32>,
-    params: vec4<f32>,  // x = tile size
+    // x = tile size, y = 1 when the tip is a bitmap and the stamp texture should be read
+    // instead of the edge profile.
+    params: vec4<f32>,
     // The dab's edge profile, sampled across the ramp from the solid core to the rim. A lookup
     // table because a fragment shader cannot evaluate a spline, and per *stroke* rather than per
     // dab because every dab of a stroke shares one -- which is also why it rides here rather than
@@ -82,6 +84,11 @@ struct Xform {
 @group(0) @binding(2) var accum_samp: sampler;
 @group(1) @binding(0) var<uniform> tp: TileParams;
 @group(2) @binding(0) var<uniform> xf: Xform;
+// The bitmap tip, and a linear clamped sampler for it. Always bound -- a round brush binds a 1x1
+// texture rather than leaving the slot empty, because an optional binding would mean a second
+// pipeline and a second bind group layout for a branch that costs nothing taken.
+@group(2) @binding(1) var stamp: texture_2d<f32>;
+@group(2) @binding(2) var stamp_samp: sampler;
 
 // Read the edge profile at `t`, the fraction of the way across the ramp.
 //
@@ -179,16 +186,34 @@ fn dab_fs(in: DabOut) -> @location(0) vec4<f32> {
     let s = sin(in.angle);
     let rx = in.local.x * c + in.local.y * s;
     let ry = -in.local.x * s + in.local.y * c;
-    let dist = length(vec2<f32>(rx, ry / max(in.roundness, 0.02)));
-    // Solid core radius; outside it, coverage ramps to zero at the edge.
-    let inner = max(in.radius * in.hardness, 0.0);
+    let stretched = ry / max(in.roundness, 0.02);
+
     var coverage: f32;
-    if (dist <= inner) {
-        coverage = 1.0;
-    } else if (dist >= in.radius) {
-        coverage = 0.0;
+    if (xf.params.y > 0.5) {
+        // A bitmap tip. The same frame transform decides where in the image this fragment falls,
+        // so a stamp squashes and turns with roundness and angle exactly as a round tip does.
+        // Mapped across the dab's full diameter, so the image's edge sits on the radius.
+        let d = max(in.radius, 1e-6) * 2.0;
+        let su = rx / d + 0.5;
+        let sv = stretched / d + 0.5;
+        if (su < 0.0 || su > 1.0 || sv < 0.0 || sv > 1.0) {
+            // Outside the dab's own square. Clamping instead would smear the image's edge texels
+            // across the rest of the page.
+            coverage = 0.0;
+        } else {
+            coverage = textureSampleLevel(stamp, stamp_samp, vec2<f32>(su, sv), 0.0).r;
+        }
     } else {
-        coverage = falloff_at((dist - inner) / (in.radius - inner));
+        let dist = length(vec2<f32>(rx, stretched));
+        // Solid core radius; outside it, coverage ramps to zero at the edge.
+        let inner = max(in.radius * in.hardness, 0.0);
+        if (dist <= inner) {
+            coverage = 1.0;
+        } else if (dist >= in.radius) {
+            coverage = 0.0;
+        } else {
+            coverage = falloff_at((dist - inner) / (in.radius - inner));
+        }
     }
     let deposit = coverage * clamp(in.flow, 0.0, 1.0);
     // Same value in every channel: the target is single-channel, and writing it to .a as

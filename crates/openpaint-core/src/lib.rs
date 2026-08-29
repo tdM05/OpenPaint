@@ -21,6 +21,7 @@ pub mod raster;
 pub mod region;
 pub mod selection;
 pub mod stabilizer;
+pub mod stamp;
 pub mod stroke;
 pub mod text;
 pub mod tile;
@@ -36,6 +37,7 @@ pub use modulation::{Input, Response, Source};
 pub use page::{Page, PageRect, PageResize, Side};
 pub use selection::Selection;
 pub use stabilizer::{Smoothed, Stabilizer};
+pub use stamp::Stamp;
 pub use stroke::StrokePainter;
 pub use text::{TextBlock, TextRenderer};
 

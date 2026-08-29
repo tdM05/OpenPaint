@@ -39,6 +39,74 @@
 
 use crate::curve::Curve;
 
+/// What decides a dab's coverage.
+///
+/// A dab's *geometry* — where it is, how big, how round, at what angle — is the same either way.
+/// This is only the answer to "how covered is this point", and putting the choice here rather than
+/// in two rasterizers is what keeps spacing, modulation, blending, tile touching and the GPU quad
+/// from knowing that bitmap tips exist at all.
+///
+/// Two arms and not more, deliberately:
+///
+/// - [`Tip::Round`] — coverage from distance, through an edge profile (see §4o). Cheap, resolution
+///   independent, and what every brush was before bitmap tips.
+/// - [`Tip::Stamp`] — coverage read from an image. What makes a chalk, a bristle brush or a
+///   screentone dot possible at all.
+///
+/// **Hardness applies to `Round` only.** A stamp already contains its own edge — that is most of
+/// what it *is* — so a hardness control over the top would be a second, contradictory answer to the
+/// same question. See [`Dab::coverage_at`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum Tip {
+    Round(Curve),
+    /// Shared rather than owned: a stamp is hundreds of kilobytes and a `Brush` is cloned for every
+    /// queued stroke, so the tip travels with the stroke by pointer.
+    Stamp(std::sync::Arc<crate::Stamp>),
+}
+
+impl Default for Tip {
+    fn default() -> Self {
+        Self::Round(linear_falloff())
+    }
+}
+
+impl Tip {
+    /// Whether this is a bitmap tip.
+    #[must_use]
+    pub fn is_stamp(&self) -> bool {
+        matches!(self, Self::Stamp(_))
+    }
+
+    /// The edge profile, when there is one to edit.
+    ///
+    /// `None` for a stamp, which is what the UI needs to know to stop offering an edge control that
+    /// would do nothing.
+    #[must_use]
+    pub fn falloff(&self) -> Option<&Curve> {
+        match self {
+            Self::Round(curve) => Some(curve),
+            Self::Stamp(_) => None,
+        }
+    }
+
+    /// The edge profile, to edit.
+    pub fn falloff_mut(&mut self) -> Option<&mut Curve> {
+        match self {
+            Self::Round(curve) => Some(curve),
+            Self::Stamp(_) => None,
+        }
+    }
+
+    /// The bitmap, when there is one.
+    #[must_use]
+    pub fn stamp(&self) -> Option<&std::sync::Arc<crate::Stamp>> {
+        match self {
+            Self::Round(_) => None,
+            Self::Stamp(stamp) => Some(stamp),
+        }
+    }
+}
+
 /// The narrowest a dab may be, as a fraction of its radius.
 ///
 /// Not zero: roundness divides, and a dab with no width would cover nothing anywhere while costing
@@ -124,8 +192,39 @@ impl Dab {
     /// specific tuned curve, not linear, so this is a placeholder that is
     /// correct-shaped but not yet correct-valued.
     #[must_use]
-    pub fn coverage_at(&self, px: f32, py: f32, falloff: &Curve) -> f32 {
-        self.coverage_at_distance(self.distance_to(px, py), falloff)
+    pub fn coverage_at(&self, px: f32, py: f32, tip: &Tip) -> f32 {
+        match tip {
+            Tip::Round(falloff) => self.coverage_at_distance(self.distance_to(px, py), falloff),
+            Tip::Stamp(stamp) => {
+                let (u, v) = self.stamp_coords(px, py);
+                // Outside the dab's own square the stamp does not reach, and clamping instead
+                // would smear the image's edge texels across the rest of the page.
+                if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                    return 0.0;
+                }
+                stamp.sample(u, v)
+            }
+        }
+    }
+
+    /// Where a page point falls within the stamp image, as `0..=1` on each axis.
+    ///
+    /// The same frame transform [`Dab::distance_to`] uses — rotated back by the dab's angle, minor
+    /// axis stretched to the major — so a stamp squashes and turns with roundness and angle exactly
+    /// as a round tip does. Without that, the two kinds of tip would answer differently to the same
+    /// controls.
+    ///
+    /// The stamp is mapped across the dab's full diameter, so its outer edge sits on the radius and
+    /// nothing about pixel bounds or tile touching changes.
+    #[must_use]
+    pub fn stamp_coords(&self, px: f32, py: f32) -> (f32, f32) {
+        let dx = px - self.x;
+        let dy = py - self.y;
+        let (sin, cos) = self.angle.sin_cos();
+        let rx = dx * cos + dy * sin;
+        let ry = (-dx * sin + dy * cos) / self.roundness.clamp(MIN_ROUNDNESS, 1.0);
+        let d = self.radius.max(f32::MIN_POSITIVE) * 2.0;
+        (rx / d + 0.5, ry / d + 0.5)
     }
 
     /// Distance from the centre, measured in the dab's own frame.
@@ -267,19 +366,19 @@ mod tests {
         };
         // Unrotated, the major axis runs along x.
         assert!(
-            d.coverage_at(19.0, 0.0, &linear_falloff()) > 0.9,
+            d.coverage_at(19.0, 0.0, &Tip::default()) > 0.9,
             "along the major axis"
         );
         assert!(
-            d.coverage_at(21.0, 0.0, &linear_falloff()) < 0.01,
+            d.coverage_at(21.0, 0.0, &Tip::default()) < 0.01,
             "and stops at the radius"
         );
         assert!(
-            d.coverage_at(0.0, 4.0, &linear_falloff()) > 0.9,
+            d.coverage_at(0.0, 4.0, &Tip::default()) > 0.9,
             "across the minor axis"
         );
         assert!(
-            d.coverage_at(0.0, 6.0, &linear_falloff()) < 0.01,
+            d.coverage_at(0.0, 6.0, &Tip::default()) < 0.01,
             "the minor axis should end at a quarter of the radius"
         );
     }
@@ -297,12 +396,12 @@ mod tests {
         };
 
         assert!(
-            flat.coverage_at(15.0, 0.0, &linear_falloff()) > 0.9
-                && flat.coverage_at(0.0, 15.0, &linear_falloff()) < 0.01
+            flat.coverage_at(15.0, 0.0, &Tip::default()) > 0.9
+                && flat.coverage_at(0.0, 15.0, &Tip::default()) < 0.01
         );
         assert!(
-            turned.coverage_at(0.0, 15.0, &linear_falloff()) > 0.9
-                && turned.coverage_at(15.0, 0.0, &linear_falloff()) < 0.01,
+            turned.coverage_at(0.0, 15.0, &Tip::default()) > 0.9
+                && turned.coverage_at(15.0, 0.0, &Tip::default()) < 0.01,
             "a quarter turn should swap the axes"
         );
     }
@@ -318,8 +417,8 @@ mod tests {
         };
         for (x, y) in [(5.0_f32, 0.0_f32), (0.0, 5.0), (9.0, 9.0), (14.0, 3.0)] {
             assert!(
-                (plain.coverage_at(x, y, &linear_falloff())
-                    - turned.coverage_at(x, y, &linear_falloff()))
+                (plain.coverage_at(x, y, &Tip::default())
+                    - turned.coverage_at(x, y, &Tip::default()))
                 .abs()
                     < 1e-4,
                 "rotating a circle changed it at ({x}, {y})"
@@ -338,16 +437,16 @@ mod tests {
         };
         // Halfway out along each dab's own major axis, the falloff should have progressed equally.
         assert!(
-            (round.coverage_at(15.0, 0.0, &linear_falloff())
-                - flat.coverage_at(15.0, 0.0, &linear_falloff()))
+            (round.coverage_at(15.0, 0.0, &Tip::default())
+                - flat.coverage_at(15.0, 0.0, &Tip::default()))
             .abs()
                 < 1e-4,
             "the falloff differs along the major axis"
         );
         // And equally at the matching fraction across the minor.
         assert!(
-            (round.coverage_at(0.0, 15.0, &linear_falloff())
-                - flat.coverage_at(0.0, 15.0 * 0.25, &linear_falloff()))
+            (round.coverage_at(0.0, 15.0, &Tip::default())
+                - flat.coverage_at(0.0, 15.0 * 0.25, &Tip::default()))
             .abs()
                 < 1e-4,
             "the falloff differs across the minor axis"
@@ -371,7 +470,7 @@ mod tests {
                         let outside = x < min_x || y < min_y || x > max_x || y > max_y;
                         if outside {
                             assert_eq!(
-                                d.coverage_at(x as f32, y as f32, &linear_falloff()),
+                                d.coverage_at(x as f32, y as f32, &Tip::default()),
                                 0.0,
                                 "roundness {roundness} angle {angle} covered ({x}, {y}), \
                                  which is outside its own bounds"
@@ -383,12 +482,141 @@ mod tests {
         }
     }
 
+    /// A tip is asked for coverage instead of the edge profile, not as well as it: the two answer
+    /// the same question and there is no sensible way to combine them.
+    #[test]
+    fn a_stamped_tip_replaces_the_procedural_edge() {
+        let solid = std::sync::Arc::new(crate::Stamp::new(1, 1, vec![255]).expect("valid"));
+        let tip = Tip::Stamp(solid);
+        // Hardness zero would make a round tip fade from the very centre. A stamp ignores it.
+        let d = Dab {
+            hardness: 0.0,
+            ..dab(20.0, 0.0)
+        };
+        assert!(
+            (d.coverage_at(10.0, 0.0, &tip) - 1.0).abs() < 1e-4,
+            "a solid stamp should be solid regardless of hardness"
+        );
+        assert!(
+            d.coverage_at(10.0, 0.0, &Tip::default()) < 0.9,
+            "and a round tip at the same hardness should not be"
+        );
+    }
+
+    /// The stamp is mapped across the dab's diameter, so nothing that reasons about a dab's extent
+    /// has to learn about tips. Outside that square it draws nothing, rather than smearing the
+    /// image's edge texels across the page.
+    #[test]
+    fn a_stamp_stays_inside_the_dab() {
+        let solid = std::sync::Arc::new(crate::Stamp::new(1, 1, vec![255]).expect("valid"));
+        let tip = Tip::Stamp(solid);
+        let d = dab(20.0, 1.0);
+        assert!(d.coverage_at(0.0, 0.0, &tip) > 0.9, "the centre is covered");
+        assert_eq!(
+            d.coverage_at(30.0, 0.0, &tip),
+            0.0,
+            "well outside the dab, nothing"
+        );
+
+        let (min_x, min_y, max_x, max_y) = d.pixel_bounds();
+        for (x, y) in [
+            (min_x - 1, 0),
+            (max_x + 1, 0),
+            (0, min_y - 1),
+            (0, max_y + 1),
+        ] {
+            assert_eq!(
+                d.coverage_at(x as f32, y as f32, &tip),
+                0.0,
+                "({x}, {y}) is outside the dab's own bounds"
+            );
+        }
+    }
+
+    /// The corners of the dab's square are inside the stamp but outside the disc, which is how a
+    /// stamped tip can make a mark a round one never could.
+    #[test]
+    fn a_stamp_reaches_the_corners_a_disc_cannot() {
+        let solid = std::sync::Arc::new(crate::Stamp::new(1, 1, vec![255]).expect("valid"));
+        let d = dab(20.0, 1.0);
+        // Just inside the square's corner: distance 19*sqrt(2) is well past the radius.
+        let (x, y) = (19.0, 19.0);
+        assert_eq!(
+            d.coverage_at(x, y, &Tip::default()),
+            0.0,
+            "a disc does not reach its square's corner"
+        );
+        assert!(
+            d.coverage_at(x, y, &Tip::Stamp(solid)) > 0.9,
+            "a stamp does"
+        );
+    }
+
+    /// Roundness and angle are dab geometry, so a stamp turns with them exactly as a disc does.
+    #[test]
+    fn stamp_coordinates_follow_the_dabs_frame() {
+        let d = Dab {
+            angle: std::f32::consts::FRAC_PI_2,
+            ..dab(20.0, 1.0)
+        };
+        // A quarter turn should send a point on +x to the stamp's -v side.
+        let (u, v) = d.stamp_coords(10.0, 0.0);
+        assert!((u - 0.5).abs() < 1e-4, "u should be centred, got {u}");
+        assert!(
+            v < 0.5,
+            "a quarter turn should move it up the image, got {v}"
+        );
+
+        let plain = dab(20.0, 1.0);
+        let (u, v) = plain.stamp_coords(10.0, 0.0);
+        assert!(u > 0.5 && (v - 0.5).abs() < 1e-4, "unrotated: {u}, {v}");
+    }
+
+    /// The centre of the dab is the centre of the image, whatever the shape.
+    #[test]
+    fn the_dab_centre_is_the_stamp_centre() {
+        for roundness in [1.0_f32, 0.4] {
+            for angle in [0.0_f32, 1.1] {
+                let d = Dab {
+                    roundness,
+                    angle,
+                    ..dab(20.0, 1.0)
+                };
+                let (u, v) = d.stamp_coords(d.x, d.y);
+                assert!(
+                    (u - 0.5).abs() < 1e-4 && (v - 0.5).abs() < 1e-4,
+                    "roundness {roundness} angle {angle} gave ({u}, {v})"
+                );
+            }
+        }
+    }
+
+    /// The two arms report themselves honestly, which is what lets the UI stop offering an edge
+    /// control that would do nothing.
+    #[test]
+    fn a_tip_says_which_kind_it_is() {
+        let round = Tip::default();
+        assert!(!round.is_stamp());
+        assert!(round.falloff().is_some());
+        assert!(round.stamp().is_none());
+
+        let stamp = Tip::Stamp(std::sync::Arc::new(
+            crate::Stamp::new(1, 1, vec![255]).expect("valid"),
+        ));
+        assert!(stamp.is_stamp());
+        assert!(
+            stamp.falloff().is_none(),
+            "a stamp has no edge profile to edit"
+        );
+        assert!(stamp.stamp().is_some());
+    }
+
     #[test]
     fn coverage_at_matches_coverage_at_distance() {
         let d = dab(10.0, 0.5);
         // (3,4) is distance 5 from the origin.
         assert!(
-            (d.coverage_at(3.0, 4.0, &linear_falloff())
+            (d.coverage_at(3.0, 4.0, &Tip::default())
                 - d.coverage_at_distance(5.0, &linear_falloff()))
             .abs()
                 < 1e-6

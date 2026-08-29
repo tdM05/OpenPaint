@@ -508,6 +508,67 @@ list. `layer_text` was added to `STRUCTURE_SCHEMA` and not to those, and *every*
 migration failed with "table already exists". There is now one `DROP_STRUCTURE`,
 and the branches collapsed into one, since they all did the same thing.
 
+### 4p. A brush tip is either a curve or a bitmap — 2026-08-29
+
+The last thing that changes what a brush *is*, and what brush presets have been
+waiting on: a chalk, a bristle brush and a screentone dot are not settings of a
+soft disc, they are a different shape of mark.
+
+`Tip` is the choice, and it sits exactly where the edge profile sat rather than
+alongside it:
+
+- **`Round(Curve)`** — coverage from distance, through §4o's edge profile.
+- **`Stamp(Arc<Stamp>)`** — coverage read from an image.
+
+**Dab geometry is unchanged.** Centre, radius, roundness and angle mean the same
+for both, and a stamp is sampled through the *same* frame transform
+`Dab::distance_to` uses — rotated back by the angle, minor axis stretched to the
+major — so a bitmap tip squashes and turns with the same controls a round one
+does. Without that the two kinds would answer differently to the same sliders.
+The image is mapped across the dab's diameter, so its edge lands on the radius
+and nothing that reasons about a dab's extent changes.
+
+**Hardness applies to `Round` only, and the UI stops offering it.** A stamp
+already carries its own edge — that is most of what it is — so a hardness
+control over the top would be a second, contradictory answer to one question.
+`Tip::falloff()` returning `None` is how the panel knows.
+
+**Coverage, not colour.** One byte per texel. A coloured tip is a different
+feature (a dual brush, or a stamped image), and mixing them would mean deciding
+what happens when a coloured tip meets a brush colour — a question with no good
+answer. The tip says where ink lands; the brush says what colour it is.
+
+#### What looks like ink is ink
+
+Two conventions exist and both are common: a tip drawn black-on-white with no
+transparency (Photoshop's `.abr` tips), and one drawn opaque-on-transparent
+(what exporting from any paint app gives you). Rather than making the artist
+know which they have, an image that uses its alpha is read from alpha and a
+fully opaque one from inverted luminance. Guessing is safe here in a way it
+usually is not: a tip wrong under one rule would be *obviously* wrong — an
+inverted mark — rather than subtly so.
+
+#### A tip is an app resource, not document content
+
+A tool you own, like a font, rather than part of the artwork. Nothing about it
+is written into a `.openpaint` file, which is what keeps a document openable on
+a machine that does not have the tip. When brush *presets* land they will
+reference a tip the same way a text layer references a family — by name, with
+the substitution reported.
+
+#### The cross-check that matters most
+
+The GPU reads the tip through a hardware sampler; the CPU walks the same
+arithmetic by hand. That is the least alike the two rasterizers have ever been —
+not two spellings of one formula but genuinely different machinery — so
+`Stamp::sample` is written to mirror a linear `ClampToEdge` sampler exactly
+(texel centres at `(i + 0.5) / n`), and the cross-check is the only thing
+holding it there. The test tip is deliberately 13x9: not square, not a power of
+two, and not symmetric, so row padding, a transpose and a flip all fail it.
+Sabotages that do: the half-texel offset dropped, the sample transposed, the
+angle ignored, rows uploaded unpadded, the stamped flag never reaching the
+shader, and `set_tip` keeping the placeholder texture.
+
 ### 4o. The dab's edge is a curve, not a number — 2026-08-28
 
 Hardness said how much of a dab is solid. Between that core and the rim the
