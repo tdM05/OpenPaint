@@ -139,6 +139,8 @@ struct OpenPaint {
     dragging: Option<Dragging>,
     /// How the magic wand behaves. Owned here because the panel only edits it.
     wand: ui::WandSettings,
+    /// The filter a transform resamples with. A preference, so it outlives any one gesture.
+    kernel: openpaint_core::Kernel,
     /// Font families installed on this machine, gathered once.
     ///
     /// Cached rather than asked for per frame: enumerating the system font set walks every
@@ -329,8 +331,21 @@ struct Dragging {
     before: Vec<(openpaint_core::tile::TileCoord, crate::history::TileBefore)>,
     /// Where the drag began, in page coordinates.
     from: (f32, f32),
-    /// How far it has moved, in whole pixels.
-    offset: (i32, i32),
+    /// How the pixels are currently placed.
+    ///
+    /// A whole-pixel translation while only dragging, which takes the exact copy path; scale and
+    /// rotation arrive from the panel and turn it into a resample.
+    transform: openpaint_core::Transform,
+    /// The filter used to resample it, when it needs resampling.
+    kernel: openpaint_core::Kernel,
+    /// Whether this session survives the release of the pointer.
+    ///
+    /// A quick drag lifts, moves and puts down in one gesture — nothing else is possible with one
+    /// button and no keyboard. A *transform* has to stay in the air while its scale and rotation
+    /// are adjusted, and is committed or abandoned explicitly. Both are the same machinery; this
+    /// says which one is happening, so a release does not silently end a session someone is still
+    /// working in.
+    persistent: bool,
 }
 
 /// Who owns the pointer between a press and its release.
@@ -596,6 +611,7 @@ impl Default for OpenPaint {
             capture: Capture::None,
             dragging: None,
             wand: ui::WandSettings::default(),
+            kernel: openpaint_core::Kernel::default(),
             font_families: Vec::new(),
             font_substituted: None,
             selection: None,
@@ -1159,15 +1175,119 @@ impl OpenPaint {
             self.request_redraw();
             return;
         };
-        renderer.float_at(&lifted, (0, 0), FLOAT_LAYER);
+        let kernel = self.kernel;
+        renderer.float_at(
+            &lifted,
+            &openpaint_core::Transform::IDENTITY,
+            kernel,
+            FLOAT_LAYER,
+        );
         self.dragging = Some(Dragging {
             layer,
             lifted,
             selection,
             before,
             from,
-            offset: (0, 0),
+            transform: openpaint_core::Transform::IDENTITY,
+            kernel,
+            persistent: false,
         });
+        self.request_redraw();
+    }
+
+    /// Lift the selection and stay in the air, so it can be scaled and rotated before landing.
+    ///
+    /// The same lift a drag does, held open. Entered from the panel rather than from the canvas
+    /// because a press inside a selection already means "drag it", and overloading that would make
+    /// the quick move stop being quick.
+    fn begin_transform(&mut self) {
+        if self.dragging.is_some() {
+            return;
+        }
+        let Some(selection) = self.selection.as_ref().map(|s| s.mask.clone()) else {
+            self.status_message = Some("Nothing is selected".to_owned());
+            self.request_redraw();
+            return;
+        };
+        let layer = tile_store::LayerId(self.editor.active_layer_id());
+        let kernel = self.kernel;
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let Some((lifted, before)) = renderer.lift_selection(&selection, layer) else {
+            self.status_message = Some("Nothing to transform: the selection is empty".to_owned());
+            self.request_redraw();
+            return;
+        };
+        // The pivot is the centre of what was lifted, so scaling and rotation happen in place
+        // rather than swinging the artwork away from the page origin.
+        let pivot = lifted.bounds().map_or((0.0, 0.0), |(x0, y0, x1, y1)| {
+            #[expect(clippy::cast_precision_loss, reason = "page coordinates")]
+            {
+                ((x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0)
+            }
+        });
+        let transform = openpaint_core::Transform {
+            pivot,
+            ..openpaint_core::Transform::IDENTITY
+        };
+        renderer.float_at(&lifted, &transform, kernel, FLOAT_LAYER);
+        self.dragging = Some(Dragging {
+            layer,
+            lifted,
+            selection,
+            before,
+            from: pivot,
+            transform,
+            kernel,
+            persistent: true,
+        });
+        self.status_message = Some(
+            "Transforming. Drag to move, adjust in the panel, Enter to apply, Esc to cancel."
+                .to_owned(),
+        );
+        self.request_redraw();
+    }
+
+    /// Adopt a transform edited in the panel and re-float the pixels.
+    fn set_transform(
+        &mut self,
+        transform: openpaint_core::Transform,
+        kernel: openpaint_core::Kernel,
+    ) {
+        self.kernel = kernel;
+        let Some(drag) = self.dragging.as_mut() else {
+            return;
+        };
+        if drag.transform == transform && drag.kernel == kernel {
+            return;
+        }
+        drag.transform = transform;
+        drag.kernel = kernel;
+        let lifted = drag.lifted.clone();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.float_at(&lifted, &transform, kernel, FLOAT_LAYER);
+        }
+        self.request_redraw();
+    }
+
+    /// Put the floating pixels back where they came from, transforming nothing.
+    ///
+    /// Free, because the layer has been untouched since the lift: the whole gesture is abandoned by
+    /// simply not committing it, which is the property the lift/float/put-down split exists for.
+    fn cancel_transform(&mut self) {
+        let Some(drag) = self.dragging.take() else {
+            return;
+        };
+        // The renderer's absence must not skip what follows. Obligations first, then a branch --
+        // §11a.7, which is exactly the shape that once killed painting outright.
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.drop_float(FLOAT_LAYER);
+            renderer.paste_back(drag.layer, drag.before);
+        }
+        // Deliberately no `mark_dirty`: nothing changed. The layer has been untouched since the
+        // lift, so an abandoned transform is not an edit to undo but an edit that never happened.
+        self.status_message = Some("Transform cancelled".to_owned());
         self.request_redraw();
     }
 
@@ -1179,50 +1299,63 @@ impl OpenPaint {
         let Some(drag) = self.dragging.as_mut() else {
             return;
         };
-        // Whole pixels: a move should not resample, so it should not offer to.
-        let offset = (
-            (to.0 - drag.from.0).round() as i32,
-            (to.1 - drag.from.1).round() as i32,
-        );
-        if offset == drag.offset {
+        // Whole pixels: dragging should not resample, so it should not offer to. A transform that
+        // is only a whole-pixel translation still takes the exact copy path.
+        let offset = ((to.0 - drag.from.0).round(), (to.1 - drag.from.1).round());
+        if offset == drag.transform.offset {
             return;
         }
-        drag.offset = offset;
+        drag.transform.offset = offset;
+        let (transform, kernel) = (drag.transform, drag.kernel);
         let lifted = drag.lifted.clone();
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.float_at(&lifted, offset, FLOAT_LAYER);
+            renderer.float_at(&lifted, &transform, kernel, FLOAT_LAYER);
         }
         self.request_redraw();
     }
 
-    /// Put them down, and take the selection with them.
+    /// End a quick drag by putting the pixels down.
+    ///
+    /// A persistent transform ignores this: it is committed by Enter or by the panel, not by
+    /// letting go of the pointer, or adjusting a scale would be impossible.
     fn move_release(&mut self) {
+        if self.dragging.as_ref().is_some_and(|d| d.persistent) {
+            return;
+        }
+        self.commit_transform();
+    }
+
+    /// Put the floating pixels down, and take the selection with them.
+    fn commit_transform(&mut self) {
         let Some(drag) = self.dragging.take() else {
             return;
         };
-        let offset = drag.offset;
-        let Some(renderer) = self.renderer.as_mut() else {
-            return;
+        let (transform, kernel) = (drag.transform, drag.kernel);
+        let page = self.editor.page_rect();
+        // As in `cancel_transform`: the state below is owed whether or not there is a renderer.
+        let recorded = if let Some(renderer) = self.renderer.as_mut() {
+            renderer.drop_float(FLOAT_LAYER);
+            renderer.put_down(
+                &drag.lifted,
+                &transform,
+                kernel,
+                drag.layer,
+                &drag.selection,
+                drag.before,
+            )
+        } else {
+            true
         };
-        renderer.drop_float(FLOAT_LAYER);
-        let recorded = renderer.put_down(
-            &drag.lifted,
-            offset,
-            drag.layer,
-            &drag.selection,
-            drag.before,
-        );
 
-        // The selection follows the pixels, so a second drag moves the same content rather than
+        // The selection follows the pixels, so a second gesture moves the same content rather than
         // whatever is now underneath the old outline.
-        if offset != (0, 0) {
-            let page = self.editor.page_rect();
+        if transform != openpaint_core::Transform::IDENTITY {
             self.set_selection(
-                Some(drag.selection.shifted(offset.0, offset.1, page)),
+                Some(drag.selection.transformed(&transform, kernel, page)),
                 if recorded {
-                    "Moved the selection"
+                    "Applied the transform"
                 } else {
-                    "That move was too large to record; it cannot be undone"
+                    "That transform was too large to record; it cannot be undone"
                 },
             );
         }
@@ -1507,17 +1640,23 @@ impl OpenPaint {
             [sx, sy]
         };
 
-        // While a move is in flight the outline follows the pixels, or it would sit over the hole
-        // they came from and say the selection is somewhere it is not.
-        let (ox, oy) = self
+        // While a transform is in flight the outline follows the pixels, or it would sit over the
+        // hole they came from and say the selection is somewhere it is not. Mapped through the
+        // transform rather than offset by it, so a rotated selection is drawn rotated — the outline
+        // is a path, and a path is exactly what an affine transform is cheap to apply to.
+        let live_transform = self
             .dragging
             .as_ref()
-            .map_or((0.0, 0.0), |d| (d.offset.0 as f32, d.offset.1 as f32));
+            .map_or(openpaint_core::Transform::IDENTITY, |d| d.transform);
         let committed = self.selection.iter().flat_map(move |s| {
             s.outline
                 .iter()
-                .map(|path| path.iter().map(|p| (p.0 + ox, p.1 + oy)).collect())
-                .collect::<Vec<openpaint_core::selection::Loop>>()
+                .map(|path| {
+                    path.iter()
+                        .map(|p| live_transform.apply(p.0, p.1))
+                        .collect()
+                })
+                .collect::<Vec<Vec<(f32, f32)>>>()
         });
         let live = self.select.iter().flat_map(Select::preview);
         committed
@@ -1573,15 +1712,8 @@ impl OpenPaint {
             // The selection follows the pixels it moved, in both directions. Without this, undoing
             // a move put the artwork back and left the outline at the destination, describing a
             // selection of something that was no longer there.
-            renderer::HistoryChange::Moved { offset } => {
-                let page = self.editor.page_rect();
-                if let Some(mask) = self
-                    .selection
-                    .as_ref()
-                    .map(|s| s.mask.shifted(offset.0, offset.1, page))
-                {
-                    self.set_selection(Some(mask), "Moved the selection back");
-                }
+            renderer::HistoryChange::SelectionRestored { selection } => {
+                self.set_selection(Some(*selection), "Moved the selection back");
                 self.request_redraw();
             }
             renderer::HistoryChange::Geometry { rect } => {
@@ -2306,6 +2438,37 @@ impl OpenPaint {
         self.request_redraw();
     }
 
+    /// Enter applies a transform, Escape puts it back. Only while one is in the air, so neither
+    /// key is stolen from anything else.
+    ///
+    /// A *quick* drag is deliberately not covered: it commits when the pointer is released, so
+    /// there is no moment at which these could apply to one.
+    fn handle_transform_keys(&mut self, event: &WindowEvent) -> bool {
+        use winit::event::ElementState;
+        use winit::keyboard::{Key, NamedKey};
+
+        if !self.dragging.as_ref().is_some_and(|d| d.persistent) {
+            return false;
+        }
+        let WindowEvent::KeyboardInput { event: key, .. } = event else {
+            return false;
+        };
+        if key.state != ElementState::Pressed {
+            return false;
+        }
+        match key.logical_key {
+            Key::Named(NamedKey::Enter) => {
+                self.commit_transform();
+                true
+            }
+            Key::Named(NamedKey::Escape) => {
+                self.cancel_transform();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Enter applies the crop, Escape cancels it. Only while the tool is up, so neither
     /// key is stolen from anything else.
     fn handle_crop_keys(&mut self, event: &WindowEvent) -> bool {
@@ -2741,6 +2904,12 @@ impl OpenPaint {
         let mut text_request = None;
         let mut text_changed = false;
         let mut brush_request = None;
+        let mut transform_request = None;
+        let live_transform = self.dragging.as_ref().map(|d| ui::TransformState {
+            transform: d.transform,
+            kernel: d.kernel,
+        });
+        let mut transform_state = live_transform;
         let result = renderer.render(xform, visible, &layers, active_index, |gpu| {
             if let Some(ui) = ui {
                 let out = ui.render(
@@ -2773,6 +2942,8 @@ impl OpenPaint {
                         wand: self.wand,
                         font_families,
                         font_substituted: font_substituted.as_deref(),
+                        transform: live_transform,
+                        kernel: self.kernel,
                     },
                 );
                 ui_wants_repaint = out.wants_repaint;
@@ -2789,6 +2960,8 @@ impl OpenPaint {
                 text_request = out.text;
                 text_changed = out.text_changed;
                 brush_request = out.brush;
+                transform_request = out.transform;
+                transform_state = out.transform_state;
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
@@ -2865,6 +3038,15 @@ impl OpenPaint {
         }
         if let Some(action) = text_request {
             self.apply_text_action(action);
+        }
+        if let Some(state) = transform_state {
+            self.set_transform(state.transform, state.kernel);
+        }
+        match transform_request {
+            Some(ui::TransformAction::Begin) => self.begin_transform(),
+            Some(ui::TransformAction::Apply) => self.commit_transform(),
+            Some(ui::TransformAction::Cancel) => self.cancel_transform(),
+            None => {}
         }
         if let Some(ui::BrushAction::LoadTip) = brush_request {
             self.spawn_file_dialog(FileDialogKind::BrushTip, |dialog| {
@@ -2983,8 +3165,12 @@ impl OpenPaint {
             }
         }
 
-        // The crop tool claims Enter and Escape while it is up.
+        // The crop tool claims Enter and Escape while it is up, and so does a transform. They
+        // cannot both be up: starting a crop is a panel action, and so is starting a transform.
         if self.handle_crop_keys(&event) {
+            return;
+        }
+        if self.handle_transform_keys(&event) {
             return;
         }
 
@@ -3445,6 +3631,114 @@ mod tests {
             content: openpaint_core::Content::Raster,
         });
         assert!(app.dirty, "an undo leaves the file behind the document");
+    }
+
+    /// A transform session standing in for one a renderer would have created.
+    ///
+    /// Headless, so nothing can actually be lifted; what these tests exercise is the *session*
+    /// logic — which release ends it, what cancelling does — and that is pure state.
+    fn session(persistent: bool, transform: openpaint_core::Transform) -> Dragging {
+        Dragging {
+            layer: tile_store::LayerId(0),
+            lifted: openpaint_core::Lifted::default(),
+            selection: openpaint_core::Selection::new(),
+            before: Vec::new(),
+            from: (0.0, 0.0),
+            transform,
+            kernel: openpaint_core::Kernel::default(),
+            persistent,
+        }
+    }
+
+    /// A transform session survives the pointer being released, which is the whole difference
+    /// between it and a quick drag: you cannot adjust a scale while holding a button down.
+    #[test]
+    fn a_transform_session_outlives_the_pointer() {
+        // No renderer headlessly, so the lift cannot happen -- but the guard that a release must
+        // not end a persistent session is pure logic, and it is the part that would break.
+        let mut app = OpenPaint {
+            dragging: Some(session(true, openpaint_core::Transform::IDENTITY)),
+            ..OpenPaint::default()
+        };
+        app.apply_select_action(ui::SelectAction::All);
+        app.move_release();
+        assert!(
+            app.dragging.is_some(),
+            "releasing the pointer ended a transform someone was still adjusting"
+        );
+    }
+
+    /// A quick drag is the opposite: it commits when the pointer is released, because with one
+    /// button and no keyboard there is nothing else it could mean.
+    #[test]
+    fn a_quick_drag_still_commits_on_release() {
+        let mut app = OpenPaint {
+            dragging: Some(session(false, openpaint_core::Transform::IDENTITY)),
+            ..OpenPaint::default()
+        };
+        app.move_release();
+        assert!(app.dragging.is_none(), "a quick drag should end on release");
+    }
+
+    /// Cancelling puts the pixels back and touches the history stack not at all: the layer has
+    /// been untouched since the lift, so an abandoned transform is not an edit to undo but an edit
+    /// that never happened.
+    ///
+    /// Constructing a `KeyEvent` is platform-specific, so the Enter/Escape wiring itself is not
+    /// reachable from a headless test — named here rather than left implicit, since that is where
+    /// a bug would hide. What is testable is what those keys call.
+    #[test]
+    fn cancelling_a_transform_ends_the_session_without_recording_anything() {
+        let mut app = OpenPaint {
+            dragging: Some(session(
+                true,
+                openpaint_core::Transform {
+                    rotation: 0.5,
+                    ..openpaint_core::Transform::IDENTITY
+                },
+            )),
+            ..OpenPaint::default()
+        };
+        app.mark_clean();
+
+        app.cancel_transform();
+        assert!(app.dragging.is_none(), "the session should be over");
+        assert!(
+            !app.dirty,
+            "an abandoned transform changed nothing, so the file is not out of date"
+        );
+    }
+
+    /// The outline follows the pixels through the whole transform, not just its translation. An
+    /// outline still sitting square around rotated pixels describes a selection of something that
+    /// is no longer there.
+    #[test]
+    fn the_live_outline_is_transformed_not_merely_offset() {
+        let mut app = OpenPaint::default();
+        app.apply_select_action(ui::SelectAction::All);
+        let square = app
+            .selection
+            .as_ref()
+            .expect("everything is selected")
+            .outline
+            .clone();
+        assert!(!square.is_empty());
+
+        let t = openpaint_core::Transform {
+            pivot: (100.0, 100.0),
+            rotation: std::f32::consts::FRAC_PI_4,
+            ..openpaint_core::Transform::IDENTITY
+        };
+        let moved: Vec<(f32, f32)> = square[0].iter().map(|p| t.apply(p.0, p.1)).collect();
+        // A 45 degree turn cannot be expressed as a translation, so at least one point has to move
+        // by a different amount from another.
+        let first = (moved[0].0 - square[0][0].0, moved[0].1 - square[0][0].1);
+        assert!(
+            moved.iter().zip(&square[0]).any(|(m, o)| {
+                ((m.0 - o.0) - first.0).abs() > 1.0 || ((m.1 - o.1) - first.1).abs() > 1.0
+            }),
+            "every point moved by the same amount, so this was a translation not a rotation"
+        );
     }
 
     /// A text layer's pixels are derived, so nothing may paint them. Checked through every

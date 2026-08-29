@@ -63,14 +63,18 @@ pub enum HistoryChange {
         index: usize,
         content: openpaint_core::Content,
     },
-    /// Pixels moved back or forward, and the selection has to follow them.
+    /// Transformed pixels moved back or forward, and the selection has to follow them.
     ///
-    /// The selection lives in the shell rather than in history — it is not part of the document —
-    /// so undo can restore the pixels but cannot move the outline itself. Reporting the offset is
-    /// how the shell keeps the two together; without it, undoing a move put the artwork back and
-    /// left the marching ants at the destination, describing a selection of something that was no
-    /// longer there.
-    Moved { offset: (i32, i32) },
+    /// Carries the mask itself rather than an offset to apply. The selection lives in the shell —
+    /// it is not part of the document — so undo can restore the pixels but cannot move the outline
+    /// itself; without this, undoing a move put the artwork back and left the marching ants at the
+    /// destination, describing a selection of something that was no longer there. An offset was
+    /// enough while a transform could only translate. It is not now: a non-uniform scale combined
+    /// with a rotation has no inverse in this parameterisation, so the mask that belongs at each
+    /// end is carried rather than derived.
+    SelectionRestored {
+        selection: Box<openpaint_core::Selection>,
+    },
 }
 
 /// Everything an overlay needs to draw itself into the current frame.
@@ -647,11 +651,12 @@ impl Renderer {
     pub fn float_at(
         &mut self,
         lifted: &openpaint_core::Lifted,
-        offset: (i32, i32),
+        transform: &openpaint_core::Transform,
+        kernel: openpaint_core::Kernel,
         float: LayerId,
     ) {
         self.canvas_renderer
-            .set_layer_tiles(float, lifted.shifted(offset.0, offset.1));
+            .set_layer_tiles(float, lifted.transformed(transform, kernel));
         self.floating = Some(float);
     }
 
@@ -666,8 +671,14 @@ impl Renderer {
     /// On the CPU, and `over` rather than a replace: a move must not punch a hole in whatever it
     /// lands on. Once per gesture rather than per frame, which is what makes the readback
     /// affordable — during the drag nothing is written to the layer at all.
-    fn paste(&mut self, lifted: &openpaint_core::Lifted, offset: (i32, i32), layer: LayerId) {
-        let placed = lifted.shifted(offset.0, offset.1);
+    fn paste(
+        &mut self,
+        lifted: &openpaint_core::Lifted,
+        transform: &openpaint_core::Transform,
+        kernel: openpaint_core::Kernel,
+        layer: LayerId,
+    ) {
+        let placed = lifted.transformed(transform, kernel);
         let coords: Vec<openpaint_core::tile::TileCoord> = placed.keys().copied().collect();
         let existing = self
             .canvas_renderer
@@ -700,12 +711,13 @@ impl Renderer {
     pub fn put_down(
         &mut self,
         lifted: &openpaint_core::Lifted,
-        offset: (i32, i32),
+        transform: &openpaint_core::Transform,
+        kernel: openpaint_core::Kernel,
         layer: LayerId,
         selection: &openpaint_core::Selection,
         lift_before: Vec<(openpaint_core::tile::TileCoord, TileBefore)>,
     ) -> bool {
-        let placed = lifted.shifted(offset.0, offset.1);
+        let placed = lifted.transformed(transform, kernel);
         let coords: Vec<openpaint_core::tile::TileCoord> = placed.keys().copied().collect();
         if coords.is_empty() {
             return true;
@@ -720,7 +732,7 @@ impl Renderer {
             return false;
         };
 
-        self.paste(lifted, offset, layer);
+        self.paste(lifted, transform, kernel, layer);
 
         // One entry for the whole gesture. The source's before-image wins on a shared tile.
         let mut before = lift_before;
@@ -736,7 +748,8 @@ impl Renderer {
             layer,
             before,
             lifted: Box::new(lifted.clone()),
-            offset,
+            transform: *transform,
+            kernel,
             selection: Box::new(selection.clone()),
         });
         true
@@ -902,38 +915,12 @@ impl Renderer {
             // Undoing a move is undoing paint: restore every tile it touched, at the source and
             // at the destination alike. What differs is only what the caller is told afterwards.
             Op::Paint { layer, before, .. } | Op::Move { layer, before, .. } => {
-                let mut encoder = self.new_stroke_encoder();
-                for (coord, was) in before {
-                    match was {
-                        TileBefore::Content(snapshot) => {
-                            // The tile still exists unless a later op removed it, and LIFO
-                            // guarantees no later op is still applied.
-                            if let Some(dst) = self.canvas_renderer.slot(*layer, *coord) {
-                                TilePool::copy_layer_from(
-                                    &mut encoder,
-                                    self.history.pool(),
-                                    snapshot,
-                                    self.canvas_renderer.pool(),
-                                    dst,
-                                );
-                            }
-                        }
-                        TileBefore::Absent => {
-                            // The stroke created this tile, so undo removes it rather than
-                            // leaving an empty tile holding residency for nothing.
-                            if let Some(slot) =
-                                self.canvas_renderer.take_tile(TileKey::new(*layer, *coord))
-                            {
-                                self.canvas_renderer.release(slot);
-                            }
-                        }
-                    }
-                }
-                self.queue.submit(std::iter::once(encoder.finish()));
+                self.revert_tiles(*layer, before);
                 // A move has to take the selection back with it; paint does not.
                 match &op {
-                    Op::Move { offset, .. } => HistoryChange::Moved {
-                        offset: (-offset.0, -offset.1),
+                    // The mask the pixels were lifted through is exactly where they belong again.
+                    Op::Move { selection, .. } => HistoryChange::SelectionRestored {
+                        selection: selection.clone(),
                     },
                     _ => HistoryChange::Pixels,
                 }
@@ -1038,11 +1025,12 @@ impl Renderer {
             Op::Move {
                 layer,
                 lifted,
-                offset,
+                transform,
+                kernel,
                 selection,
                 ..
             } => {
-                let (layer, offset) = (*layer, *offset);
+                let (layer, transform, kernel) = (*layer, *transform, *kernel);
                 let lifted = lifted.clone();
                 let selection = selection.clone();
                 if let Some(before) = self.paint_mask_unrecorded(
@@ -1054,8 +1042,11 @@ impl Renderer {
                 ) {
                     self.history.release_all(before);
                 }
-                self.paste(&lifted, offset, layer);
-                HistoryChange::Moved { offset }
+                self.paste(&lifted, &transform, kernel, layer);
+                let page = self.canvas_renderer.page();
+                HistoryChange::SelectionRestored {
+                    selection: Box::new(selection.transformed(&transform, kernel, page)),
+                }
             }
             Op::Content {
                 layer,
@@ -1116,6 +1107,62 @@ impl Renderer {
             index,
             content: content.clone(),
         }
+    }
+
+    /// Put a layer's tiles back to the before-images held in `before`.
+    ///
+    /// The reverting half of an undo, extracted because cancelling a transform needs exactly the
+    /// same thing: both are "this operation never happened". A second copy of it would be a
+    /// §11a.8 hazard — one definition, two places.
+    ///
+    /// Does **not** release the snapshots. Undo hands them on to redo; a cancel has to release
+    /// them itself, and making that explicit is what keeps the two from leaking.
+    fn revert_tiles(
+        &mut self,
+        layer: LayerId,
+        before: &[(openpaint_core::tile::TileCoord, TileBefore)],
+    ) {
+        let mut encoder = self.new_stroke_encoder();
+        for (coord, was) in before {
+            match was {
+                TileBefore::Content(snapshot) => {
+                    // The tile still exists unless a later op removed it, and LIFO guarantees no
+                    // later op is still applied.
+                    if let Some(dst) = self.canvas_renderer.slot(layer, *coord) {
+                        TilePool::copy_layer_from(
+                            &mut encoder,
+                            self.history.pool(),
+                            snapshot,
+                            self.canvas_renderer.pool(),
+                            dst,
+                        );
+                    }
+                }
+                TileBefore::Absent => {
+                    // The operation created this tile, so reverting removes it rather than leaving
+                    // an empty tile holding residency for nothing.
+                    if let Some(slot) = self.canvas_renderer.take_tile(TileKey::new(layer, *coord))
+                    {
+                        self.canvas_renderer.release(slot);
+                    }
+                }
+            }
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Abandon a lift: put the layer back exactly as it was, and drop the snapshots.
+    ///
+    /// Free, and that is the property the lift/float/put-down split exists for — the layer has been
+    /// untouched since the lift, so cancelling is not an edit to undo but an edit that never
+    /// happened. Nothing reaches the history stack.
+    pub fn paste_back(
+        &mut self,
+        layer: LayerId,
+        before: Vec<(openpaint_core::tile::TileCoord, TileBefore)>,
+    ) {
+        self.revert_tiles(layer, &before);
+        self.history.release_all(before);
     }
 
     /// Copy snapshot tiles back into the canvas, allocating fresh pool layers for them.

@@ -557,6 +557,46 @@ them, and the test now measures the *spread* across the output rather than its
 average. Another instance of §11a's rule — a sabotage that does not fail tells
 you about the test.
 
+### 5e. A transform stays in the air until it is committed — 2026-08-29
+
+A quick drag lifts, moves and puts down in one gesture. That is all one
+button and no keyboard can express, and it is the right interaction for a
+move — but it leaves nowhere to adjust a scale, because the moment you let
+go it has landed.
+
+So a *transform* is a session: lift, hold, adjust, then Enter to apply or
+Escape to put it back. Both are the same machinery, and `Dragging.persistent`
+is the one bit that says which is happening — so a release cannot silently
+end a session someone is still working in.
+
+**Added rather than substituted.** Pressing inside a selection still means
+"drag it, commit on release", exactly as before. Making the persistent
+session the only model would have been tidier and would also have changed
+behaviour that already works, so the quick drag stays and the transform is
+reached from the panel.
+
+**Cancelling is free**, which is the property the lift/float/put-down split
+exists for: the layer is untouched between the lift and the put-down, so an
+abandoned transform is not an edit to undo but an edit that never happened.
+Nothing reaches the history stack and the document is not marked dirty.
+
+**`Op::Move` carries the transform and the filter**, not an offset. A redo
+that resampled with a different kernel would produce different pixels from the
+ones that were undone. It also carries the *source* mask rather than an offset
+to invert: a non-uniform scale combined with a rotation has no inverse in this
+parameterisation, and keeping the mask that was already being kept is both
+exact and cheaper than deriving one.
+
+The live outline is now mapped through the transform rather than offset by it,
+so a rotated selection is drawn rotated. An outline is a path, and a path is
+exactly what an affine transform is cheap to apply to.
+
+One §11a.7 repeat caught by a sabotage: `commit_transform` and
+`cancel_transform` both bailed out early when there was no renderer, skipping
+the state changes below — so a sabotage that wrongly marked the document dirty
+on cancel *passed*, because the line was unreachable in the test. Obligations
+first, then branch. That hazard has now bitten three times.
+
 ### 4p. A brush tip is either a curve or a bitmap — 2026-08-29
 
 The last thing that changes what a brush *is*, and what brush presets have been

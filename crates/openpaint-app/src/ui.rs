@@ -114,6 +114,24 @@ pub enum LayerAction {
     SetBlend { index: usize, blend: Blend },
 }
 
+/// What the Transform section asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransformAction {
+    /// Lift the selection and hold it in the air.
+    Begin,
+    /// Put it down where it now sits.
+    Apply,
+    /// Put it back where it came from.
+    Cancel,
+}
+
+/// A transform in flight, as the panel needs to see and edit it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransformState {
+    pub transform: openpaint_core::Transform,
+    pub kernel: openpaint_core::Kernel,
+}
+
 /// What the Brush section asked for, beyond editing the brush in place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrushAction {
@@ -233,6 +251,10 @@ pub struct Status<'a> {
     pub font_families: &'a [String],
     /// Set when the active text layer is being shown in a font it was not written in.
     pub font_substituted: Option<&'a str>,
+    /// Set while a transform is in the air.
+    pub transform: Option<TransformState>,
+    /// The filter a transform would use, whether or not one is in flight.
+    pub kernel: openpaint_core::Kernel,
     /// What autosave has to report: a line of text, ready to show.
     pub autosave: &'a str,
     /// Selection boundary in screen space, as closed loops.
@@ -594,6 +616,10 @@ pub struct Outcome {
     pub text: Option<TextAction>,
     /// A brush command.
     pub brush: Option<BrushAction>,
+    /// A transform command.
+    pub transform: Option<TransformAction>,
+    /// The transform in flight, as the panel now holds it.
+    pub transform_state: Option<TransformState>,
 }
 
 pub struct Ui {
@@ -689,6 +715,9 @@ impl Ui {
         let mut page_action = None;
         let mut text_action = None;
         let mut brush_action = None;
+        let mut transform_action = None;
+        let mut transform_state = status.transform;
+        let mut kernel = status.kernel;
         let mut text_changed = false;
         let mut text = text;
         let mut tool_action = None;
@@ -987,6 +1016,110 @@ impl Ui {
                                 .small()
                                 .weak(),
                             );
+                            ui.separator();
+                            ui.heading("Transform");
+                            if let Some(state) = transform_state.as_mut() {
+                                let t = &mut state.transform;
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Drag on the canvas to move. Enter applies, Esc puts it \
+                                         back.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                let mut uniform = (t.scale.0 - t.scale.1).abs() < 1e-4;
+                                ui.horizontal(|ui| {
+                                    ui.label("Scale");
+                                    let mut x = t.scale.0 * 100.0;
+                                    if ui
+                                        .add(egui::DragValue::new(&mut x).speed(0.5).suffix("%"))
+                                        .changed()
+                                    {
+                                        t.scale.0 = x / 100.0;
+                                        if uniform {
+                                            t.scale.1 = t.scale.0;
+                                        }
+                                    }
+                                    let mut y = t.scale.1 * 100.0;
+                                    if ui
+                                        .add(egui::DragValue::new(&mut y).speed(0.5).suffix("%"))
+                                        .changed()
+                                    {
+                                        t.scale.1 = y / 100.0;
+                                        if uniform {
+                                            t.scale.0 = t.scale.1;
+                                        }
+                                    }
+                                    if ui
+                                        .checkbox(&mut uniform, "Lock")
+                                        .on_hover_text("Keep the two axes equal.")
+                                        .changed()
+                                        && uniform
+                                    {
+                                        t.scale.1 = t.scale.0;
+                                    }
+                                });
+                                let mut degrees = t.rotation.to_degrees();
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut degrees, -180.0..=180.0)
+                                            .text("Rotation")
+                                            .suffix("\u{b0}"),
+                                    )
+                                    .changed()
+                                {
+                                    t.rotation = degrees.to_radians();
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui.button("Flip horizontally").clicked() {
+                                        t.scale.0 = -t.scale.0;
+                                    }
+                                    if ui.button("Flip vertically").clicked() {
+                                        t.scale.1 = -t.scale.1;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    if ui.button("Apply").clicked() {
+                                        transform_action = Some(TransformAction::Apply);
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        transform_action = Some(TransformAction::Cancel);
+                                    }
+                                });
+                                state.kernel = kernel;
+                            } else {
+                                ui.add_enabled_ui(status.has_selection, |ui| {
+                                    if ui
+                                        .button("Transform selection")
+                                        .on_hover_text(
+                                            "Lift the selection so it can be scaled and rotated \
+                                             before it lands.",
+                                        )
+                                        .clicked()
+                                    {
+                                        transform_action = Some(TransformAction::Begin);
+                                    }
+                                });
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label("Resampling");
+                                egui::ComboBox::from_id_salt("transform-kernel")
+                                    .selected_text(kernel.label())
+                                    .show_ui(ui, |ui| {
+                                        for option in openpaint_core::Kernel::ALL {
+                                            ui.selectable_value(
+                                                &mut kernel,
+                                                option,
+                                                option.label(),
+                                            );
+                                        }
+                                    });
+                            });
+                            if let Some(state) = transform_state.as_mut() {
+                                state.kernel = kernel;
+                            }
+
                             ui.separator();
                             ui.heading("Text");
                             if let Some(block) = text.as_deref_mut() {
@@ -1648,6 +1781,8 @@ impl Ui {
             text_changed,
             text: text_action,
             brush: brush_action,
+            transform: transform_action,
+            transform_state,
         }
     }
 }

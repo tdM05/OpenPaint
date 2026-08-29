@@ -119,8 +119,15 @@ pub enum Op {
         /// The pixels themselves, so redo can put them back down. Kept whole for the same reason
         /// `PaintSource::Mask` is: there is no gesture left to recompute them from.
         lifted: Box<openpaint_core::Lifted>,
-        offset: (i32, i32),
-        /// Where they came from, so redo can clear the source again.
+        /// How they were placed. A whole-pixel move is a copy; anything else resamples, so the
+        /// filter has to be recorded with it or a redo could reproduce the pixels differently from
+        /// the ones that were undone.
+        transform: openpaint_core::Transform,
+        kernel: openpaint_core::Kernel,
+        /// Where they came from, so redo can clear the source again — and so undo can put the
+        /// *outline* back exactly, rather than trying to invert the transform. A non-uniform scale
+        /// combined with a rotation has no inverse in this parameterisation, and keeping the
+        /// original costs a mask that was already being kept.
         selection: Box<openpaint_core::Selection>,
     },
     /// Geometry only. Nothing is saved because nothing is destroyed (DECISIONS §5c).
