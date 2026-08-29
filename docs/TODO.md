@@ -66,7 +66,32 @@ line at the bottom of a side panel.
 
 ---
 
-## 3. Deferred features (decided we want them; not now)
+## 3. The next real piece of work: render the float on the GPU
+
+A live transform still resamples on the **CPU** (§5g). After the obvious waste was
+removed it is 33 ms per frame for a 256-pixel selection and 453 ms for a 1024-pixel one
+— usable at small sizes, not a live drag at large ones. That is not a tuning problem:
+resampling is O(area) with a twenty-tap filter, so no amount of care makes the CPU the
+right machine for a preview that has to keep up with a pen.
+
+**The fix is §4a applied where it was not: produce the float's destination tiles with a
+render pass instead of a loop.** The lifted pixels go up as a texture once at the lift;
+each frame draws the destination tiles sampling through the inverse transform. Nothing
+else changes — not `Lifted`, not the compositor, not the commit path, which keeps the
+CPU Mitchell resample because it runs once per gesture and that is where the quality is
+worth paying for (§5d).
+
+Worth deciding rather than assuming, because it is the same class of change as layer
+groups: a new pipeline writing into the tile pool's array texture.
+
+Open question inside it: whether the preview filters with the hardware's bilinear or a
+cubic in the shader. The commit is Mitchell either way, so the only question is whether
+a preview that is slightly softer than the result is acceptable — every other app says
+yes.
+
+---
+
+## 4. Deferred features (decided we want them; not now)
 
 - **Cursor feedback on the transform box** — a scale cursor on the handles, a rotate
   cursor on the ring. Needs a cursor seam that works for pen as well as mouse (Q14).

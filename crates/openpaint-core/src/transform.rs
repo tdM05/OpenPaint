@@ -296,6 +296,16 @@ pub fn resample(
     let radius = kernel.radius();
     let (rx, ry) = (radius * spread_x, radius * spread_y);
 
+    // Scratch for the horizontal weights, allocated once for the whole call rather than per pixel.
+    // Sized from the footprint itself, so minification -- which widens it without bound -- has no
+    // cliff to fall off: there is no cap to exceed and no tap quietly dropped.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a filter footprint in pixels; `rx` is finite and small"
+    )]
+    let mut wx = vec![0.0_f32; (rx.ceil() as usize) * 2 + 3];
+
     for py in min_y..max_y {
         for px in min_x..max_x {
             #[expect(
@@ -318,6 +328,26 @@ pub fn resample(
             )]
             let (y0, y1) = ((cv - ry).ceil() as i32, (cv + ry).floor() as i32);
 
+            // The kernel is separable, so the horizontal weights depend only on the column and are
+            // the same for every row of the footprint. Computing them once per destination pixel
+            // instead of once per tap removes four fifths of the cubic evaluations -- the first
+            // version recomputed each one for every row it appeared in.
+            //
+            // `wx[i]` is the weight of column `x0 + i`, and the inner loop reads the source at that
+            // same expression. Those two have to agree: any drift between them shifts the whole
+            // reconstruction sideways by a pixel, which is a resample of the wrong thing rather
+            // than a slightly worse one.
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "`x1` is at or after `x0` by construction"
+            )]
+            let columns = ((x1 - x0 + 1).max(0) as usize).min(wx.len());
+            for (i, w) in wx.iter_mut().enumerate().take(columns) {
+                #[expect(clippy::cast_precision_loss, reason = "as above")]
+                let offset = (x0 + i as i32) as f32 - cu;
+                *w = kernel.weight(offset / spread_x);
+            }
+
             let mut acc = [0.0_f32; 4];
             let mut total = 0.0_f32;
             for sy_i in y0..=y1 {
@@ -326,14 +356,18 @@ pub fn resample(
                 if wy == 0.0 {
                     continue;
                 }
-                for sx_i in x0..=x1 {
-                    #[expect(clippy::cast_precision_loss, reason = "as above")]
-                    let wx = kernel.weight((sx_i as f32 - cu) / spread_x);
-                    if wx == 0.0 {
+                for (i, &w_col) in wx.iter().enumerate().take(columns) {
+                    // `i` indexes the same column the weight above was computed for.
+                    if w_col == 0.0 {
                         continue;
                     }
-                    let w = wx * wy;
-                    let texel = source(sx_i, sy_i);
+                    let w = w_col * wy;
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_possible_wrap,
+                        reason = "a footprint index, bounded by MAX_FOOTPRINT"
+                    )]
+                    let texel = source(x0 + i as i32, sy_i);
                     for c in 0..4 {
                         acc[c] += texel[c] * w;
                     }

@@ -652,6 +652,60 @@ Two consequences, both listed as work in `TODO.md` §1 rather than done here:
 currently says so. It is deliberately a table of *known gaps* rather than a claim of
 completeness.
 
+### 5g. Placement is a frame's work, and a filter tap must not hash — 2026-08-29
+
+Reported the same day the box landed: *"transform works now; though it appears very
+very laggy."* It was, and by a lot. Measured on the dev box, in release, **per pointer
+sample**:
+
+| Selection | Before | After |
+| --- | --- | --- |
+| 256×256 | 275 ms | 33 ms |
+| 512×512 | 620 ms | 126 ms |
+| 1024×1024 | 1763 ms | 453 ms |
+
+Three separate mistakes, none of them the algorithm:
+
+1. **Every filter tap was a hash lookup.** A cubic reads sixteen to twenty-five source
+   pixels per destination pixel, and each went through a `HashMap`. Hashing, not
+   filtering, was most of what a rotate cost. `TileGrid` is a dense index over the
+   handful of tiles an operation touches — an index, not storage, so the sparse map
+   stays the canvas's shape and only the inner loop stops paying for it.
+
+2. **It resampled the tile-aligned bounds.** `Lifted::bounds` snaps out to 256-pixel
+   tiles, so a selection sitting inside one tile filtered four times its own area,
+   three quarters of it reconstructing transparency. `Lifted::content_bounds` is tight
+   to the ink. The old doc claimed the consumer "skips transparent source anyway" — it
+   does not, and that claim is why nobody wrote the tight one.
+
+3. **It resampled once per pointer sample.** A pen reports several samples per
+   displayed frame, so most of that work was thrown away unseen. Placement is now
+   computed once at the top of a frame. The transform still follows every sample; only
+   the *pixels* wait, because a frame is the only thing that shows them.
+
+Also removed: a full clone of the lifted tiles on every sample, which for a large
+selection is megabytes of memcpy for nothing.
+
+**The separable weights are hoisted, and that is where the danger was.** The horizontal
+weights depend only on the column, so computing them once per destination pixel rather
+than once per tap removes four fifths of the cubic evaluations. But the hoisted array
+and the source read now have to agree about which column is which — and a sabotage that
+shifted one against the other passed the *entire* suite. Every resampling test measured
+what came out and none measured where. `an_untouched_axis_does_not_drift` is the fix: a
+vertical stretch must not move a horizontal edge by even a pixel. Worth recording as a
+general lesson — **a test that checks a value can be blind to a coordinate.**
+
+**This is a floor, not a fix.** Resampling is O(area) with a twenty-tap filter, so the
+CPU will never make a large selection interactive; 453 ms for a 1024-pixel selection is
+still not a live drag. The architectural answer is §4a's: the float should be *rendered*
+by the GPU into destination tiles rather than reconstructed on the CPU, which changes
+nothing about `Lifted`, the commit path, or the compositor — it swaps the machine doing
+the arithmetic. Recorded in `TODO.md` as the next real piece of work, because it is the
+same class of change as layer groups and wants deciding rather than assuming.
+
+The commit path keeps the CPU resample and should: it runs once per gesture, and that is
+exactly where Mitchell's quality is worth its cost (§5d).
+
 ### 5e. A transform stays in the air until it is committed — 2026-08-29
 
 A quick drag lifts, moves and puts down in one gesture. That is all one

@@ -137,6 +137,121 @@ impl Default for Tile {
     }
 }
 
+/// A dense rectangular index over a range of tile coordinates.
+///
+/// Exists to keep hashing out of inner loops. A tile map is naturally a `HashMap`, and that is the
+/// right shape for a sparse canvas — but a loop that reads twenty source pixels per output pixel
+/// pays for a hash twenty times, and resampling measured at 620 ms per pointer sample before this
+/// existed, almost all of it hashing rather than filtering.
+///
+/// The range is the tiles a single operation touches, so the grid is a handful of entries wide.
+/// It is an *index*, not storage: the caller keeps a `Vec` of whatever it wants per tile and looks
+/// it up by the index returned here.
+#[derive(Clone, Copy, Debug)]
+pub struct TileGrid {
+    origin: TileCoord,
+    /// Width and height in tiles.
+    size: (usize, usize),
+}
+
+impl TileGrid {
+    /// A grid over the tiles covering a **tile-aligned** page rectangle, maxima exclusive.
+    #[must_use]
+    pub fn over(min_x: i32, min_y: i32, max_x: i32, max_y: i32) -> Self {
+        Self::covering((min_x, min_y, max_x, max_y))
+    }
+
+    /// A grid over the tiles any part of a page rectangle falls in, maxima exclusive.
+    ///
+    /// Tolerates an empty or inverted rectangle by describing no tiles at all, so a caller does
+    /// not have to check first — `locate` then answers `None` everywhere, which is the honest
+    /// answer rather than a panic.
+    #[must_use]
+    pub fn covering((min_x, min_y, max_x, max_y): (i32, i32, i32, i32)) -> Self {
+        if max_x <= min_x || max_y <= min_y {
+            return Self {
+                origin: (0, 0),
+                size: (0, 0),
+            };
+        }
+        let side = TILE_SIZE as i32;
+        let origin = (min_x.div_euclid(side), min_y.div_euclid(side));
+        let last = ((max_x - 1).div_euclid(side), (max_y - 1).div_euclid(side));
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "`last` is at or after `origin` by construction"
+        )]
+        let size = (
+            (last.0 - origin.0 + 1) as usize,
+            (last.1 - origin.1 + 1) as usize,
+        );
+        Self { origin, size }
+    }
+
+    /// How many tiles the grid describes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.size.0 * self.size.1
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The index of a tile coordinate, or `None` if it is outside the grid.
+    #[must_use]
+    pub fn index_of(&self, coord: TileCoord) -> Option<usize> {
+        let (dx, dy) = (coord.0 - self.origin.0, coord.1 - self.origin.1);
+        #[expect(clippy::cast_possible_wrap, reason = "grid extents are a few tiles")]
+        if dx < 0 || dy < 0 || dx >= self.size.0 as i32 || dy >= self.size.1 as i32 {
+            return None;
+        }
+        #[expect(clippy::cast_sign_loss, reason = "checked non-negative just above")]
+        Some(dy as usize * self.size.0 + dx as usize)
+    }
+
+    /// Which tile a page pixel is in, and where inside it.
+    ///
+    /// The local coordinates are returned even when the tile is outside the grid, because they are
+    /// correct regardless and the caller that wants them has already paid for the division.
+    #[must_use]
+    pub fn locate(&self, x: i32, y: i32) -> (Option<usize>, usize, usize) {
+        let side = TILE_SIZE as i32;
+        let coord = (x.div_euclid(side), y.div_euclid(side));
+        let (lx, ly) = (x.rem_euclid(side) as usize, y.rem_euclid(side) as usize);
+        (self.index_of(coord), lx, ly)
+    }
+
+    /// The tile coordinate at an index.
+    #[must_use]
+    pub fn coord_at(&self, index: usize) -> TileCoord {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "grid extents are a few tiles"
+        )]
+        (
+            self.origin.0 + (index % self.size.0) as i32,
+            self.origin.1 + (index / self.size.0) as i32,
+        )
+    }
+
+    /// Turn a grid of optional values back into the sparse map the rest of the engine speaks.
+    ///
+    /// Absent entries are dropped rather than stored empty: a tile that nothing was written to is
+    /// a tile that does not exist, and materialising it would make an empty transform look like a
+    /// full one to everything downstream.
+    #[must_use]
+    pub fn collect<T>(&self, values: Vec<Option<T>>) -> std::collections::HashMap<TileCoord, T> {
+        values
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, v)| v.map(|v| (self.coord_at(i), v)))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

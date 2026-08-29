@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 
 use crate::selection::Selection;
-use crate::tile::{Tile, TileCoord, TILE_SIZE};
+use crate::tile::{Tile, TileCoord, TileGrid, TILE_SIZE};
 
 /// Pixels taken out of a layer, in premultiplied linear colour.
 ///
@@ -135,8 +135,11 @@ impl Lifted {
     /// The page-pixel rectangle the lifted pixels occupy, as `(min_x, min_y, max_x, max_y)` with
     /// the maxima exclusive.
     ///
-    /// Tile-aligned rather than tight to the ink. A tighter box would mean scanning every texel,
-    /// and the only thing this feeds is a resampling loop that skips transparent source anyway.
+    /// Tile-aligned rather than tight to the ink, and cheap for that reason.
+    ///
+    /// Not what a resampling loop should walk: it does *not* skip transparent source, so a
+    /// selection sitting in the middle of a tile makes it filter three quarters of nothing. Use
+    /// [`Lifted::content_bounds`] for that, and this where a safe, cheap box is enough.
     #[must_use]
     pub fn bounds(&self) -> Option<(i32, i32, i32, i32)> {
         let side = TILE_SIZE as i32;
@@ -149,6 +152,53 @@ impl Lifted {
                     (lx.min(x), ly.min(y), hx.max(x + side), hy.max(y + side))
                 }
             });
+        }
+        bounds
+    }
+
+    /// The page-pixel rectangle the lifted pixels *actually* occupy, maxima exclusive.
+    ///
+    /// Tight to the ink, which for a resampling loop is the difference between filtering the
+    /// artwork and filtering the empty part of the tiles it happens to sit in. A 256-pixel
+    /// selection lifted from the middle of a tile has tile-aligned bounds of 512 by 512 — four
+    /// times the destination pixels, all but a quarter of them reconstructing transparency.
+    ///
+    /// Costs a scan of the lifted texels, which is one pass over data the transform is about to
+    /// read twenty times anyway.
+    #[must_use]
+    pub fn content_bounds(&self) -> Option<(i32, i32, i32, i32)> {
+        let side = TILE_SIZE as i32;
+        let mut bounds: Option<(i32, i32, i32, i32)> = None;
+        for (coord, tile) in &self.tiles {
+            let (ox, oy) = (coord.0 * side, coord.1 * side);
+            for ly in 0..TILE_SIZE {
+                let mut first = None;
+                let mut last = 0;
+                for lx in 0..TILE_SIZE {
+                    // Alpha alone is not enough: a premultiplied texel may carry colour with zero
+                    // alpha only if something upstream is wrong, but `shifted` already treats a
+                    // texel as present when *any* channel is, and two answers to "is there
+                    // anything here" would eventually disagree.
+                    let texel = tile.texel(lx, ly);
+                    if texel[3] > 0.0 || texel[0] > 0.0 || texel[1] > 0.0 || texel[2] > 0.0 {
+                        first.get_or_insert(lx);
+                        last = lx;
+                    }
+                }
+                let Some(first) = first else {
+                    continue;
+                };
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_possible_wrap,
+                    reason = "indices within a 256-wide tile"
+                )]
+                let (x0, x1, y) = (ox + first as i32, ox + last as i32 + 1, oy + ly as i32);
+                bounds = Some(match bounds {
+                    None => (x0, y, x1, y + 1),
+                    Some((lx, ly0, hx, hy)) => (lx.min(x0), ly0.min(y), hx.max(x1), hy.max(y + 1)),
+                });
+            }
         }
         bounds
     }
@@ -189,27 +239,61 @@ impl Lifted {
             )]
             return self.shifted(transform.offset.0 as i32, transform.offset.1 as i32);
         }
-        let Some((min_x, min_y, max_x, max_y)) = self.bounds() else {
+        // Tight, not tile-aligned: every destination pixel inside these bounds costs a full
+        // filter footprint whether or not there is anything under it, so walking the empty part of
+        // the tiles is work spent reconstructing transparency.
+        let Some((min_x, min_y, max_x, max_y)) = self.content_bounds() else {
             return HashMap::new();
         };
 
-        let side = TILE_SIZE as i32;
-        let mut out: HashMap<TileCoord, Tile> = HashMap::new();
+        let dest_bounds = transform.bounds_of(min_x, min_y, max_x, max_y);
+
+        // Both sides of the loop are laid out as dense grids of tiles first, so neither the taps
+        // nor the writes hash anything.
+        //
+        // This is not micro-optimisation. A cubic reads sixteen to twenty-five source pixels per
+        // destination pixel, and every one of them was a `HashMap` lookup -- so hashing, not
+        // filtering, was most of what a rotate cost. Measured on a 512x512 selection it was
+        // 620 ms *per pointer sample*, which is why a transform felt broken rather than merely
+        // slow. The grids are bounded by the tiles the transform actually touches, so the memory
+        // is a pointer or a tile per tile, not a copy of the page.
+        //
+        // Spanning whole tiles even though the bounds are tight: the filter footprint reaches a
+        // little past the content, and a tap landing in the next tile has to find it.
+        let src = TileGrid::covering((min_x, min_y, max_x, max_y));
+        let mut source: Vec<Option<&Tile>> = vec![None; src.len()];
+        for (coord, tile) in &self.tiles {
+            if let Some(i) = src.index_of(*coord) {
+                source[i] = Some(tile);
+            }
+        }
+
+        let dst = TileGrid::covering(dest_bounds);
+        let mut written: Vec<Option<Tile>> = Vec::new();
+        written.resize_with(dst.len(), || None);
+
         crate::transform::resample(
             transform,
             kernel,
-            transform.bounds_of(min_x, min_y, max_x, max_y),
-            |x, y| self.texel_at(x, y),
+            dest_bounds,
+            |x, y| {
+                let (tile, lx, ly) = src.locate(x, y);
+                match tile.and_then(|i| source[i]) {
+                    Some(t) => t.texel(lx, ly),
+                    None => [0.0; 4],
+                }
+            },
             |x, y, texel| {
-                let dest = (x.div_euclid(side), y.div_euclid(side));
-                out.entry(dest).or_insert_with(Tile::transparent).set_texel(
-                    x.rem_euclid(side) as usize,
-                    y.rem_euclid(side) as usize,
-                    texel,
-                );
+                let (tile, lx, ly) = dst.locate(x, y);
+                if let Some(i) = tile {
+                    written[i]
+                        .get_or_insert_with(Tile::transparent)
+                        .set_texel(lx, ly, texel);
+                }
             },
         );
-        out
+
+        dst.collect(written)
     }
 }
 
@@ -482,6 +566,150 @@ mod tests {
 
     /// The bounds have to cover every tile the lift touched, since that is what the resampler
     /// reads from.
+    /// The tight bounds hug the ink; the tile-aligned ones hug the tiles.
+    ///
+    /// Both are wanted, so what matters is the case that separates them: a selection sitting
+    /// inside one tile must come back as itself, because a resampling loop given the tile spends
+    /// four times as long reconstructing transparency as it does on the artwork.
+    #[test]
+    fn the_tight_bounds_hug_the_ink() {
+        let page = PageRect::from_size(2048, 2048);
+        let sel = Selection::from_rect(PageRect::new(300, 320, 100, 60), page);
+        let lifted = Lifted::from_layer(&sel, solid);
+
+        assert_eq!(lifted.content_bounds(), Some((300, 320, 400, 380)));
+        assert_eq!(
+            lifted.bounds(),
+            Some((256, 256, 512, 512)),
+            "the tile-aligned box is the tile it landed in, and that is what it is for"
+        );
+        assert!(Lifted::default().content_bounds().is_none());
+    }
+
+    /// An axis the transform does not touch comes back exactly where it was.
+    ///
+    /// **This is the test the suite was missing, and a sabotage found the hole.** Shifting the
+    /// hoisted filter weights by one column relative to the pixels they weight moves the whole
+    /// reconstruction sideways by a pixel — a resample of the wrong thing, not a slightly worse
+    /// one — and every existing test passed anyway, because they all measured *what* came out
+    /// rather than *where*.
+    ///
+    /// Stretching vertically leaves x untouched, so the vertical edges of the content must not
+    /// move at all. Catmull-Rom because it interpolates: an unmoved pixel comes back exactly,
+    /// which is the property that makes an exact assertion honest here.
+    #[test]
+    fn an_untouched_axis_does_not_drift() {
+        let page = PageRect::from_size(1024, 1024);
+        let sel = Selection::from_rect(PageRect::new(100, 100, 100, 100), page);
+        let lifted = Lifted::from_layer(&sel, solid);
+
+        let out = lifted.transformed(
+            &crate::Transform {
+                pivot: (150.0, 150.0),
+                scale: (1.0, 2.0),
+                ..crate::Transform::IDENTITY
+            },
+            crate::Kernel::CatmullRom,
+        );
+        let placed = Lifted { tiles: out };
+
+        let (x0, _, x1, _) = placed
+            .content_bounds()
+            .expect("the stretch produced something");
+        assert_eq!(
+            (x0, x1),
+            (100, 200),
+            "a vertical stretch moved the horizontal edges"
+        );
+
+        // And the same for the other axis, so a mirrored mistake cannot hide either.
+        let out = lifted.transformed(
+            &crate::Transform {
+                pivot: (150.0, 150.0),
+                scale: (2.0, 1.0),
+                ..crate::Transform::IDENTITY
+            },
+            crate::Kernel::CatmullRom,
+        );
+        let placed = Lifted { tiles: out };
+        let (_, y0, _, y1) = placed
+            .content_bounds()
+            .expect("the stretch produced something");
+        assert_eq!(
+            (y0, y1),
+            (100, 200),
+            "a horizontal stretch moved the vertical edges"
+        );
+    }
+
+    /// A soft edge is part of the content, so the tight bounds have to reach it.
+    ///
+    /// Pins the definition against a threshold: reading "is there anything here" as "is it mostly
+    /// opaque" would trim the anti-aliased fringe off every lasso, and the transform would then
+    /// resample a box slightly smaller than the artwork and clip its own edges. Checked against a
+    /// brute-force scan rather than against numbers, so the test states the definition rather than
+    /// an example of it.
+    #[test]
+    fn the_tight_bounds_include_the_soft_edge() {
+        let page = PageRect::from_size(1024, 1024);
+        // A diagonal, so the boundary is anti-aliased rather than pixel-aligned.
+        let sel = Selection::from_polygon(&[(200.0, 200.0), (400.0, 260.0), (240.0, 400.0)], page);
+        let lifted = Lifted::from_layer(&sel, solid);
+
+        let (tx0, ty0, tx1, ty1) = lifted.bounds().expect("something was lifted");
+        let mut scanned: Option<(i32, i32, i32, i32)> = None;
+        for y in ty0..ty1 {
+            for x in tx0..tx1 {
+                let t = lifted.texel_at(x, y);
+                if t[3] > 0.0 || t[0] > 0.0 || t[1] > 0.0 || t[2] > 0.0 {
+                    scanned = Some(match scanned {
+                        None => (x, y, x + 1, y + 1),
+                        Some((a, b, c, d)) => (a.min(x), b.min(y), c.max(x + 1), d.max(y + 1)),
+                    });
+                }
+            }
+        }
+        assert_eq!(
+            lifted.content_bounds(),
+            scanned,
+            "the tight bounds must be exactly the texels that are there"
+        );
+    }
+
+    /// A transform must not take perceptible time, because it runs while the pen is moving.
+    ///
+    /// A regression test for a shipped defect, not a benchmark — the transform shipped resampling
+    /// through a `HashMap` lookup per filter tap, over the tile-aligned bounds, once per pointer
+    /// sample. That measured 620 ms for this input, and it read to the user as the tool being
+    /// broken rather than slow.
+    ///
+    /// The bound is deliberately loose: it is not measuring anything, it is trying to be
+    /// impossible to pass with the wrong *shape* of loop while being impossible to fail on a slow
+    /// machine with the right one. Note it is a debug-profile bound too, which is where this runs
+    /// by default.
+    #[test]
+    fn a_rotation_is_not_slow() {
+        let page = PageRect::from_size(2048, 2048);
+        let sel = Selection::from_rect(PageRect::new(400, 400, 512, 512), page);
+        let lifted = Lifted::from_layer(&sel, solid);
+        let transform = crate::Transform {
+            pivot: (656.0, 656.0),
+            rotation: 0.3,
+            scale: (1.2, 1.2),
+            ..crate::Transform::IDENTITY
+        };
+
+        let started = std::time::Instant::now();
+        let out = lifted.transformed(&transform, crate::Kernel::Mitchell);
+        let took = started.elapsed();
+
+        assert!(!out.is_empty(), "the rotation produced nothing");
+        assert!(
+            took < std::time::Duration::from_millis(2500),
+            "rotating a 512x512 selection took {took:?}; that is the shape of the loop, not a slow machine"
+        );
+    }
+
     #[test]
     fn bounds_cover_every_lifted_tile() {
         let sel = Selection::from_rect(PageRect::new(100, 100, 400, 300), page());

@@ -356,6 +356,12 @@ struct Dragging {
     grab: Option<Grab>,
     /// Whether a corner drag keeps the two axes equal.
     lock_aspect: bool,
+    /// Whether the floating pixels on screen still match `transform`.
+    ///
+    /// Set when the transform changes, cleared when the float is rebuilt — which happens once per
+    /// *frame*, not once per pointer sample. A pen reports far faster than the display refreshes,
+    /// and resampling a placement nobody will ever see is the most expensive kind of nothing.
+    float_stale: bool,
     /// How the pixels are currently placed.
     ///
     /// A whole-pixel translation while only dragging, which takes the exact copy path; scale and
@@ -1241,6 +1247,7 @@ impl OpenPaint {
                 start: openpaint_core::Transform::IDENTITY,
             }),
             lock_aspect: false,
+            float_stale: false,
             transform: openpaint_core::Transform::IDENTITY,
             kernel,
             persistent: false,
@@ -1296,6 +1303,7 @@ impl OpenPaint {
             rect,
             grab: None,
             lock_aspect: false,
+            float_stale: false,
             transform,
             kernel,
             persistent: true,
@@ -1322,11 +1330,32 @@ impl OpenPaint {
         }
         drag.transform = transform;
         drag.kernel = kernel;
-        let lifted = drag.lifted.clone();
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.float_at(&lifted, &transform, kernel, FLOAT_LAYER);
-        }
+        drag.float_stale = true;
         self.request_redraw();
+    }
+
+    /// Rebuild the floating pixels if the transform has moved on since they were made.
+    ///
+    /// Called once at the top of a frame, which is the whole point. Resampling is not cheap — it
+    /// reconstructs every destination pixel from about twenty source ones — and a pen delivers
+    /// several samples per displayed frame, so doing it per sample threw most of the work away
+    /// unseen. Placement is a *frame* concern, so it is computed where frames are.
+    ///
+    /// Borrowed rather than cloned. The previous version copied the lifted tiles on every sample,
+    /// which for a large selection is megabytes of memcpy for nothing; splitting the borrow of
+    /// `dragging` from the borrow of `renderer` costs one `take` and gives it back.
+    fn refresh_float(&mut self) {
+        if !self.dragging.as_ref().is_some_and(|d| d.float_stale) {
+            return;
+        }
+        let Some(mut drag) = self.dragging.take() else {
+            return;
+        };
+        drag.float_stale = false;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.float_at(&drag.lifted, &drag.transform, drag.kernel, FLOAT_LAYER);
+        }
+        self.dragging = Some(drag);
     }
 
     /// Put the floating pixels back where they came from, transforming nothing.
@@ -2905,6 +2934,9 @@ impl OpenPaint {
 
     /// Draw one frame: canvas first, then the UI on top of it.
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        // Before anything reads the canvas: the floating pixels of a transform are produced per
+        // frame rather than per pointer sample, so this is where they catch up.
+        self.refresh_float();
         // Computed up front, while `self` can still be borrowed immutably: the renderer
         // is taken mutably just below.
         let crop_overlay = self.crop_overlay();
@@ -3779,6 +3811,7 @@ mod tests {
             },
             grab: None,
             lock_aspect: false,
+            float_stale: false,
             transform,
             kernel: openpaint_core::Kernel::default(),
             persistent,
@@ -4244,6 +4277,48 @@ mod tests {
             again.offset, once.offset,
             "the same pointer position must mean the same placement"
         );
+    }
+
+    /// A run of pointer samples costs one rebuild of the floating pixels, not one each.
+    ///
+    /// Resampling reconstructs every destination pixel from about twenty source ones, and a pen
+    /// reports several samples per displayed frame — so the shipped version threw most of that
+    /// work away unseen, and a rotate felt broken. The transform still updates on every sample;
+    /// only the *placement* waits for a frame, because a frame is the only thing that shows it.
+    #[test]
+    fn a_run_of_samples_costs_one_rebuild_of_the_float() {
+        let mut app = OpenPaint {
+            dragging: Some(Dragging {
+                grab: Some(Grab {
+                    handle: transform_box::Handle::Inside,
+                    from: (50.0, 50.0),
+                    start: openpaint_core::Transform::IDENTITY,
+                }),
+                ..session(true, openpaint_core::Transform::IDENTITY)
+            }),
+            ..OpenPaint::default()
+        };
+
+        for x in 60..70_u8 {
+            app.apply_grab((f32::from(x), 50.0));
+        }
+        let drag = app.dragging.as_ref().expect("still dragging");
+        assert!(
+            drag.float_stale,
+            "ten samples should leave exactly one rebuild owing"
+        );
+        assert_eq!(
+            drag.transform.offset,
+            (19.0, 0.0),
+            "the transform itself still follows every sample"
+        );
+
+        app.refresh_float();
+        assert!(
+            !app.dragging.as_ref().expect("still dragging").float_stale,
+            "the frame paid the debt"
+        );
+        app.refresh_float();
     }
 
     /// The whole point of capture: a press that was refused owns nothing afterwards.
