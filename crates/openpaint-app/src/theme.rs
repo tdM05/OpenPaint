@@ -21,10 +21,17 @@
 //! A theme is meant to be readable and hand-editable — that is most of the point of it being a
 //! file. `"#6AA0D8"` is a colour anyone can change; `[106, 160, 216, 255]` is a puzzle.
 //!
-//! # Logical units
+//! # Logical units are physical units
 //!
-//! Every measurement is logical, matching [`crate::layout`]. The display scale is applied once at
-//! draw time. See that module for why this is not a detail to settle later.
+//! Every measurement is logical, matching [`crate::layout`], and the display scale is applied once
+//! at draw time. Worth stating what that buys, because it answers a question that comes up as soon
+//! as anything has to be *hit*: a logical unit is 1/96 inch by convention, so **96 units is an inch
+//! and 3.8 units is a millimetre**, on any display at any scaling. A target specified here is
+//! therefore a real size on real glass, not a number of pixels that shrinks as screens get denser.
+//!
+//! The touch guidance everyone quotes is a 9 mm target — about 34 units. A pen is far more precise
+//! than a fingertip, so the grab surfaces below sit under that; but they are chosen against it
+//! rather than against how they looked on one screen.
 
 use std::fmt;
 
@@ -147,6 +154,10 @@ pub struct Metrics {
     ///
     /// Still a grab surface, just one that spends no room on a name — a header *style* available
     /// to any panel, not an exception carved out for the toolbar (§1c).
+    ///
+    /// Started at 8 units, about 2 mm, and was reported as *"the tool bar grab thing is very
+    /// small"* — which it was. A grab surface that saves space by being unusable has saved
+    /// nothing.
     pub header_compact: f32,
     /// Space either side of a tab's label.
     pub tab_padding: f32,
@@ -190,11 +201,11 @@ impl Default for Theme {
             },
             metrics: Metrics {
                 gutter: 2.0,
-                header: 24.0,
-                header_compact: 8.0,
-                tab_padding: 10.0,
+                header: 28.0,
+                header_compact: 18.0,
+                tab_padding: 12.0,
                 padding: 8.0,
-                splitter_grab: 10.0,
+                splitter_grab: 18.0,
                 radius: 3.0,
                 label: 11.0,
                 body: 12.0,
@@ -338,13 +349,30 @@ mod tests {
         assert_eq!(Theme::default().metrics, Theme::paper().metrics);
     }
 
-    /// A header is a grab target before it is a label, so it has to be big enough to press with a
-    /// pen. Forty-four is the usual touch minimum; a pen is more precise than a fingertip, but not
-    /// so much that a 12-unit strip is fair.
+    /// Every grab surface is big enough to press with a pen, in millimetres rather than in pixels.
+    ///
+    /// A logical unit is 1/96 inch, so the conversion is exact and the assertions can be written
+    /// in the unit that actually matters. Touch guidance is 9 mm; a pen is more precise, so 4 mm
+    /// is the floor here — but it is a floor chosen against a real measure rather than against how
+    /// something looked on one screen.
+    ///
+    /// The compact header shipped at 8 units, a shade over 2 mm, and was reported as too small to
+    /// use. This is the check that would have caught it.
     #[test]
-    fn a_header_is_big_enough_to_grab() {
+    fn every_grab_surface_is_big_enough_for_a_pen() {
+        const PER_MM: f32 = 96.0 / 25.4;
         let m = Theme::default().metrics;
-        assert!(m.header >= 20.0, "a full header is {} units", m.header);
+        for (what, units) in [
+            ("a full header", m.header),
+            ("a compact header", m.header_compact),
+            ("a divider's grab width", m.splitter_grab),
+        ] {
+            let mm = units / PER_MM;
+            assert!(
+                mm >= 4.0,
+                "{what} is {units} units, only {mm:.1} mm -- too small to press with a pen"
+            );
+        }
         assert!(
             m.splitter_grab > m.gutter,
             "a divider must be wider to grab than the line it draws, or it cannot be caught"

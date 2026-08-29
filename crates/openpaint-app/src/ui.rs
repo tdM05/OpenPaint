@@ -644,9 +644,11 @@ fn workspace_panel(
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        egui::RichText::new("F2 old panel  \u{b7}  Ctrl+Shift+Z reset layout")
-                            .small()
-                            .weak(),
+                        egui::RichText::new(
+                            "F2 old panel  \u{b7}  F3 undo layout  \u{b7}  Ctrl+F3 reset",
+                        )
+                        .small()
+                        .weak(),
                     );
                 });
             });

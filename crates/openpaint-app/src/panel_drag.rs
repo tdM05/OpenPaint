@@ -4,20 +4,32 @@
 //! tree is pure geometry and this is a state machine with a clock in it, and because the tree has
 //! to stay testable without inventing a gesture to reach it.
 //!
-//! # Tap or drag, decided without a mode
+//! # Hold, *then* move — and a tap is only ever a tap
 //!
 //! Pressing a tab is ambiguous: it could mean "show me that one" or "I am taking this somewhere".
 //! A mouse disambiguates by hovering first; **a pen arrives already down** and offers no such
-//! warning (§1c). Two independent triggers settle it without a grip widget or an edit mode:
+//! warning (§1c).
 //!
-//! - **Move past [`SLOP`]** — a drag. Immediate, so a mouse user who drags at once sees nothing
-//!   unusual.
-//! - **Hold past [`HOLD_MS`]** — also a drag, and it lifts *before* the pointer moves, so a pen
-//!   user can see the panel come loose and then decide where to take it.
+//! The first version treated movement past [`SLOP`] *or* a hold past [`HOLD_MS`] as a drag, and
+//! that was wrong in practice: a pen tap drifts a little and takes a moment, so ordinary taps kept
+//! becoming accidental moves. Reported as *"sometimes you just wanna use a tab but then it starts
+//! moving the editor"*, and it is worth naming why the code drifted from the design — §1c said
+//! "press-and-hold-then-move drags" and the implementation said "hold **or** move", which is a
+//! different rule that reads almost the same.
 //!
-//! Releasing without either is a tap, which switches tabs and must leave no trace — in particular
-//! it must not push anything onto the layout's undo stack, or Ctrl+Z would start walking back
-//! through tab selections.
+//! So, precisely:
+//!
+//! - **Held past [`HOLD_MS`]** — the panel *arms*. It has not moved yet; it is loose.
+//! - **Moved after arming** — it follows the pointer.
+//! - **Released before arming, having barely moved** — a tap. Switches tabs and nothing else.
+//! - **Released before arming, having moved** — nothing at all, because a stray swipe across a
+//!   header meant neither thing.
+//!
+//! Movement alone therefore never starts a drag. That costs a mouse user a fifth of a second
+//! before a panel comes loose, which is the right trade for an app whose primary input is a pen.
+//!
+//! A tap must leave no trace — in particular it must not push anything onto the layout's undo
+//! stack, or Ctrl+Z would start walking back through tab selections.
 //!
 //! # Why the drop target is remembered by panel, not by path
 //!
@@ -33,17 +45,18 @@
 
 use crate::layout::{Axis, Layout, LayoutHistory, PanelId, Path, Placed, Rect, Zone};
 
-/// How far a pointer may wander before a press becomes a drag, in logical units.
+/// How far a pointer may wander and still count as a tap, in logical units.
 ///
-/// Generous, because a pen resting on glass drifts and a hand shakes. Too small and every tap
-/// becomes an accidental rearrangement; too large and dragging feels stuck.
-pub const SLOP: f32 = 5.0;
+/// Generous, because a pen resting on glass drifts and a hand shakes. This no longer decides
+/// whether something is a *drag* — only whether a release was a tap or nothing.
+pub const SLOP: f32 = 9.0;
 
-/// How long a still press must be held before the panel lifts, in milliseconds.
+/// How long a press must be held before the panel comes loose, in milliseconds.
 ///
-/// The touch convention. Long enough that a quick tab switch never trips it, short enough that
-/// deliberately picking a panel up does not feel like waiting.
-pub const HOLD_MS: f64 = 260.0;
+/// The touch convention, shortened a little: it is now the *only* way to start a drag, so it sits
+/// on the path of everything rather than being one of two routes. Long enough that no ordinary tab
+/// tap reaches it, short enough that picking a panel up does not feel like waiting.
+pub const HOLD_MS: f64 = 200.0;
 
 /// What the pointer went down on. The caller decides this, because it drew the chrome and is the
 /// only thing that knows where a tab ends and a header begins.
@@ -104,8 +117,12 @@ enum Grab {
         path: Path,
         press: (f32, f32),
         press_ms: f64,
-        /// Whether the panel has come loose — by movement or by time.
-        lifted: bool,
+        /// Whether the panel has come loose. Set by time alone — see the module note.
+        armed: bool,
+        /// Whether the pointer has wandered past [`SLOP`] since the press.
+        ///
+        /// Only decides whether a release that never armed was a tap or nothing at all.
+        strayed: bool,
     },
     Splitter {
         path: Path,
@@ -128,6 +145,24 @@ impl PanelDrag {
         self.grab.is_some()
     }
 
+    /// Whether a press is waiting to arm, and how long is left.
+    ///
+    /// **Painting is demand-driven**, so a hold that nobody asks to draw simply never fires: with
+    /// the pointer still, no events arrive, no frame is drawn, and the timer is never read. The
+    /// caller uses this to keep frames coming until the panel comes loose. Same trap as every
+    /// other timed thing in this app — see `Stabilizer` and the note on `request_redraw`.
+    #[must_use]
+    pub fn waiting_ms(&self, now_ms: f64) -> Option<f64> {
+        match self.grab {
+            Some(Grab::Tab {
+                press_ms,
+                armed: false,
+                ..
+            }) => Some((HOLD_MS - (now_ms - press_ms)).max(0.0)),
+            _ => None,
+        }
+    }
+
     /// Begin a gesture. Returns whether this module took the pointer.
     ///
     /// A press on anything but a tab or a divider is declined, so the panel's own content sees it
@@ -143,7 +178,8 @@ impl PanelDrag {
                 path: path.clone(),
                 press: (x, y),
                 press_ms: now_ms,
-                lifted: false,
+                armed: false,
+                strayed: false,
             }),
             Target::Splitter { path, index } => {
                 layout.split_axis(path).map(|axis| Grab::Splitter {
@@ -197,12 +233,15 @@ impl PanelDrag {
                 panel,
                 press,
                 press_ms,
-                lifted,
+                armed,
+                strayed,
                 ..
             } => {
-                let moved = (x - press.0).hypot(y - press.1) >= SLOP;
-                *lifted = *lifted || moved || (now_ms - *press_ms) >= HOLD_MS;
-                if !*lifted {
+                *strayed = *strayed || (x - press.0).hypot(y - press.1) >= SLOP;
+                // Time alone arms it. Movement is deliberately *not* a trigger: that is the whole
+                // correction, and re-adding an `|| moved` here brings the accidental drags back.
+                *armed = *armed || (now_ms - *press_ms) >= HOLD_MS;
+                if !*armed {
                     return None;
                 }
                 let panel = *panel;
@@ -236,10 +275,17 @@ impl PanelDrag {
                 panel,
                 tab,
                 path,
-                lifted,
+                armed,
+                strayed,
                 ..
             } => {
-                if !lifted {
+                if !armed {
+                    if strayed {
+                        // A swipe across a header that never became a drag. It meant neither
+                        // thing, so it does neither — switching tabs here is how a stray stroke
+                        // ends up changing what you are looking at.
+                        return Outcome::Nothing;
+                    }
                     // A tap. Deliberately not recorded: Ctrl+Z must walk back through arrangement,
                     // not through which tab you were looking at.
                     layout.set_active(&path, tab);
@@ -344,23 +390,80 @@ mod tests {
         assert_eq!(h.depth(), (0, 0), "a tap is not an undoable edit");
     }
 
-    /// Moving past the slop lifts immediately, so a mouse user who drags at once sees nothing
-    /// unusual.
+    /// **Movement alone never starts a drag**, however far it goes.
+    ///
+    /// The correction that this whole module was rewritten for. The first version treated a move
+    /// past the slop as a drag, and ordinary pen taps — which drift — kept becoming accidental
+    /// panel moves. A test asserting the old rule passed the whole time, which is why it is
+    /// replaced rather than relaxed.
     #[test]
-    fn movement_lifts_the_panel_at_once() {
+    fn movement_alone_never_starts_a_drag() {
         let mut l = workspace();
         let mut d = PanelDrag::default();
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
 
+        // Right across the window, well inside the hold time.
+        for x in [710.0, 760.0, 900.0, 400.0] {
+            assert_eq!(
+                d.drag(&mut l, area(), x, 300.0, 40.0),
+                None,
+                "moving to {x} before the hold must not lift anything"
+            );
+        }
+    }
+
+    /// A swipe across a header that never armed does neither thing: it does not move a panel, and
+    /// it does not switch tabs either. A stray stroke must not change what you are looking at.
+    #[test]
+    fn a_stray_swipe_does_nothing_at_all() {
+        let mut l = workspace();
+        let mut h = LayoutHistory::default();
+        let mut d = PanelDrag::default();
+        let before = l.clone();
+
+        d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
+        d.drag(&mut l, area(), 780.0, 12.0, 30.0);
         assert_eq!(
-            d.drag(&mut l, area(), 703.0, 10.0, 5.0),
-            None,
-            "inside the slop, still just a press"
+            d.release(&mut l, &mut h, area(), 780.0, 12.0),
+            Outcome::Nothing
         );
+        assert_eq!(l, before, "the tab on show did not change either");
+        assert_eq!(h.depth(), (0, 0));
+    }
+
+    /// Once armed, movement carries the panel — which is the other half of the rule.
+    #[test]
+    fn movement_after_arming_carries_the_panel() {
+        let mut l = workspace();
+        let mut d = PanelDrag::default();
+        d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
+
+        assert!(d.drag(&mut l, area(), 700.0, 10.0, HOLD_MS + 1.0).is_some());
         let preview = d
-            .drag(&mut l, area(), 740.0, 300.0, 10.0)
-            .expect("past the slop");
+            .drag(&mut l, area(), 400.0, 400.0, HOLD_MS + 20.0)
+            .expect("armed, so it follows");
         assert!(matches!(preview, Preview::Carrying { panel: LAYERS, .. }));
+    }
+
+    /// A press waiting to arm asks for frames, because painting is demand-driven and a hold that
+    /// nobody draws never fires. Reported as "tap and hold sometimes does not show the menu" — it
+    /// was not sometimes, it was whenever the pointer was still enough to stop producing events.
+    #[test]
+    fn a_waiting_press_asks_for_the_frames_that_let_it_fire() {
+        let l = workspace();
+        let mut d = PanelDrag::default();
+        assert_eq!(d.waiting_ms(0.0), None, "nothing is waiting yet");
+
+        d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
+        let left = d.waiting_ms(50.0).expect("a press is waiting");
+        assert!(
+            (left - (HOLD_MS - 50.0)).abs() < 0.001,
+            "it should report the time left, got {left}"
+        );
+
+        let mut l2 = workspace();
+        d.drag(&mut l2, area(), 700.0, 10.0, HOLD_MS + 1.0);
+        assert_eq!(d.waiting_ms(HOLD_MS + 1.0), None, "armed, so nothing waits");
     }
 
     /// Holding still lifts too, so a pen user sees the panel come loose *before* deciding where to

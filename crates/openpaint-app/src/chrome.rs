@@ -422,15 +422,19 @@ mod tests {
                 y,
             )
         };
+        // Aimed at the label rather than at the tab's extreme left edge, because the divider's
+        // grab width is centred on the boundary and so claims a margin of the panel beside it.
+        // See `a_divider_takes_a_margin_from_its_neighbour`.
+        let aim = metrics().tab_padding + 2.0;
         assert_eq!(
-            hit(c.tabs[0].rect.x + 5.0, c.tabs[0].rect.y + 5.0),
+            hit(c.tabs[0].rect.x + aim, c.tabs[0].rect.y + 5.0),
             Target::Tab {
                 path: leaf.path.clone(),
                 tab: 0
             }
         );
         assert_eq!(
-            hit(c.tabs[1].rect.x + 5.0, c.tabs[1].rect.y + 5.0),
+            hit(c.tabs[1].rect.x + aim, c.tabs[1].rect.y + 5.0),
             Target::Tab {
                 path: leaf.path.clone(),
                 tab: 1
@@ -439,6 +443,37 @@ mod tests {
         assert_eq!(
             hit(c.content.x + 20.0, c.content.y + 40.0),
             Target::Elsewhere
+        );
+    }
+
+    /// A divider claims a margin of the panel beside it, and that margin is bounded.
+    ///
+    /// **A known consequence, stated rather than discovered.** The grab width is centred on the
+    /// boundary, so widening it to something a pen can catch — which it had to be — necessarily
+    /// takes half of that width from each neighbour. The trade is worth making: a divider is two
+    /// units of visible line and needs the margin to be usable at all, while a tab is dozens of
+    /// units wide and can spare its leading edge.
+    ///
+    /// What must not happen is the margin swallowing something whole, so that is what is checked.
+    #[test]
+    fn a_divider_takes_a_margin_from_its_neighbour() {
+        let l = workspace();
+        let placed = l.resolve(area());
+        let splitters = l.splitters(area(), metrics().splitter_grab);
+        let leaf = placed[1].clone();
+        let c = panel(&leaf, &metrics(), HeaderStyle::Named, |_| 40.0);
+        let first = c.tabs[0].rect;
+
+        let margin = metrics().splitter_grab / 2.0;
+        assert!(
+            margin < first.w * 0.5,
+            "the divider claims {margin} of a {} tab, which is most of it",
+            first.w
+        );
+        // And the label itself is clear of it, which is where anyone actually aims.
+        assert!(
+            metrics().tab_padding + 2.0 > margin,
+            "a tab's label starts inside the divider's margin"
         );
     }
 

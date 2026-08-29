@@ -308,8 +308,6 @@ impl Workspace {
         let m = self.theme.metrics;
         let p = self.theme.palette;
 
-        painter.rect_filled(to_egui(screen), 0.0_f32, rgb(p.ground));
-
         let placed = self.layout.resolve(screen);
         let splitters = self.layout.splitters(screen, m.splitter_grab);
 
@@ -322,6 +320,14 @@ impl Workspace {
                 i.time * 1000.0,
             )
         });
+        // Painting is demand-driven, so a hold with the pointer still would never fire: no events,
+        // no frames, and the timer never read. Reported as the hold "sometimes" not working — it
+        // was whenever the pen was steady enough to stop producing motion.
+        if let Some(left) = self.drag.waiting_ms(now_ms) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                (left / 1000.0).max(0.008),
+            ));
+        }
         let mut preview = None;
         if let Some(pos) = pointer {
             let (x, y) = (pos.x, pos.y);
@@ -353,7 +359,44 @@ impl Workspace {
 
         // --- draw, from the layout as it now stands ---
         let placed = self.layout.resolve(screen);
-        self.canvas_rect = None;
+
+        // Where the canvas panel is, worked out *before* anything is painted.
+        //
+        // **The ground cannot simply be filled over the whole window.** The canvas is drawn by the
+        // GPU underneath egui, so a full-screen fill paints over the artwork — which is exactly
+        // what happened: the workspace came up with no canvas at all, not even a white page. So
+        // the ground is filled as the four rectangles *around* the canvas instead, and the canvas
+        // panel's own content is never painted.
+        self.canvas_rect = placed.iter().find_map(|slot| {
+            (slot.tabs.get(slot.active) == Some(&CANVAS)).then(|| {
+                chrome::panel(slot, &m, style_of(slot), |i| {
+                    self.measure(ctx, slot.tabs.get(i).copied())
+                })
+                .content
+            })
+        });
+        match self.canvas_rect {
+            None => {
+                painter.rect_filled(to_egui(screen), 0.0_f32, rgb(p.ground));
+            }
+            Some(c) => {
+                for band in [
+                    Rect::new(screen.x, screen.y, screen.w, c.y - screen.y),
+                    Rect::new(
+                        screen.x,
+                        c.y + c.h,
+                        screen.w,
+                        (screen.y + screen.h) - (c.y + c.h),
+                    ),
+                    Rect::new(screen.x, c.y, c.x - screen.x, c.h),
+                    Rect::new(c.x + c.w, c.y, (screen.x + screen.w) - (c.x + c.w), c.h),
+                ] {
+                    if band.w > 0.0 && band.h > 0.0 {
+                        painter.rect_filled(to_egui(band), 0.0_f32, rgb(p.ground));
+                    }
+                }
+            }
+        }
         for slot in &placed {
             let Some(&showing) = slot.tabs.get(slot.active) else {
                 continue;
@@ -363,7 +406,11 @@ impl Workspace {
                 self.measure(ctx, slot.tabs.get(i).copied())
             });
 
-            painter.rect_filled(to_egui(c.outer), m.radius, rgb(p.panel));
+            // The header always; the body only for panels that draw something in it. The canvas
+            // panel's body is the artwork underneath.
+            if showing != CANVAS {
+                painter.rect_filled(to_egui(c.outer), m.radius, rgb(p.panel));
+            }
             painter.rect_filled(to_egui(c.header), m.radius, rgb(p.header));
 
             match style {
@@ -405,9 +452,8 @@ impl Workspace {
             }
 
             if showing == CANVAS {
-                // The canvas draws itself, on the GPU. All this does is say where.
-                self.canvas_rect = Some(c.content);
-                painter.rect_filled(to_egui(c.content), 0.0_f32, rgb(p.canvas));
+                // Nothing painted over the content: the artwork is already there, drawn by the
+                // GPU before egui ran. Painting anything here — even the canvas colour — hides it.
                 continue;
             }
 

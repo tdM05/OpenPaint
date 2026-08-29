@@ -3190,14 +3190,13 @@ impl OpenPaint {
                     // By logical key, so these are stable across keyboard layouts. Modifiers
                     // are excluded so Ctrl+S and friends are not eaten here.
                     // The way back from any arrangement at all, including one with no menu bar
-                    // left to reach a command from. A shortcut rather than a button for exactly
-                    // that reason (§1c).
-                    Key::Character(c)
-                        if pressed
-                            && self.workspace_mode
-                            && self.nav.modifiers.control_key()
-                            && self.nav.modifiers.shift_key()
-                            && c.eq_ignore_ascii_case("z") =>
+                    // left to reach a command from.
+                    //
+                    // **Not Ctrl+Shift+Z**, which was the first choice and never fired once:
+                    // `handle_history` runs earlier and that combination is redo. Picking a
+                    // shortcut without checking what already owns it is its own small lesson.
+                    Key::Named(NamedKey::F3)
+                        if pressed && self.workspace_mode && self.nav.modifiers.control_key() =>
                     {
                         self.workspace.reset();
                         self.status_message =
