@@ -193,6 +193,93 @@ impl Selection {
     }
 }
 
+/// One line of a selection boundary, in page space.
+pub type Segment = ((f32, f32), (f32, f32));
+
+/// Coverage at or above this counts as inside when drawing the boundary.
+///
+/// Only the *outline* uses a threshold. Every operation on a selection uses the coverage itself, so
+/// this decides where a line is drawn and nothing about what a fill does.
+const INSIDE: u8 = 128;
+
+impl Selection {
+    /// The boundary, as page-space line segments ready to draw.
+    ///
+    /// Computed from the mask rather than from the gesture that produced it. Drawing the lasso
+    /// polygon we already have would look better today and be wrong tomorrow: a flood fill, an
+    /// inversion, or an intersection produces a mask with no polygon behind it, and then the outline
+    /// and the truth would quietly disagree. One source, so they cannot.
+    ///
+    /// Axis-aligned pixel edges — the staircase Photoshop's marching ants also draw — with
+    /// collinear runs merged. Merging is not cosmetic: a smooth lasso has thousands of unit edges,
+    /// and handing every one of them to the UI each frame is the difference between tens of
+    /// segments and thousands.
+    #[must_use]
+    pub fn outline(&self) -> Vec<Segment> {
+        let inside = |x: i32, y: i32| self.coverage_at(x, y) >= INSIDE;
+
+        // Collect the unit edges of the boundary, keyed so runs along the same line are adjacent.
+        let mut horizontal: Vec<(i32, i32)> = Vec::new(); // (y, x) for the edge above pixel (x, y)
+        let mut vertical: Vec<(i32, i32)> = Vec::new(); // (x, y) for the edge left of pixel (x, y)
+        for (coord, tile) in &self.tiles {
+            let side = TILE_SIZE as i32;
+            for ly in 0..TILE_SIZE {
+                for lx in 0..TILE_SIZE {
+                    if tile[ly * TILE_SIZE + lx] < INSIDE {
+                        continue;
+                    }
+                    let x = coord.0 * side + lx as i32;
+                    let y = coord.1 * side + ly as i32;
+                    // An edge exists wherever an inside pixel meets an outside one. Testing both
+                    // sides of every pixel would emit each shared edge twice; testing only the
+                    // lower and right neighbours of the *outside* pixel is the usual trick, but
+                    // reading the neighbour directly is clearer and the mask is already random
+                    // access.
+                    if !inside(x, y - 1) {
+                        horizontal.push((y, x));
+                    }
+                    if !inside(x, y + 1) {
+                        horizontal.push((y + 1, x));
+                    }
+                    if !inside(x - 1, y) {
+                        vertical.push((x, y));
+                    }
+                    if !inside(x + 1, y) {
+                        vertical.push((x + 1, y));
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        merge_runs(&mut horizontal, |line, from, to| {
+            out.push(((from as f32, line as f32), (to as f32, line as f32)));
+        });
+        merge_runs(&mut vertical, |line, from, to| {
+            out.push(((line as f32, from as f32), (line as f32, to as f32)));
+        });
+        out
+    }
+}
+
+/// Merge unit edges that lie on the same line and touch, emitting one segment per run.
+fn merge_runs(edges: &mut [(i32, i32)], mut emit: impl FnMut(i32, i32, i32)) {
+    edges.sort_unstable();
+    let mut i = 0;
+    while i < edges.len() {
+        let (line, start) = edges[i];
+        let mut end = start;
+        while i + 1 < edges.len() && edges[i + 1] == (line, end + 1) {
+            end += 1;
+            i += 1;
+        }
+        // Half-open: a run covering pixels `start..=end` spans the boundary from `start` to
+        // `end + 1`, because an edge belongs to the pixel it borders.
+        emit(line, start, end + 1);
+        i += 1;
+    }
+}
+
 /// Even-odd point-in-polygon, on an implicitly closed path.
 fn point_in_polygon(x: f32, y: f32, points: &[(f32, f32)]) -> bool {
     let mut inside = false;
@@ -219,6 +306,54 @@ mod tests {
 
     fn page() -> PageRect {
         PageRect::from_size(400, 400)
+    }
+
+    #[test]
+    fn an_empty_selection_has_no_outline() {
+        assert!(Selection::new().outline().is_empty());
+    }
+
+    /// A rectangle's boundary is four segments, not four hundred.
+    ///
+    /// Merging is what makes the outline drawable: a smooth lasso has thousands of unit edges, and
+    /// handing every one to the UI each frame is a different order of cost.
+    #[test]
+    fn a_rectangles_outline_is_four_merged_segments() {
+        let sel = Selection::from_rect(PageRect::new(100, 100, 50, 40), page());
+        let outline = sel.outline();
+        assert_eq!(
+            outline.len(),
+            4,
+            "expected four sides, got {} segments: {outline:?}",
+            outline.len()
+        );
+
+        let total: f32 = outline
+            .iter()
+            .map(|(a, b)| (b.0 - a.0).abs() + (b.1 - a.1).abs())
+            .sum();
+        assert!(
+            (total - 2.0 * (50.0 + 40.0)).abs() < 0.01,
+            "the perimeter came to {total}, not 2*(50+40)"
+        );
+    }
+
+    /// The outline traces the mask, so a hole in the selection is drawn.
+    ///
+    /// This is why it is computed from coverage rather than from the lasso polygon: after an
+    /// inversion there is no polygon, and an outline that only knew about gestures would show the
+    /// wrong shape the first time anyone inverted anything.
+    #[test]
+    fn an_inverted_selection_outlines_the_hole_and_the_page_edge() {
+        let sel = Selection::from_rect(PageRect::new(100, 100, 50, 40), page()).inverted(page());
+        let outline = sel.outline();
+        // Four sides of the page plus four sides of the hole.
+        assert_eq!(
+            outline.len(),
+            8,
+            "expected the page border and the hole, got {} segments",
+            outline.len()
+        );
     }
 
     #[test]

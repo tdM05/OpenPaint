@@ -114,6 +114,23 @@ pub enum LayerAction {
     SetBlend { index: usize, blend: Blend },
 }
 
+/// The selection tools the panel offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectTool {
+    Lasso,
+    Rect,
+}
+
+/// What the selection controls want done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectAction {
+    /// Turn a selection tool on, or off if it is already on.
+    Use(SelectTool),
+    All,
+    None,
+    Invert,
+}
+
 /// What the crop tool should do next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CropAction {
@@ -155,6 +172,12 @@ pub struct Status<'a> {
     pub recovery: Option<&'a str>,
     /// What autosave has to report: a line of text, ready to show.
     pub autosave: &'a str,
+    /// Selection boundary in screen space, as segments.
+    pub selection: &'a [[[f32; 2]; 2]],
+    /// Which selection tool is active, if any.
+    pub select_tool: Option<SelectTool>,
+    /// Whether there is a selection to act on.
+    pub has_selection: bool,
 }
 
 /// Where to draw the brush outline, and how big.
@@ -190,6 +213,8 @@ pub struct Outcome {
     pub confirm: Option<ConfirmChoice>,
     /// The answer to the offer of recovered work.
     pub recovery: Option<RecoveryChoice>,
+    /// A selection command.
+    pub select: Option<SelectAction>,
 }
 
 pub struct Ui {
@@ -285,6 +310,7 @@ impl Ui {
         let mut tool_action = None;
         let mut confirm_choice = None;
         let mut recovery_choice = None;
+        let mut select_action = None;
 
         let mut panel_rect = egui::Rect::NOTHING;
         let output = self.ctx.run(input, |ctx| {
@@ -314,6 +340,46 @@ impl Ui {
                                     "B and E switch tool. Each keeps its own size, because an eraser \
                                      almost never wants the brush's. [ and ] resize; Shift+[ and \
                                      Shift+] rotate the canvas.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+
+                            ui.separator();
+                            ui.heading("Select");
+                            ui.horizontal(|ui| {
+                                for (tool, label) in [
+                                    (SelectTool::Lasso, "Lasso"),
+                                    (SelectTool::Rect, "Rectangle"),
+                                ] {
+                                    let on = status.select_tool == Some(tool);
+                                    if ui.selectable_label(on, label).clicked() {
+                                        select_action = Some(SelectAction::Use(tool));
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                if ui.button("All").clicked() {
+                                    select_action = Some(SelectAction::All);
+                                }
+                                // Disabled rather than hidden, so the commands do not move around
+                                // depending on state.
+                                if ui
+                                    .add_enabled(status.has_selection, egui::Button::new("None"))
+                                    .clicked()
+                                {
+                                    select_action = Some(SelectAction::None);
+                                }
+                                if ui
+                                    .add_enabled(status.has_selection, egui::Button::new("Invert"))
+                                    .clicked()
+                                {
+                                    select_action = Some(SelectAction::Invert);
+                                }
+                            });
+                            ui.label(
+                                egui::RichText::new(
+                                    "Ctrl+A selects everything, Ctrl+D deselects,                                      Ctrl+Shift+I inverts. A selection is a mask: fill, and                                      later the bucket and transform, all act through it.",
                                 )
                                 .small()
                                 .weak(),
@@ -847,6 +913,32 @@ impl Ui {
             }
         }
 
+        // The selection boundary. Two strokes, dark under light, for the same reason the crop
+        // outline has two: it has to stay legible over white paper and over black ink without
+        // knowing which is there. Static rather than animated -- marching ants are a later
+        // refinement, and a still outline is not wrong, only quieter.
+        if !status.selection.is_empty() {
+            let ppp = self.ctx.pixels_per_point();
+            let painter = self.ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("selection-overlay"),
+            ));
+            for [a, b] in status.selection {
+                let seg = [
+                    egui::pos2(a[0] / ppp, a[1] / ppp),
+                    egui::pos2(b[0] / ppp, b[1] / ppp),
+                ];
+                painter.line_segment(
+                    seg,
+                    egui::Stroke::new(2.0_f32, egui::Color32::from_black_alpha(140)),
+                );
+                painter.line_segment(
+                    seg,
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(235)),
+                );
+            }
+        }
+
         // The brush outline, drawn after the crop overlay so that on the one frame where both
         // could exist the crop wins the pixels. Painted, not a widget, for the same reason the
         // crop handles are: egui never sees pen input (Q14).
@@ -948,6 +1040,7 @@ impl Ui {
             tool: tool_action,
             confirm: confirm_choice,
             recovery: recovery_choice,
+            select: select_action,
         }
     }
 }

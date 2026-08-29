@@ -129,6 +129,15 @@ struct OpenPaint {
     /// The crop tool, present only while it is active. Its presence *is* the tool
     /// state, so there is no separate mode enum to keep in sync.
     crop: Option<Crop>,
+    /// The selection tool, present only while it is active — same pattern as `crop`, and
+    /// deliberately not a variant of [`editor::Tool`]: that enum indexes an array of brushes, and a
+    /// selection tool has no brush to index.
+    select: Option<Select>,
+    /// The document's selection, and the outline it draws.
+    ///
+    /// The outline is cached beside it because it is derived from the whole mask, which is far too
+    /// much work to redo every frame and changes only when the selection does.
+    selection: Option<ActiveSelection>,
     /// Most recent notable outcome (export, resize refusal, history loss), shown in
     /// the panel so it isn't only visible in a console the user may not be watching.
     status_message: Option<String>,
@@ -225,6 +234,82 @@ enum Dialog {
     },
 }
 
+/// The selection, and the outline it draws.
+///
+/// Kept together because the outline is *derived* from the mask: separate fields could drift, and a
+/// selection outline that disagrees with what a fill will do is worse than none.
+struct ActiveSelection {
+    mask: openpaint_core::Selection,
+    outline: Vec<openpaint_core::selection::Segment>,
+}
+
+/// A selection gesture in progress.
+///
+/// Holds the shape being drawn, not the resulting mask: the mask is built once on release, because
+/// rasterizing a growing polygon on every pen sample would cost the whole page per sample for a
+/// preview the outline of the gesture already gives.
+#[derive(Clone, Debug)]
+enum Select {
+    /// Freehand. Points in page space, in the order the pen visited them.
+    Lasso { points: Vec<(f32, f32)> },
+    /// Drag a rectangle. `from` is the anchor, `to` follows the pen.
+    Rect {
+        from: Option<(f32, f32)>,
+        to: (f32, f32),
+    },
+}
+
+impl Select {
+    /// What the gesture would select, or `None` if it is not a shape yet.
+    fn resolve(&self, page: PageRect) -> Option<openpaint_core::Selection> {
+        match self {
+            Self::Lasso { points } => {
+                let sel = openpaint_core::Selection::from_polygon(points, page);
+                (!sel.is_empty()).then_some(sel)
+            }
+            Self::Rect { from, to } => {
+                let from = (*from)?;
+                let rect = rect_between(from, *to);
+                let sel = openpaint_core::Selection::from_rect(rect, page);
+                (!sel.is_empty()).then_some(sel)
+            }
+        }
+    }
+
+    /// The gesture's own outline, drawn live while dragging.
+    fn preview(&self) -> Vec<((f32, f32), (f32, f32))> {
+        match self {
+            Self::Lasso { points } => points
+                .windows(2)
+                .map(|w| (w[0], w[1]))
+                .chain(
+                    // The closing edge, shown from the start: a lasso is implicitly closed, and
+                    // seeing where it will close is most of what makes one aimable.
+                    (points.len() > 2).then(|| (*points.last().expect("non-empty"), points[0])),
+                )
+                .collect(),
+            Self::Rect { from, to } => from.map_or_else(Vec::new, |from| {
+                let (a, b) = (from, *to);
+                vec![
+                    ((a.0, a.1), (b.0, a.1)),
+                    ((b.0, a.1), (b.0, b.1)),
+                    ((b.0, b.1), (a.0, b.1)),
+                    ((a.0, b.1), (a.0, a.1)),
+                ]
+            }),
+        }
+    }
+}
+
+/// The page rectangle spanned by two corners, in either order.
+fn rect_between(a: (f32, f32), b: (f32, f32)) -> PageRect {
+    let x0 = a.0.min(b.0).floor() as i32;
+    let y0 = a.1.min(b.1).floor() as i32;
+    let x1 = a.0.max(b.0).ceil() as i32;
+    let y1 = a.1.max(b.1).ceil() as i32;
+    PageRect::new(x0, y0, (x1 - x0).max(0) as u32, (y1 - y0).max(0) as u32)
+}
+
 /// In-progress canvas navigation.
 ///
 /// Bindings are hardcoded here for now. DECISIONS section 6 wants input mapping to
@@ -278,6 +363,8 @@ impl Default for OpenPaint {
             pen_events: Vec::new(),
             nav: Nav::default(),
             crop: None,
+            select: None,
+            selection: None,
             status_message: None,
             in_dispatch: false,
             document_path: None,
@@ -330,6 +417,10 @@ impl OpenPaint {
                     self.crop_press(sample);
                     return;
                 }
+                if self.select.is_some() {
+                    self.select_press(sample);
+                    return;
+                }
                 if let Some((cx, cy)) = self.to_canvas(sample) {
                     self.stroke_start(cx, cy, sample.pressure, sample.time_ms());
                     self.note_latency_input(sample);
@@ -356,6 +447,14 @@ impl OpenPaint {
                     }
                     return;
                 }
+                if self.select.is_some() {
+                    // Every sample, not just the last: a lasso *is* the path the pen took, so
+                    // dropping the intermediate ones would cut corners off the shape.
+                    for sample in samples {
+                        self.select_drag(sample);
+                    }
+                    return;
+                }
                 if !self.editor.is_drawing() || self.nav.is_active() {
                     return;
                 }
@@ -375,6 +474,10 @@ impl OpenPaint {
             PenEvent::Up => {
                 if let Some(crop) = self.crop.as_mut() {
                     crop.release();
+                    return;
+                }
+                if self.select.is_some() {
+                    self.select_release();
                     return;
                 }
                 // Queues the bake that commits the stroke; demand-driven painting
@@ -654,6 +757,152 @@ impl OpenPaint {
     }
 
     /// The crop rectangle in screen space, for the panel to paint.
+    /// Begin a selection gesture.
+    fn select_press(&mut self, sample: &PenSample) {
+        let Some(p) = self.to_page_unclipped(sample) else {
+            return;
+        };
+        match self.select.as_mut() {
+            Some(Select::Lasso { points }) => {
+                points.clear();
+                points.push(p);
+            }
+            Some(Select::Rect { from, to }) => {
+                *from = Some(p);
+                *to = p;
+            }
+            None => return,
+        }
+        self.request_redraw();
+    }
+
+    /// Extend it.
+    fn select_drag(&mut self, sample: &PenSample) {
+        let Some(p) = self.to_page_unclipped(sample) else {
+            return;
+        };
+        match self.select.as_mut() {
+            Some(Select::Lasso { points }) => {
+                // Only when the pen has actually moved a pixel. A resting pen reports continuously
+                // (see `note_pointer`), and a polygon with thousands of coincident vertices is
+                // slower to rasterize and no more accurate.
+                if points
+                    .last()
+                    .is_none_or(|last| (last.0 - p.0).abs() >= 1.0 || (last.1 - p.1).abs() >= 1.0)
+                {
+                    points.push(p);
+                }
+            }
+            Some(Select::Rect { from, to }) => {
+                if from.is_none() {
+                    return;
+                }
+                *to = p;
+            }
+            None => return,
+        }
+        self.request_redraw();
+    }
+
+    /// Finish it, and make the mask.
+    fn select_release(&mut self) {
+        let page = self.editor.page_rect();
+        let resolved = self.select.as_ref().and_then(|s| s.resolve(page));
+
+        // Reset the gesture either way, so the next press starts a fresh shape rather than
+        // extending the last one.
+        match self.select.as_mut() {
+            Some(Select::Lasso { points }) => points.clear(),
+            Some(Select::Rect { from, .. }) => *from = None,
+            None => {}
+        }
+
+        match resolved {
+            Some(selection) => self.set_selection(Some(selection)),
+            // A gesture that enclosed nothing -- a tap, or a lasso of three coincident points --
+            // reads as "deselect", which is what a click on empty space means in every art app.
+            None => self.set_selection(None),
+        }
+    }
+
+    /// Replace the selection, recomputing the outline it draws.
+    ///
+    /// The single place the selection changes, so the outline can never be stale: it is derived
+    /// from the mask, and deriving it anywhere else would let the two drift.
+    fn set_selection(&mut self, selection: Option<openpaint_core::Selection>) {
+        self.selection = selection.map(|mask| {
+            let outline = mask.outline();
+            ActiveSelection { mask, outline }
+        });
+        self.status_message = Some(match self.selection.as_ref() {
+            Some(_) => "Selected".to_owned(),
+            None => "Deselected".to_owned(),
+        });
+        self.request_redraw();
+    }
+
+    /// Act on a selection command from the panel or a shortcut.
+    fn apply_select_action(&mut self, action: ui::SelectAction) {
+        let page = self.editor.page_rect();
+        match action {
+            ui::SelectAction::Use(tool) => {
+                let already = matches!(
+                    (&self.select, tool),
+                    (Some(Select::Lasso { .. }), ui::SelectTool::Lasso)
+                        | (Some(Select::Rect { .. }), ui::SelectTool::Rect)
+                );
+                self.select = if already {
+                    None
+                } else {
+                    // The crop tool also consumes input entirely, so the two cannot both be up.
+                    self.crop = None;
+                    Some(match tool {
+                        ui::SelectTool::Lasso => Select::Lasso { points: Vec::new() },
+                        ui::SelectTool::Rect => Select::Rect {
+                            from: None,
+                            to: (0.0, 0.0),
+                        },
+                    })
+                };
+                self.request_redraw();
+            }
+            ui::SelectAction::All => {
+                self.set_selection(Some(openpaint_core::Selection::everything(page)))
+            }
+            ui::SelectAction::None => self.set_selection(None),
+            ui::SelectAction::Invert => {
+                // Inverting nothing selects everything, which is what every art app does and is
+                // more useful than refusing.
+                let inverted = self.selection.as_ref().map_or_else(
+                    || openpaint_core::Selection::everything(page),
+                    |s| s.mask.inverted(page),
+                );
+                self.set_selection((!inverted.is_empty()).then_some(inverted));
+            }
+        }
+    }
+
+    /// The selection and any in-progress gesture, in screen space, ready to draw.
+    fn selection_overlay(&self) -> Vec<[[f32; 2]; 2]> {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return Vec::new();
+        };
+        let (sw, sh) = renderer.size_px();
+        let to_screen = |p: (f32, f32)| {
+            let (sx, sy) = self.view.canvas_to_screen(p.0, p.1, sw, sh);
+            [sx, sy]
+        };
+
+        // The committed selection, plus the gesture being drawn over it.
+        let committed = self.selection.iter().flat_map(|s| s.outline.iter());
+        let live = self.select.iter().flat_map(Select::preview);
+        committed
+            .copied()
+            .chain(live)
+            .map(|(a, b)| [to_screen(a), to_screen(b)])
+            .collect()
+    }
+
     fn crop_overlay(&self) -> Option<ui::CropOverlay> {
         let crop = self.crop.as_ref()?;
         let renderer = self.renderer.as_ref()?;
@@ -1291,6 +1540,8 @@ impl OpenPaint {
         };
         self.editor.stroke_end();
         self.crop = None;
+        // A mask is in page coordinates, so it means nothing once the page it was drawn on is gone.
+        self.set_selection(None);
 
         let tiles: Vec<_> = loaded.tiles.into_iter().collect();
         let pages = loaded.document.page_count();
@@ -1315,6 +1566,8 @@ impl OpenPaint {
     fn new_document(&mut self) {
         self.editor.stroke_end();
         self.crop = None;
+        // A mask is in page coordinates, so it means nothing once the page it was drawn on is gone.
+        self.set_selection(None);
         self.editor
             .replace_document(openpaint_core::Document::new(openpaint_core::Page::new(
                 editor::PAGE_W,
@@ -1383,7 +1636,8 @@ impl OpenPaint {
     /// Handle undo/redo shortcuts. Returns `true` if the event was consumed.
     ///
     /// Ctrl+Z undoes, Ctrl+Shift+Z and Ctrl+Y redo; Ctrl+N, Ctrl+O, Ctrl+S and Ctrl+Shift+S are
-    /// new/open/save/save-as; Ctrl+E exports a PNG -- the bindings every art app shares. Hardcoded for now, like navigation
+    /// new/open/save/save-as; Ctrl+E exports a PNG; Ctrl+A, Ctrl+D and Ctrl+Shift+I select all,
+    /// deselect and invert -- the bindings every art app shares. Hardcoded for now, like navigation
     /// (OPEN_QUESTIONS Q16).
     fn handle_history(&mut self, event: &WindowEvent) -> bool {
         use winit::event::ElementState;
@@ -1417,6 +1671,19 @@ impl OpenPaint {
                     }
                     "n" | "N" => {
                         self.request_dialog(Dialog::New { confirmed: false });
+                        return true;
+                    }
+                    "a" | "A" => {
+                        self.apply_select_action(ui::SelectAction::All);
+                        return true;
+                    }
+                    "d" | "D" => {
+                        self.apply_select_action(ui::SelectAction::None);
+                        return true;
+                    }
+                    // Ctrl+Shift+I, the binding every art app uses for invert-selection.
+                    "i" | "I" if self.nav.modifiers.shift_key() => {
+                        self.apply_select_action(ui::SelectAction::Invert);
                         return true;
                     }
                     "e" | "E" => {
@@ -1656,6 +1923,12 @@ impl OpenPaint {
             (r.x, r.y, r.w, r.h)
         });
         let brush_cursor = self.brush_cursor();
+        let selection_overlay = self.selection_overlay();
+        let select_tool = self.select.as_ref().map(|s| match s {
+            Select::Lasso { .. } => ui::SelectTool::Lasso,
+            Select::Rect { .. } => ui::SelectTool::Rect,
+        });
+        let has_selection = self.selection.is_some();
         let perf = self.perf.snapshot();
         let recovery_prompt = self.recovery.as_ref().map(autosave::Recoverable::describe);
         // Built here rather than in the panel so the panel stays a renderer of state. It reports
@@ -1725,6 +1998,7 @@ impl OpenPaint {
         let mut tool_request = None;
         let mut confirm_request = None;
         let mut recovery_request = None;
+        let mut select_request = None;
         let mut page_request = None;
         let history_status = renderer.history_status();
         let residency = renderer.residency();
@@ -1777,6 +2051,9 @@ impl OpenPaint {
                         perf,
                         recovery: recovery_prompt.as_deref(),
                         autosave: &autosave_status,
+                        selection: &selection_overlay,
+                        select_tool,
+                        has_selection,
                     },
                 );
                 ui_wants_repaint = out.wants_repaint;
@@ -1788,6 +2065,7 @@ impl OpenPaint {
                 tool_request = out.tool;
                 confirm_request = out.confirm;
                 recovery_request = out.recovery;
+                select_request = out.select;
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
@@ -1829,6 +2107,9 @@ impl OpenPaint {
         }
         if let Some(choice) = confirm_request {
             self.answer_confirm(choice);
+        }
+        if let Some(action) = select_request {
+            self.apply_select_action(action);
         }
         if let Some(choice) = recovery_request {
             // Taken either way: an offer answered is an offer gone, and leaving it set would put
@@ -2327,6 +2608,105 @@ mod tests {
             "the line went from {before} dabs to {after} while the pen was held still; it \
              should have kept travelling toward the cursor"
         );
+    }
+
+    /// A lasso gesture resolves into a mask, and a tap does not.
+    ///
+    /// Exercises the gesture seam rather than the rasterizer: whether points reach the polygon at
+    /// all, and whether a release with nothing enclosed reads as "deselect" rather than leaving a
+    /// degenerate selection behind.
+    #[test]
+    fn a_lasso_gesture_becomes_a_selection() {
+        let mut app = OpenPaint::default();
+        app.apply_select_action(ui::SelectAction::Use(ui::SelectTool::Lasso));
+        assert!(app.select.is_some(), "the tool should be armed");
+
+        // Points are in *page* space here; `select_press`/`select_drag` map from screen, which
+        // needs a renderer, so drive the gesture directly.
+        if let Some(Select::Lasso { points }) = app.select.as_mut() {
+            points.extend([
+                (100.0, 100.0),
+                (300.0, 100.0),
+                (300.0, 300.0),
+                (100.0, 300.0),
+            ]);
+        }
+        app.select_release();
+
+        let selection = app.selection.as_ref().expect("the lasso enclosed an area");
+        assert_eq!(
+            selection.mask.coverage_at(200, 200),
+            255,
+            "inside the lasso"
+        );
+        assert_eq!(selection.mask.coverage_at(50, 50), 0, "outside it");
+        assert!(
+            !selection.outline.is_empty(),
+            "a selection with no outline cannot be seen"
+        );
+    }
+
+    /// A tap deselects, which is what a click on empty space means in every art app.
+    #[test]
+    fn a_tap_clears_the_selection() {
+        let mut app = OpenPaint::default();
+        app.apply_select_action(ui::SelectAction::All);
+        assert!(app.selection.is_some());
+
+        app.apply_select_action(ui::SelectAction::Use(ui::SelectTool::Lasso));
+        if let Some(Select::Lasso { points }) = app.select.as_mut() {
+            points.push((10.0, 10.0));
+        }
+        app.select_release();
+        assert!(
+            app.selection.is_none(),
+            "a gesture that enclosed nothing left a selection behind"
+        );
+    }
+
+    /// The gesture resets between uses, or a second lasso would extend the first.
+    #[test]
+    fn each_gesture_starts_fresh() {
+        let mut app = OpenPaint::default();
+        app.apply_select_action(ui::SelectAction::Use(ui::SelectTool::Lasso));
+        if let Some(Select::Lasso { points }) = app.select.as_mut() {
+            points.extend([(100.0, 100.0), (200.0, 100.0), (200.0, 200.0)]);
+        }
+        app.select_release();
+
+        match app.select.as_ref() {
+            Some(Select::Lasso { points }) => assert!(
+                points.is_empty(),
+                "the previous lasso's points survived into the next gesture"
+            ),
+            other => panic!("the tool should still be armed, got {other:?}"),
+        }
+    }
+
+    /// Invert with nothing selected selects everything, rather than refusing.
+    #[test]
+    fn inverting_nothing_selects_everything() {
+        let mut app = OpenPaint::default();
+        app.apply_select_action(ui::SelectAction::Invert);
+        let selection = app.selection.as_ref().expect("invert produced nothing");
+        assert_eq!(selection.mask.coverage_at(0, 0), 255);
+    }
+
+    /// Selecting a tool twice puts it away, and the crop tool cannot be up at the same time —
+    /// both consume input entirely, so two at once means one of them silently loses.
+    #[test]
+    fn selection_and_crop_do_not_overlap() {
+        let mut app = OpenPaint::default();
+        app.crop = Some(crop::Crop::new(app.editor.page_rect()));
+
+        app.apply_select_action(ui::SelectAction::Use(ui::SelectTool::Rect));
+        assert!(
+            app.crop.is_none(),
+            "arming a selection left the crop tool up"
+        );
+
+        app.apply_select_action(ui::SelectAction::Use(ui::SelectTool::Rect));
+        assert!(app.select.is_none(), "the tool did not toggle off");
     }
 
     /// The ring reports the size of the mark *on screen*, so it has to track zoom.
