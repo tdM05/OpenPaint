@@ -1975,15 +1975,42 @@ That is also why the list below is grouped by system rather than by phase.
 **An artist can take a page from rough to export today.** That is the bar this section
 existed to reach, and it is reached.
 
-### The one loose end behind us
+### Phase 0 step 6 → ✅ ANSWERED 2026-08-29: octotablet stays
 
-**Phase 0 step 6 never got a verdict.** It was "assess the feel; if octotablet is not
-good enough, hand-roll Windows Ink (`WM_POINTER`) behind the same trait for prediction
-and coalesced samples." The trait seam is there and the latency readout is there, but
-nobody has said whether the feel is good enough. Worth an explicit answer before the UI
-work starts, because it is the only remaining question that could change the input
-architecture — and because §11a's rule about reasoning versus testing has already caught
-one wrong claim about input this week (Q14).
+Step 6 was "assess the feel; if octotablet is not good enough, hand-roll Windows Ink
+(`WM_POINTER`) for prediction and coalesced samples." It had sat unanswered because
+"assess the feel" is a judgement, and nobody had made it. §4f already says latency is
+measured rather than felt; the same rule applies here, so the question was turned into a
+number first (`Perf::rate`) and then answered.
+
+**Measured on the Veikk, drawing:**
+
+| | Normal | Fast |
+| --- | --- | --- |
+| Samples per second | 252 | 241 |
+
+**Nothing is being coalesced away, and the second column is the proof.** A high number
+alone could be a coincidence of hardware; a number that barely moves between normal and
+fast drawing cannot be. Fast motion is exactly when a frame-limited input path collapses
+— it would pin near the refresh rate or fall off a cliff. A four per cent change is the
+pen reporting at its own rate, whatever that rate is.
+
+So `WM_POINTER` would buy **nothing** on the count it was proposed for: we already have
+every sample the device produces. What remains of that idea is *prediction*, which is a
+separate feature justified by the latency figure rather than by this one, and which can
+be added behind the same trait whenever the latency readout says it is worth it.
+
+**The step figure, and a readout bug it exposed.** Page-space distance between samples
+measured 40.6 px mean, 101 px peak — alarming until you notice it scales with zoom, and
+the canvas was zoomed out. `stroke_to` interpolates linearly between samples, so a chord
+deviates from the true curve by roughly `chord² / (8 × curve radius)`: at these numbers
+that is sub-pixel on a gentle curve and a few pixels on a tight one, divided by the zoom
+again on screen. Not a problem, and **not an input problem either** — if faceting ever
+shows up, the fix is curve fitting in `stroke_to`, not a different input API. The readout
+now prints screen pixels and the zoom alongside, because the page figure was right and
+unreadable.
+
+**The input architecture is settled.** Nothing now blocks the UI.
 
 ### The frontier is the UI, and it is not polish
 
@@ -1997,8 +2024,7 @@ it cheap to try several designs in parallel branches before committing to one.
 
 ### Next, in order of what is blocked
 
-1. **Settle Phase 0 step 6** — say whether the pen feel is good enough. Cheap, and it
-   gates nothing else once answered.
+1. ~~Settle Phase 0 step 6~~ — done, above. octotablet stays.
 2. **Design the UI** — the layout first (§1b), then Q4, because the layout constrains the
    framework more than the reverse. Q14 gets solved properly here rather than twice.
 3. **Build it.**
@@ -2197,9 +2223,6 @@ What is genuinely still open, in the order it matters:
 - **Q14 — routing pen input into the UI.** No longer a blocker (it works, by an accident
   of Windows synthesising mouse messages) but still real, and it should be solved once,
   as part of Q4.
-- **Phase 0 step 6** — whether the pen feel is good enough, or whether Windows Ink gets
-  hand-rolled for prediction and coalesced samples. The only open question that could
-  still change the input architecture.
 - **Q5 — colour-management depth.** sRGB-only today. `Rgba16Float` in memory means the
   headroom is already there, so this stays deferrable and should stay deferred until
   someone needs print output.

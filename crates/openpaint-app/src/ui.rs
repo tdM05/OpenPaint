@@ -1670,8 +1670,18 @@ impl Ui {
                                 }
                             }
                             if let Some((mean, peak)) = status.perf.step {
+                                // Both, because either alone misleads. Page pixels are what the
+                                // brush engine interpolates across and so what decides whether a
+                                // curve facets; screen pixels are what the hand actually moved.
+                                // Printing only the first made 40 px look alarming when the canvas
+                                // was simply zoomed out — the figure was right and unreadable.
+                                let zoom = view.scale().max(f32::MIN_POSITIVE);
                                 ui.label(format!(
-                                    "Step {mean:.1} px, peak {peak:.1} (page pixels between samples)"
+                                    "Step {mean:.1} page px, peak {peak:.1} ({:.1} / {:.1} on \
+                                     screen at {:.0}%)",
+                                    mean * zoom,
+                                    peak * zoom,
+                                    zoom * 100.0
                                 ));
                             }
                             ui.label(
