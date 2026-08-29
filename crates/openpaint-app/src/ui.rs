@@ -199,6 +199,11 @@ pub enum SelectTool {
 pub enum SelectAction {
     /// Turn a selection tool on, or off if it is already on.
     Use(SelectTool),
+    /// Put the selection tool away, leaving what is selected alone.
+    ///
+    /// **Not [`SelectAction::None`]**, which deselects. Two different things that sound alike, and
+    /// conflating them is how choosing the brush threw away a lasso somebody had just drawn.
+    Stop,
     All,
     None,
     Invert,
@@ -820,8 +825,16 @@ pub struct BrushCursor {
 /// page) re-create the GPU resources the current frame is still drawing with.
 #[derive(Default)]
 pub struct Outcome {
-    /// egui wants another frame soon.
+    /// egui wants another frame as soon as possible.
     pub wants_repaint: bool,
+    /// egui wants a frame *after* a delay, or `None` if it wants nothing scheduled.
+    ///
+    /// **Not the same as `wants_repaint` being false.** A timed thing — a panel arming under a
+    /// held pen, a tooltip, an animation — asks for a frame at a future moment, and dropping that
+    /// request means the moment never arrives. The hold-to-move gesture silently never fired for
+    /// exactly this reason: the request was made, reported as a non-zero delay, and thrown away
+    /// because only zero was honoured.
+    pub repaint_after: Option<std::time::Duration>,
     pub extend: Option<(Side, u32)>,
     pub crop: Option<CropAction>,
     /// Discard the tiles outside the page, reclaiming their memory.
@@ -1019,7 +1032,11 @@ impl Ui {
                             // or the pen would still be lassoing while the rail says Brush.
                             Picked::Paint(t) => {
                                 tool_action = Some(t);
-                                select_action = Some(SelectAction::None);
+                                // `Stop`, not `None`: put the tool away and leave the selection
+                                // alone. Switching to the brush to paint *inside* a lasso is the
+                                // whole colouring workflow (§4q), so deselecting here would undo
+                                // the thing the artist just did.
+                                select_action = Some(SelectAction::Stop);
                             }
                             Picked::Select(t) => select_action = Some(SelectAction::Use(t)),
                         }
@@ -2276,6 +2293,13 @@ impl Ui {
                 .viewport_output
                 .get(&ViewportId::ROOT)
                 .is_some_and(|v| v.repaint_delay.is_zero()),
+            repaint_after: output
+                .viewport_output
+                .get(&ViewportId::ROOT)
+                .map(|v| v.repaint_delay)
+                // Zero is "now", which `wants_repaint` already carries; `MAX` is egui's way of
+                // saying "nothing scheduled". Neither is a deadline.
+                .filter(|d| !d.is_zero() && *d < std::time::Duration::MAX),
             extend,
             crop: crop_action,
             trim,

@@ -163,6 +163,12 @@ struct OpenPaint {
     /// why `save_brush_preset` asks the *brush* whether it is stamped rather than trusting this to
     /// be current: the brush is the truth, and this is only how to find the file again.
     brush_tip_path: Option<std::path::PathBuf>,
+    /// When the UI has asked for a frame at a future moment.
+    ///
+    /// Painting is demand-driven and the loop deliberately never redraws on its own, so anything
+    /// that has to happen *after a delay* needs a deadline someone checks. Without this a panel
+    /// held under a still pen never arms, because nothing wakes to notice the time passing.
+    repaint_at: Option<Instant>,
     /// The panel workspace, and whether it is the UI on screen.
     ///
     /// Both are here while the old side panel still exists. They are two answers to the same
@@ -682,6 +688,7 @@ impl Default for OpenPaint {
             kernel: openpaint_core::Kernel::default(),
             font_families: Vec::new(),
             brush_tip_path: None,
+            repaint_at: None,
             workspace: workspace::Workspace::default(),
             workspace_mode: false,
             brushes: presets::Library::load(),
@@ -1645,6 +1652,8 @@ impl OpenPaint {
                     "Selected all",
                 );
             }
+            // The tool goes away; the mask stays. See `SelectAction::Stop`.
+            ui::SelectAction::Stop => self.select = None,
             ui::SelectAction::None => self.set_selection(None, "Deselected"),
             ui::SelectAction::Fill => self.fill_selection(),
             ui::SelectAction::Clear => self.clear_selection_pixels(),
@@ -3320,6 +3329,7 @@ impl OpenPaint {
         let visible = self.view.visible_rect(w, h);
 
         let mut ui_wants_repaint = false;
+        let mut ui_repaint_after = None;
         let mut ui_viewport = None;
         let mut extend_request = None;
         let mut crop_request = None;
@@ -3417,6 +3427,7 @@ impl OpenPaint {
                     workspace,
                 );
                 ui_wants_repaint = out.wants_repaint;
+                ui_repaint_after = out.repaint_after;
                 extend_request = out.extend;
                 crop_request = out.crop;
                 trim_request = out.trim;
@@ -3458,6 +3469,11 @@ impl OpenPaint {
         let refit_queued = ui_viewport.is_some_and(|area| self.view.set_viewport(area));
         if ui_wants_repaint || refit_queued {
             self.request_redraw();
+        }
+        // Keep the earliest deadline: a later request must not push an earlier one back.
+        if let Some(delay) = ui_repaint_after {
+            let at = Instant::now() + delay;
+            self.repaint_at = Some(self.repaint_at.map_or(at, |have| have.min(at)));
         }
 
         // Applied after the frame, not inside the overlay closure: resizing
@@ -3836,6 +3852,14 @@ impl ApplicationHandler for OpenPaint {
             // Event-driven backends (mouse) with nothing in flight stay idle until a real window
             // event, keeping the app at 0% CPU when nothing is happening.
             return;
+        }
+
+        // A frame the UI asked for at a future moment, now due. The loop already wakes often
+        // enough to notice; what it never does is redraw on its own, which is why this is here
+        // rather than left to chance.
+        if self.repaint_at.is_some_and(|at| Instant::now() >= at) {
+            self.repaint_at = None;
+            self.request_redraw();
         }
 
         // Keep waking up. Note we deliberately do NOT request a redraw here:

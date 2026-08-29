@@ -499,6 +499,27 @@ impl Workspace {
 
         // --- the drop overlay, on top of everything ---
         if let Some(Preview::Carrying { panel, over }) = preview {
+            // The panel that has come loose, marked at its source. Without this the hold arms
+            // invisibly and the only way to know it worked is to move and find out -- which makes
+            // a learnable gesture into one you have to discover. One fill; iPadOS does the same
+            // thing by lifting the tile before you move it.
+            if let Some((path, _)) = self.layout.find(panel) {
+                if let Some(slot) = placed.iter().find(|s| s.path == path) {
+                    let c = chrome::panel(slot, &m, style_of(slot), |i| {
+                        self.measure(ctx, slot.tabs.get(i).copied())
+                    });
+                    painter.rect_filled(
+                        to_egui(c.header),
+                        m.radius,
+                        egui::Color32::from_rgba_unmultiplied(
+                            p.state.0[0],
+                            p.state.0[1],
+                            p.state.0[2],
+                            110,
+                        ),
+                    );
+                }
+            }
             let top = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
                 egui::Id::new("workspace-drop"),
