@@ -3,7 +3,7 @@
 > Living record of what we've agreed on. Update this whenever a decision is
 > made or changed. Anything still undecided lives in `OPEN_QUESTIONS.md`.
 
-Last updated: 2026-08-29
+Last updated: 2026-08-29 (roadmap rewritten)
 
 ---
 
@@ -47,6 +47,34 @@ page management are the reference.
 3. **File format.** CSP's is closed. Ours is an open documented container (§7).
 
 Short version: **CSP for UX, Procreate-and-better for the engine.**
+
+### 1b. What the UI has to be — stated by the author 2026-08-29
+
+Three goals, in the author's words, before any framework is chosen. Written down first
+because they are the criteria a choice gets judged against, and a criterion invented
+after the fact is not a criterion.
+
+1. **Intuitive — "not messy like Krita."** The failure mode being named is not ugliness,
+   it is a UI where everything is available and nothing is findable. §1 already rules out
+   feature-maximalism; this rules out its interface equivalent.
+2. **Clean and modern, but not flashy.** The UI is a frame around the artwork. Anything
+   that draws attention to itself is taking attention from the page.
+3. **Customizable in a *general* way.** Panels go where the artist puts them — not "these
+   three panels may live in this one dock". The author's framing is the important part:
+   *"as little hardcoding as possible, so that the inherent design is so good, things
+   follow from this."*
+
+The third is the demanding one and it is a real constraint on Q4, not a wish. "Any panel
+anywhere" means a genuine docking model — panels as interchangeable content in a layout
+tree the artist edits — rather than a fixed arrangement with a few movable pieces. Most
+UI toolkits make the second easy and the third hard, and which of those a candidate makes
+easy is the question to ask of it first.
+
+It also rhymes with how the engine has been built and is worth stating as one idea rather
+than two: the general primitive, once, with the specific behaviours falling out of it.
+That is §4k's mask with many producers and consumers, §4q's one gate every stroke passes
+through, §4m's any-input-drives-any-parameter. A layout tree of interchangeable panels is
+the same move applied to the UI.
 
 ### Explicitly NOT doing
 - **Not building on / forking Krita.** It's GPL, ~1M+ lines of C++/Qt, and its
@@ -1896,51 +1924,109 @@ live document. Accepting duplicates work in progress; it destroys nothing. Telli
 until multiple windows exist.
 
 
-## 8. Phased roadmap
+## 8. Roadmap — rewritten 2026-08-29
 
-- **Phase 0 — Vertical slice (prove the feel):** repo scaffold + winit/wgpu
-  render loop + one pressure/tilt brush (via the input abstraction) on a tiled
-  canvas. If this doesn't feel good, nothing else matters. **IN PROGRESS:**
-  - [x] Step 1 — window opens (winit). Verified on Windows.
-  - [x] Step 2 — wgpu renderer clears surface. Verified (RTX 3070 Ti / D3D12).
-  - [x] Step 3 — tiled canvas + stamp-based brush + mouse drawing. Verified.
-  - [x] Step 4 — input abstraction (PenSample/PenEvent + InputBackend trait),
-        mouse as first swappable backend. Behavior-identical refactor.
-  - [x] Step 5 — octotablet backend (Windows Ink) behind the trait; extended
-        trait with a polled path (`poll` + `wants_continuous_poll`) since
-        octotablet is polled, not event-driven. Windows target cross-checked
-        from Linux. **VERIFIED on the real tablet 2026-08-27:** Veikk enumerates
-        as `name="Stylus"`, `axes=PRESSURE | TILT`, and pressure varies correctly
-        (e.g. 0.18→0.23, 0.82→0.60) driving dab radius. Required enabling the
-        driver's "Windows Ink" option first — see OPEN_QUESTIONS Q10d.
-        Tilt is declared but always reports 0.0 on this device (no tilt hardware),
-        so tilt-driven behavior is still unvalidated.
-    - **The first step-5 build froze on launch (fixed).** Cause: a COM/STA
-      reentrancy deadlock, not a GPU or pen-hardware problem. RealTimeStylus
-      delivers its "async" plugin callbacks on our *own UI thread*; octotablet
-      holds an internal mutex across those callbacks while making
-      out-of-process COM calls, and a COM call from an STA pumps the message
-      queue while it waits. Because step 5 called `request_redraw()` every
-      loop iteration, a `WM_PAINT` was always pending, so that nested pump
-      re-entered our handler → `poll()` → `pump()` → the same non-reentrant
-      mutex on the same thread. Hard deadlock on frame 1 at 0% CPU.
-      Fix: drain input only from `about_to_wait` (winit calls it solely from
-      the top of its own loop, never from a window procedure), pace it with
-      `ControlFlow::WaitUntil` instead of a permanently-pending redraw, and add
-      a reentrancy guard around our handlers. See Q10c.
-  - [ ] Step 6 — assess feel; if inadequate, swap to hand-rolled Windows Ink
-        (WM_POINTER) behind the same trait (prediction + coalesced samples).
-- **Phase 1 — Real engine:** full brush engine; layers + blend modes + masks;
-  undo history; color management (linear-space compositing).
-- **Phase 2 — Document & pages:** the multi-page/growable model; on-disk
-  container; save/load; PSD/PNG import-export.
-- **Phase 3 — Webcomic/sketchbook tooling:** panels, templates, page-management
-  UI, CBZ/PDF export, webtoon slicing/fold guides.
-- **Phase 4 — Pro polish:** Wintab; brush editor; stabilization; transform/
-  selection tools; performance passes; final CSP-like UI.
+> The original phases are kept at the bottom for the record. They stopped describing
+> the project some time ago, and a plan nobody can plan against is worse than none.
 
-**Discipline:** nail Phase 0's *feel* before broadening. True CSP-quality is a
-multi-year effort; focus beats breadth.
+### What the original ordering got wrong, and why that was mostly right
+
+The phases assumed features arrive in order of grandeur: engine, then documents, then
+comic tooling, then "pro polish". What actually happened is that features arrived when
+they **unblocked** something, and the ordering scrambled accordingly:
+
+- **Stabilization, selection and transform** were Phase 4. They shipped in the first
+  week, because stabilization is part of *feel* (Phase 0's whole purpose) and selection
+  is the primitive the colouring workflow is built on — a bucket, a wand and a confined
+  brush are all one mask (§4k).
+- **Layers, undo, the document format and pages** — Phases 1 and 2 — interleaved
+  completely, because each kept turning out to need the others.
+- **Masks and layer groups** were Phase 1 and have not shipped, because clipping (§4j)
+  covered the workflow they were wanted for and nothing else was blocked on them.
+
+The lesson worth carrying: **order by what is blocked, not by how advanced it sounds.**
+That is also why the list below is grouped by system rather than by phase.
+
+### Done
+
+- **Input.** Pen backend on Windows Ink through octotablet, behind a swappable trait;
+  mouse elsewhere. Pressure and tilt verified on real hardware. One pointer capture
+  decided at the press (§4l). Stabilization defined in time (§4h).
+- **Brush engine.** Dabs emitted by core, rasterized on the GPU (§4a). Elliptical dabs
+  (§4n), a curve for the edge (§4o), bitmap tips (§4p), any input driving any parameter
+  through a curve (§4m), per-stroke flow and opacity accumulation, eraser, alpha lock,
+  and named presets (§4r).
+- **Canvas.** Tiled, linear premultiplied `Rgba16Float` (§4b), a bounded GPU tile pool
+  with CPU spill so document size does not depend on graphics memory (§4d).
+- **Layers.** Opacity, visibility, reorder, delete, duplicate, merge down (§6c), three
+  blend modes, clip-to-below (§4j). Composited in one GPU pass (§4e).
+- **Selection.** Lasso, rectangle, wand, select-all, invert — one coverage mask with
+  many producers and many consumers (§4k). Fill, delete, bucket, and confining every
+  stroke (§4q).
+- **Transform.** Move, scale, rotate, flip, with a grabbable box (§5f) and resampling
+  that keeps a plain move lossless (§5d).
+- **Text.** A layer whose source of truth is its text, not its pixels (§6a), with its own
+  crate for fonts and undo that stores the words rather than the tiles.
+- **Document.** Multi-page, growable, `.openpaint` as SQLite (§7), autosave and crash
+  recovery (§7a), PNG export, a document colour palette (§6d).
+- **Undo.** Everything that changes pixels, bounded by a snapshot pool that refuses an
+  edit it could not reverse rather than performing it.
+
+**An artist can take a page from rough to export today.** That is the bar this section
+existed to reach, and it is reached.
+
+### The one loose end behind us
+
+**Phase 0 step 6 never got a verdict.** It was "assess the feel; if octotablet is not
+good enough, hand-roll Windows Ink (`WM_POINTER`) behind the same trait for prediction
+and coalesced samples." The trait seam is there and the latency readout is there, but
+nobody has said whether the feel is good enough. Worth an explicit answer before the UI
+work starts, because it is the only remaining question that could change the input
+architecture — and because §11a's rule about reasoning versus testing has already caught
+one wrong claim about input this week (Q14).
+
+### The frontier is the UI, and it is not polish
+
+Everything above is driven from a debug panel that §3 calls throwaway, and Q4 — what
+draws the real UI — is the least reversible decision left in the project. What the UI
+has to be is now written down in §1b.
+
+This is a *shell replacement*, not a rewrite: the engine knows nothing about buttons, and
+§3's architecture principle exists precisely so this is a swap. That is also what makes
+it cheap to try several designs in parallel branches before committing to one.
+
+### Next, in order of what is blocked
+
+1. **Settle Phase 0 step 6** — say whether the pen feel is good enough. Cheap, and it
+   gates nothing else once answered.
+2. **Design the UI** — the layout first (§1b), then Q4, because the layout constrains the
+   framework more than the reverse. Q14 gets solved properly here rather than twice.
+3. **Build it.**
+4. **The features that need a real UI to be worth building** — layer groups, speech
+   bubbles, a brush editor, panel and frame tools, rulers and perspective guides. Each is
+   as much interaction as engine, and building the interaction half into a throwaway
+   panel means building it twice.
+5. **Render the float on the GPU** (`TODO.md` §3) — the one performance item with a
+   known ceiling rather than a suspicion.
+6. **Everything still deferred**: Wintab, PSD interop, CBZ/PDF export, webtoon slicing,
+   colour management beyond sRGB.
+
+### The original phases, for the record
+
+- **Phase 0 — Vertical slice:** scaffold, render loop, one pressure brush on a tiled
+  canvas. Steps 1–5 done and verified on hardware; step 6 has no verdict (above).
+- **Phase 1 — Real engine:** brush engine, layers, blend modes, masks, undo, linear
+  compositing. Done except **masks**.
+- **Phase 2 — Document & pages:** the page model, container, save/load, import/export.
+  Done except **PSD interop** and **PNG import**.
+- **Phase 3 — Webcomic/sketchbook tooling:** panels, templates, page-management UI,
+  CBZ/PDF, webtoon slicing. Page management partly done; the rest untouched.
+- **Phase 4 — Pro polish:** Wintab, brush editor, stabilization, transform/selection,
+  performance, the CSP-like UI. Stabilization and transform/selection shipped early; the
+  rest untouched.
+
+**Discipline, unchanged and still right:** nail the feel before broadening. True
+CSP-quality is a multi-year effort; focus beats breadth.
 
 ---
 
@@ -2098,6 +2184,24 @@ of the same shape.
 ---
 
 ## 11. Decisions still OPEN
-See `OPEN_QUESTIONS.md`. Notably: Windows build/delivery mechanics (Q2b), final
-UI framework, color-management depth, file-format specifics, and whether to port
-libmypaint vs. build our own brush engine.
+
+See `OPEN_QUESTIONS.md`. Three of the five this section used to list have since been
+answered — the file format (Q6), the brush engine (Q7, build our own), and the Windows
+build loop (Q2b, develop on Windows) — which is why it is worth rewriting rather than
+extending.
+
+What is genuinely still open, in the order it matters:
+
+- **Q4 — what draws the real UI.** The least reversible decision left, and the one
+  everything in §8's "next" list waits behind. Judged against §1b.
+- **Q14 — routing pen input into the UI.** No longer a blocker (it works, by an accident
+  of Windows synthesising mouse messages) but still real, and it should be solved once,
+  as part of Q4.
+- **Phase 0 step 6** — whether the pen feel is good enough, or whether Windows Ink gets
+  hand-rolled for prediction and coalesced samples. The only open question that could
+  still change the input architecture.
+- **Q5 — colour-management depth.** sRGB-only today. `Rgba16Float` in memory means the
+  headroom is already there, so this stays deferrable and should stay deferred until
+  someone needs print output.
+- **Q18 — the composite cache**, and Q13's remaining piece: zoomed-out views of a heavily
+  painted document.

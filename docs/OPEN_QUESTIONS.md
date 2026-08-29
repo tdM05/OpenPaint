@@ -3,7 +3,7 @@
 > Decisions not yet made. When resolved, move a summary into `DECISIONS.md`
 > and note the resolution here.
 
-Last updated: 2026-08-27
+Last updated: 2026-08-29
 
 ---
 
@@ -28,21 +28,22 @@ general engine rather than a webtoon path and a page path.
 
 ## Blocking / high-priority (affects code we write soon)
 
-### Q2b. Windows build & delivery mechanics  ⚠️ needed for the test loop
-Author codes on Linux (SSH), tests on a separate Windows machine with the tablet.
-How do builds get to Windows, and how are they built?
-- **Cross-compile from Linux** to `x86_64-pc-windows-gnu` (or `-msvc`) and copy
-  the `.exe` over — fastest inner loop, but wgpu/graphics + Windows Ink FFI may
-  need the MSVC toolchain and careful setup.
-- **Build natively on Windows** (author runs `cargo build` there; we sync code
-  via git) — most reliable for Windows-specific APIs (Windows Ink), needs Rust
-  installed on the Windows box.
-- **CI (GitHub Actions) produces Windows artifacts** — clean, reproducible,
-  slower loop (push → wait → download).
-Also: how does the author *get* each build (shared folder, git pull + local
-build, GitHub release/artifact download)?
+### Q2b. Windows build & delivery mechanics → ✅ RESOLVED 2026-08-29: develop on Windows
 
-**Status: UNDECIDED — need author input on the Windows environment (see below).**
+Settled by what actually happened rather than by a decision: the work moved onto the
+Windows machine, and `cargo build` runs there beside the tablet. There is no delivery
+step at all — the loop is edit, build, run, draw.
+
+That collapses the problem the three options were competing to solve. It also removes
+the reason cross-compilation looked attractive: the inner loop is already as short as it
+can be, and Windows-specific code (Windows Ink, the octotablet backend, the D3D12 path)
+is compiled and exercised by the same command that builds everything else, rather than
+being the part nobody can check.
+
+**What is given up, and it is worth naming**: nothing routinely builds on Linux any
+more, so a Linux-only breakage would go unnoticed until someone tried. The CI already
+guards Windows; a Linux job would guard the portability §2 and §6 both promise. Cheap,
+not urgent, and the right time is before anyone else is asked to build this.
 
 ---
 
