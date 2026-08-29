@@ -2110,9 +2110,10 @@ it cheap to try several designs in parallel branches before committing to one.
 ### Next, in order of what is blocked
 
 1. ~~Settle Phase 0 step 6~~ — done, above. octotablet stays.
-2. **Design the UI** — the layout first (§1b), then Q4, because the layout constrains the
-   framework more than the reverse. Q14 gets solved properly here rather than twice.
-3. **Build it.**
+2. **Build the UI.** The layout model is settled (§1c) and the panel workspace is live
+   behind F2; what remains is the descriptor engine that panels are described with, and
+   porting the old panel's sections onto it. The sequence, with its reasoning, is
+   **`UI_PLAN.md`** — read that before starting UI work.
 4. **The features that need a real UI to be worth building** — layer groups, speech
    bubbles, a brush editor, panel and frame tools, rulers and perspective guides. Each is
    as much interaction as engine, and building the interaction half into a throwaway

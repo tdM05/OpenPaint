@@ -10,6 +10,9 @@
 
 Last updated: 2026-08-29
 
+> UI work has its own document: **`UI_PLAN.md`**. This file keeps what is not part of
+> that sequence.
+
 ---
 
 ## 1. Nothing may fail silently ⚠️ the standing one
