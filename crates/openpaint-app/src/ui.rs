@@ -229,7 +229,7 @@ pub struct Status<'a> {
 /// Drawn rather than assembled from widgets, for the same reason the crop and selection overlays
 /// are: this is direct manipulation of a shape, and a shape is not a stack of rectangles.
 fn curve_editor(ui: &mut egui::Ui, label: &str, curve: &mut Curve) -> bool {
-    const SIDE: f32 = 108.0;
+    const SIDE: f32 = 140.0;
     ui.label(egui::RichText::new(label).small());
     // An **explicit** id, not the automatic one. egui derives automatic ids from a per-frame
     // counter, so anything that changes what the panel contains -- the wand's sliders appearing,
@@ -681,10 +681,14 @@ impl Ui {
                                 .small()
                                 .weak(),
                             );
-                            ui.horizontal(|ui| {
-                                curve_editor(ui, "Size", &mut brush.size_response);
-                                curve_editor(ui, "Flow", &mut brush.flow_response);
-                            });
+                            // Stacked rather than side by side. Side by side put the right-hand
+                            // editor's top-right corner under the scroll bar's hover zone, which
+                            // floats over the content -- so the one control at (1, 1) could not be
+                            // grabbed. Stacking keeps both editors at the left margin, well clear
+                            // of it, and leaves room for larger boxes, which are easier to aim at.
+                            curve_editor(ui, "Size vs pressure", &mut brush.size_response);
+                            ui.add_space(2.0);
+                            curve_editor(ui, "Flow vs pressure", &mut brush.flow_response);
 
                             ui.separator();
                             ui.add(egui::Slider::new(&mut brush.flow, 0.0..=1.0).text("Flow"));
