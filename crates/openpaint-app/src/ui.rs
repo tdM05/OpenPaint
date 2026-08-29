@@ -150,6 +150,12 @@ pub struct TransformState {
 /// What the Brush section asked for, beyond editing the brush in place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrushAction {
+    /// Keep the current colour in the document's palette.
+    SaveColor,
+    /// Adopt a colour from the palette.
+    UseColor([u8; 3]),
+    /// Drop a colour from the palette.
+    ForgetColor(usize),
     /// Choose an image to use as the dab's shape.
     LoadTip,
     /// Save the brush as it stands, under the name in the box.
@@ -265,6 +271,8 @@ pub struct Status<'a> {
     pub perf: crate::perf::PerfSnapshot,
     /// Set while unsaved work from a previous run is waiting to be accepted or thrown away.
     pub recovery: Option<&'a str>,
+    /// The colours saved with this document, in the order they were added.
+    pub palette: &'a [[u8; 3]],
     /// The saved brushes, in the order they were added.
     pub presets: &'a [openpaint_core::BrushPreset],
     /// Set when the brush library itself is in trouble -- unreadable, or unwritable.
@@ -1128,9 +1136,55 @@ impl Ui {
                             ui.horizontal(|ui| {
                                 ui.label("Color");
                                 ui.color_edit_button_srgb(&mut color_srgb);
+                                if ui
+                                    .small_button("+")
+                                    .on_hover_text("Keep this colour with the document.")
+                                    .clicked()
+                                {
+                                    brush_action = Some(BrushAction::SaveColor);
+                                }
                             });
 
                             ui.separator();
+                            // The swatches. Saved *with the document*, because a comic's palette
+                            // is a property of the comic: the skin tone that has to match on page
+                            // forty is the one from page one.
+                            if !status.palette.is_empty() {
+                                ui.horizontal_wrapped(|ui| {
+                                    for (i, rgb) in status.palette.iter().enumerate() {
+                                        let colour =
+                                            egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                                        let (rect, response) = ui.allocate_exact_size(
+                                            egui::vec2(18.0, 18.0),
+                                            egui::Sense::click(),
+                                        );
+                                        ui.painter().rect_filled(rect, 2.0_f32, colour);
+                                        // A hairline border, so a white swatch on a light panel is
+                                        // still a swatch rather than a gap.
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            2.0_f32,
+                                            egui::Stroke::new(
+                                                1.0_f32,
+                                                egui::Color32::from_black_alpha(90),
+                                            ),
+                                        );
+                                        if response.clicked() {
+                                            brush_action = Some(BrushAction::UseColor(*rgb));
+                                        }
+                                        // Right-click to forget, so the row stays swatches rather
+                                        // than swatches interleaved with delete buttons.
+                                        if response.secondary_clicked() {
+                                            brush_action = Some(BrushAction::ForgetColor(i));
+                                        }
+                                        response.on_hover_text(format!(
+                                            "#{:02X}{:02X}{:02X} \u{2014} click to use, \
+                                             right-click to forget",
+                                            rgb[0], rgb[1], rgb[2]
+                                        ));
+                                    }
+                                });
+                            }
                             if ui.button("Reset to defaults").clicked() {
                                 *brush = Brush::default();
                                 color_srgb = brush.color_srgb8();

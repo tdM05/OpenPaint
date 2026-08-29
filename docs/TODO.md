@@ -34,7 +34,9 @@ question, and only for the few refusals that risk work.
 | Paint on a hidden layer | nothing happens at all | say the layer is hidden, offer to show it |
 | Paint on a locked layer | (lock not built yet) | say so when it is |
 | Fill / delete with no selection | status line | fine, but should not be panel-only |
-| Bucket click entirely outside the selection | status line (new) | good — this is the model |
+| Bucket click entirely outside the selection | status line | good — this is the model |
+| Saving a colour already in the palette | status line | good |
+| Merging the bottom layer | status line | good |
 | Transform with no selection | status line | same |
 | Transform an empty selection | status line | same |
 | Press outside the transform box | nothing happens | probably right, but confirm it does not read as dead |

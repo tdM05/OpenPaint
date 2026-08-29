@@ -72,6 +72,46 @@ fn patterned(seed: u32) -> Tile {
     t
 }
 
+/// A palette survives a save and a load, in order.
+///
+/// Stored as authored sRGB rather than converted: a swatch is a colour the artist *chose*, and a
+/// round trip through linear at eight bits would drift it a shade every time the file was opened.
+/// So the assertion is on the exact bytes, which is the property that matters.
+#[test]
+fn a_palette_round_trips() {
+    let f = TempFile::new("palette");
+    let mut doc = sample();
+    for rgb in [[0, 0, 0], [255, 231, 200], [12, 34, 56]] {
+        assert!(doc.add_to_palette(rgb));
+    }
+
+    save(f.path(), &doc, [], &[]).expect("save");
+    let back = load(f.path()).expect("load");
+    assert_eq!(
+        back.document.palette(),
+        [[0, 0, 0], [255, 231, 200], [12, 34, 56]]
+    );
+}
+
+/// A file written before palettes existed loads with none, rather than failing.
+///
+/// The tolerance every added table has followed since `meta`: absence reads as the default, so
+/// reading needs no branch on the schema version. Simulated by dropping the table, which is exactly
+/// the shape an older file has.
+#[test]
+fn a_file_without_a_palette_still_loads() {
+    let f = TempFile::new("no-palette");
+    let doc = sample();
+    save(f.path(), &doc, [], &[]).expect("save");
+
+    let db = rusqlite::Connection::open(f.path()).expect("open");
+    db.execute_batch("DROP TABLE palette;").expect("drop");
+    drop(db);
+
+    let back = load(f.path()).expect("a document without a palette is not malformed");
+    assert!(back.document.palette().is_empty());
+}
+
 #[test]
 fn a_document_round_trips_exactly() {
     let f = TempFile::new("structure");

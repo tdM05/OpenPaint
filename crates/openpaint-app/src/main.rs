@@ -3174,6 +3174,9 @@ impl OpenPaint {
             return;
         };
         let ui = self.ui.as_mut();
+        // Cloned out before `editor` is borrowed mutably, and cheap: a palette is a few dozen
+        // triples. The panel only reads it.
+        let palette = self.editor.document().palette().to_vec();
         let editor = &mut self.editor;
 
         // Execute any queued stroke work before the frame reads the canvas.
@@ -3298,6 +3301,7 @@ impl OpenPaint {
                         select_tool,
                         has_selection,
                         wand: self.wand,
+                        palette: &palette,
                         presets: brushes.presets(),
                         preset_trouble: brush_trouble,
                         font_families,
@@ -3417,6 +3421,29 @@ impl OpenPaint {
                 self.spawn_file_dialog(FileDialogKind::BrushTip, |dialog| {
                     dialog.pick_file().map(|p| vec![p])
                 });
+            }
+            Some(ui::BrushAction::SaveColor) => {
+                let rgb = self.editor.brush().color_srgb8();
+                self.status_message = Some(if self.editor.document_mut().add_to_palette(rgb) {
+                    self.mark_dirty();
+                    format!("Kept #{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+                } else {
+                    // Not a failure, but not a no-op either as far as the artist is concerned:
+                    // they pressed a button and the row did not grow, and silence there reads as
+                    // the button being broken (§6b).
+                    "That colour is already in the palette.".to_owned()
+                });
+                self.request_redraw();
+            }
+            Some(ui::BrushAction::UseColor(rgb)) => {
+                self.editor.brush_mut().set_color_srgb8(rgb);
+                self.request_redraw();
+            }
+            Some(ui::BrushAction::ForgetColor(i)) => {
+                if self.editor.document_mut().remove_from_palette(i) {
+                    self.mark_dirty();
+                    self.request_redraw();
+                }
             }
             Some(ui::BrushAction::SavePreset) => self.save_brush_preset(&preset_name),
             Some(ui::BrushAction::ApplyPreset(i)) => self.apply_brush_preset(i),

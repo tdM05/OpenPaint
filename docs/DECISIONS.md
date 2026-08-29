@@ -750,6 +750,37 @@ the state changes below — so a sabotage that wrongly marked the document dirty
 on cancel *passed*, because the line was unreachable in the test. Obligations
 first, then branch. That hazard has now bitten three times.
 
+### 6d. A palette belongs to the comic, not to the machine — 2026-08-29
+
+Colour was a picker and nothing else: mix a skin tone, use it, lose it. The question was
+where the swatches live, and it has a clear answer for this app.
+
+**Document content.** A comic's palette is a property of the comic — the skin tone that
+has to match on page forty is the one from page one, and it has to survive being handed
+to a colourist on another machine. A per-user swatch list is a different and smaller
+feature ("colours I like" rather than "colours this story uses") and can arrive later
+without this being in its way. Note this is the opposite call from brush presets (§4r)
+and for the opposite reason: a brush is a tool you own, a palette is part of the work.
+
+**Stored as authored sRGB, not converted.** A swatch is a colour the artist *chose*, so
+it is kept the way they chose it. Round-tripping through linear at eight bits is lossy,
+and a swatch that drifted a shade each time the file was opened would be worse than
+useless. Everywhere else in the engine colour is linear premultiplied (§4b) because that
+is what arithmetic wants; this is not arithmetic, it is a record.
+
+**Duplicates are refused, and the refusal says so.** A palette that fills with six copies
+of the same black is one nobody can pick from — but pressing a button and watching the row
+not grow reads as a broken button, so it answers rather than staying quiet (§6b).
+
+**Schema v7**, following the same tolerance every added table has since `meta`: absence
+reads as the default, so a file written before palettes existed loads with none and
+reading needs no branch on the schema version.
+
+A sabotage worth recording, because it is a mistake that is easy to repeat: the removal
+test took index 0 out of the list, which is the one index where "remove what was asked
+for" and "remove the first" agree. **A test has to pick the case that separates the right
+answer from the plausible one**, and index 0 never does.
+
 ### 6c. Merging is the compositor's rule seen from the other side — 2026-08-29
 
 A page is unfinishable without merge down and duplicate, so they land together.

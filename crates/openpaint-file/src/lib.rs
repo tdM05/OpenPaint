@@ -57,7 +57,7 @@ use openpaint_core::{
 /// the counter proved derivable from the layers themselves. Both were `NOT NULL`, so a version-1
 /// *writer* cannot fill a version-2 file -- hence the bump. Reading needs no branch at all: a
 /// version-2 reader simply stops asking for them, which works on both.
-pub const SCHEMA_VERSION: i32 = 6;
+pub const SCHEMA_VERSION: i32 = 7;
 
 /// How a tile's bytes are encoded in the file.
 ///
@@ -292,6 +292,12 @@ const STRUCTURE_SCHEMA: &str = "
             writing_mode  TEXT    NOT NULL,
             PRIMARY KEY (page_idx, layer_idx)
         );
+        CREATE TABLE palette (
+            idx INTEGER PRIMARY KEY,
+            r   INTEGER NOT NULL,
+            g   INTEGER NOT NULL,
+            b   INTEGER NOT NULL
+        );
         ";
 
 /// Drop every structure table, so [`STRUCTURE_SCHEMA`] can recreate them.
@@ -300,6 +306,7 @@ const STRUCTURE_SCHEMA: &str = "
 /// not to this makes *every* migration fail with "table already exists" — which is how the need for
 /// this was found, when `layer_text` arrived at v6.
 const DROP_STRUCTURE: &str = "
+        DROP TABLE IF EXISTS palette;
         DROP TABLE IF EXISTS layer_text;
         DROP TABLE IF EXISTS layer;
         DROP TABLE IF EXISTS page;
@@ -358,6 +365,7 @@ fn migrate(db: &rusqlite::Connection, from: i32) -> Result<(), Error> {
     //   v3 added `meta`.
     //   v4 added `layer.lock_alpha`; v5 added `layer.clip_below`.
     //   v6 added `layer_text`.
+    //   v7 added `palette`.
     //
     // Nothing is migrated *into* the new shapes, and nothing needs to be: a file written before a
     // flag existed did not have that flag set, and one written before `layer_text` had no text
@@ -410,6 +418,18 @@ pub fn save(
         tx.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)",
             rusqlite::params![key, value],
+        )?;
+    }
+    tx.execute("DELETE FROM palette", [])?;
+    for (index, rgb) in document.palette().iter().enumerate() {
+        tx.execute(
+            "INSERT INTO palette (idx, r, g, b) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                index as i64,
+                i64::from(rgb[0]),
+                i64::from(rgb[1]),
+                i64::from(rgb[2])
+            ],
         )?;
     }
     tx.execute("DELETE FROM layer_text", [])?;
@@ -673,8 +693,23 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
         pages.push(page);
     }
 
-    let document = Document::restored(pages, usize::try_from(active_page).unwrap_or(0))
+    let mut document = Document::restored(pages, usize::try_from(active_page).unwrap_or(0))
         .ok_or_else(|| Error::Malformed("document has no pages".into()))?;
+
+    // Absence reads as "no palette", the same tolerance `lock_alpha` and `layer_text` established:
+    // a file written before v7 has no such table, and that is not a malformed document. Reading
+    // still needs no branch on the schema version.
+    if let Ok(mut stmt) = db.prepare("SELECT r, g, b FROM palette ORDER BY idx") {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok([
+                r.get::<_, i64>(0)? as u8,
+                r.get::<_, i64>(1)? as u8,
+                r.get::<_, i64>(2)? as u8,
+            ])
+        }) {
+            document.set_palette(rows.filter_map(Result::ok).collect());
+        }
+    }
 
     let mut tiles = HashMap::new();
     let mut tile_stmt = db.prepare("SELECT page_idx, layer_id, tx, ty, codec, bytes FROM tile")?;

@@ -32,6 +32,18 @@ pub struct Document {
     /// monotonic within a session because undo holds tiles keyed by the ids of *deleted*
     /// layers, and handing one out again would let a restore land on the wrong layer.
     next_layer_id: u32,
+    /// Colours saved with this document, in the order they were added.
+    ///
+    /// **Document content, not an app setting**, and that is the decision worth naming. A comic's
+    /// palette is a property of the comic: the skin tone that has to match on page forty is the
+    /// same one from page one, and it has to survive being handed to a colourist on another
+    /// machine. A per-user swatch list is a different, smaller feature — "colours I like" rather
+    /// than "colours this story uses" — and it can arrive later without this being in its way.
+    ///
+    /// Authored sRGB, not linear premultiplied. A palette entry is a colour the artist *chose*, so
+    /// it is stored the way they chose it: converting to linear and back is lossy at 8 bits, and a
+    /// swatch that drifted a shade each time the file was opened would be worse than useless.
+    palette: Vec<[u8; 3]>,
 }
 
 impl Document {
@@ -43,6 +55,7 @@ impl Document {
             pages: vec![page],
             active: 0,
             next_layer_id,
+            palette: Vec::new(),
         }
     }
 
@@ -64,6 +77,9 @@ impl Document {
             active: active.min(pages.len() - 1),
             pages,
             next_layer_id,
+            // Set afterwards by the loader rather than taken here: a file written before palettes
+            // existed simply has none, and an empty one is the honest answer for it.
+            palette: Vec::new(),
         })
     }
 
@@ -135,6 +151,40 @@ impl Document {
         // upward does not put its next page somewhere else entirely.
         page.resize(rect);
         self.insert_page(self.active + 1, page)
+    }
+
+    /// The colours saved with this document.
+    #[must_use]
+    pub fn palette(&self) -> &[[u8; 3]] {
+        &self.palette
+    }
+
+    /// Replace the whole palette, for loading.
+    pub fn set_palette(&mut self, palette: Vec<[u8; 3]>) {
+        self.palette = palette;
+    }
+
+    /// Add a colour, unless it is already there. Returns whether it was added.
+    ///
+    /// Refusing a duplicate rather than allowing one is what makes the swatch row usable: a
+    /// palette that fills up with six copies of the same black is a palette nobody can pick from.
+    /// Exact equality is the right test because these are authored values — the artist either
+    /// chose this colour before or they did not.
+    pub fn add_to_palette(&mut self, rgb: [u8; 3]) -> bool {
+        if self.palette.contains(&rgb) {
+            return false;
+        }
+        self.palette.push(rgb);
+        true
+    }
+
+    /// Remove the colour at an index. Returns whether there was one.
+    pub fn remove_from_palette(&mut self, index: usize) -> bool {
+        if index >= self.palette.len() {
+            return false;
+        }
+        self.palette.remove(index);
+        true
     }
 
     /// Take the next layer id. The only place ids come from.
@@ -268,6 +318,34 @@ fn copy_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A palette refuses duplicates, because a row with six copies of the same black is one
+    /// nobody can pick from.
+    #[test]
+    fn a_palette_keeps_each_colour_once_and_in_order() {
+        let mut doc = Document::new(Page::new(256, 256));
+        assert!(doc.add_to_palette([10, 20, 30]));
+        assert!(doc.add_to_palette([200, 0, 0]));
+        assert!(
+            !doc.add_to_palette([10, 20, 30]),
+            "a colour already kept is not kept twice"
+        );
+        assert_eq!(doc.palette(), [[10, 20, 30], [200, 0, 0]]);
+
+        assert!(doc.add_to_palette([1, 2, 3]));
+        // Deliberately not index 0: removing the first entry is the one case where "remove the
+        // index asked for" and "remove the first" agree, so it cannot tell them apart.
+        assert!(doc.remove_from_palette(1));
+        assert_eq!(
+            doc.palette(),
+            [[10, 20, 30], [1, 2, 3]],
+            "the middle one went, and only it"
+        );
+        assert!(
+            !doc.remove_from_palette(5),
+            "an index past the end removes nothing"
+        );
+    }
 
     /// A duplicate carries everything that makes the layer look the way it does, and its content
     /// with it — so duplicating a caption gives a second editable caption, not a picture of one.
