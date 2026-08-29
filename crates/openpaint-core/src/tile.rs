@@ -47,7 +47,11 @@ pub type TileCoord = (i32, i32);
 /// `Clone` because strokes snapshot the tiles they touch before painting, so the
 /// stroke can be re-composited as it builds up (see [`crate::stroke`]). That same
 /// snapshot is what undo needs (OPEN_QUESTIONS Q13).
-#[derive(Clone)]
+///
+/// `PartialEq` and `Debug` are for tests: comparing whole tiles is how a transform proves it moved
+/// pixels rather than approximately moved them, and `Debug` prints the texel buffer, which is
+/// enormous -- so it is for assertion messages about *whether* tiles differ, never for logging one.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Tile {
     /// Row-major, `TILE_SIZE` wide, 4 values per texel.
     texels: Vec<f16>,
