@@ -638,15 +638,19 @@ it must say **what happened, why, and what to do instead**. An app that quietly 
 nothing teaches the artist that it is broken, and they are not wrong to think so: from
 where they sit, "refused for a good reason" and "bug" look identical.
 
-Two consequences, both listed as work in `TODO.md` §1 rather than done here:
+**The gap is coverage, not the surface.** Corrected by the author on the day this was
+written: the status line works and the messages it carries are good. What is missing is
+the cases that reach it — painting on a hidden layer, a wand that finds nothing, a
+failed save — and those are missing one at a time, silently.
 
-- **A status line on a debug panel is not a notification surface.** It is invisible to
-  someone looking at their drawing, and the panel is throwaway anyway (§3). Refusals
-  need a transient notice near the canvas, and a dialog for anything that risks work.
-- **Refusals need one seam.** Today each writes its own string at its own call site,
-  which is how coverage ends up patchy — the same shape as §4l, where every tool had
-  its own idea of who owned the pointer. One place to call, and the audit becomes "who
-  calls it".
+So the work is one seam, listed in `TODO.md` §1 rather than done here: today each
+refusal writes its own string at its own call site, which is how coverage ends up patchy
+— the same shape as §4l, where every tool had its own idea of who owned the pointer. One
+place to call, and the audit becomes "who calls it".
+
+The one thing the status line should *not* carry is a refusal that risks work — a failed
+save or autosave. Those want a dialog, because a line nobody happens to look at is
+indistinguishable from silence in exactly the case where silence is worst.
 
 `TODO.md` §1 holds the audit table: every place the app can decline, and whether it
 currently says so. It is deliberately a table of *known gaps* rather than a claim of

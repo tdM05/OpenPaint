@@ -22,9 +22,11 @@ confused and it just does not work)."*
 The principle is in `DECISIONS.md` §6b. This is the audit list that goes with it: every
 place the app can decline to do something, and whether it currently says so.
 
-The rule for each row: **a refusal must say what happened, why, and what to do instead**
-— and it must appear where the artist is looking, which for a canvas gesture is not a
-line at the bottom of a side panel.
+The rule for each row: **a refusal must say what happened, why, and what to do instead.**
+
+**The status line itself works** — bottom-left, and the messages it carries are good. The
+gap is *coverage*: the rows below that say nothing at all. Prominence is a smaller, later
+question, and only for the few refusals that risk work.
 
 | Situation | Today | Wanted |
 | --- | --- | --- |
@@ -43,16 +45,16 @@ line at the bottom of a side panel.
 | A brush tip file will not load | (unverified) | say which file and why |
 | Autosave fails | (unverified) | must be visible; silent autosave failure is the worst case here |
 
-**Two things to build before the table can be finished:**
+**One thing to build before the table can be finished: a single place refusals go.**
 
-1. **A real notification surface.** A one-line `status_message` on a debug panel is not
-   it — the panel is explicitly throwaway (§3), and a message there is invisible to
-   someone looking at their drawing. Wanted: a transient notice near the canvas, and a
-   dialog for anything that risks work.
-2. **A single place refusals go.** Today each refusal writes its own string at its own
-   call site, which is exactly how coverage ends up patchy — the same shape as the
-   pointer-capture bug in §4l, where every tool had its own idea of who owned the
-   pointer. One `refuse(reason)` seam, and the audit becomes "who calls it".
+Today each refusal writes its own string at its own call site, which is exactly how
+coverage ends up patchy — the same shape as the pointer-capture bug in §4l, where every
+tool had its own idea of who owned the pointer. One `refuse(reason)` seam, and the audit
+above becomes "who calls it" rather than a list somebody has to keep up to date by hand.
+
+Later, and separately: a **dialog** for the few refusals that risk work — a failed save,
+a failed autosave. Those must not be a line anyone can scroll past. Everything else the
+status line already handles.
 
 ---
 
