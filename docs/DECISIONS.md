@@ -1664,9 +1664,11 @@ it. A tool that re-frames the view mid-gesture makes the gesture unaimable.
 undoable and guarded by the same dimension and pixel-budget limits as an extend, with
 no crop-specific path to keep in sync.
 
-**The handles are painted, not egui widgets.** Pen input never reaches egui
-(OPEN_QUESTIONS Q14), so widget handles would be mouse-only — unusable with the very
-input device this app is for. Geometry lives in `crop.rs` in page coordinates, driven
+**The handles are painted, not egui widgets.** Pen input never reaches egui, which sees
+only the mouse events Windows synthesises from it (OPEN_QUESTIONS Q14) — coalesced and
+lagging, which is the wrong clock for a drag with the very input device this app is for.
+They are also in page space, so they have to move with the canvas's own pan and rotation,
+which no widget in screen space can do. Geometry lives in `crop.rs` in page coordinates, driven
 from the app's own input path, which sees pen and mouse alike; egui only draws the
 outline. Keeping the geometry free of GPU and UI types is also what makes the eight
 drag behaviours and the hit-testing directly testable.

@@ -6,6 +6,17 @@
 //! Windows Ink for input prediction + coalesced samples), only this file
 //! changes.
 //!
+//! # The mouse arrives here too, and that is deliberate
+//!
+//! octotablet emulates a tool from the mouse by default, so while this backend is active the
+//! mouse's motion comes through *here* rather than through [`crate::input_mouse`] — only one
+//! backend is installed at a time, so without that emulation the mouse could not draw at all on
+//! Windows. It is load-bearing, not incidental.
+//!
+//! The cost is that a mouse pose is indistinguishable from a pen pose downstream: it has no
+//! pressure axis, so it takes the "missing means full" fallback and reads as a constant 1.0. The
+//! log line names which it was for exactly that reason — see [`Action::Pose`].
+//!
 //! octotablet is *polled*: [`InputBackend::poll`] drains `Manager::pump()` once
 //! per loop iteration. Its events are grouped into frames — `Pose` carries the
 //! current axes (position, pressure, tilt), `Down`/`Up` mark press state,
@@ -104,6 +115,15 @@ enum Action {
         pos: (f64, f64),
         pressure: f32,
         tilt: (f32, f32),
+        /// What produced this pose, for the log line only.
+        ///
+        /// **Not decoration.** octotablet emulates a tool from the mouse by default, and that
+        /// emulated tool has no pressure axis — so its poses arrive with the "missing axis means
+        /// full" fallback of 1.0 and were logged as `pen pose … pressure=1.000`, which reads as a
+        /// pen reporting maximum pressure while hovering. Two very different problems look
+        /// identical without this: a mouse being a mouse, and a pen whose driver stopped declaring
+        /// pressure (OPEN_QUESTIONS Q10d, which has already cost one debugging session).
+        tool: &'static str,
     },
     Down,
     Up,
@@ -148,6 +168,15 @@ impl InputBackend for PenBackend {
                     };
                     match tool_event {
                         ToolEvent::Pose(pose) => actions.push(Action::Pose {
+                            // Read off the tool's declared axes rather than its name: a name is
+                            // whatever a driver felt like writing, while the presence of a
+                            // pressure axis is the thing that actually decides whether the numbers
+                            // below mean anything.
+                            tool: if tool.axes.available().contains(AvailableAxes::PRESSURE) {
+                                "pen"
+                            } else {
+                                "no-pressure tool (mouse emulation, or a driver not declaring it)"
+                            },
                             // Position is in *physical* pixels from the window's
                             // top-left, which is what `Gpu::to_canvas` wants (it
                             // divides by the wgpu surface size, also physical) and
@@ -186,6 +215,7 @@ impl InputBackend for PenBackend {
                     pos,
                     pressure,
                     tilt,
+                    tool,
                 } => {
                     self.last_pos = pos;
                     self.last_pressure = pressure;
@@ -195,7 +225,8 @@ impl InputBackend for PenBackend {
                     if self.logged_poses < 20 {
                         self.logged_poses += 1;
                         println!(
-                            "pen pose: pos=({:.1},{:.1}) pressure={:.3} tilt=({:.3},{:.3}) down={}",
+                            "pose [{tool}]: pos=({:.1},{:.1}) pressure={:.3} tilt=({:.3},{:.3}) \
+                             down={}",
                             pos.0, pos.1, pressure, tilt.0, tilt.1, self.down
                         );
                     }

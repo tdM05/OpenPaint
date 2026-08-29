@@ -808,8 +808,10 @@ impl OpenPaint {
     /// never get to see:
     ///
     /// 1. Anything modal — the panel under the pointer, a prompt, an active pan. The panel check is
-    ///    needed for the *pen* in particular, because pen input bypasses winit and egui's own
-    ///    pointer capture never sees it (OPEN_QUESTIONS Q14).
+    ///    needed because our pen path does not consult egui at all: egui may believe it has
+    ///    captured the pointer -- it sees the mouse events Windows synthesises from the pen -- while
+    ///    octotablet delivers the same gesture straight to the canvas (OPEN_QUESTIONS Q14). Two
+    ///    consumers, one gesture, and only this check keeps the canvas out of it.
     /// 2. Alt, which samples a colour. A modifier rather than a palette entry because that is how
     ///    the tool is used, and the palette does not exist yet.
     /// 3. Whichever tool is up, each of which consumes input entirely.
@@ -2275,8 +2277,9 @@ impl OpenPaint {
 
     /// Resize the active tool's brush by a factor, and say what it became.
     ///
-    /// The status line matters more than it looks: the pen cannot reach the panel (Q14), so
-    /// without feedback the only way to know the new size is to draw with it.
+    /// The status line matters more than it looks: this is a keyboard shortcut, so the artist's
+    /// eyes are on the canvas rather than on the slider that moved. Without feedback the only way
+    /// to know the new size is to draw with it and see.
     fn scale_brush(&mut self, factor: f32) -> bool {
         let brush = self.editor.brush_mut();
         brush.radius = (brush.radius * factor).clamp(MIN_BRUSH_RADIUS, MAX_BRUSH_RADIUS);

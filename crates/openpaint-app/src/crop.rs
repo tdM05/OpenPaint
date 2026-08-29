@@ -13,10 +13,12 @@
 //!
 //! # Why this is not built from egui widgets
 //!
-//! Pen input bypasses winit and never reaches egui (OPEN_QUESTIONS Q14), so handles made
-//! of egui widgets would be mouse-only. Everything here works in **page coordinates**
-//! and is driven from the app's own input path, which sees pen and mouse alike. egui is
-//! used only to *paint* the outline.
+//! Handles made of egui widgets would be in the wrong space and on the wrong clock. Wrong space
+//! because these live in **page coordinates** and must move with the canvas's own pan, zoom and
+//! rotation; wrong clock because egui only ever sees the pointer as a mouse event Windows
+//! synthesised from the pen (OPEN_QUESTIONS Q14), coalesced and lagging. Everything here is driven
+//! from the app's own input path, which sees the real pen. egui is used only to *paint* the
+//! outline.
 //!
 //! Geometry lives here, apart from any GPU or UI type, so the fiddly part — hit-testing
 //! and the eight drag behaviours — is testable directly.

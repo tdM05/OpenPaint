@@ -327,28 +327,53 @@ undoable, because it destroys pixels and 5c applies to layers exactly as it does
 - **Clipping and masks** (alpha lock, clip-to-below), which is how flats get coloured.
 - **Reordering by drag** rather than Up/Down buttons -- a real-UI concern (Q4).
 
-### Q14. Pen input cannot reach the UI layer - ARCHITECTURAL, blocks any real UI
-Surfaced 2026-08-27 when the egui debug panel landed: **only the mouse can operate
-it.** Pen input arrives through octotablet, which bypasses winit's event stream
-entirely, so egui never sees a pen event and cannot hover, click, or drag a widget.
+### Q14. Pen input and the UI — ⚠️ CORRECTED 2026-08-29: it works, but by luck
 
-Harmless for a debug panel, fatal for the real UI - a drawing app whose buttons
-cannot be pressed with the pen is unusable, and the pen is the primary input device
-by design (DECISIONS section 2).
+**The original claim here was wrong, and the author disproved it by using the app.** It
+said the pen could not operate the UI at all, because pen input arrives through
+octotablet and bypasses winit, so egui never sees a pen event. The first half is true.
+The conclusion is not: **the pen presses buttons perfectly well on the Veikk.**
 
-Interim mitigation in place: `Ui::blocks_point` reports the rect egui occupies and
-`Gpu::stroke_begin` refuses to paint there, so strokes don't land "through" the
-panel. That is a hit-test, not input routing - it stops the pen painting under the
-UI but does not let the pen *use* the UI.
+**Why it works.** Windows synthesises legacy mouse messages from pen input for
+compatibility, and nothing here opts out of that. Those reach winit, and therefore egui,
+as ordinary mouse events. So the UI is driven by synthesised mouse input while the canvas
+is driven by real pen input, and both are live at once.
 
-**The real fix is to stop treating pen input as canvas-only.** Pen events should
-enter a single input-dispatch layer that offers them to the UI first and the canvas
-second, exactly as winit events are handled now. That means synthesizing UI-facing
-pointer events from `PenEvent`, or feeding egui raw events directly.
-**Open:** where that dispatch layer lives, and whether it is worth building against
-egui at all given egui is explicitly throwaway (DECISIONS section 3) - it may be
-better to solve once, properly, when the real UI framework is chosen (Q4). Until
-then the mouse operates the UI and the pen draws.
+**Why that is still worth knowing.** It is a property of the platform, not a decision we
+made, and three things would break it:
+
+1. **Opting out of synthesis.** A hand-rolled `WM_POINTER` path (the Phase-0 step 6
+   option) can consume pen input before Windows synthesises anything. Do that without
+   routing pen to the UI first and every button goes dead to the pen — with no warning,
+   because the code that "worked" never mentioned mouse synthesis.
+2. **Any other platform.** Linux and macOS make no such promise, so a port would find
+   this hole rather than inherit the fix.
+3. **Fidelity.** Synthesised mouse events are coalesced and lag the real pen samples. Fine
+   for pressing a button, wrong for anything in the UI that wants a smooth drag — a curve
+   editor, a colour wheel, a canvas-space handle.
+
+**So the work is real but it is not a blocker, and the priority drops accordingly.** The
+right shape is unchanged from the original note: one input-dispatch layer that offers a
+pointer to the UI first and the canvas second, instead of pen-is-canvas-only. Do it when
+the real UI framework is chosen (Q4) rather than against throwaway egui, or it gets built
+twice.
+
+**The lesson, which is the more valuable half.** This sat in the docs for two days as
+"ARCHITECTURAL, blocks any real UI" and was never true. It was reasoned from how the
+event plumbing is wired rather than from picking up the pen — and the author found it in
+seconds by doing the latter. Reasoning about input is not testing input, and this file
+should say which of the two produced any claim in it.
+
+#### A related defect the same report found — ✅ FIXED
+The pen log printed `pen pose: … pressure=1.000` for **mouse** movement. octotablet
+emulates a tool from the mouse by default (`emulate_tool_from_mouse`), and while the pen
+backend is installed that emulated tool is how the mouse reaches the canvas at all — it
+is load-bearing, not incidental. But it has no pressure axis, so its poses take the
+"missing means full" fallback and read as a pen pinned at maximum pressure while merely
+hovering. That is indistinguishable from Q10d, the driver bug that has already cost one
+debugging session. The log line now names which tool produced each pose, decided by
+whether it declares a pressure axis rather than by whatever name a driver felt like
+writing.
 
 ### Q17. History is stroke-shaped, and GPU-resident
 Undo/redo landed 2026-08-27 (`crates/openpaint-app/src/history.rs`). Design and its

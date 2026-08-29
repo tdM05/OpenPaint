@@ -8,13 +8,19 @@
 //! have correct semantics but were unreachable until now, so their behavior could
 //! only be verified by unit test, never felt.
 //!
-//! # Known limitation: the pen cannot operate this UI
+//! # The pen operates this UI, but not through us
 //!
-//! Pen input arrives through octotablet, which bypasses winit's event stream
-//! entirely, so egui never sees it — only the mouse can click these widgets. Fine
-//! for a debug panel, but it is a real architectural item for the eventual UI:
-//! pen events will need routing into the UI layer as well as the canvas. Tracked
-//! in OPEN_QUESTIONS Q14.
+//! Pen input arrives through octotablet, which bypasses winit's event stream entirely, so egui
+//! never sees a pen event. It still works: Windows synthesises legacy mouse messages from pen
+//! input, those reach winit, and egui takes them for ordinary mouse input. So the panel is driven
+//! by synthesis while the canvas is driven by the real thing.
+//!
+//! That is the platform being helpful rather than a decision we made, and it is worth knowing
+//! because it is fragile in three directions: consuming pen input ourselves (a hand-rolled
+//! `WM_POINTER` path) can switch the synthesis off and kill every button with no warning; no other
+//! platform promises it; and synthesised events are coalesced and lag, which is fine for pressing
+//! a button and wrong for dragging anything. Tracked in OPEN_QUESTIONS Q14 — which said the
+//! opposite until the author picked up a pen and disproved it.
 //!
 //! To stop strokes landing "through" the panel, [`Ui::blocks_point`] reports the
 //! region egui occupies and the caller skips painting there. That check is needed
@@ -1373,8 +1379,8 @@ impl Ui {
                             );
                             ui.label(
                                 egui::RichText::new(
-                                    "Navigation is mouse/keyboard only for now: pen input \
-                                     bypasses the UI layer (Q14).",
+                                    "Navigation is mouse and keyboard for now -- these are \
+                                     shortcuts, not gestures.",
                                 )
                                 .small()
                                 .weak(),
@@ -1818,8 +1824,11 @@ impl Ui {
         });
 
         // Paint the crop rectangle and the transform box over the canvas. Deliberately painted,
-        // not built from widgets: egui never sees pen input (Q14), so widget handles would be
-        // mouse-only. Input is handled in the app's own path instead.
+        // not built from widgets. Two reasons, and the second is the one that would still hold if
+        // the first were fixed: the handles live in *page* space, so they move with the canvas's
+        // own pan, zoom and rotation; and egui only ever sees the pointer through Windows'
+        // synthesised mouse events (Q14), which are coalesced and lag the real pen -- fine for
+        // pressing a button, wrong for dragging a handle. Input is handled in the app's own path.
         //
         // One call each, through one function: the two boxes are the same drawing, and the day
         // one grew a rotation handle the other would silently not have it.
@@ -1883,7 +1892,8 @@ impl Ui {
 
         // The brush outline, drawn after the crop overlay so that on the one frame where both
         // could exist the crop wins the pixels. Painted, not a widget, for the same reason the
-        // crop handles are: egui never sees pen input (Q14).
+        // crop handles are: it lives in canvas space and has to track the pen without the lag of
+        // a synthesised mouse event (Q14).
         if let Some(cursor) = status.brush_cursor {
             let ppp = self.ctx.pixels_per_point();
             let painter = self.ctx.layer_painter(egui::LayerId::new(
