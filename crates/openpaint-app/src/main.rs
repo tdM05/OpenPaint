@@ -260,6 +260,65 @@ enum Select {
 }
 
 impl Select {
+    /// Begin a gesture at a page position.
+    ///
+    /// The **only** way one starts. A press is the one event the app already refuses when the panel
+    /// owns the pixel, so making it the sole entry point is what keeps a gesture from beginning
+    /// somewhere it was never wanted.
+    fn press(&mut self, p: (f32, f32)) {
+        match self {
+            Self::Lasso { points } => {
+                points.clear();
+                points.push(p);
+            }
+            Self::Rect { from, to } => {
+                *from = Some(p);
+                *to = p;
+            }
+        }
+    }
+
+    /// Extend a gesture already under way. Returns whether anything changed.
+    ///
+    /// **Ignored unless a press started it.** Dragging is reported whenever the button is held,
+    /// wherever the pointer is — including across the panel — and the press that would have been
+    /// refused there is not available to say so. Without this guard, clicking any control began a
+    /// lasso from wherever the mouse happened to twitch, and releasing it resolved that one stray
+    /// point into "a tap", which deselects. That is the bug that made picking a colour throw the
+    /// selection away.
+    fn drag(&mut self, p: (f32, f32)) -> bool {
+        if !self.in_progress() {
+            return false;
+        }
+        match self {
+            Self::Lasso { points } => {
+                // Only when the pen has actually moved a pixel. A resting pen reports poses
+                // continuously (see `note_pointer`), and a polygon with thousands of coincident
+                // vertices is slower to rasterize and no more accurate.
+                if points
+                    .last()
+                    .is_none_or(|last| (last.0 - p.0).abs() >= 1.0 || (last.1 - p.1).abs() >= 1.0)
+                {
+                    points.push(p);
+                    return true;
+                }
+                false
+            }
+            Self::Rect { to, .. } => {
+                *to = p;
+                true
+            }
+        }
+    }
+
+    /// Forget any gesture, leaving the tool armed for the next press.
+    fn reset(&mut self) {
+        match self {
+            Self::Lasso { points } => points.clear(),
+            Self::Rect { from, .. } => *from = None,
+        }
+    }
+
     /// Whether a gesture is actually under way.
     ///
     /// A press on the canvas starts one; a press the UI swallowed does not. The distinction
@@ -771,18 +830,10 @@ impl OpenPaint {
         let Some(p) = self.to_page_unclipped(sample) else {
             return;
         };
-        match self.select.as_mut() {
-            Some(Select::Lasso { points }) => {
-                points.clear();
-                points.push(p);
-            }
-            Some(Select::Rect { from, to }) => {
-                *from = Some(p);
-                *to = p;
-            }
-            None => return,
+        if let Some(select) = self.select.as_mut() {
+            select.press(p);
+            self.request_redraw();
         }
-        self.request_redraw();
     }
 
     /// Extend it.
@@ -790,27 +841,9 @@ impl OpenPaint {
         let Some(p) = self.to_page_unclipped(sample) else {
             return;
         };
-        match self.select.as_mut() {
-            Some(Select::Lasso { points }) => {
-                // Only when the pen has actually moved a pixel. A resting pen reports continuously
-                // (see `note_pointer`), and a polygon with thousands of coincident vertices is
-                // slower to rasterize and no more accurate.
-                if points
-                    .last()
-                    .is_none_or(|last| (last.0 - p.0).abs() >= 1.0 || (last.1 - p.1).abs() >= 1.0)
-                {
-                    points.push(p);
-                }
-            }
-            Some(Select::Rect { from, to }) => {
-                if from.is_none() {
-                    return;
-                }
-                *to = p;
-            }
-            None => return,
+        if self.select.as_mut().is_some_and(|s| s.drag(p)) {
+            self.request_redraw();
         }
-        self.request_redraw();
     }
 
     /// Finish it, and make the mask.
@@ -832,10 +865,8 @@ impl OpenPaint {
 
         // Reset the gesture either way, so the next press starts a fresh shape rather than
         // extending the last one.
-        match self.select.as_mut() {
-            Some(Select::Lasso { points }) => points.clear(),
-            Some(Select::Rect { from, .. }) => *from = None,
-            None => {}
+        if let Some(select) = self.select.as_mut() {
+            select.reset();
         }
 
         match resolved {
@@ -2861,6 +2892,78 @@ mod tests {
             app.editor.clear_mode(),
             None,
             "clearing is a change in alpha, which is exactly what the lock forbids"
+        );
+    }
+
+    /// Clicking a panel control must not disturb the selection — the *whole* click.
+    ///
+    /// Reported twice, because the first fix only covered half of it. A click on the panel is
+    /// press, then some movement while the button is held, then release. The press is refused,
+    /// because the app checks whether the panel owns that pixel. **The drag and the release are
+    /// not** — they arrive at the canvas handlers with nothing to mark them as somebody else's.
+    ///
+    /// So the first movement started a lasso (there was no previous point to compare against, so
+    /// any twitch pushed one), which made a gesture "in progress", which let the release through
+    /// the guard added for the first report, which resolved one stray point as a tap, which
+    /// deselects. Guarding the release alone was not enough, and this drives the full sequence
+    /// rather than the ending.
+    #[test]
+    fn a_click_on_the_panel_leaves_the_selection_alone() {
+        let mut app = OpenPaint::default();
+        app.apply_select_action(ui::SelectAction::All);
+        app.apply_select_action(ui::SelectAction::Use(ui::SelectTool::Lasso));
+        assert!(app.selection.is_some());
+
+        // No press ever reached the canvas. The movement and the release still do.
+        if let Some(select) = app.select.as_mut() {
+            assert!(
+                !select.drag((120.0, 40.0)),
+                "a drag with no press behind it started a gesture"
+            );
+            assert!(
+                !select.drag((121.0, 41.0)),
+                "and the second one continued it"
+            );
+        }
+        app.select_release();
+        assert!(
+            app.selection.is_some(),
+            "clicking a control cleared the selection"
+        );
+    }
+
+    /// A press *is* allowed to start one, and the tap that follows still deselects.
+    #[test]
+    fn a_press_on_the_canvas_still_starts_a_gesture() {
+        let mut app = OpenPaint::default();
+        app.apply_select_action(ui::SelectAction::All);
+        app.apply_select_action(ui::SelectAction::Use(ui::SelectTool::Lasso));
+
+        if let Some(select) = app.select.as_mut() {
+            select.press((100.0, 100.0));
+            assert!(
+                select.drag((140.0, 100.0)),
+                "a drag after a press should extend the gesture"
+            );
+        }
+        app.select_release();
+        assert!(
+            app.selection.is_none(),
+            "a real gesture enclosing nothing should still deselect"
+        );
+
+        // And a real lasso still selects. No need to re-arm: a release resets the gesture but
+        // leaves the tool up, and asking for the same tool again would toggle it *off*.
+        if let Some(select) = app.select.as_mut() {
+            select.press((100.0, 100.0));
+            select.drag((300.0, 100.0));
+            select.drag((300.0, 300.0));
+            select.drag((100.0, 300.0));
+        }
+        app.select_release();
+        assert!(
+            app.selection.is_some(),
+            "a lasso that enclosed an area produced no selection"
         );
     }
 
