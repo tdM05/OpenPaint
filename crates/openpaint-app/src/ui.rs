@@ -231,8 +231,17 @@ pub struct Status<'a> {
 fn curve_editor(ui: &mut egui::Ui, label: &str, curve: &mut Curve) -> bool {
     const SIDE: f32 = 108.0;
     ui.label(egui::RichText::new(label).small());
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(SIDE, SIDE), egui::Sense::click_and_drag());
+    // An **explicit** id, not the automatic one. egui derives automatic ids from a per-frame
+    // counter, so anything that changes what the panel contains -- the wand's sliders appearing,
+    // the layer list growing -- renumbers every widget after it. A click is press on one frame and
+    // release on another, so a widget whose id moved in between never sees either half, and the
+    // editor simply did not respond. Sliders survive that because they are dragged, not clicked.
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(SIDE, SIDE), egui::Sense::hover());
+    let response = ui.interact(
+        rect,
+        ui.id().with(("curve-editor", label)),
+        egui::Sense::click_and_drag(),
+    );
     let painter = ui.painter_at(rect);
 
     // Curve space is (0,0) bottom-left to (1,1) top-right; screen y runs the other way.
@@ -259,14 +268,37 @@ fn curve_editor(ui: &mut egui::Ui, label: &str, curve: &mut Curve) -> bool {
     let mut points: Vec<(f32, f32)> = curve.points().to_vec();
     let mut changed = false;
 
-    if let Some(pos) = response.interact_pointer_pos() {
-        let hit = points
+    let id = response.id;
+    let nearest = |pos: egui::Pos2, points: &[(f32, f32)]| {
+        points
             .iter()
             .enumerate()
             .map(|(i, p)| (i, to_screen(*p).distance(pos)))
             .filter(|(_, d)| *d < 10.0)
             .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(i, _)| i);
+            .map(|(i, _)| i)
+    };
+
+    // Which point a drag grabbed, latched for the length of the drag. Re-picking the nearest
+    // point every frame looks equivalent and is not: drag two points close together and the drag
+    // hops to whichever is now nearer, so a point can be dropped somewhere nobody aimed for.
+    if response.drag_started() {
+        let grabbed = response
+            .interact_pointer_pos()
+            .and_then(|p| nearest(p, &points));
+        ui.memory_mut(|m| m.data.insert_temp(id, grabbed));
+    }
+    if response.drag_stopped() {
+        ui.memory_mut(|m| m.data.remove::<Option<usize>>(id));
+    }
+
+    if let Some(pos) = response.interact_pointer_pos() {
+        let hit = if response.dragged() {
+            ui.memory(|m| m.data.get_temp::<Option<usize>>(id))
+                .flatten()
+        } else {
+            nearest(pos, &points)
+        };
 
         if response.secondary_clicked() {
             // Never below two, and never an end: an end is what defines the range.
@@ -483,6 +515,10 @@ impl Ui {
                     // instead of collapsing onto its content.
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
+                        // Off, or a drag on any control inside scrolls the panel instead of
+                        // reaching the control. Harmless for sliders, which egui claims first, and
+                        // fatal for anything doing its own dragging.
+                        .drag_to_scroll(false)
                         .show(ui, |ui| {
                             ui.heading("Tool");
                             ui.horizontal(|ui| {
