@@ -249,6 +249,48 @@ impl Selection {
         build.finish()
     }
 
+    /// The same mask moved by a whole-pixel offset, clipped to the page.
+    ///
+    /// So a selection follows the pixels it moved: a second drag then picks up the same content
+    /// rather than whatever is now sitting under the old outline.
+    #[must_use]
+    pub fn shifted(&self, dx: i32, dy: i32, page: PageRect) -> Self {
+        let side = TILE_SIZE as i32;
+        let mut build = Builder::default();
+        let mut run: Vec<u8> = Vec::new();
+        for (coord, tile) in &self.tiles {
+            for ly in 0..TILE_SIZE {
+                let y = coord.1 * side + ly as i32 + dy;
+                if y < page.y || y >= page.end().1 {
+                    continue;
+                }
+                // A run at a time, so a tile is resolved once per run rather than once per pixel.
+                let mut lx = 0;
+                while lx < TILE_SIZE {
+                    if tile[ly * TILE_SIZE + lx] == 0 {
+                        lx += 1;
+                        continue;
+                    }
+                    let start = lx;
+                    run.clear();
+                    while lx < TILE_SIZE && tile[ly * TILE_SIZE + lx] > 0 {
+                        run.push(tile[ly * TILE_SIZE + lx]);
+                        lx += 1;
+                    }
+                    let x = coord.0 * side + start as i32 + dx;
+                    // Clipped to the page: coverage outside it could never be filled.
+                    let from = x.max(page.x);
+                    let to = (x + run.len() as i32).min(page.end().0);
+                    if to > from {
+                        let skip = (from - x) as usize;
+                        build.write_run(from, y, &run[skip..skip + (to - from) as usize]);
+                    }
+                }
+            }
+        }
+        build.finish()
+    }
+
     /// Everything on the page this selection does not cover.
     ///
     /// Walks tiles rather than pixels: a per-pixel [`Selection::coverage_at`] would do a hash
@@ -623,6 +665,43 @@ mod tests {
         assert!(
             outline.iter().all(|l| l.len() == 4),
             "both loops are rectangles, so both should have four corners: {outline:?}"
+        );
+    }
+
+    /// The mask follows the pixels a move took, so a second drag picks up the same content.
+    #[test]
+    fn shifting_moves_the_mask_and_clips_to_the_page() {
+        let sel = Selection::from_rect(PageRect::new(100, 100, 40, 40), page());
+        let moved = sel.shifted(30, -20, page());
+
+        assert_eq!(moved.coverage_at(130, 80), 255, "the moved corner");
+        assert_eq!(moved.coverage_at(169, 119), 255, "and its far corner");
+        assert_eq!(moved.coverage_at(100, 100), 0, "nothing left behind");
+        assert_eq!(moved.coverage_at(170, 80), 0, "nor past the new edge");
+    }
+
+    /// Partial coverage has to survive the move, or a feathered selection would harden the first
+    /// time it was dragged.
+    #[test]
+    fn shifting_preserves_partial_coverage() {
+        let mut sel = Selection::from_rect(PageRect::new(100, 100, 40, 40), page());
+        sel.set_coverage(120, 120, 77);
+        let moved = sel.shifted(10, 10, page());
+        assert_eq!(moved.coverage_at(130, 130), 77);
+        assert_eq!(moved.coverage_at(131, 130), 255);
+    }
+
+    /// Moved past the edge, the part that leaves the page is dropped rather than wrapping.
+    #[test]
+    fn shifting_off_the_page_clips_rather_than_wrapping() {
+        let sel = Selection::from_rect(PageRect::new(10, 10, 40, 40), page());
+        let moved = sel.shifted(-30, -30, page());
+        assert_eq!(moved.coverage_at(0, 0), 255, "the part still on the page");
+        assert_eq!(moved.coverage_at(19, 19), 255, "up to its new far corner");
+        assert_eq!(
+            moved.coverage_at(390, 390),
+            0,
+            "coverage wrapped around to the opposite corner"
         );
     }
 

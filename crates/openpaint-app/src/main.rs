@@ -135,6 +135,8 @@ struct OpenPaint {
     select: Option<Select>,
     /// Who owns the pointer right now. See [`Capture`].
     capture: Capture,
+    /// A move in progress: the pixels lifted off the layer, and what the lift overwrote.
+    dragging: Option<Dragging>,
     /// How the magic wand behaves. Owned here because the panel only edits it.
     wand: ui::WandSettings,
     /// The document's selection, and the outline it draws.
@@ -238,6 +240,29 @@ enum Dialog {
     },
 }
 
+/// The layer the floating pixels of a transform live on while a drag is in progress.
+///
+/// Not in the document, and deliberately the largest possible id: document layers are numbered from
+/// zero by a counter that only ever increases, so this cannot collide with one.
+const FLOAT_LAYER: tile_store::LayerId = tile_store::LayerId(u32::MAX);
+
+/// Pixels in the air between a lift and a put-down.
+struct Dragging {
+    /// The layer they came from, and will go back to.
+    layer: tile_store::LayerId,
+    /// The pixels, already weighted by the selection's coverage.
+    lifted: openpaint_core::Lifted,
+    /// The selection they were lifted through, kept so a redo can clear the source again.
+    selection: openpaint_core::Selection,
+    /// What clearing the source overwrote. Held until the put-down so the whole gesture records as
+    /// one entry rather than two.
+    before: Vec<(openpaint_core::tile::TileCoord, crate::history::TileBefore)>,
+    /// Where the drag began, in page coordinates.
+    from: (f32, f32),
+    /// How far it has moved, in whole pixels.
+    offset: (i32, i32),
+}
+
 /// Who owns the pointer between a press and its release.
 ///
 /// **Decided once, at the press, and held until the release.** That is pointer capture, the model
@@ -267,6 +292,8 @@ enum Capture {
     Crop,
     /// A selection gesture.
     Select,
+    /// Dragging the selected pixels.
+    Move,
     /// Sampling a colour, and *continuing* to sample while the pointer is held — which is what
     /// holding Alt does in Photoshop, and falls out of capture rather than needing a special case.
     Pick,
@@ -295,6 +322,8 @@ enum Select {
         from: Option<(f32, f32)>,
         to: (f32, f32),
     },
+    /// Drag the selected pixels. Carries where the drag began, so the offset is a difference.
+    Move { from: Option<(f32, f32)> },
     /// Click to select the region of similar colour under the pointer — the magic wand.
     ///
     /// A click rather than a drag, so it carries a point rather than a shape, and it resolves in
@@ -320,6 +349,7 @@ impl Select {
                 *to = p;
             }
             Self::Wand { at } => *at = Some(p),
+            Self::Move { from } => *from = Some(p),
         }
     }
 
@@ -356,6 +386,8 @@ impl Select {
             // A wand is aimed, not dragged. Following the pointer would make a slip during the
             // click silently change which region is found.
             Self::Wand { .. } => false,
+            // Handled by the shell, which owns the floating pixels.
+            Self::Move { .. } => false,
         }
     }
 
@@ -365,6 +397,7 @@ impl Select {
             Self::Lasso { points } => points.clear(),
             Self::Rect { from, .. } => *from = None,
             Self::Wand { at } => *at = None,
+            Self::Move { from } => *from = None,
         }
     }
 
@@ -378,6 +411,7 @@ impl Select {
             Self::Lasso { points } => !points.is_empty(),
             Self::Rect { from, .. } => from.is_some(),
             Self::Wand { at } => at.is_some(),
+            Self::Move { from } => from.is_some(),
         }
     }
 
@@ -396,6 +430,7 @@ impl Select {
             }
             // Answered by the caller, which is the only thing that can see the pixels.
             Self::Wand { .. } => None,
+            Self::Move { .. } => None,
         }
     }
 
@@ -419,6 +454,8 @@ impl Select {
             }),
             // Nothing to preview: the shape is not known until the pixels are read.
             Self::Wand { .. } => Vec::new(),
+            // The selection's own outline is drawn moved instead, alongside the pixels.
+            Self::Move { .. } => Vec::new(),
         }
     }
 }
@@ -487,6 +524,7 @@ impl Default for OpenPaint {
             crop: None,
             select: None,
             capture: Capture::None,
+            dragging: None,
             wand: ui::WandSettings::default(),
             selection: None,
             status_message: None,
@@ -524,6 +562,7 @@ impl OpenPaint {
                     Capture::Pick => self.sample_color(sample),
                     Capture::Crop => self.crop_press(sample),
                     Capture::Select => self.select_press(sample),
+                    Capture::Move => self.move_press(sample),
                     Capture::Paint => {
                         if let Some((cx, cy)) = self.to_canvas(sample) {
                             self.stroke_start(cx, cy, sample.pressure, sample.time_ms());
@@ -566,6 +605,12 @@ impl OpenPaint {
                             self.select_drag(sample);
                         }
                     }
+                    Capture::Move => {
+                        // Only the newest: a move is where the pointer *is*, not the path it took.
+                        if let Some(sample) = samples.last() {
+                            self.move_drag(sample);
+                        }
+                    }
                     Capture::Paint => {
                         for sample in samples {
                             if let Some((cx, cy)) = self.to_canvas(sample) {
@@ -590,6 +635,7 @@ impl OpenPaint {
                         }
                     }
                     Capture::Select => self.select_release(),
+                    Capture::Move => self.move_release(),
                     // Queues the bake that commits the stroke; demand-driven painting means it
                     // needs a frame requested or it simply never happens.
                     Capture::Paint => {
@@ -631,6 +677,14 @@ impl OpenPaint {
         }
         if self.crop.is_some() {
             return Capture::Crop;
+        }
+        if matches!(self.select, Some(Select::Move { .. })) {
+            // Only with something to move. Otherwise the press falls through, so the tool being up
+            // does not make the canvas inert.
+            if self.selection.is_some() {
+                return Capture::Move;
+            }
+            return Capture::None;
         }
         if self.select.is_some() {
             return Capture::Select;
@@ -979,6 +1033,94 @@ impl OpenPaint {
         }
     }
 
+    /// Pick the selected pixels up off the layer.
+    fn move_press(&mut self, sample: &PenSample) {
+        let Some(from) = self.to_page_unclipped(sample) else {
+            return;
+        };
+        let Some(selection) = self.selection.as_ref().map(|s| s.mask.clone()) else {
+            return;
+        };
+        let layer = tile_store::LayerId(self.editor.active_layer_id());
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let Some((lifted, before)) = renderer.lift_selection(&selection, layer) else {
+            self.status_message = Some("Nothing to move: the selection is empty".to_owned());
+            self.request_redraw();
+            return;
+        };
+        renderer.float_at(&lifted, (0, 0), FLOAT_LAYER);
+        self.dragging = Some(Dragging {
+            layer,
+            lifted,
+            selection,
+            before,
+            from,
+            offset: (0, 0),
+        });
+        self.request_redraw();
+    }
+
+    /// Follow the pointer with the floating pixels.
+    fn move_drag(&mut self, sample: &PenSample) {
+        let Some(to) = self.to_page_unclipped(sample) else {
+            return;
+        };
+        let Some(drag) = self.dragging.as_mut() else {
+            return;
+        };
+        // Whole pixels: a move should not resample, so it should not offer to.
+        let offset = (
+            (to.0 - drag.from.0).round() as i32,
+            (to.1 - drag.from.1).round() as i32,
+        );
+        if offset == drag.offset {
+            return;
+        }
+        drag.offset = offset;
+        let lifted = drag.lifted.clone();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.float_at(&lifted, offset, FLOAT_LAYER);
+        }
+        self.request_redraw();
+    }
+
+    /// Put them down, and take the selection with them.
+    fn move_release(&mut self) {
+        let Some(drag) = self.dragging.take() else {
+            return;
+        };
+        let offset = drag.offset;
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        renderer.drop_float(FLOAT_LAYER);
+        let recorded = renderer.put_down(
+            &drag.lifted,
+            offset,
+            drag.layer,
+            &drag.selection,
+            drag.before,
+        );
+
+        // The selection follows the pixels, so a second drag moves the same content rather than
+        // whatever is now underneath the old outline.
+        if offset != (0, 0) {
+            let page = self.editor.page_rect();
+            self.set_selection(
+                Some(drag.selection.shifted(offset.0, offset.1, page)),
+                if recorded {
+                    "Moved the selection"
+                } else {
+                    "That move was too large to record; it cannot be undone"
+                },
+            );
+        }
+        self.mark_dirty();
+        self.request_redraw();
+    }
+
     /// The region under a page point, by the wand's current settings.
     fn wand_region(&mut self, at: (f32, f32)) -> Option<openpaint_core::Selection> {
         let page = self.editor.page_rect();
@@ -1028,6 +1170,7 @@ impl OpenPaint {
                             to: (0.0, 0.0),
                         },
                         ui::SelectTool::Wand => Select::Wand { at: None },
+                        ui::SelectTool::Move => Select::Move { from: None },
                     })
                 };
                 self.request_redraw();
@@ -1127,8 +1270,18 @@ impl OpenPaint {
             [sx, sy]
         };
 
-        // The committed selection, plus the gesture being drawn over it.
-        let committed = self.selection.iter().flat_map(|s| s.outline.clone());
+        // While a move is in flight the outline follows the pixels, or it would sit over the hole
+        // they came from and say the selection is somewhere it is not.
+        let (ox, oy) = self
+            .dragging
+            .as_ref()
+            .map_or((0.0, 0.0), |d| (d.offset.0 as f32, d.offset.1 as f32));
+        let committed = self.selection.iter().flat_map(move |s| {
+            s.outline
+                .iter()
+                .map(|path| path.iter().map(|p| (p.0 + ox, p.1 + oy)).collect())
+                .collect::<Vec<openpaint_core::selection::Loop>>()
+        });
         let live = self.select.iter().flat_map(Select::preview);
         committed
             .chain(live)
@@ -2165,6 +2318,7 @@ impl OpenPaint {
             Select::Lasso { .. } => ui::SelectTool::Lasso,
             Select::Rect { .. } => ui::SelectTool::Rect,
             Select::Wand { .. } => ui::SelectTool::Wand,
+            Select::Move { .. } => ui::SelectTool::Move,
         });
         let has_selection = self.selection.is_some();
         let perf = self.perf.snapshot();
@@ -2249,8 +2403,30 @@ impl OpenPaint {
         // Cloned, not borrowed: `editor` is handed to the overlay closure mutably, and the
         // stack is a handful of small structs so the copy is immaterial next to the borrow
         // gymnastics avoiding it would need.
-        let layers = editor.layers().to_vec();
+        let mut layers = editor.layers().to_vec();
         let active_index = editor.active_layer_index();
+        // The floating pixels of a move go in as a layer directly above the one they came from.
+        // A floating selection *is* a layer, so the compositor needs no special case and the
+        // preview is composited by the very code that will composite the result — which is what
+        // makes "what you drag is what you get" true by construction rather than by matching two
+        // implementations.
+        //
+        // Above `active_index` rather than at it, so the active index still points at the layer
+        // being painted and the in-progress stroke injects into the right place.
+        if self.dragging.is_some() {
+            layers.insert(
+                active_index + 1,
+                openpaint_core::Layer::restored(
+                    FLOAT_LAYER.0,
+                    "floating",
+                    1.0,
+                    openpaint_core::Blend::Normal,
+                    true,
+                    false,
+                    false,
+                ),
+            );
+        }
         let active_tool = editor.tool();
         let confirm_prompt = self.pending_confirm.map(|c| c.what);
         let page_count = editor.document().page_count();

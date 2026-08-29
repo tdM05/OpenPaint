@@ -594,6 +594,43 @@ impl CanvasRenderer {
         self.instance_count = 0;
     }
 
+    /// Replace every tile of a layer.
+    ///
+    /// Used for the floating pixels of a transform, which are re-shifted on every drag. They go in
+    /// as ordinary tiles of an ordinary layer, because that is what a floating selection *is* —
+    /// which is why a live transform preview needs no shader of its own.
+    pub fn set_layer_tiles(
+        &mut self,
+        layer: LayerId,
+        tiles: impl IntoIterator<Item = (TileCoord, openpaint_core::tile::Tile)>,
+    ) {
+        self.discard_layer(layer);
+        for (coord, tile) in tiles {
+            self.store.preload(TileKey::new(layer, coord), tile);
+        }
+    }
+
+    /// Replace one tile's contents.
+    pub fn replace_tile(&mut self, key: TileKey, tile: openpaint_core::tile::Tile) {
+        self.store.preload(key, tile);
+    }
+
+    /// Read specific tiles of a layer, wherever they live.
+    pub fn read_tiles(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layer: LayerId,
+        coords: &[TileCoord],
+    ) -> std::collections::HashMap<TileCoord, openpaint_core::tile::Tile> {
+        let keys: Vec<TileKey> = coords.iter().map(|c| TileKey::new(layer, *c)).collect();
+        self.store
+            .snapshot_some(device, queue, &keys)
+            .into_iter()
+            .map(|(k, t)| (k.coord, t))
+            .collect()
+    }
+
     /// Drop every tile belonging to a deleted layer.
     pub fn discard_layer(&mut self, layer: LayerId) {
         let doomed: Vec<TileCoord> = self.layer_tiles(layer).collect();

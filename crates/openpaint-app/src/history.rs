@@ -107,6 +107,22 @@ pub enum Op {
         /// be redone as a black stroke.
         mode: crate::editor::PaintMode,
     },
+    /// A selection's pixels picked up and put down somewhere else.
+    ///
+    /// Its own variant rather than a [`PaintSource`], because it is not paint: it *removes* pixels
+    /// from one place as well as adding them to another, and a redo has to do both. `before` covers
+    /// the source and the destination together, so the whole gesture is one entry in the stack --
+    /// dragging a selection should cost one undo, not two.
+    Move {
+        layer: LayerId,
+        before: Vec<(TileCoord, TileBefore)>,
+        /// The pixels themselves, so redo can put them back down. Kept whole for the same reason
+        /// `PaintSource::Mask` is: there is no gesture left to recompute them from.
+        lifted: Box<openpaint_core::Lifted>,
+        offset: (i32, i32),
+        /// Where they came from, so redo can clear the source again.
+        selection: Box<openpaint_core::Selection>,
+    },
     /// Geometry only. Nothing is saved because nothing is destroyed (DECISIONS §5c).
     Resize { resize: PageResize },
     /// Tiles discarded by Trim, owned by the operation so undo can put them straight back.
@@ -130,7 +146,9 @@ impl Op {
     /// Snapshot layers this operation holds, for release on eviction.
     fn into_slots(self) -> Vec<Slot> {
         match self {
-            Self::Paint { before, .. } => before
+            // Move holds the same shape of before-image as Paint, and releasing it matters more:
+            // a move snapshots its source and its destination.
+            Self::Paint { before, .. } | Self::Move { before, .. } => before
                 .into_iter()
                 .filter_map(|(_, b)| match b {
                     TileBefore::Content(slot) => Some(slot),
@@ -247,6 +265,27 @@ impl History {
     }
 
     /// Hand a snapshot layer back, for a caller abandoning a partly-built operation.
+    /// Give back every snapshot in a before-image that will not be recorded.
+    ///
+    /// A redo re-does the work but must not record it again, so the snapshots it takes along the
+    /// way are dead the moment they are made. Without this a redo leaks a pool layer per tile.
+    pub fn release_all(&mut self, before: Vec<(TileCoord, TileBefore)>) {
+        for (_, was) in before {
+            self.release_snapshot(was);
+        }
+    }
+
+    /// Give back a snapshot that turned out not to be needed.
+    ///
+    /// A transform snapshots its source and its destination separately, and they overlap wherever
+    /// the move was short. Whichever copy is discarded has to return its pool layer, or a drag
+    /// would leak snapshot memory for every tile it touched twice.
+    pub fn release_snapshot(&mut self, before: TileBefore) {
+        if let TileBefore::Content(slot) = before {
+            self.release_slot(slot);
+        }
+    }
+
     pub fn release_slot(&mut self, slot: Slot) {
         self.pool.free(slot);
     }

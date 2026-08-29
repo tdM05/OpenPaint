@@ -121,6 +121,8 @@ pub enum SelectTool {
     Rect,
     /// Click a region of similar colour — the magic wand, and what a bucket uses.
     Wand,
+    /// Drag the selected pixels somewhere else.
+    Move,
 }
 
 /// What the selection controls want done.
@@ -393,6 +395,7 @@ impl Ui {
                                     (SelectTool::Lasso, "Lasso"),
                                     (SelectTool::Rect, "Rectangle"),
                                     (SelectTool::Wand, "Wand"),
+                                    (SelectTool::Move, "Move"),
                                 ] {
                                     let on = status.select_tool == Some(tool);
                                     if ui.selectable_label(on, label).clicked() {

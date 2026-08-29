@@ -469,6 +469,181 @@ impl Renderer {
         }
     }
 
+    /// Paint a mask onto a layer and hand back what it overwrote, recording nothing.
+    ///
+    /// The same work `fill_selection` does, minus the history entry. A transform needs it because
+    /// clearing the source is only *half* of a move: recording it on its own would put two entries
+    /// in the undo stack for one gesture, so the caller keeps the before-image and records once.
+    fn paint_mask_unrecorded(
+        &mut self,
+        selection: &openpaint_core::Selection,
+        layer: LayerId,
+        color_linear_premul: [f32; 4],
+        opacity: f32,
+        mode: crate::editor::PaintMode,
+    ) -> Option<Vec<(openpaint_core::tile::TileCoord, TileBefore)>> {
+        let page = self.canvas_renderer.page();
+        self.stroke_layer.set_page(&self.queue, page);
+        self.stroke_layer
+            .set_paint(&self.queue, color_linear_premul, opacity, mode);
+
+        let mut encoder = self.new_stroke_encoder();
+        self.stroke_layer.begin_stroke();
+        self.stroke_layer
+            .fill_from_mask(&self.device, &self.queue, &mut encoder, selection, page);
+
+        let tiles = self.stroke_layer.tiles_to_bake(page);
+        if tiles.is_empty() {
+            self.queue.submit(std::iter::once(encoder.finish()));
+            return Some(Vec::new());
+        }
+        let before =
+            self.history
+                .snapshot_tiles(&mut encoder, &self.canvas_renderer, layer, &tiles);
+        self.stroke_layer.bake(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &mut self.canvas_renderer,
+            layer,
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+        before
+    }
+
+    /// Lift the selected pixels off a layer, clearing them from it.
+    ///
+    /// Returns the pixels and what the clear overwrote, so the caller can record the whole move as
+    /// one operation when it is put down.
+    pub fn lift_selection(
+        &mut self,
+        selection: &openpaint_core::Selection,
+        layer: LayerId,
+    ) -> Option<(
+        openpaint_core::Lifted,
+        Vec<(openpaint_core::tile::TileCoord, TileBefore)>,
+    )> {
+        let coords: Vec<openpaint_core::tile::TileCoord> =
+            selection.tiles().map(|(c, _)| *c).collect();
+        let source = self
+            .canvas_renderer
+            .read_tiles(&self.device, &self.queue, layer, &coords);
+        let lifted = openpaint_core::Lifted::from_layer(selection, |c| source.get(&c).cloned());
+        if lifted.is_empty() {
+            return None;
+        }
+        // Colour is irrelevant to an erase; the blend discards the source entirely.
+        let before = self.paint_mask_unrecorded(
+            selection,
+            layer,
+            [0.0; 4],
+            1.0,
+            crate::editor::PaintMode::Erase,
+        )?;
+        Some((lifted, before))
+    }
+
+    /// Show floating pixels at an offset, without touching the layer they came from.
+    ///
+    /// They go in as the tiles of `float`, an ordinary layer the document does not know about. A
+    /// floating selection *is* a layer, so the compositor needs no special case and the preview is
+    /// composited by exactly the code that will composite the result.
+    pub fn float_at(
+        &mut self,
+        lifted: &openpaint_core::Lifted,
+        offset: (i32, i32),
+        float: LayerId,
+    ) {
+        self.canvas_renderer
+            .set_layer_tiles(float, lifted.shifted(offset.0, offset.1));
+    }
+
+    /// Stop showing the floating pixels.
+    pub fn drop_float(&mut self, float: LayerId) {
+        self.canvas_renderer.discard_layer(float);
+    }
+
+    /// Composite floating pixels onto a layer.
+    ///
+    /// On the CPU, and `over` rather than a replace: a move must not punch a hole in whatever it
+    /// lands on. Once per gesture rather than per frame, which is what makes the readback
+    /// affordable — during the drag nothing is written to the layer at all.
+    fn paste(&mut self, lifted: &openpaint_core::Lifted, offset: (i32, i32), layer: LayerId) {
+        let placed = lifted.shifted(offset.0, offset.1);
+        let coords: Vec<openpaint_core::tile::TileCoord> = placed.keys().copied().collect();
+        let existing = self
+            .canvas_renderer
+            .read_tiles(&self.device, &self.queue, layer, &coords);
+        for (coord, tile) in placed {
+            let mut base = existing
+                .get(&coord)
+                .cloned()
+                .unwrap_or_else(openpaint_core::tile::Tile::transparent);
+            for ly in 0..openpaint_core::tile::TILE_SIZE {
+                for lx in 0..openpaint_core::tile::TILE_SIZE {
+                    let src = tile.texel(lx, ly);
+                    if src[3] <= 0.0 && src[0] <= 0.0 && src[1] <= 0.0 && src[2] <= 0.0 {
+                        continue;
+                    }
+                    let dst = base.texel(lx, ly);
+                    base.set_texel(lx, ly, openpaint_core::color::over_premul(src, dst));
+                }
+            }
+            self.canvas_renderer
+                .replace_tile(TileKey::new(layer, coord), base);
+        }
+    }
+
+    /// Put floating pixels down on a layer, recording the whole move as one operation.
+    ///
+    /// `lift_before` is what clearing the source overwrote. Merged with what the destination is
+    /// about to overwrite, and the source wins where they overlap: it was taken first, so it is the
+    /// true state before the gesture began.
+    pub fn put_down(
+        &mut self,
+        lifted: &openpaint_core::Lifted,
+        offset: (i32, i32),
+        layer: LayerId,
+        selection: &openpaint_core::Selection,
+        lift_before: Vec<(openpaint_core::tile::TileCoord, TileBefore)>,
+    ) -> bool {
+        let placed = lifted.shifted(offset.0, offset.1);
+        let coords: Vec<openpaint_core::tile::TileCoord> = placed.keys().copied().collect();
+        if coords.is_empty() {
+            return true;
+        }
+
+        let mut encoder = self.new_stroke_encoder();
+        let dest_before =
+            self.history
+                .snapshot_tiles(&mut encoder, &self.canvas_renderer, layer, &coords);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        let Some(dest_before) = dest_before else {
+            return false;
+        };
+
+        self.paste(lifted, offset, layer);
+
+        // One entry for the whole gesture. The source's before-image wins on a shared tile.
+        let mut before = lift_before;
+        let already: std::collections::HashSet<_> = before.iter().map(|(c, _)| *c).collect();
+        for (coord, was) in dest_before {
+            if already.contains(&coord) {
+                self.history.release_snapshot(was);
+            } else {
+                before.push((coord, was));
+            }
+        }
+        self.history.push(Op::Move {
+            layer,
+            before,
+            lifted: Box::new(lifted.clone()),
+            offset,
+            selection: Box::new(selection.clone()),
+        });
+        true
+    }
+
     /// Select the region of similar colour under a page pixel — the magic wand.
     ///
     /// Reads the *composited* image, which for comics is the only useful answer: colour goes on an
@@ -626,7 +801,9 @@ impl Renderer {
             return HistoryChange::None;
         };
         let change = match &op {
-            Op::Paint { layer, before, .. } => {
+            // Undoing a move is undoing paint: restore every tile it touched, at the source and
+            // at the destination alike. Only *redo* has to know the difference.
+            Op::Paint { layer, before, .. } | Op::Move { layer, before, .. } => {
                 let mut encoder = self.new_stroke_encoder();
                 for (coord, was) in before {
                     match was {
@@ -743,6 +920,31 @@ impl Renderer {
                     *layer,
                 );
                 self.queue.submit(std::iter::once(encoder.finish()));
+                HistoryChange::Pixels
+            }
+            // Redo re-does both halves: clear the source again, then put the pixels back down.
+            // The push is suppressed, because this op is already in the stack -- it is being
+            // replayed, not performed.
+            Op::Move {
+                layer,
+                lifted,
+                offset,
+                selection,
+                ..
+            } => {
+                let (layer, offset) = (*layer, *offset);
+                let lifted = lifted.clone();
+                let selection = selection.clone();
+                if let Some(before) = self.paint_mask_unrecorded(
+                    &selection,
+                    layer,
+                    [0.0; 4],
+                    1.0,
+                    crate::editor::PaintMode::Erase,
+                ) {
+                    self.history.release_all(before);
+                }
+                self.paste(&lifted, offset, layer);
                 HistoryChange::Pixels
             }
             Op::Resize { resize } => {

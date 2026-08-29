@@ -1114,6 +1114,74 @@ mod tests {
         );
     }
 
+    /// A move takes the pixels rather than copying them, reading them off a real GPU layer.
+    ///
+    /// The hole is the half that is easy to get wrong: a move that copies looks right at the
+    /// destination and wrong only where nobody is looking.
+    ///
+    /// **What this does not cover:** `Renderer::lift_selection` and `put_down`, which own the
+    /// clear, the merge and the history entry. They need a window, so they cannot be driven
+    /// headlessly — the same limit that hid the input-dispatch bugs, and worth naming rather than
+    /// leaving as an assumed pass.
+    #[test]
+    fn moving_a_selection_takes_the_pixels_rather_than_copying_them() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        const SIDE: u32 = 200;
+
+        let mut editor = Editor::new();
+        editor.resize_page(openpaint_core::PageRect::from_size(SIDE, SIDE));
+        let page = editor.page_rect();
+        let probe = test_stroke_layer(&device);
+        let mut canvas = test_canvas(&device, page, &probe);
+        let id = LayerId(editor.active_layer_id());
+
+        // A solid square in one corner of the layer.
+        let mut cpu = openpaint_core::Canvas::new(SIDE, SIDE);
+        for y in 20..60 {
+            for x in 20..60 {
+                cpu.replace_pixel(x, y, [1.0, 0.0, 0.0, 1.0]);
+            }
+        }
+        let mut enc = device.create_command_encoder(&Default::default());
+        canvas.upload_dirty(&device, &queue, &mut enc, id, &mut cpu);
+        queue.submit(std::iter::once(enc.finish()));
+
+        // Lift it through a selection of exactly that square, and put it down 100 px right.
+        let selection = openpaint_core::Selection::from_rect(
+            openpaint_core::PageRect::new(20, 20, 40, 40),
+            page,
+        );
+        // Read the layer back as a tile, the shape `Lifted::from_layer` asks for.
+        let texels = crate::test_gpu::readback_tile(&device, &queue, &canvas, id, (0, 0))
+            .expect("the layer should be resident");
+        let mut whole = openpaint_core::tile::Tile::transparent();
+        for (i, texel) in texels.iter().enumerate() {
+            whole.set_texel(
+                i % openpaint_core::tile::TILE_SIZE,
+                i / openpaint_core::tile::TILE_SIZE,
+                *texel,
+            );
+        }
+        let source: std::collections::HashMap<_, _> = [((0, 0), whole)].into_iter().collect();
+        let lifted = openpaint_core::Lifted::from_layer(&selection, |c| source.get(&c).cloned());
+        assert!(!lifted.is_empty(), "nothing was lifted");
+
+        let placed = lifted.shifted(100, 0);
+        let at = |t: &openpaint_core::tile::Tile, x: usize, y: usize| t.texel(x, y);
+        let moved_tile = placed.get(&(0, 0)).expect("still in the first tile");
+        assert!(
+            at(moved_tile, 130, 40)[3] > 0.99,
+            "the square did not arrive at its destination"
+        );
+        assert!(
+            at(moved_tile, 40, 40)[3] < 0.01,
+            "the square is still at its source, so it was copied rather than moved"
+        );
+    }
+
     /// Clearing a selection removes coverage rather than painting over it.
     ///
     /// The distinction is invisible on a single layer against paper — painting white and erasing
