@@ -240,7 +240,7 @@ enum Dialog {
 /// selection outline that disagrees with what a fill will do is worse than none.
 struct ActiveSelection {
     mask: openpaint_core::Selection,
-    outline: Vec<openpaint_core::selection::Segment>,
+    outline: Vec<openpaint_core::selection::Loop>,
 }
 
 /// A selection gesture in progress.
@@ -277,25 +277,22 @@ impl Select {
     }
 
     /// The gesture's own outline, drawn live while dragging.
-    fn preview(&self) -> Vec<((f32, f32), (f32, f32))> {
+    ///
+    /// A closed loop like a finished selection's, so the live preview and the committed outline go
+    /// through exactly the same drawing code — and a lasso shows where it will close from the
+    /// start, which is most of what makes one aimable.
+    fn preview(&self) -> Vec<openpaint_core::selection::Loop> {
         match self {
-            Self::Lasso { points } => points
-                .windows(2)
-                .map(|w| (w[0], w[1]))
-                .chain(
-                    // The closing edge, shown from the start: a lasso is implicitly closed, and
-                    // seeing where it will close is most of what makes one aimable.
-                    (points.len() > 2).then(|| (*points.last().expect("non-empty"), points[0])),
-                )
-                .collect(),
+            Self::Lasso { points } => {
+                if points.len() < 2 {
+                    Vec::new()
+                } else {
+                    vec![points.clone()]
+                }
+            }
             Self::Rect { from, to } => from.map_or_else(Vec::new, |from| {
                 let (a, b) = (from, *to);
-                vec![
-                    ((a.0, a.1), (b.0, a.1)),
-                    ((b.0, a.1), (b.0, b.1)),
-                    ((b.0, b.1), (a.0, b.1)),
-                    ((a.0, b.1), (a.0, a.1)),
-                ]
+                vec![vec![(a.0, a.1), (b.0, a.1), (b.0, b.1), (a.0, b.1)]]
             }),
         }
     }
@@ -889,23 +886,22 @@ impl OpenPaint {
     }
 
     /// The selection and any in-progress gesture, in screen space, ready to draw.
-    fn selection_overlay(&self) -> Vec<[[f32; 2]; 2]> {
+    fn selection_overlay(&self) -> Vec<Vec<[f32; 2]>> {
         let Some(renderer) = self.renderer.as_ref() else {
             return Vec::new();
         };
         let (sw, sh) = renderer.size_px();
-        let to_screen = |p: (f32, f32)| {
+        let to_screen = |p: &(f32, f32)| {
             let (sx, sy) = self.view.canvas_to_screen(p.0, p.1, sw, sh);
             [sx, sy]
         };
 
         // The committed selection, plus the gesture being drawn over it.
-        let committed = self.selection.iter().flat_map(|s| s.outline.iter());
+        let committed = self.selection.iter().flat_map(|s| s.outline.clone());
         let live = self.select.iter().flat_map(Select::preview);
         committed
-            .copied()
             .chain(live)
-            .map(|(a, b)| [to_screen(a), to_screen(b)])
+            .map(|path| path.iter().map(to_screen).collect())
             .collect()
     }
 

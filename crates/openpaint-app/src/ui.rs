@@ -172,8 +172,8 @@ pub struct Status<'a> {
     pub recovery: Option<&'a str>,
     /// What autosave has to report: a line of text, ready to show.
     pub autosave: &'a str,
-    /// Selection boundary in screen space, as segments.
-    pub selection: &'a [[[f32; 2]; 2]],
+    /// Selection boundary in screen space, as closed loops.
+    pub selection: &'a [Vec<[f32; 2]>],
     /// Which selection tool is active, if any.
     pub select_tool: Option<SelectTool>,
     /// Whether there is a selection to act on.
@@ -747,9 +747,6 @@ impl Ui {
                                 .small()
                                 .weak(),
                             );
-                            if let Some(msg) = status.message {
-                                ui.label(egui::RichText::new(msg).small());
-                            }
                             ui.separator();
                             ui.heading("Page");
                             ui.label(format!(
@@ -814,6 +811,35 @@ impl Ui {
                         });
                 });
             panel_rect = panel.response.rect;
+
+            // The status bar. It used to be a label at the bottom of this panel, under Export,
+            // below several hundred pixels of other controls -- so it scrolled off screen and was
+            // reported, fairly, as "what status line? I don't see it". Feedback nobody can see is
+            // not feedback.
+            //
+            // Along the bottom of the *canvas*, where every application puts one, and drawn rather
+            // than laid out so it cannot push the canvas around the way the confirm window once
+            // did.
+            if let Some(msg) = status.message {
+                let screen = ctx.screen_rect();
+                let left = panel_rect.right();
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("status-bar"),
+                ));
+                let text = painter.layout_no_wrap(
+                    msg.to_owned(),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_white_alpha(230),
+                );
+                let pad = egui::vec2(10.0, 5.0);
+                let size = text.size() + pad * 2.0;
+                let at = egui::pos2(left + 12.0, screen.bottom() - size.y - 12.0);
+                let box_rect = egui::Rect::from_min_size(at, size);
+                painter.rect_filled(box_rect, 4.0, egui::Color32::from_black_alpha(190));
+                painter.galley(at + pad, text, egui::Color32::WHITE);
+            }
+
 
             // Recovered work gets its own window rather than being folded into the unsaved-changes
             // prompt: the question is different (there is nothing to save yet) and so are the
@@ -923,28 +949,36 @@ impl Ui {
                 egui::Order::Foreground,
                 egui::Id::new("selection-overlay"),
             ));
-            for [a, b] in status.selection {
-                let seg = [
-                    egui::pos2(a[0] / ppp, a[1] / ppp),
-                    egui::pos2(b[0] / ppp, b[1] / ppp),
-                ];
-                // Dark underneath, white dashes on top: the marching-ants convention, and the
-                // reason it is a convention is that nothing else reads unambiguously over both
-                // white paper and black ink.
+            for path in status.selection {
+                if path.len() < 2 {
+                    continue;
+                }
+                // Closed: the loop's last point joins its first, and the dash phase has to run
+                // across that join like any other.
+                let mut points: Vec<egui::Pos2> = path
+                    .iter()
+                    .map(|p| egui::pos2(p[0] / ppp, p[1] / ppp))
+                    .collect();
+                points.push(points[0]);
+
+                // Dark underneath, white dashes on top: the marching-ants convention, and it is a
+                // convention because nothing else reads unambiguously over both white paper and
+                // black ink.
                 //
-                // Dashed rather than solid because a solid line at the page border -- which is
-                // exactly where "select all" and "invert" put one -- is indistinguishable from the
-                // page border itself. That was reported as "impossible to tell if it inverted",
-                // and it was a fair complaint about a solid outline.
-                painter.line_segment(
-                    seg,
+                // Dashed rather than solid because a solid line at the page border -- exactly where
+                // "select all" and "invert" put one -- is indistinguishable from the page border
+                // itself. Dashed *along the path*, not per segment: dashing each segment
+                // separately turned a curved lasso into a spray of dots, because a curve's
+                // segments are one to three pixels long and a dash pattern is a property of a path.
+                painter.add(egui::Shape::line(
+                    points.clone(),
                     egui::Stroke::new(2.0_f32, egui::Color32::from_black_alpha(190)),
-                );
+                ));
                 painter.extend(egui::Shape::dashed_line(
-                    &seg,
+                    &points,
                     egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
-                    4.0_f32,
-                    4.0_f32,
+                    5.0_f32,
+                    5.0_f32,
                 ));
             }
         }

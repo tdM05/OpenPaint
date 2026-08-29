@@ -261,8 +261,8 @@ impl Selection {
     }
 }
 
-/// One line of a selection boundary, in page space.
-pub type Segment = ((f32, f32), (f32, f32));
+/// A closed boundary loop, in page space. The last point joins the first.
+pub type Loop = Vec<(f32, f32)>;
 
 /// Coverage at or above this counts as inside when drawing the boundary.
 ///
@@ -271,24 +271,34 @@ pub type Segment = ((f32, f32), (f32, f32));
 const INSIDE: u8 = 128;
 
 impl Selection {
-    /// The boundary, as page-space line segments ready to draw.
+    /// The boundary, as closed loops ready to draw.
     ///
-    /// Computed from the mask rather than from the gesture that produced it. Drawing the lasso
-    /// polygon we already have would look better today and be wrong tomorrow: a flood fill, an
-    /// inversion, or an intersection produces a mask with no polygon behind it, and then the outline
-    /// and the truth would quietly disagree. One source, so they cannot.
+    /// Computed from the mask, not from the gesture that produced it. Drawing the lasso polygon we
+    /// already have would look better today and be wrong tomorrow: an inversion, an intersection or
+    /// a flood fill produces a mask with no polygon behind it, and then the outline and the truth
+    /// would quietly disagree. One source, so they cannot.
     ///
-    /// Axis-aligned pixel edges — the staircase Photoshop's marching ants also draw — with
-    /// collinear runs merged. Merging is not cosmetic: a smooth lasso has thousands of unit edges,
-    /// and handing every one of them to the UI each frame is the difference between tens of
-    /// segments and thousands.
+    /// # Why loops rather than loose segments
+    ///
+    /// The first version returned unmerged-then-merged segments, and the marching-ants dashes were
+    /// applied to each one separately. On a rectangle that is fine -- its four sides are hundreds
+    /// of pixels long. On a *curve* every merged run is one to three pixels, so a four-pixel dash
+    /// pattern rendered each of them as a single dot, and a lasso came out as a dotted spray.
+    ///
+    /// A dash pattern is a property of a path, so the boundary has to be a path. Edges are emitted
+    /// with the inside on their left, which makes them chain end to end into closed loops, and the
+    /// dash phase then runs continuously around each loop the way it should.
     #[must_use]
-    pub fn outline(&self) -> Vec<Segment> {
+    pub fn outline(&self) -> Vec<Loop> {
         let inside = |x: i32, y: i32| self.coverage_at(x, y) >= INSIDE;
 
-        // Collect the unit edges of the boundary, keyed so runs along the same line are adjacent.
-        let mut horizontal: Vec<(i32, i32)> = Vec::new(); // (y, x) for the edge above pixel (x, y)
-        let mut vertical: Vec<(i32, i32)> = Vec::new(); // (x, y) for the edge left of pixel (x, y)
+        // Directed boundary edges by start vertex. Winding consistently -- top edge to +x, right to
+        // +y, bottom to -x, left to -y, with y pointing down -- is what makes them chain: the end
+        // of one edge is the start of exactly one other.
+        let mut next: HashMap<(i32, i32), Vec<(i32, i32)>> = HashMap::new();
+        let mut edge = |from: (i32, i32), to: (i32, i32)| {
+            next.entry(from).or_default().push(to);
+        };
         for (coord, tile) in &self.tiles {
             let side = TILE_SIZE as i32;
             for ly in 0..TILE_SIZE {
@@ -298,54 +308,67 @@ impl Selection {
                     }
                     let x = coord.0 * side + lx as i32;
                     let y = coord.1 * side + ly as i32;
-                    // An edge exists wherever an inside pixel meets an outside one. Testing both
-                    // sides of every pixel would emit each shared edge twice; testing only the
-                    // lower and right neighbours of the *outside* pixel is the usual trick, but
-                    // reading the neighbour directly is clearer and the mask is already random
-                    // access.
                     if !inside(x, y - 1) {
-                        horizontal.push((y, x));
-                    }
-                    if !inside(x, y + 1) {
-                        horizontal.push((y + 1, x));
-                    }
-                    if !inside(x - 1, y) {
-                        vertical.push((x, y));
+                        edge((x, y), (x + 1, y));
                     }
                     if !inside(x + 1, y) {
-                        vertical.push((x + 1, y));
+                        edge((x + 1, y), (x + 1, y + 1));
+                    }
+                    if !inside(x, y + 1) {
+                        edge((x + 1, y + 1), (x, y + 1));
+                    }
+                    if !inside(x - 1, y) {
+                        edge((x, y + 1), (x, y));
                     }
                 }
             }
         }
 
-        let mut out = Vec::new();
-        merge_runs(&mut horizontal, |line, from, to| {
-            out.push(((from as f32, line as f32), (to as f32, line as f32)));
-        });
-        merge_runs(&mut vertical, |line, from, to| {
-            out.push(((line as f32, from as f32), (line as f32, to as f32)));
-        });
-        out
+        // Walk each loop, consuming edges as it goes.
+        let mut starts: Vec<(i32, i32)> = next.keys().copied().collect();
+        // Sorted so the output does not depend on hash order, which would make it untestable and
+        // make the dash phase jump between otherwise identical frames.
+        starts.sort_unstable();
+
+        let mut loops = Vec::new();
+        for start in starts {
+            while next.get(&start).is_some_and(|v| !v.is_empty()) {
+                let mut path = vec![start];
+                let mut at = start;
+                while let Some(to) = next.get_mut(&at).and_then(Vec::pop) {
+                    if to == start {
+                        break;
+                    }
+                    path.push(to);
+                    at = to;
+                }
+                if path.len() >= 4 {
+                    loops.push(simplify(&path));
+                }
+            }
+        }
+        loops
     }
 }
 
-/// Merge unit edges that lie on the same line and touch, emitting one segment per run.
-fn merge_runs(edges: &mut [(i32, i32)], mut emit: impl FnMut(i32, i32, i32)) {
-    edges.sort_unstable();
-    let mut i = 0;
-    while i < edges.len() {
-        let (line, start) = edges[i];
-        let mut end = start;
-        while i + 1 < edges.len() && edges[i + 1] == (line, end + 1) {
-            end += 1;
-            i += 1;
+/// Drop points that lie on a straight run, so a long edge is two points rather than two hundred.
+///
+/// Not cosmetic: the outline is rebuilt whenever the selection changes and redrawn every frame, and
+/// a full-page selection has thousands of collinear vertices along each side.
+fn simplify(path: &[(i32, i32)]) -> Loop {
+    let n = path.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let prev = path[(i + n - 1) % n];
+        let here = path[i];
+        let after = path[(i + 1) % n];
+        let collinear =
+            (prev.0 == here.0 && here.0 == after.0) || (prev.1 == here.1 && here.1 == after.1);
+        if !collinear {
+            out.push((here.0 as f32, here.1 as f32));
         }
-        // Half-open: a run covering pixels `start..=end` spans the boundary from `start` to
-        // `end + 1`, because an edge belongs to the pixel it borders.
-        emit(line, start, end + 1);
-        i += 1;
     }
+    out
 }
 
 /// Accumulates coverage into sparse tiles as it is produced.
@@ -486,28 +509,66 @@ mod tests {
         assert!(Selection::new().outline().is_empty());
     }
 
-    /// A rectangle's boundary is four segments, not four hundred.
+    /// A rectangle's boundary is one loop of four corners, not four hundred vertices.
     ///
-    /// Merging is what makes the outline drawable: a smooth lasso has thousands of unit edges, and
-    /// handing every one to the UI each frame is a different order of cost.
+    /// Both halves matter. **One loop**, because dashes are a property of a path: applying them to
+    /// loose segments is what turned a curved lasso into a spray of dots. **Four corners**, because
+    /// the outline is redrawn every frame and a full-page selection has thousands of collinear
+    /// vertices along each side.
     #[test]
-    fn a_rectangles_outline_is_four_merged_segments() {
+    fn a_rectangles_outline_is_one_loop_of_four_corners() {
         let sel = Selection::from_rect(PageRect::new(100, 100, 50, 40), page());
         let outline = sel.outline();
+        assert_eq!(outline.len(), 1, "expected one loop, got {outline:?}");
         assert_eq!(
-            outline.len(),
+            outline[0].len(),
             4,
-            "expected four sides, got {} segments: {outline:?}",
-            outline.len()
+            "expected four corners, got {:?}",
+            outline[0]
         );
 
-        let total: f32 = outline
-            .iter()
-            .map(|(a, b)| (b.0 - a.0).abs() + (b.1 - a.1).abs())
+        let path = &outline[0];
+        let perimeter: f32 = (0..path.len())
+            .map(|i| {
+                let a = path[i];
+                let b = path[(i + 1) % path.len()];
+                (b.0 - a.0).abs() + (b.1 - a.1).abs()
+            })
             .sum();
         assert!(
-            (total - 2.0 * (50.0 + 40.0)).abs() < 0.01,
-            "the perimeter came to {total}, not 2*(50+40)"
+            (perimeter - 2.0 * (50.0 + 40.0)).abs() < 0.01,
+            "the perimeter came to {perimeter}, not 2*(50+40)"
+        );
+    }
+
+    /// A curved boundary comes out as one continuous loop, not a heap of fragments.
+    ///
+    /// This is the reported bug: the outline traced the right shape but rendered as tiny dots,
+    /// because every fragment was dashed on its own and a curve's fragments are one to three pixels
+    /// long. Fragment count is the thing to assert -- a single closed path dashes correctly, and
+    /// two hundred of them cannot.
+    #[test]
+    fn a_curved_outline_is_one_continuous_loop() {
+        let points: Vec<(f32, f32)> = (0..64)
+            .map(|i| {
+                let a = i as f32 * std::f32::consts::TAU / 64.0;
+                (200.0 + 80.0 * a.cos(), 200.0 + 80.0 * a.sin())
+            })
+            .collect();
+        let outline = Selection::from_polygon(&points, page()).outline();
+
+        assert_eq!(
+            outline.len(),
+            1,
+            "a circle's boundary came out as {} pieces; dashes would render it as dots",
+            outline.len()
+        );
+        // A staircase around a circle of radius 80 has plenty of corners, but nothing like one per
+        // boundary pixel -- the collinear runs between them are what `simplify` removes.
+        assert!(
+            outline[0].len() > 20,
+            "the loop has only {} corners; it is not tracing the curve",
+            outline[0].len()
         );
     }
 
@@ -520,12 +581,15 @@ mod tests {
     fn an_inverted_selection_outlines_the_hole_and_the_page_edge() {
         let sel = Selection::from_rect(PageRect::new(100, 100, 50, 40), page()).inverted(page());
         let outline = sel.outline();
-        // Four sides of the page plus four sides of the hole.
+        // Two loops: the page border, and the hole where the rectangle was.
         assert_eq!(
             outline.len(),
-            8,
-            "expected the page border and the hole, got {} segments",
-            outline.len()
+            2,
+            "expected the page border and the hole, got {outline:?}"
+        );
+        assert!(
+            outline.iter().all(|l| l.len() == 4),
+            "both loops are rectangles, so both should have four corners: {outline:?}"
         );
     }
 
