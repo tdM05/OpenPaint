@@ -459,7 +459,6 @@ mod tests {
     fn a_divider_takes_a_margin_from_its_neighbour() {
         let l = workspace();
         let placed = l.resolve(area());
-        let splitters = l.splitters(area(), metrics().splitter_grab);
         let leaf = placed[1].clone();
         let c = panel(&leaf, &metrics(), HeaderStyle::Named, |_| 40.0);
         let first = c.tabs[0].rect;
