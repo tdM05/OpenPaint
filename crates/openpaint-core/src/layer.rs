@@ -22,6 +22,8 @@
 //! un-premultiplies, blends, and re-premultiplies around it. The GPU has a second copy of
 //! this in `composite.wgsl`, and [`Blend::apply`] is what the tests compare it against.
 
+use crate::text::TextBlock;
+
 /// How a layer combines with what is beneath it.
 ///
 /// Deliberately a small set. These three cover the overwhelming majority of comic and
@@ -74,6 +76,44 @@ impl Blend {
     }
 }
 
+/// What a layer is *made of* — the thing its pixels are derived from.
+///
+/// The distinction that matters is **who owns the truth**:
+///
+/// - [`Content::Raster`]: the tiles are the truth. A brush writes them and nothing regenerates
+///   them, which is why a painted stroke survives forever.
+/// - [`Content::Text`]: the [`TextBlock`] is the truth and the tiles are a *cache* of it, thrown
+///   away and rebuilt whenever the text, font or box changes. That is what lets a caption typed on
+///   Monday be retyped on Thursday.
+///
+/// Everything downstream is deliberately untouched by this. The compositor reads tiles keyed by
+/// layer id and neither knows nor cares which of these filled them, so blend modes, opacity,
+/// clipping, alpha lock, selection and export need no text-specific code at all. The one thing that
+/// does change is who may write those tiles: see [`Layer::accepts_paint`].
+///
+/// This enum is also where vector content lands later. It is the reason the text work does not have
+/// to be redone to get there — the shape of the answer is already "a layer has a source of truth",
+/// and a vector layer is another arm of it.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum Content {
+    #[default]
+    Raster,
+    /// Boxed because a [`TextBlock`] is far larger than the unit variant, and a `Layer` is cloned
+    /// for every history snapshot; without the box every raster layer would pay text's size.
+    Text(Box<TextBlock>),
+}
+
+impl Content {
+    /// The name shown where a layer's kind is displayed.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Raster => "Raster",
+            Self::Text(_) => "Text",
+        }
+    }
+}
+
 /// One layer of a page: how it looks, not what is on it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layer {
@@ -87,6 +127,13 @@ pub struct Layer {
     pub lock_alpha: bool,
     /// Mask this layer by the layer below it. See [`Layer::clips_below`].
     pub clip_below: bool,
+    /// What this layer is made of. See [`Content`].
+    ///
+    /// Private, and reached through [`Layer::content`] / [`Layer::set_content`], because changing it
+    /// is not an ordinary field write: a layer whose content becomes [`Content::Text`] stops
+    /// accepting paint, and one that becomes [`Content::Raster`] has just had its text discarded.
+    /// Both are decisions, and the type should make them look like decisions.
+    content: Content,
 }
 
 impl Layer {
@@ -113,7 +160,19 @@ impl Layer {
             visible,
             lock_alpha,
             clip_below,
+            content: Content::Raster,
         }
+    }
+
+    /// The same layer, carrying text instead of pixels.
+    ///
+    /// Separate from [`Layer::restored`] rather than an eighth positional argument to it: that call
+    /// already takes three bools in a row, and a loader that has no text to restore should not have
+    /// to say so.
+    #[must_use]
+    pub fn with_text(mut self, block: TextBlock) -> Self {
+        self.content = Content::Text(Box::new(block));
+        self
     }
 
     /// Create a layer with a given id. Only [`crate::page::Page`] hands out ids, so that
@@ -128,6 +187,7 @@ impl Layer {
             visible: true,
             lock_alpha: false,
             clip_below: false,
+            content: Content::Raster,
         }
     }
 
@@ -165,6 +225,56 @@ impl Layer {
         self.clip_below
     }
 
+    /// What this layer is made of.
+    #[must_use]
+    pub fn content(&self) -> &Content {
+        &self.content
+    }
+
+    /// Replace what this layer is made of.
+    ///
+    /// Note what this does *not* do: it does not touch tiles. Those live in the renderer, and a
+    /// content change invalidates them rather than rewriting them — the caller re-derives. Doing it
+    /// here would put the renderer inside the document model, which is the one thing this crate is
+    /// meant not to know about.
+    pub fn set_content(&mut self, content: Content) {
+        self.content = content;
+    }
+
+    /// The text this layer holds, if it holds text.
+    #[must_use]
+    pub fn text(&self) -> Option<&TextBlock> {
+        match &self.content {
+            Content::Raster => None,
+            Content::Text(block) => Some(block),
+        }
+    }
+
+    /// The text this layer holds, to edit in place.
+    ///
+    /// The tiles are stale the moment this is written through, so whatever takes it is responsible
+    /// for re-deriving them.
+    pub fn text_mut(&mut self) -> Option<&mut TextBlock> {
+        match &mut self.content {
+            Content::Raster => None,
+            Content::Text(block) => Some(block),
+        }
+    }
+
+    /// Whether a brush may write to this layer's pixels.
+    ///
+    /// **The rule that makes derived content safe.** A stroke painted on a text layer would vanish
+    /// the next time the text was re-rendered — not immediately, but the next time someone fixed a
+    /// typo, which is far worse than refusing outright. So the answer is no, and the UI offers to
+    /// convert the layer to raster instead, which is the same bargain CSP strikes.
+    ///
+    /// Asked as a question about the layer rather than checked at each tool, so a tool added later
+    /// cannot forget: painting, filling, clearing, erasing and moving all go through this.
+    #[must_use]
+    pub fn accepts_paint(&self) -> bool {
+        matches!(self.content, Content::Raster)
+    }
+
     /// Opacity clamped to the range the compositor accepts.
     #[must_use]
     pub fn effective_opacity(&self) -> f32 {
@@ -179,6 +289,67 @@ impl Layer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default is what every layer has always been, so adding a content kind changed no
+    /// existing layer.
+    #[test]
+    fn a_layer_is_raster_unless_told_otherwise() {
+        let l = Layer::new(1, "Layer 1");
+        assert_eq!(*l.content(), Content::Raster);
+        assert!(l.text().is_none());
+        assert!(l.accepts_paint());
+    }
+
+    /// The rule that keeps derived content safe: a brush must never write pixels that a later
+    /// re-render would discard.
+    #[test]
+    fn a_text_layer_refuses_paint() {
+        let l = Layer::new(1, "Caption").with_text(TextBlock::at(10.0, 20.0));
+        assert!(
+            !l.accepts_paint(),
+            "painting here would vanish the next time the text was edited"
+        );
+        assert!(l.text().is_some());
+        assert_eq!(l.content().label(), "Text");
+    }
+
+    /// Converting to raster is what the UI offers instead of refusing forever, and it has to
+    /// actually restore painting.
+    #[test]
+    fn converting_to_raster_gives_paint_back_and_drops_the_text() {
+        let mut l = Layer::new(1, "Caption").with_text(TextBlock::at(0.0, 0.0));
+        l.set_content(Content::Raster);
+        assert!(l.accepts_paint());
+        assert!(
+            l.text().is_none(),
+            "the text is gone, which is what makes this one-way"
+        );
+    }
+
+    /// Content travels with the layer, so a history snapshot restores the text as well as the
+    /// name and blend mode.
+    #[test]
+    fn content_is_part_of_a_layers_identity() {
+        let mut a = Layer::new(1, "Caption").with_text(TextBlock::at(0.0, 0.0));
+        let b = a.clone();
+        assert_eq!(a, b);
+
+        a.text_mut().expect("text layer").text = "Hello".into();
+        assert_ne!(a, b, "an edit to the text has to be a change to the layer");
+        assert_eq!(b.text().expect("still text").text, "");
+    }
+
+    /// Everything that is not pixels keeps working on a text layer, because nothing downstream
+    /// looks at the content kind.
+    #[test]
+    fn a_text_layer_is_still_an_ordinary_layer() {
+        let mut l = Layer::new(1, "Caption").with_text(TextBlock::at(0.0, 0.0));
+        l.blend = Blend::Multiply;
+        l.opacity = 0.5;
+        assert!((l.effective_opacity() - 0.5).abs() < 1e-6);
+        l.visible = false;
+        assert_eq!(l.effective_opacity(), 0.0);
+    }
 
     #[test]
     fn normal_ignores_what_is_underneath() {
