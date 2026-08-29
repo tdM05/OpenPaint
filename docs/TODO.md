@@ -58,7 +58,67 @@ status line already handles.
 
 ---
 
-## 2. Known defects
+## 2. A selection must confine every tool, through one gate ⚠️ next
+
+**Raised by the author, 2026-08-29:** *"if I select, then go to brush tool, is the
+intention for the paint to stay within the selection? cause rn the paint goes anywhere.
+is this a general problem for eraser and other tools too? is there a clean way to
+generalize all this behaviour rather than hardcoding stuff."*
+
+**Yes to all three, and yes there is.** DECISIONS §4k already lists "confining a brush"
+as a consumer of the mask; it is the one consumer that was never wired up. Every raster
+app confines every painting and editing operation to an active selection — a brush that
+ignores it would be read as broken, not as a variant.
+
+**A selection is a property of the destination, not a feature of a tool.** That is the
+whole point, and it is what stops this being fourteen separate patches: the brush does
+not need to know what a selection is. Something else does, once.
+
+**The gate already exists.** Every stroke — brush, eraser, alpha-locked — becomes pixels
+on a layer in exactly one place: `paint_fs` in `stroke.wgsl`. The three paint modes are
+three *blend states* over that one fragment shader. So confining every brush and the
+eraser is one texture bound there and one multiply into the coverage it outputs.
+
+### The generalisation: a write mask
+
+Constraints on writing to a layer split into two kinds, and conflating them is how this
+gets hardcoded:
+
+| Kind | What it is | Where it belongs |
+| --- | --- | --- |
+| **Selection mask** | per-pixel coverage over the document | multiply at the write gate |
+| **Layer mask** (not built) | per-pixel coverage attached to a layer | the same multiply |
+| **Alpha lock** | depends on the destination's own alpha | blend state — already right |
+| **Clipping** | depends on the layer *below* | the compositor, non-destructive — already right (§4j) |
+
+The first two are the same thing: an external coverage image. Their product is the
+**write mask**, computed once per operation and applied at the one gate. The other two
+are not masks at all — they read pixels rather than carry them — and folding them in
+would be the mistake.
+
+The rule that falls out, and that the audit in §1 can be checked against: **anything
+that writes to a layer goes through the write mask.** Brush, eraser, bucket, gradient,
+filters, paste. Nothing else has to know.
+
+### Two things it buys immediately
+
+- **Soft selections work for free.** The mask is 8-bit coverage rather than a bitmask
+  (§4k), so a feathered selection gives a feathered brush edge without anyone writing
+  code for it. That was the reason for coverage, and this is where it pays.
+- **Layer masks stop being a feature.** They become a second input to a multiply that
+  already exists — which is what §4k predicted when it called the selection "the same
+  primitive a layer mask needs".
+
+### The one interaction question
+
+Painting entirely outside the selection then does nothing, which is correct and is what
+every app does — but it is also §1's problem in its purest form. Photoshop pops "the
+area is not editable" after a stroke that lands nowhere. Ours should say something too,
+and it is a good first customer for the `refuse` seam.
+
+---
+
+## 3. Known defects
 
 - **The app test binary occasionally dies with `STATUS_ACCESS_VIOLATION`** rather than
   failing a test — roughly one run in ten on the dev box, always at process level, never
@@ -68,7 +128,7 @@ status line already handles.
 
 ---
 
-## 3. The next real piece of work: render the float on the GPU
+## 4. The next real piece of work: render the float on the GPU
 
 A live transform still resamples on the **CPU** (§5g). After the obvious waste was
 removed it is 33 ms per frame for a 256-pixel selection and 453 ms for a 1024-pixel one
@@ -93,7 +153,7 @@ yes.
 
 ---
 
-## 4. Deferred features (decided we want them; not now)
+## 5. Deferred features (decided we want them; not now)
 
 - **Cursor feedback on the transform box** — a scale cursor on the handles, a rotate
   cursor on the ring. Needs a cursor seam that works for pen as well as mouse (Q14).
