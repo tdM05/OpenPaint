@@ -15,6 +15,7 @@ pub mod document;
 pub mod layer;
 pub mod page;
 pub mod raster;
+pub mod selection;
 pub mod stabilizer;
 pub mod stroke;
 pub mod tile;
@@ -25,6 +26,7 @@ pub use dab::Dab;
 pub use document::Document;
 pub use layer::{Blend, Layer};
 pub use page::{Page, PageRect, PageResize, Side};
+pub use selection::Selection;
 pub use stabilizer::{Smoothed, Stabilizer};
 pub use stroke::StrokePainter;
 

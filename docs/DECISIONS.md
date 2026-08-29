@@ -391,6 +391,60 @@ engine is written:
 On-disk storage format is a **separate, later** decision (Q6) — 16-bit in memory
 does not oblige 16-bit on disk.
 
+### 4k. Selection is a coverage mask, and a bucket is not a tool — 2026-08-28
+
+Prompted by the right challenge: *"isn't bucket just whatever is in the
+selection? why make the bucket do both?"* Yes. I had conflated region-finding
+with filling, and the split is better.
+
+**Three separate things**, and the middle one is where all the difficulty lives:
+
+1. **A mask** — per-pixel coverage over the document. One data structure.
+2. **Producers** — lasso, rectangle, select-all, invert, and later a flood fill
+   from a seed point.
+3. **Consumers** — fill, delete, transform, confining a brush.
+
+So a bucket fill is *find a region, fill it, discard the mask*. The magic wand is
+*find a region, keep the mask*. Same machinery, different front end. Building a
+flood fill inside a bucket tool guarantees a second, subtly different copy the day
+the wand arrives — the mistake `export::Composite` was extracted to undo, and
+`§11a` has that class listed twice already.
+
+It also settles a question that would otherwise have been a special case: with a
+selection active, a bucket click fills the *intersection* of the found region and
+the selection. That composes for free here.
+
+**Coverage, not a bitmask.** One byte per pixel, eight times the memory of a
+boolean on something transient that is already eight times cheaper than a colour
+tile. It buys anti-aliased selection edges, feathering, partial selection and
+soft-edged fills — all of which would mean rewriting every consumer to retrofit.
+And it makes this the **same primitive a layer mask needs**: per-pixel coverage
+attached to a layer instead of to the document. Layer masks are arguably a bigger
+feature than selection for comics, and they should not need a second
+implementation.
+
+**The CPU holds the truth**, which dissolves a problem rather than solving it. The
+canvas needed the whole residency-and-spill machinery of `tile_store.rs` because
+its tiles are the only copy of the artwork. A mask's authoritative copy is ordinary
+memory, so any GPU mirror is a *cache*: rebuildable, and exhausting it cannot
+corrupt anything. It is also where a flood fill wants its data, being inherently
+serial.
+
+**Sequencing, corrected twice by the same conversation.** Alpha lock shipped before
+clipping and should not have (§4j). Then: mask → lasso and rectangle → fill →
+select-all/invert first, and the flood-fill region-finder after. Lasso-only fill is
+*not* the comic workflow — hand-tracing fifty regions you already inked is exactly
+the labour a bucket deletes — but it ships a real capability and builds the
+primitive the flood fill plugs into, so nothing is thrown away.
+
+**Vector layers stay open**, confirmed rather than hoped. The compositor consumes
+tile *slots* and does not care where a tile's pixels came from, so a vector layer
+is one whose tiles are **derived** — a cache re-rasterized when geometry changes —
+not authoritative. Three things preserve that: geometry stored in page-space floats
+(so re-rasterizing at print resolution is free), nothing assuming a layer's tiles
+are the only truth for its pixels, and accepting that `Layer` eventually needs a
+kind. Not now; just not foreclosed.
+
 ### 4j. Clipping is the colouring workflow; alpha lock is the shortcut — 2026-08-28
 
 Asked directly, and the answer corrected a sequencing mistake: **artists clip far
