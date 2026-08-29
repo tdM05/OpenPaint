@@ -35,6 +35,7 @@
 
 mod autosave;
 mod canvas_renderer;
+mod chrome;
 mod crop;
 mod editor;
 mod export;
@@ -52,6 +53,7 @@ mod stroke_exec;
 mod stroke_layer;
 #[cfg(test)]
 mod test_gpu;
+mod theme;
 mod tile_pool;
 mod tile_store;
 mod transform_box;

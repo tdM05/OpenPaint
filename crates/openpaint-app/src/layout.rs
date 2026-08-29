@@ -114,7 +114,7 @@ impl Zone {
 ///
 /// Large enough to hit with a pen without aiming, small enough that "join as a tab" stays the
 /// easiest thing to do: stacking is the common intent and splitting is the deliberate one.
-const EDGE_BAND: f32 = 0.25;
+pub const EDGE_BAND: f32 = 0.25;
 
 /// The smallest fraction of a split a child may be dragged down to.
 ///

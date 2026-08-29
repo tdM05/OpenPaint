@@ -42,6 +42,7 @@ rfd = "0.17"
 # live next to the document: that folder may be read-only, on removable media, or synced.
 dirs = "6"
 # The brush library is JSON in the data directory -- see `presets.rs` for why not SQLite.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
