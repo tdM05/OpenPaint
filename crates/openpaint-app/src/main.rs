@@ -1333,6 +1333,20 @@ impl OpenPaint {
         match change {
             renderer::HistoryChange::None => {}
             renderer::HistoryChange::Pixels => self.request_redraw(),
+            // The selection follows the pixels it moved, in both directions. Without this, undoing
+            // a move put the artwork back and left the outline at the destination, describing a
+            // selection of something that was no longer there.
+            renderer::HistoryChange::Moved { offset } => {
+                let page = self.editor.page_rect();
+                if let Some(mask) = self
+                    .selection
+                    .as_ref()
+                    .map(|s| s.mask.shifted(offset.0, offset.1, page))
+                {
+                    self.set_selection(Some(mask), "Moved the selection back");
+                }
+                self.request_redraw();
+            }
             renderer::HistoryChange::Geometry { rect } => {
                 self.editor.resize_page(rect);
                 self.request_redraw();
@@ -2403,30 +2417,8 @@ impl OpenPaint {
         // Cloned, not borrowed: `editor` is handed to the overlay closure mutably, and the
         // stack is a handful of small structs so the copy is immaterial next to the borrow
         // gymnastics avoiding it would need.
-        let mut layers = editor.layers().to_vec();
+        let layers = editor.layers().to_vec();
         let active_index = editor.active_layer_index();
-        // The floating pixels of a move go in as a layer directly above the one they came from.
-        // A floating selection *is* a layer, so the compositor needs no special case and the
-        // preview is composited by the very code that will composite the result — which is what
-        // makes "what you drag is what you get" true by construction rather than by matching two
-        // implementations.
-        //
-        // Above `active_index` rather than at it, so the active index still points at the layer
-        // being painted and the in-progress stroke injects into the right place.
-        if self.dragging.is_some() {
-            layers.insert(
-                active_index + 1,
-                openpaint_core::Layer::restored(
-                    FLOAT_LAYER.0,
-                    "floating",
-                    1.0,
-                    openpaint_core::Blend::Normal,
-                    true,
-                    false,
-                    false,
-                ),
-            );
-        }
         let active_tool = editor.tool();
         let confirm_prompt = self.pending_confirm.map(|c| c.what);
         let page_count = editor.document().page_count();

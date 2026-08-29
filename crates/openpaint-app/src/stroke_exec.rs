@@ -548,6 +548,7 @@ mod tests {
             doc.layers(),
             0,
             Some(&layer),
+            None,
         );
         queue.submit(std::iter::once(enc.finish()));
         let screen =

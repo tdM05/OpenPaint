@@ -54,6 +54,14 @@ pub enum HistoryChange {
     },
     /// A restored page was deleted again.
     PageDeleted { index: usize },
+    /// Pixels moved back or forward, and the selection has to follow them.
+    ///
+    /// The selection lives in the shell rather than in history — it is not part of the document —
+    /// so undo can restore the pixels but cannot move the outline itself. Reporting the offset is
+    /// how the shell keeps the two together; without it, undoing a move put the artwork back and
+    /// left the marching ants at the destination, describing a selection of something that was no
+    /// longer there.
+    Moved { offset: (i32, i32) },
 }
 
 /// Everything an overlay needs to draw itself into the current frame.
@@ -89,6 +97,13 @@ pub struct Renderer {
     unrecordable: bool,
     /// Set when the last frame's visible tiles did not all fit in the pool.
     pressured: bool,
+    /// The layer holding a transform's floating pixels, while one is in the air.
+    ///
+    /// Injected into the *active* layer by the compositor rather than composited as a layer of its
+    /// own. It is that layer's content, held above it — so a clipped layer above must still take
+    /// the artwork as its base, and inserting the float as a layer made it the base instead, which
+    /// is why a shading layer clipped to the artwork vanished the moment a move began.
+    floating: Option<LayerId>,
     window: Arc<Window>,
 }
 
@@ -193,6 +208,7 @@ impl Renderer {
             recording_paint: ([0.0; 4], 1.0, crate::editor::PaintMode::Normal),
             unrecordable: false,
             pressured: false,
+            floating: None,
             window,
         })
     }
@@ -556,11 +572,13 @@ impl Renderer {
     ) {
         self.canvas_renderer
             .set_layer_tiles(float, lifted.shifted(offset.0, offset.1));
+        self.floating = Some(float);
     }
 
     /// Stop showing the floating pixels.
     pub fn drop_float(&mut self, float: LayerId) {
         self.canvas_renderer.discard_layer(float);
+        self.floating = None;
     }
 
     /// Composite floating pixels onto a layer.
@@ -802,7 +820,7 @@ impl Renderer {
         };
         let change = match &op {
             // Undoing a move is undoing paint: restore every tile it touched, at the source and
-            // at the destination alike. Only *redo* has to know the difference.
+            // at the destination alike. What differs is only what the caller is told afterwards.
             Op::Paint { layer, before, .. } | Op::Move { layer, before, .. } => {
                 let mut encoder = self.new_stroke_encoder();
                 for (coord, was) in before {
@@ -832,7 +850,13 @@ impl Renderer {
                     }
                 }
                 self.queue.submit(std::iter::once(encoder.finish()));
-                HistoryChange::Pixels
+                // A move has to take the selection back with it; paint does not.
+                match &op {
+                    Op::Move { offset, .. } => HistoryChange::Moved {
+                        offset: (-offset.0, -offset.1),
+                    },
+                    _ => HistoryChange::Pixels,
+                }
             }
             Op::Resize { resize } => {
                 self.resize_canvas(resize.inverted(), false);
@@ -945,7 +969,7 @@ impl Renderer {
                     self.history.release_all(before);
                 }
                 self.paste(&lifted, offset, layer);
-                HistoryChange::Pixels
+                HistoryChange::Moved { offset }
             }
             Op::Resize { resize } => {
                 self.resize_canvas(*resize, false);
@@ -1031,6 +1055,7 @@ impl Renderer {
             layers,
             active,
             Some(&self.stroke_layer),
+            self.floating,
         );
         self.queue.submit(std::iter::once(prep.finish()));
         self.stroke_layer.set_frame(&self.queue, xform, page);

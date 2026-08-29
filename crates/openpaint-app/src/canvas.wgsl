@@ -62,6 +62,10 @@ struct LayerInfo {
 // Which accumulation layer holds the in-progress stroke for each tile, by instance, or ABSENT.
 // Per tile because accumulation is tiled for the same reason the canvas is (DECISIONS 4d).
 @group(0) @binding(6) var<storage, read> stroke_slots: array<u32>;
+// Which canvas-pool layer holds the floating pixels of a transform for each tile, or ABSENT.
+// They live in the same array texture as the canvas, because a floating selection is made of
+// ordinary tiles -- only where it is composited differs.
+@group(0) @binding(7) var<storage, read> float_slots: array<u32>;
 
 // Two triangles over the unit square, (0,0) at the top-left in page space.
 fn quad(vid: u32) -> vec2<f32> {
@@ -188,6 +192,21 @@ fn composite_fs(in: TileOut) -> @location(0) vec4<f32> {
             // An explicit level, because an implicit one needs derivatives and this is inside
             // a loop -- and because there is no mip chain to choose from anyway.
             src = textureSampleLevel(tiles, samp, in.uv, i32(slot), 0.0);
+        }
+
+        // The floating pixels of a transform belong *to* the active layer too: they are its own
+        // content held in the air, so they must go on before its opacity, blend and clipping.
+        //
+        // This is why they are injected rather than inserted as an extra layer. As a layer they
+        // would sit between the active one and whatever is above it -- and a clipped layer above
+        // would then take *them* as its clip base, so a shading layer clipped to the artwork
+        // vanished the moment a move began, and came back on release.
+        if (i == active_layer) {
+            let float_slot = float_slots[in.instance];
+            if (float_slot != ABSENT) {
+                let f = textureSampleLevel(tiles, samp, in.uv, i32(float_slot), 0.0);
+                src = f + src * (1.0 - f.a);
+            }
         }
 
         // The in-progress stroke belongs *to* the active layer, so it goes on before the

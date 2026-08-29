@@ -103,6 +103,7 @@ pub struct CanvasRenderer {
     infos_capacity: usize,
     /// One entry per instance: which accumulation layer holds the in-progress stroke there.
     stroke_buf: wgpu::Buffer,
+    float_buf: wgpu::Buffer,
     stroke_capacity: usize,
     instances: wgpu::Buffer,
     instance_capacity: usize,
@@ -161,6 +162,7 @@ impl CanvasRenderer {
             infos_capacity * std::mem::size_of::<LayerInfoRecord>(),
         );
         let stroke_buf = storage_buffer(device, "canvas-stroke-slots", stroke_capacity * 4);
+        let float_buf = storage_buffer(device, "canvas-float-slots", stroke_capacity * 4);
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("canvas-tile-instances"),
             size: (instance_capacity * std::mem::size_of::<TileInstance>()) as wgpu::BufferAddress,
@@ -192,6 +194,8 @@ impl CanvasRenderer {
                 storage_entry(4),
                 texture_entry(5),
                 storage_entry(6),
+                // The floating pixels of a transform, by tile.
+                storage_entry(7),
             ],
         });
 
@@ -205,6 +209,7 @@ impl CanvasRenderer {
             &infos_buf,
             &accum_view,
             &stroke_buf,
+            &float_buf,
         );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -293,6 +298,7 @@ impl CanvasRenderer {
             infos_buf,
             infos_capacity,
             stroke_buf,
+            float_buf,
             stroke_capacity,
             instances,
             instance_capacity,
@@ -721,6 +727,7 @@ impl CanvasRenderer {
         layers: &[Layer],
         active: usize,
         stroke: Option<&StrokeLayer>,
+        float: Option<LayerId>,
     ) -> bool {
         let (ex, ey) = self.page.end();
         let painting = stroke.is_some_and(StrokeLayer::has_paint);
@@ -782,6 +789,7 @@ impl CanvasRenderer {
         let mut instances = Vec::with_capacity(wanted.len());
         let mut slots = Vec::with_capacity(wanted.len() * layers.len().max(1));
         let mut stroke_slots = Vec::with_capacity(wanted.len());
+        let mut float_slots = Vec::with_capacity(wanted.len());
 
         for coord in wanted {
             for layer in layers {
@@ -799,13 +807,19 @@ impl CanvasRenderer {
                 }
             }
             stroke_slots.push(stroke.and_then(|s| s.accum_slot(coord)).unwrap_or(ABSENT));
+            // The floating tiles are ordinary canvas tiles, so they need residency like any other.
+            float_slots.push(
+                float
+                    .and_then(|id| self.make_resident(device, queue, encoder, id, coord))
+                    .unwrap_or(ABSENT),
+            );
             instances.push(TileInstance {
                 coord: [coord.0, coord.1],
             });
         }
 
         self.instance_count = instances.len() as u32;
-        self.write_storage(device, queue, &slots, &infos, &stroke_slots);
+        self.write_storage(device, queue, &slots, &infos, &stroke_slots, &float_slots);
         if !instances.is_empty() {
             if instances.len() > self.instance_capacity {
                 self.instance_capacity = instances.len().next_power_of_two();
@@ -830,6 +844,7 @@ impl CanvasRenderer {
         slots: &[u32],
         infos: &[LayerInfoRecord],
         stroke_slots: &[u32],
+        float_slots: &[u32],
     ) {
         let mut rebind = false;
         if slots.len() > self.slots_capacity {
@@ -848,6 +863,7 @@ impl CanvasRenderer {
         }
         if stroke_slots.len() > self.stroke_capacity {
             self.stroke_capacity = stroke_slots.len().next_power_of_two();
+            self.float_buf = storage_buffer(device, "canvas-float-slots", self.stroke_capacity * 4);
             self.stroke_buf =
                 storage_buffer(device, "canvas-stroke-slots", self.stroke_capacity * 4);
             rebind = true;
@@ -863,6 +879,7 @@ impl CanvasRenderer {
                 &self.infos_buf,
                 &self.accum_view,
                 &self.stroke_buf,
+                &self.float_buf,
             );
         }
 
@@ -871,6 +888,9 @@ impl CanvasRenderer {
         }
         if !infos.is_empty() {
             queue.write_buffer(&self.infos_buf, 0, bytemuck::cast_slice(infos));
+        }
+        if !float_slots.is_empty() {
+            queue.write_buffer(&self.float_buf, 0, bytemuck::cast_slice(float_slots));
         }
         if !stroke_slots.is_empty() {
             queue.write_buffer(&self.stroke_buf, 0, bytemuck::cast_slice(stroke_slots));
@@ -938,6 +958,7 @@ fn make_bind_group(
     infos: &wgpu::Buffer,
     accum: &wgpu::TextureView,
     stroke: &wgpu::Buffer,
+    float: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("canvas-bg"),
@@ -970,6 +991,10 @@ fn make_bind_group(
             wgpu::BindGroupEntry {
                 binding: 6,
                 resource: stroke.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: float.as_entire_binding(),
             },
         ],
     })
@@ -1074,6 +1099,7 @@ pub(crate) mod tests {
             view.visible_rect(W, H),
             &layers,
             0,
+            None,
             None,
         );
         queue.submit(std::iter::once(enc.finish()));
@@ -1237,6 +1263,7 @@ pub(crate) mod tests {
             doc.layers(),
             0,
             None,
+            None,
         );
         queue.submit(std::iter::once(enc.finish()));
         let rendered = draw_to_target(&device, &queue, &canvas, W, H);
@@ -1329,6 +1356,7 @@ pub(crate) mod tests {
                 view.visible_rect(W, H),
                 doc.layers(),
                 0,
+                None,
                 None,
             );
             queue.submit(std::iter::once(enc.finish()));
@@ -1521,6 +1549,7 @@ pub(crate) mod tests {
                 view.visible_rect(VIEW, VIEW),
                 doc.layers(),
                 0,
+                None,
                 None,
             ),
             "the test budget should be ample"
