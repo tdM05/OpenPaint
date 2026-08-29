@@ -15,6 +15,7 @@ pub mod document;
 pub mod layer;
 pub mod page;
 pub mod raster;
+pub mod region;
 pub mod selection;
 pub mod stabilizer;
 pub mod stroke;

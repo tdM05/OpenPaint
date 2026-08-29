@@ -103,6 +103,17 @@ impl Selection {
         self.tiles.get(&coord).map_or(0, |t| t[ly * TILE_SIZE + lx])
     }
 
+    /// Write a horizontal run of coverage.
+    ///
+    /// For a producer that generates coverage in scanline order — the flood fill does — so a tile
+    /// is resolved once per run rather than once per pixel.
+    pub fn write_coverage_run(&mut self, x: i32, y: i32, values: &[u8]) {
+        let mut build = Builder::default();
+        std::mem::swap(&mut build.tiles, &mut self.tiles);
+        build.write_run(x, y, values);
+        self.tiles = build.tiles;
+    }
+
     /// Set one pixel's coverage directly.
     ///
     /// The primitive a mask brush needs -- painting into a selection is what Quick Mask is, and a
