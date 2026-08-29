@@ -139,6 +139,16 @@ struct OpenPaint {
     dragging: Option<Dragging>,
     /// How the magic wand behaves. Owned here because the panel only edits it.
     wand: ui::WandSettings,
+    /// Font families installed on this machine, gathered once.
+    ///
+    /// Cached rather than asked for per frame: enumerating the system font set walks every
+    /// installed family, which is nothing once and noticeable sixty times a second.
+    font_families: Vec<String>,
+    /// The family actually used for the active text layer, when it is not the one asked for.
+    ///
+    /// Kept so the panel can say so. Silently lettering a page in a substituted face is the
+    /// failure this whole `FontResolution` path exists to prevent.
+    font_substituted: Option<String>,
     /// The document's selection, and the outline it draws.
     ///
     /// The outline is cached beside it because it is derived from the whole mask, which is far too
@@ -199,13 +209,27 @@ struct OpenPaint {
 /// Which file dialog is in flight, and where its answer will arrive.
 struct FileDialogTask {
     kind: FileDialogKind,
-    answer: std::sync::mpsc::Receiver<Option<std::path::PathBuf>>,
+    /// A list even where only one file can be chosen, because one of these dialogs picks several
+    /// and a second channel type would be two of everything for no gain.
+    answer: std::sync::mpsc::Receiver<Option<Vec<std::path::PathBuf>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FileDialogKind {
     Save,
     Open,
+    /// Font files to make available without installing them system-wide.
+    Fonts,
+}
+
+impl FileDialogKind {
+    /// The file types this dialog offers, as `(label, extensions)`.
+    fn filter(self) -> (&'static str, &'static [&'static str]) {
+        match self {
+            Self::Save | Self::Open => ("OpenPaint document", &[DOCUMENT_EXTENSION]),
+            Self::Fonts => ("Font", &["ttf", "otf", "ttc", "otc"]),
+        }
+    }
 }
 
 /// A pending "you have unsaved changes" question.
@@ -526,6 +550,8 @@ impl Default for OpenPaint {
             capture: Capture::None,
             dragging: None,
             wand: ui::WandSettings::default(),
+            font_families: Vec::new(),
+            font_substituted: None,
             selection: None,
             status_message: None,
             in_dispatch: false,
@@ -1237,9 +1263,11 @@ impl OpenPaint {
     }
 
     /// Fill the selection with the brush colour, on the active layer.
-    /// Fill the selection with the brush colour, on the active layer.
     fn fill_selection(&mut self) {
-        let mode = self.editor.fill_mode();
+        let Some(mode) = self.editor.fill_mode() else {
+            self.refuse_paint_on_derived_layer("filled");
+            return;
+        };
         // Cloned rather than copied: a brush now owns response curves, so it is no longer Copy.
         let brush = self.editor.brush().clone();
         self.paint_selection(
@@ -1257,16 +1285,115 @@ impl OpenPaint {
     /// is doing anything else.
     fn clear_selection_pixels(&mut self) {
         let Some(mode) = self.editor.clear_mode() else {
-            self.status_message = Some(
-                "This layer's alpha is locked, so clearing cannot remove anything. Unlock it first."
-                    .to_owned(),
-            );
-            self.request_redraw();
+            if self.editor.active_layer_accepts_paint() {
+                self.status_message = Some(
+                    "This layer's alpha is locked, so clearing cannot remove anything. \
+                     Unlock it first."
+                        .to_owned(),
+                );
+                self.request_redraw();
+            } else {
+                self.refuse_paint_on_derived_layer("cleared");
+            }
             return;
         };
         // Colour is irrelevant to an erase — the blend discards the source entirely — but opacity
         // is not: it is how much coverage comes off, so a partial clear is expressible.
         self.paint_selection([0.0; 4], 1.0, mode, "Cleared the selection");
+    }
+
+    /// Take an edited block back from the panel and re-derive the layer from it.
+    ///
+    /// The write-back and the re-render are one step on purpose. A text layer's tiles are a cache
+    /// of its block, and any path that could update one without the other would leave the canvas
+    /// showing wording the document no longer has.
+    fn apply_text_edit(&mut self, block: openpaint_core::TextBlock) {
+        let Some(current) = self.editor.active_text_mut() else {
+            // The active layer changed under the panel — a stale edit, not an error.
+            return;
+        };
+        if *current == block {
+            return;
+        }
+        *current = block;
+        self.editor.rename_active_layer_from_text();
+        self.rerender_active_text();
+        self.mark_dirty();
+        self.request_redraw();
+    }
+
+    /// Add a text layer, or convert one to raster.
+    fn apply_text_action(&mut self, action: ui::TextAction) {
+        match action {
+            ui::TextAction::AddLayer => {
+                // Placed in the middle of the page rather than at its origin: a caption at (0, 0)
+                // is half off the top-left corner and reads as a bug.
+                let page = self.editor.document().active().rect();
+                let block = openpaint_core::TextBlock {
+                    text: String::new(),
+                    ..openpaint_core::TextBlock::at(
+                        page.x as f32 + page.w as f32 * 0.25,
+                        page.y as f32 + page.h as f32 * 0.4,
+                    )
+                };
+                self.editor.add_text_layer(block);
+                self.status_message =
+                    Some("Text layer added — type the caption in the Text panel.".to_owned());
+                self.mark_dirty();
+                self.request_redraw();
+            }
+            ui::TextAction::LoadFontFile => {
+                self.spawn_file_dialog(FileDialogKind::Fonts, |dialog| dialog.pick_files());
+            }
+            ui::TextAction::ConvertToRaster => {
+                if self.editor.convert_active_layer_to_raster() {
+                    // Nothing to re-render: the pixels are already the layer's tiles. It simply
+                    // stops re-deriving them, which is exactly what makes this one-way.
+                    self.font_substituted = None;
+                    self.status_message = Some(
+                        "Converted to a raster layer. It can be painted on now, and the text is \
+                         no longer editable."
+                            .to_owned(),
+                    );
+                    self.mark_dirty();
+                    self.request_redraw();
+                }
+            }
+        }
+    }
+
+    /// Re-derive the active text layer's pixels from its block.
+    fn rerender_active_text(&mut self) {
+        let Some(block) = self.editor.active_text().cloned() else {
+            self.font_substituted = None;
+            return;
+        };
+        let layer = tile_store::LayerId(self.editor.active_layer_id());
+        let page = self.editor.document().active().rect();
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        match renderer.rerender_text_layer(layer, &block, page) {
+            Ok(font) => {
+                self.font_substituted = font.is_substituted().then(|| font.resolved.clone());
+            }
+            Err(err) => {
+                self.font_substituted = None;
+                self.status_message = Some(format!("Could not lay out the text: {err}"));
+            }
+        }
+    }
+
+    /// Say why a layer whose pixels are derived cannot be painted on.
+    ///
+    /// Refusing silently would be the worst of the options — the tool would simply appear broken.
+    /// The message names the way out, because there is one: converting the layer to raster.
+    fn refuse_paint_on_derived_layer(&mut self, verb: &str) {
+        self.status_message = Some(format!(
+            "A text layer's pixels come from its text, so it cannot be {verb} — the paint would \
+             disappear the next time the text changed. Convert it to a raster layer first."
+        ));
+        self.request_redraw();
     }
 
     /// Apply paint to the selection on the active layer, undoably.
@@ -1893,20 +2020,22 @@ impl OpenPaint {
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "untitled.openpaint".to_owned());
         self.spawn_file_dialog(FileDialogKind::Save, move |dialog| {
-            dialog.set_file_name(suggested).save_file()
+            dialog.set_file_name(suggested).save_file().map(|p| vec![p])
         });
     }
 
     /// Ask for a file on another thread, then open it when the answer arrives.
     fn open_with_dialog(&mut self) {
-        self.spawn_file_dialog(FileDialogKind::Open, rfd::FileDialog::pick_file);
+        self.spawn_file_dialog(FileDialogKind::Open, |dialog| {
+            dialog.pick_file().map(|p| vec![p])
+        });
     }
 
     /// Run a file dialog on a fresh thread and remember where its answer will land.
     fn spawn_file_dialog(
         &mut self,
         kind: FileDialogKind,
-        show: impl FnOnce(rfd::FileDialog) -> Option<std::path::PathBuf> + Send + 'static,
+        show: impl FnOnce(rfd::FileDialog) -> Option<Vec<std::path::PathBuf>> + Send + 'static,
     ) {
         if self.file_dialog.is_some() {
             // One at a time. A second would be modal to nothing and confusing.
@@ -1919,9 +2048,10 @@ impl OpenPaint {
         std::thread::spawn(move || {
             // Owned by our window, so it cannot end up behind it. The `Arc<Window>` moves in
             // with it, which is also what keeps the handle valid for as long as the dialog is up.
+            let (label, extensions) = kind.filter();
             let dialog = rfd::FileDialog::new()
                 .set_parent(window.as_ref())
-                .add_filter("OpenPaint document", &[DOCUMENT_EXTENSION]);
+                .add_filter(label, extensions);
             // The receiver is gone if the app closed meanwhile; nothing to do about that.
             let _ = tx.send(show(dialog));
         });
@@ -1944,7 +2074,15 @@ impl OpenPaint {
         let kind = task.kind;
         self.file_dialog = None;
 
-        match (kind, answer) {
+        // Every branch below wants at least one path, and the shapes differ only in how many.
+        let mut answer = answer.filter(|paths| !paths.is_empty());
+        let first = answer.as_mut().and_then(|paths| paths.first().cloned());
+
+        match (kind, first) {
+            (FileDialogKind::Fonts, Some(_)) => {
+                let paths = answer.unwrap_or_default();
+                self.load_font_files(&paths);
+            }
             (FileDialogKind::Save, Some(path)) => {
                 // The dialog does not always append it, and a document without the extension
                 // will not match the open dialog's filter later.
@@ -1964,6 +2102,28 @@ impl OpenPaint {
                 self.request_redraw();
             }
         }
+    }
+
+    /// Make font files available to this session without installing them.
+    ///
+    /// Letterers keep collections of fonts they have no wish to add to the system font list, and
+    /// asking someone to pollute their OS to letter one page is the wrong trade. Session-scoped
+    /// rather than saved into the document: which files a machine has is not a property of the
+    /// artwork, and a path baked into a file would be wrong on the next machine anyway.
+    fn load_font_files(&mut self, paths: &[std::path::PathBuf]) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let gained = renderer.load_font_files(paths);
+        self.font_families = renderer.font_families();
+        self.status_message = Some(if gained.is_empty() {
+            "No new font families were found in those files.".to_owned()
+        } else {
+            format!("Added {}.", gained.join(", "))
+        });
+        // A text layer asking for one of these may have been showing a substitute until now.
+        self.rerender_active_text();
+        self.request_redraw();
     }
 
     /// Replace the open document with the one in `path`.
@@ -2470,12 +2630,20 @@ impl OpenPaint {
         // producing a frame, and the work above it is bookkeeping that happens whether or not a
         // frame follows. `render` presents before it returns, so the interval ends at the present.
         let frame_start = Instant::now();
+        // Cloned out and written back after, rather than borrowed: the panel already holds
+        // `editor` mutably through `brush_mut`, and a caption is a string and a dozen numbers.
+        let mut text_edit = editor.active_text().cloned();
+        let font_families = &self.font_families;
+        let font_substituted = self.font_substituted.clone();
+        let mut text_request = None;
+        let mut text_changed = false;
         let result = renderer.render(xform, visible, &layers, active_index, |gpu| {
             if let Some(ui) = ui {
                 let out = ui.render(
                     &window,
                     gpu,
                     editor.brush_mut(),
+                    text_edit.as_mut(),
                     view,
                     ui::Status {
                         history: history_status,
@@ -2499,6 +2667,8 @@ impl OpenPaint {
                         select_tool,
                         has_selection,
                         wand: self.wand,
+                        font_families,
+                        font_substituted: font_substituted.as_deref(),
                     },
                 );
                 ui_wants_repaint = out.wants_repaint;
@@ -2512,6 +2682,8 @@ impl OpenPaint {
                 recovery_request = out.recovery;
                 select_request = out.select;
                 self.wand = out.wand;
+                text_request = out.text;
+                text_changed = out.text_changed;
                 ui_inset_left = Some(ui.inset_left_px());
             }
         });
@@ -2580,6 +2752,14 @@ impl OpenPaint {
         }
         if let Some(action) = layer_request {
             self.apply_layer_action(action);
+        }
+        if text_changed {
+            if let Some(block) = text_edit {
+                self.apply_text_edit(block);
+            }
+        }
+        if let Some(action) = text_request {
+            self.apply_text_action(action);
         }
         if trim_request {
             self.trim_to_page();
@@ -2751,7 +2931,7 @@ impl ApplicationHandler for OpenPaint {
         }
 
         match Renderer::new(window.clone(), self.editor.page_rect()) {
-            Ok(renderer) => {
+            Ok(mut renderer) => {
                 println!("{} - {}", openpaint_core::hello(), openpaint_core::VERSION);
                 println!("input backend: {}", self.input.name());
                 self.ui = Some(ui::Ui::new(
@@ -2771,6 +2951,9 @@ impl ApplicationHandler for OpenPaint {
                 // (strokes, resizes, and UI activity request them), so nothing
                 // else would paint the initial canvas.
                 renderer.window().request_redraw();
+                // Enumerated once, here, rather than per frame: walking every installed family is
+                // nothing on startup and noticeable sixty times a second.
+                self.font_families = renderer.font_families();
                 self.renderer = Some(renderer);
                 // The window exists now, so the title can finally say which document is open.
                 self.update_title();
@@ -3074,6 +3257,128 @@ mod tests {
         );
     }
 
+    /// A text layer's pixels are derived, so nothing may paint them. Checked through every
+    /// command rather than just the brush, because each one is a separate way in and the guard is
+    /// only worth having if none of them can go round it.
+    #[test]
+    fn nothing_paints_on_a_text_layer() {
+        let mut app = OpenPaint::default();
+        app.apply_text_action(ui::TextAction::AddLayer);
+        assert!(
+            app.editor.active_text().is_some(),
+            "the new layer should hold text"
+        );
+
+        assert_eq!(app.editor.paint_mode(), None, "the brush must be refused");
+        app.editor.set_tool(editor::Tool::Eraser);
+        assert_eq!(app.editor.paint_mode(), None, "and so must the eraser");
+        app.editor.set_tool(editor::Tool::Brush);
+        assert_eq!(app.editor.fill_mode(), None, "and fill");
+        assert_eq!(app.editor.clear_mode(), None, "and clear");
+    }
+
+    /// Refusing silently would make the tool look broken. The message has to name the way out,
+    /// because there is one.
+    #[test]
+    fn refusing_a_text_layer_says_why_and_how_to_proceed() {
+        let mut app = OpenPaint::default();
+        app.apply_text_action(ui::TextAction::AddLayer);
+        app.apply_select_action(ui::SelectAction::All);
+        app.fill_selection();
+
+        let message = app.status_message.as_deref().unwrap_or_default();
+        assert!(
+            message.contains("text layer"),
+            "the refusal should say what the layer is: {message:?}"
+        );
+        assert!(
+            message.to_lowercase().contains("raster"),
+            "and how to get past it: {message:?}"
+        );
+    }
+
+    /// A stroke on a text layer must not merely be refused a mode — it must produce no dabs, or
+    /// something downstream would still act on them.
+    #[test]
+    fn a_stroke_on_a_text_layer_emits_nothing() {
+        let mut app = OpenPaint::default();
+        app.apply_text_action(ui::TextAction::AddLayer);
+        let before = app.editor.pending_stroke().1.len();
+
+        let t0 = input::now_ms();
+        app.stroke_start(100.0, 100.0, 1.0, 0.0, t0);
+        app.stroke_continue(200.0, 200.0, 1.0, 0.0, t0 + 8.0);
+        app.stroke_finish();
+
+        assert_eq!(
+            app.editor.pending_stroke().1.len(),
+            before,
+            "a stroke on a text layer put dabs in the queue"
+        );
+    }
+
+    /// Converting is the way out, and it has to actually give painting back.
+    #[test]
+    fn converting_to_raster_makes_a_layer_paintable_again() {
+        let mut app = OpenPaint::default();
+        app.apply_text_action(ui::TextAction::AddLayer);
+        assert_eq!(app.editor.paint_mode(), None);
+
+        app.apply_text_action(ui::TextAction::ConvertToRaster);
+        assert_eq!(
+            app.editor.paint_mode(),
+            Some(editor::PaintMode::Normal),
+            "after converting, the brush should work"
+        );
+        assert!(
+            app.editor.active_text().is_none(),
+            "the text should be gone, which is what makes this one-way"
+        );
+    }
+
+    /// An ordinary raster layer must be unaffected by any of this.
+    #[test]
+    fn a_raster_layer_still_paints() {
+        let app = OpenPaint::default();
+        assert!(app.editor.active_layer_accepts_paint());
+        assert_eq!(app.editor.paint_mode(), Some(editor::PaintMode::Normal));
+        assert_eq!(app.editor.fill_mode(), Some(editor::PaintMode::Normal));
+    }
+
+    /// The layer palette should read as the script. A stale name is worse than none, because it
+    /// looks correct.
+    #[test]
+    fn editing_the_text_renames_its_layer() {
+        let mut app = OpenPaint::default();
+        app.apply_text_action(ui::TextAction::AddLayer);
+        let mut block = app.editor.active_text().cloned().expect("text layer");
+        block.text = "THE DOOR SLAMS".into();
+        app.apply_text_edit(block);
+
+        let index = app.editor.active_layer_index();
+        assert_eq!(app.editor.layers()[index].name, "THE DOOR SLAMS");
+    }
+
+    /// A new caption should land somewhere visible. At the page origin it is half off the corner
+    /// and reads as a bug.
+    #[test]
+    fn a_new_text_block_lands_inside_the_page() {
+        let mut app = OpenPaint::default();
+        app.apply_text_action(ui::TextAction::AddLayer);
+        let block = app.editor.active_text().expect("text layer");
+        let page = app.editor.document().active().rect();
+        assert!(
+            block.x > page.x as f32 && block.x < (page.x + page.w as i32) as f32,
+            "x {} is outside the page",
+            block.x
+        );
+        assert!(
+            block.y > page.y as f32 && block.y < (page.y + page.h as i32) as f32,
+            "y {} is outside the page",
+            block.y
+        );
+    }
+
     /// A lasso gesture resolves into a mask, and a tap does not.
     ///
     /// Exercises the gesture seam rather than the rasterizer: whether points reach the polygon at
@@ -3183,13 +3488,13 @@ mod tests {
         let mut app = OpenPaint::default();
 
         app.editor.set_tool(editor::Tool::Brush);
-        assert_eq!(app.editor.fill_mode(), editor::PaintMode::Normal);
+        assert_eq!(app.editor.fill_mode(), Some(editor::PaintMode::Normal));
         assert_eq!(app.editor.clear_mode(), Some(editor::PaintMode::Erase));
 
         app.editor.set_tool(editor::Tool::Eraser);
         assert_eq!(
             app.editor.fill_mode(),
-            editor::PaintMode::Normal,
+            Some(editor::PaintMode::Normal),
             "fill turned into an erase because the eraser happened to be selected"
         );
         assert_eq!(app.editor.clear_mode(), Some(editor::PaintMode::Erase));
@@ -3208,7 +3513,7 @@ mod tests {
 
         assert_eq!(
             app.editor.fill_mode(),
-            editor::PaintMode::LockAlpha,
+            Some(editor::PaintMode::LockAlpha),
             "a fill on a locked layer must stay inside the pixels already there"
         );
         assert_eq!(

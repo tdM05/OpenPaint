@@ -1686,6 +1686,7 @@ dependencies = [
  "octotablet",
  "openpaint-core",
  "openpaint-file",
+ "openpaint-text",
  "png",
  "pollster 0.3.0",
  "rfd",

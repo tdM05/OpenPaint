@@ -155,6 +155,16 @@ impl Document {
         self.active_mut().insert_layer_above(at, id, name)
     }
 
+    /// Add a text layer above the active one, and select it. Returns its index.
+    ///
+    /// Named from its own text rather than from the id, unlike [`Document::add_layer`]: a caption
+    /// has something to be called, and "Layer 8" would throw it away.
+    pub fn add_text_layer(&mut self, block: crate::text::TextBlock) -> usize {
+        let id = self.take_layer_id();
+        let at = self.active().active_index();
+        self.active_mut().insert_text_layer_above(at, id, block)
+    }
+
     /// Move a page to a new index, shifting the rest. Returns where it ended up.
     pub fn move_page(&mut self, from: usize, to: usize) -> Option<usize> {
         if from >= self.pages.len() {

@@ -316,6 +316,9 @@ impl Editor {
     /// broken app, and the caller can say why instead.
     #[must_use]
     pub fn paint_mode(&self) -> Option<PaintMode> {
+        if !self.active_layer_accepts_paint() {
+            return None;
+        }
         let locked = self.active_layer_locks_alpha();
         match (self.tool.erases(), locked) {
             (true, true) => None,
@@ -323,6 +326,20 @@ impl Editor {
             (false, true) => Some(PaintMode::LockAlpha),
             (false, false) => Some(PaintMode::Normal),
         }
+    }
+
+    /// Whether the active layer's pixels may be painted at all.
+    ///
+    /// False on a text layer, whose pixels are derived from its text: a stroke there would not fail
+    /// now, it would vanish the next time someone fixed a typo. Asked here so that every command
+    /// that paints inherits the answer -- brush, eraser, fill, clear -- rather than each one
+    /// remembering to check. See [`openpaint_core::Layer::accepts_paint`].
+    #[must_use]
+    pub fn active_layer_accepts_paint(&self) -> bool {
+        self.document
+            .active()
+            .layer(self.active_layer_index())
+            .is_none_or(openpaint_core::Layer::accepts_paint)
     }
 
     /// Whether the layer being painted has its transparency frozen.
@@ -341,13 +358,17 @@ impl Editor {
     /// and a button reading "fill with brush colour" that erased instead would simply be lying.
     ///
     /// Alpha lock still applies, because that is a property of the layer rather than of the tool.
+    /// `None` on a layer that does not accept paint, for the same reason as [`Editor::paint_mode`].
     #[must_use]
-    pub fn fill_mode(&self) -> PaintMode {
-        if self.active_layer_locks_alpha() {
+    pub fn fill_mode(&self) -> Option<PaintMode> {
+        if !self.active_layer_accepts_paint() {
+            return None;
+        }
+        Some(if self.active_layer_locks_alpha() {
             PaintMode::LockAlpha
         } else {
             PaintMode::Normal
-        }
+        })
     }
 
     /// How a clear is applied. Always erases, and `None` where that could do nothing.
@@ -356,7 +377,72 @@ impl Editor {
     /// lock means alpha cannot change, and clearing is nothing but a change in alpha.
     #[must_use]
     pub fn clear_mode(&self) -> Option<PaintMode> {
-        (!self.active_layer_locks_alpha()).then_some(PaintMode::Erase)
+        (self.active_layer_accepts_paint() && !self.active_layer_locks_alpha())
+            .then_some(PaintMode::Erase)
+    }
+
+    /// Add a text layer above the active one and select it. Returns its index.
+    pub fn add_text_layer(&mut self, block: openpaint_core::TextBlock) -> usize {
+        self.document.add_text_layer(block)
+    }
+
+    /// The active layer's text, if it is a text layer.
+    #[must_use]
+    pub fn active_text(&self) -> Option<&openpaint_core::TextBlock> {
+        self.document
+            .active()
+            .layer(self.active_layer_index())
+            .and_then(openpaint_core::Layer::text)
+    }
+
+    /// The active layer's text, to edit in place.
+    ///
+    /// Its tiles are stale the moment this is written through, so the caller must re-render the
+    /// layer. Not done here because rendering needs the font stack, which lives with the renderer.
+    pub fn active_text_mut(&mut self) -> Option<&mut openpaint_core::TextBlock> {
+        let index = self.active_layer_index();
+        self.document
+            .active_mut()
+            .layer_mut(index)
+            .and_then(openpaint_core::Layer::text_mut)
+    }
+
+    /// Rename the active layer after its own text, after that text has changed.
+    ///
+    /// Kept in step deliberately: a layer palette that still shows the first draft of a caption is
+    /// worse than one that shows nothing, because it looks correct.
+    pub fn rename_active_layer_from_text(&mut self) {
+        let index = self.active_layer_index();
+        let Some(name) = self
+            .document
+            .active()
+            .layer(index)
+            .and_then(openpaint_core::Layer::text)
+            .map(openpaint_core::page::layer_name_for)
+        else {
+            return;
+        };
+        if let Some(layer) = self.document.active_mut().layer_mut(index) {
+            layer.name = name;
+        }
+    }
+
+    /// Turn the active text layer into an ordinary raster layer, keeping the pixels it currently
+    /// shows.
+    ///
+    /// One-way, and that is the point: it is what the UI offers instead of refusing paint forever.
+    /// The pixels stay because they are already in the layer's tiles — nothing has to be
+    /// re-rendered, the layer simply stops re-deriving them.
+    pub fn convert_active_layer_to_raster(&mut self) -> bool {
+        let index = self.active_layer_index();
+        let Some(layer) = self.document.active_mut().layer_mut(index) else {
+            return false;
+        };
+        if layer.accepts_paint() {
+            return false;
+        }
+        layer.set_content(openpaint_core::Content::Raster);
+        true
     }
 
     /// Begin a stroke at a canvas-space position.

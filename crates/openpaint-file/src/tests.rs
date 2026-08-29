@@ -677,3 +677,227 @@ fn clip_below_round_trips() {
     // The two flags are independent, and adjacent columns are exactly where a mix-up would hide.
     assert!(!layers[1].lock_alpha, "clip_below leaked into lock_alpha");
 }
+
+/// A caption is only editable on Thursday if the *text* survived the save, not the pixels.
+#[test]
+fn a_text_layer_round_trips_everything_it_holds() {
+    let f = TempFile::new("text");
+    let mut doc = sample();
+    // Deliberately not a single default: every field has to be checked, because a field left out
+    // of the INSERT silently resets on load and looks like a rendering bug much later.
+    let block = TextBlock {
+        text: "WHAT WAS\nTHAT NOISE?".into(),
+        font: FontSpec {
+            family: "Comic Sans MS".into(),
+            weight: 700,
+            italic: true,
+        },
+        size: 41.5,
+        line_height: 1.35,
+        letter_spacing: -1.25,
+        color_srgb8: [200, 30, 90],
+        x: -12.5,
+        y: 340.75,
+        wrap_width: Some(275.0),
+        align: Align::Center,
+        writing_mode: WritingMode::Horizontal,
+    };
+    doc.add_text_layer(block.clone());
+    save(f.path(), &doc, [], &[]).expect("save");
+
+    let back = load(f.path()).expect("load");
+    let restored = back
+        .document
+        .active()
+        .layers()
+        .iter()
+        .find_map(openpaint_core::Layer::text)
+        .expect("the text layer came back as raster");
+    assert_eq!(*restored, block, "a field was lost or altered by the file");
+}
+
+/// The layer stack is order-sensitive, and text is attached by index. A block landing on the wrong
+/// layer would be invisible in a one-layer test.
+#[test]
+fn text_stays_attached_to_its_own_layer() {
+    let f = TempFile::new("text-index");
+    let mut doc = Document::new(Page::new(400, 400));
+    doc.add_layer();
+    doc.add_text_layer(TextBlock {
+        text: "middle".into(),
+        ..TextBlock::default()
+    });
+    doc.add_layer();
+    let expected: Vec<Option<String>> = doc
+        .active()
+        .layers()
+        .iter()
+        .map(|l| l.text().map(|b| b.text.clone()))
+        .collect();
+    save(f.path(), &doc, [], &[]).expect("save");
+
+    let back = load(f.path()).expect("load");
+    let actual: Vec<Option<String>> = back
+        .document
+        .active()
+        .layers()
+        .iter()
+        .map(|l| l.text().map(|b| b.text.clone()))
+        .collect();
+    assert_eq!(actual, expected, "text moved to a different layer");
+    assert_eq!(
+        actual.iter().filter(|t| t.is_some()).count(),
+        1,
+        "exactly one layer should hold text"
+    );
+}
+
+/// Two text layers on one page, so a query that returns the first row for every layer is caught.
+#[test]
+fn several_text_layers_keep_their_own_words() {
+    let f = TempFile::new("text-many");
+    let mut doc = Document::new(Page::new(400, 400));
+    for word in ["first", "second", "third"] {
+        doc.add_text_layer(TextBlock {
+            text: word.into(),
+            ..TextBlock::default()
+        });
+    }
+    save(f.path(), &doc, [], &[]).expect("save");
+
+    let back = load(f.path()).expect("load");
+    let words: Vec<String> = back
+        .document
+        .active()
+        .layers()
+        .iter()
+        .filter_map(|l| l.text().map(|b| b.text.clone()))
+        .collect();
+    assert_eq!(words, ["first", "second", "third"]);
+}
+
+/// Text on a page other than the first. The block table is keyed by page as well as layer, and a
+/// query that forgot the page filter would put page two's captions on page one.
+#[test]
+fn text_stays_on_its_own_page() {
+    let f = TempFile::new("text-pages");
+    let mut doc = Document::new(Page::new(400, 400));
+    doc.add_page(Page::new(400, 400));
+    doc.add_text_layer(TextBlock {
+        text: "page two".into(),
+        ..TextBlock::default()
+    });
+    let second = doc.active_index();
+    assert!(second > 0, "the new page should be the active one");
+    save(f.path(), &doc, [], &[]).expect("save");
+
+    let back = load(f.path()).expect("load");
+    assert!(
+        back.document
+            .page(0)
+            .expect("page one")
+            .layers()
+            .iter()
+            .all(|l| l.text().is_none()),
+        "page one picked up page two's caption"
+    );
+    assert_eq!(
+        back.document
+            .page(second)
+            .expect("page two")
+            .layers()
+            .iter()
+            .find_map(openpaint_core::Layer::text)
+            .expect("page two lost its caption")
+            .text,
+        "page two"
+    );
+}
+
+/// A single line and a wrapped box are the same kind of block with and without a width, so the
+/// difference between `None` and `Some` has to survive as itself rather than as a zero.
+#[test]
+fn an_unwrapped_block_comes_back_unwrapped() {
+    let f = TempFile::new("text-wrap");
+    let mut doc = Document::new(Page::new(400, 400));
+    doc.add_text_layer(TextBlock {
+        text: "one line".into(),
+        wrap_width: None,
+        ..TextBlock::default()
+    });
+    save(f.path(), &doc, [], &[]).expect("save");
+
+    let back = load(f.path()).expect("load");
+    assert_eq!(
+        back.document
+            .active()
+            .layers()
+            .iter()
+            .find_map(openpaint_core::Layer::text)
+            .expect("text layer")
+            .wrap_width,
+        None,
+        "an unwrapped block came back with a width"
+    );
+}
+
+/// A file written before text layers existed is not malformed; it simply has none.
+#[test]
+fn a_file_without_the_text_table_still_loads() {
+    let f = TempFile::new("no-text-table");
+    let doc = sample();
+    save(f.path(), &doc, [], &[]).expect("save");
+    {
+        let db = rusqlite::Connection::open(f.path()).expect("reopen");
+        db.execute_batch("DROP TABLE layer_text;")
+            .expect("drop the table");
+        db.pragma_update(None, "user_version", 5)
+            .expect("downgrade");
+    }
+
+    let back = load(f.path()).expect("a v5 file should still load");
+    assert_eq!(
+        back.document.active().layer_count(),
+        doc.active().layer_count()
+    );
+    assert!(
+        back.document
+            .active()
+            .layers()
+            .iter()
+            .all(|l| l.text().is_none()),
+        "a file with no text table should produce no text layers"
+    );
+}
+
+/// Saving over a v5 file has to work, which is the case that broke when `layer_text` first landed:
+/// the migration recreated the structure tables without dropping the new one.
+#[test]
+fn a_v5_file_can_be_saved_over() {
+    let f = TempFile::new("v5-resave");
+    save(f.path(), &sample(), [], &[]).expect("save");
+    {
+        let db = rusqlite::Connection::open(f.path()).expect("reopen");
+        db.pragma_update(None, "user_version", 5)
+            .expect("downgrade");
+    }
+
+    let mut doc = Document::new(Page::new(300, 300));
+    doc.add_text_layer(TextBlock {
+        text: "added after the migration".into(),
+        ..TextBlock::default()
+    });
+    save(f.path(), &doc, [], &[]).expect("save over a v5 file");
+
+    let back = load(f.path()).expect("load");
+    assert_eq!(
+        back.document
+            .active()
+            .layers()
+            .iter()
+            .find_map(openpaint_core::Layer::text)
+            .expect("text layer")
+            .text,
+        "added after the migration"
+    );
+}

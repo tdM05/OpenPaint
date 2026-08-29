@@ -391,6 +391,101 @@ engine is written:
 On-disk storage format is a **separate, later** decision (Q6) — 16-bit in memory
 does not oblige 16-bit on disk.
 
+### 6a. A layer has a source of truth; text is the first that is not pixels — 2026-08-29
+
+The question text forced, and the one worth answering carefully: **a caption
+typed on Monday has to be retypeable on Thursday.** That is impossible if what
+the document keeps is the pixels a rasterizer once produced.
+
+So `Layer` gained a `Content`:
+
+- **`Raster`** — the tiles *are* the truth. A brush writes them, nothing
+  regenerates them, and a stroke therefore survives forever.
+- **`Text(TextBlock)`** — the block is the truth. The tiles are a *cache*,
+  thrown away and rebuilt whenever the text, font or box changes.
+
+**Nothing downstream changes, and that is the whole design.** The compositor
+reads tiles keyed by layer id and neither knows nor cares which of the two
+filled them, so blend modes, opacity, clipping, alpha lock, selection, export
+and the file's tile table all keep working with no text-specific code in any of
+them. Text was built without touching the compositor at all.
+
+The one thing that does change is **who may write those tiles**, and it is asked
+as a question about the *layer* — `Layer::accepts_paint` — rather than checked
+per tool. Brush, eraser, fill and clear all inherit the answer, so a tool added
+later cannot forget. Painting on a text layer would not fail at the time; it
+would vanish the next time someone fixed a typo, which is far worse. The way out
+is the same bargain CSP strikes: convert to raster, one-way, keeping the pixels.
+
+`Content` is also where **vector layers** land. That is the reason this work
+does not have to be redone to get there: the shape of the answer is already "a
+layer has a source of truth", and a vector layer is another arm of the enum. A
+speech-bubble system is that plus a shape object re-deriving alongside the text.
+
+**Undo is the text changing, not the tiles.** A text edit costs a string in the
+history stack instead of a tile snapshot, and undo is exact rather than a
+re-rasterization that has to match.
+
+#### The font stack is a separate crate, not a module
+
+`openpaint-text` owns parley, swash and fontique; `openpaint-core` owns
+`TextBlock` and has no font dependency at all. A module boundary would have made
+the seam a convention — a crate boundary makes it a fact the compiler enforces,
+so replacing the text stack cannot reach the document model, the file format or
+the renderer.
+
+parley over cosmic-text for its **span model**: per-word styling and Japanese
+*furigana* are ranges of differently styled text inside one block, which is the
+shape parley is built around. Both handle the horizontal Latin case that landed
+first, so the tiebreak is what comes after it.
+
+**What crosses the seam is an 8-bit coverage mask**, not positioned glyphs.
+Glyph ids are meaningless without the font that produced them, so handing those
+back would have leaked the library's types across the boundary the crate exists
+to draw. Colour is applied where the mask becomes tiles, which is the path a
+selection fill already takes — so text inherits correct linear blending instead
+of reimplementing it.
+
+#### A missing font is reported, not hidden
+
+`FontSpec` is a *request*; `FontResolution` says what was actually used, read out
+of the font file itself. Documents travel, and lettering silently reflowed into
+a substituted face is the failure this whole path exists to prevent.
+
+Better than CSP on one point, and it costs nothing: **the derived tiles are
+saved too.** Open a document on a machine without the font and the page still
+looks right, from the cache, *and* says the font is missing — rather than
+quietly re-laying it out. Re-rendering happens on edit, not on load, which is
+what makes that work.
+
+#### Things deliberately not done yet
+
+- **Vertical writing** (*tategaki*) is reserved in the model and the file format
+  and unimplemented in the renderer, which returns `UnsupportedWritingMode`
+  rather than falling back to horizontal. Setting a manga page silently sideways
+  is worse than not drawing it.
+- **An on-canvas caret.** The block is edited through an egui `TextEdit`, which
+  already brings caret, selection, clipboard and IME — so Japanese and Korean
+  input work today. Writing a text editor inside a panel that is explicitly
+  throwaway (§3) would be work thrown away; the canvas caret belongs with the
+  real UI.
+- **Colour fonts** render as flat outlines, and **variable fonts** expose their
+  named instances rather than continuous axes. Both are work, neither is a
+  design limit.
+
+#### Schema v6
+
+`layer_text`, a separate table rather than fifteen mostly-null columns on
+`layer`: a raster layer has none of them, and the file stays legible to anyone
+dumping it. Absence reads as "no text layers", the same tolerance `lock_alpha`
+established, so a v5 file loads without a branch on the version.
+
+The migration also found a hazard worth keeping: every structure change so far
+recreates the structure tables, and each branch had its own copy of the `DROP`
+list. `layer_text` was added to `STRUCTURE_SCHEMA` and not to those, and *every*
+migration failed with "table already exists". There is now one `DROP_STRUCTURE`,
+and the branches collapsed into one, since they all did the same thing.
+
 ### 4o. The dab's edge is a curve, not a number — 2026-08-28
 
 Hardness said how much of a dab is solid. Between that core and the rim the
@@ -1465,6 +1560,14 @@ of the same shape.
    General rule: in a procedure whose steps are obligations rather than options, **do
    the obligations first and branch afterwards** — and if it has more than one
    `return`, treat that as a smell to justify rather than a convenience.
+
+8. **One definition split across two lists.** Adding `layer_text` to
+   `STRUCTURE_SCHEMA` and not to the `DROP` statements each migration branch carried
+   its own copy of made *every* migration fail with "table already exists" — a break in
+   code that had nothing to do with the feature. The shape to watch for is a
+   declaration and its inverse maintained separately: a schema and its drop list, an
+   enum and a `match` over it written out by hand, a struct and a serializer. Where the
+   compiler cannot pair them, the fix is one list both sides use, not care.
 
 ### Verification hazards
 

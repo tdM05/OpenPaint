@@ -114,6 +114,17 @@ pub enum LayerAction {
     SetBlend { index: usize, blend: Blend },
 }
 
+/// What the Text section asked for, beyond editing the block in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextAction {
+    /// Add a text layer, ready to type into.
+    AddLayer,
+    /// Turn the active text layer into an ordinary raster layer. One-way.
+    ConvertToRaster,
+    /// Make font files available without installing them system-wide.
+    LoadFontFile,
+}
+
 /// The selection tools the panel offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectTool {
@@ -208,6 +219,13 @@ pub struct Status<'a> {
     pub perf: crate::perf::PerfSnapshot,
     /// Set while unsaved work from a previous run is waiting to be accepted or thrown away.
     pub recovery: Option<&'a str>,
+    /// Font families installed on this machine, sorted, for the picker.
+    ///
+    /// Passed in rather than read here because enumerating them is a font-stack operation and this
+    /// panel is throwaway; the list is gathered once at startup and reused.
+    pub font_families: &'a [String],
+    /// Set when the active text layer is being shown in a font it was not written in.
+    pub font_substituted: Option<&'a str>,
     /// What autosave has to report: a line of text, ready to show.
     pub autosave: &'a str,
     /// Selection boundary in screen space, as closed loops.
@@ -369,6 +387,143 @@ fn curve_editor(ui: &mut egui::Ui, label: &str, curve: &mut Curve) -> bool {
     changed
 }
 
+/// The controls for one text block. Returns whether anything changed.
+///
+/// Every edit here invalidates the layer's pixels, so the return value is not a convenience — the
+/// caller must re-derive on it, and a control added later that forgets to report would leave the
+/// canvas showing the previous wording.
+///
+/// The words themselves are edited in an ordinary `TextEdit` rather than with a caret drawn on the
+/// canvas. Deliberate: this panel is throwaway (DECISIONS §3), a canvas caret is a text editor's
+/// worth of work, and `TextEdit` already brings a caret, selection, clipboard and IME — which is
+/// what makes Japanese and Korean input work today rather than after the real UI lands.
+fn text_editor(
+    ui: &mut egui::Ui,
+    block: &mut openpaint_core::TextBlock,
+    families: &[String],
+    substituted: Option<&str>,
+) -> bool {
+    let mut changed = false;
+
+    if let Some(actual) = substituted {
+        // Loud, because the alternative is shipping a page lettered in the wrong face.
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 160, 60),
+            format!(
+                "\u{26a0} {:?} is not installed. Showing {actual:?}.",
+                block.font.family
+            ),
+        );
+    }
+
+    changed |= ui
+        .add(
+            egui::TextEdit::multiline(&mut block.text)
+                .desired_rows(3)
+                .desired_width(f32::INFINITY)
+                .hint_text("Type the caption"),
+        )
+        .changed();
+
+    ui.horizontal(|ui| {
+        ui.label("Font");
+        let current = if block.font.family.is_empty() {
+            "(default)".to_owned()
+        } else {
+            block.font.family.clone()
+        };
+        egui::ComboBox::from_id_salt("text-font-family")
+            .selected_text(current)
+            .width(180.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(block.font.family.is_empty(), "(default)")
+                    .clicked()
+                {
+                    block.font.family.clear();
+                    changed = true;
+                }
+                for family in families {
+                    if ui
+                        .selectable_label(&block.font.family == family, family)
+                        .clicked()
+                    {
+                        block.font.family.clone_from(family);
+                        changed = true;
+                    }
+                }
+            });
+    });
+
+    ui.horizontal(|ui| {
+        let mut bold = block.font.weight >= 600;
+        if ui.checkbox(&mut bold, "Bold").changed() {
+            block.font.weight = if bold { 700 } else { 400 };
+            changed = true;
+        }
+        changed |= ui.checkbox(&mut block.font.italic, "Italic").changed();
+    });
+
+    changed |= ui
+        .add(egui::Slider::new(&mut block.size, 6.0..=300.0).text("Size px"))
+        .changed();
+    changed |= ui
+        .add(egui::Slider::new(&mut block.line_height, 0.5..=3.0).text("Line height"))
+        .changed();
+    changed |= ui
+        .add(egui::Slider::new(&mut block.letter_spacing, -10.0..=40.0).text("Letter spacing"))
+        .changed();
+
+    ui.horizontal(|ui| {
+        ui.label("Align");
+        for align in openpaint_core::text::Align::ALL {
+            if ui
+                .selectable_label(block.align == align, align.label())
+                .clicked()
+            {
+                block.align = align;
+                changed = true;
+            }
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("Colour");
+        changed |= ui.color_edit_button_srgb(&mut block.color_srgb8).changed();
+    });
+
+    ui.horizontal(|ui| {
+        // `None` is a single line that grows as it is typed; `Some` is a box that wraps. Two ways
+        // of placing text, one field, rather than two kinds of block.
+        let mut wraps = block.wrap_width.is_some();
+        if ui
+            .checkbox(&mut wraps, "Wrap")
+            .on_hover_text("Off: one line that grows. On: wraps at the width below.")
+            .changed()
+        {
+            block.wrap_width = wraps.then_some(400.0);
+            changed = true;
+        }
+        if let Some(width) = block.wrap_width.as_mut() {
+            changed |= ui
+                .add(egui::Slider::new(width, 40.0..=4000.0).text("px"))
+                .changed();
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("Position");
+        changed |= ui
+            .add(egui::DragValue::new(&mut block.x).speed(1.0))
+            .changed();
+        changed |= ui
+            .add(egui::DragValue::new(&mut block.y).speed(1.0))
+            .changed();
+    });
+
+    changed
+}
+
 /// One brush parameter's modulation: which input drives it, and the curve that maps it.
 ///
 /// Built in a loop over [`Brush::responses_mut`] rather than written out per parameter, so adding a
@@ -426,6 +581,10 @@ pub struct Outcome {
     pub select: Option<SelectAction>,
     /// Wand settings, as the panel currently holds them.
     pub wand: WandSettings,
+    /// The active text layer's block was edited, so its pixels need re-deriving.
+    pub text_changed: bool,
+    /// A text command.
+    pub text: Option<TextAction>,
 }
 
 pub struct Ui {
@@ -500,6 +659,7 @@ impl Ui {
         window: &Window,
         gpu: Overlay<'_>,
         brush: &mut Brush,
+        text: Option<&mut openpaint_core::TextBlock>,
         view: &View,
         status: Status<'_>,
     ) -> Outcome {
@@ -518,6 +678,9 @@ impl Ui {
         let mut trim = false;
         let mut layer_action = None;
         let mut page_action = None;
+        let mut text_action = None;
+        let mut text_changed = false;
+        let mut text = text;
         let mut tool_action = None;
         let mut confirm_choice = None;
         let mut recovery_choice = None;
@@ -775,6 +938,54 @@ impl Ui {
                                 .small()
                                 .weak(),
                             );
+                            ui.separator();
+                            ui.heading("Text");
+                            if let Some(block) = text.as_deref_mut() {
+                                text_changed |= text_editor(
+                                    ui,
+                                    block,
+                                    status.font_families,
+                                    status.font_substituted,
+                                );
+                                ui.separator();
+                                if ui
+                                    .button("Convert to raster layer")
+                                    .on_hover_text(
+                                        "Keeps the pixels and stops re-deriving them, so the \
+                                         layer can be painted on. This cannot be undone by \
+                                         retyping — the text is gone.",
+                                    )
+                                    .clicked()
+                                {
+                                    text_action = Some(TextAction::ConvertToRaster);
+                                }
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "The active layer is not a text layer. A text layer keeps \
+                                         the words rather than the pixels, so a caption stays \
+                                         retypeable — and cannot be painted on.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.button("Add text layer").clicked() {
+                                    text_action = Some(TextAction::AddLayer);
+                                }
+                                if ui
+                                    .button("Load font file\u{2026}")
+                                    .on_hover_text(
+                                        "Use a .ttf or .otf without installing it. Available for \
+                                         this session.",
+                                    )
+                                    .clicked()
+                                {
+                                    text_action = Some(TextAction::LoadFontFile);
+                                }
+                            });
+
                             ui.separator();
                             ui.heading("View");
                             ui.label(format!(
@@ -1385,6 +1596,8 @@ impl Ui {
             recovery: recovery_choice,
             select: select_action,
             wand,
+            text_changed,
+            text: text_action,
         }
     }
 }

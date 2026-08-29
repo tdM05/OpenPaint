@@ -104,6 +104,12 @@ pub struct Renderer {
     /// the artwork as its base, and inserting the float as a layer made it the base instead, which
     /// is why a shading layer clipped to the artwork vanished the moment a move began.
     floating: Option<LayerId>,
+    /// Fonts, layout and glyph rasterization.
+    ///
+    /// Held by the renderer rather than by the editor because it is a *cache*, not document state:
+    /// it enumerates the system font set once and reuses layout scratch space, and nothing in it
+    /// belongs in a saved file. Same reasoning as the tile store.
+    text: openpaint_text::FontStack,
     window: Arc<Window>,
 }
 
@@ -209,6 +215,7 @@ impl Renderer {
             unrecordable: false,
             pressured: false,
             floating: None,
+            text: openpaint_text::FontStack::new(),
             window,
         })
     }
@@ -363,6 +370,45 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         self.canvas_renderer.discard_layer(layer);
         Some(adopted)
+    }
+
+    /// Every font family this machine can letter with, for a font picker.
+    pub fn font_families(&mut self) -> Vec<String> {
+        self.text.families()
+    }
+
+    /// Register font files that are not installed on the system, returning the families gained.
+    pub fn load_font_files(&mut self, paths: &[std::path::PathBuf]) -> Vec<String> {
+        self.text.load_font_files(paths)
+    }
+
+    /// Re-derive a text layer's pixels from its text.
+    ///
+    /// **Replaces the layer's tiles rather than compositing onto them.** A text layer's pixels are
+    /// a cache of its `TextBlock`, so re-rendering is recomputing that cache, not an edit —
+    /// compositing would leave the previous wording underneath every time someone fixed a typo.
+    ///
+    /// Deliberately outside history for the same reason. What is undoable is the *text* changing;
+    /// the pixels follow from it. That makes a text edit cost a string in the undo stack instead of
+    /// a tile snapshot, and makes undo exact rather than a re-rasterization that has to match.
+    ///
+    /// # Errors
+    /// Whatever the layout stack could not do — currently only an unimplemented writing mode.
+    pub fn rerender_text_layer(
+        &mut self,
+        layer: LayerId,
+        block: &openpaint_core::TextBlock,
+        page: openpaint_core::PageRect,
+    ) -> Result<openpaint_core::text::FontResolution, openpaint_core::text::LayoutError> {
+        use openpaint_core::text::TextRenderer;
+
+        let rendered = self.text.render(block)?;
+        let tiles =
+            openpaint_core::text::tiles_from_mask(&rendered, block.color_linear_premul(), page);
+        // `set_layer_tiles` discards first, so a caption that got shorter does not leave its old
+        // tail on the page.
+        self.canvas_renderer.set_layer_tiles(layer, tiles);
+        Ok(rendered.font)
     }
 
     /// Move every tile of every layer of a page into history, so the page can be deleted

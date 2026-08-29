@@ -27,6 +27,7 @@
 //! list of [`Layer`] properties.
 
 use crate::layer::Layer;
+use crate::text::TextBlock;
 
 /// Default DPI for a new page. Screen-ish; print presets set their own.
 pub const DEFAULT_DPI: f32 = 72.0;
@@ -150,6 +151,29 @@ impl PageResize {
     pub fn loses_pixels(&self) -> bool {
         !self.new.covers(&self.old)
     }
+}
+
+/// How much of a caption is used as its layer's name.
+///
+/// Long enough to tell two lines of dialogue apart, short enough not to push everything else out of
+/// the layer palette.
+const NAME_FROM_TEXT_CHARS: usize = 24;
+
+/// Name a text layer after its own first line.
+///
+/// First line rather than first `n` characters of the whole block: a caption's line breaks are
+/// deliberate, and folding them into the name would run two sentences together.
+#[must_use]
+pub fn layer_name_for(block: &TextBlock) -> String {
+    let first = block.text.lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        return "Text".to_owned();
+    }
+    let mut name: String = first.chars().take(NAME_FROM_TEXT_CHARS).collect();
+    if first.chars().count() > NAME_FROM_TEXT_CHARS {
+        name.push('\u{2026}');
+    }
+    name
 }
 
 /// A page: its rectangle, its stack of layers, and its print metadata.
@@ -299,6 +323,20 @@ impl Page {
         at
     }
 
+    /// Insert a new text layer directly above `above`, and select it.
+    ///
+    /// Its name comes from the text itself, the way every lettering app does it, so a layer palette
+    /// full of captions reads as the script rather than as "Layer 7, Layer 8, Layer 9". A block that
+    /// is still empty gets a placeholder, since it has nothing to be named after yet.
+    pub fn insert_text_layer_above(&mut self, above: usize, id: u32, block: TextBlock) -> usize {
+        let at = (above + 1).min(self.layers.len());
+        let name = layer_name_for(&block);
+        self.layers
+            .insert(at, Layer::new(id, name).with_text(block));
+        self.active = at;
+        at
+    }
+
     /// Remove a layer, returning its id so its tiles can be released.
     ///
     /// Refuses to remove the last one: a page with no layers has nowhere to paint, and every
@@ -370,6 +408,7 @@ impl Page {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text::TextBlock;
 
     /// Add a layer with a fresh id, standing in for `Document::add_layer`.
     ///
@@ -379,6 +418,77 @@ mod tests {
         let id = p.highest_layer_id() + 1;
         let at = p.active_index();
         p.insert_layer_above(at, id, format!("Layer {}", id + 1))
+    }
+
+    /// A layer palette full of captions should read as the script, not as "Layer 7, Layer 8".
+    #[test]
+    fn a_text_layer_is_named_after_its_text() {
+        let mut page = Page::new(256, 256);
+        let block = TextBlock {
+            text: "WHAT WAS THAT NOISE?".into(),
+            ..TextBlock::default()
+        };
+        let at = page.insert_text_layer_above(0, 99, block);
+        assert_eq!(
+            page.layer(at).expect("inserted").name,
+            "WHAT WAS THAT NOISE?"
+        );
+        assert_eq!(page.active_index(), at, "the new layer should be selected");
+        assert!(!page.layer(at).expect("inserted").accepts_paint());
+    }
+
+    /// A block with nothing in it has nothing to be named after, and an empty string would be an
+    /// unclickable row in the palette.
+    #[test]
+    fn an_empty_text_layer_gets_a_placeholder_name() {
+        assert_eq!(layer_name_for(&TextBlock::default()), "Text");
+        assert_eq!(
+            layer_name_for(&TextBlock {
+                text: "   \n  ".into(),
+                ..TextBlock::default()
+            }),
+            "Text"
+        );
+    }
+
+    /// Line breaks in a caption are deliberate, so the name is the first line rather than the first
+    /// few characters of everything run together.
+    #[test]
+    fn a_layer_name_stops_at_the_first_line() {
+        let name = layer_name_for(&TextBlock {
+            text: "Hello\nthere".into(),
+            ..TextBlock::default()
+        });
+        assert_eq!(name, "Hello", "the second line should not be run on");
+    }
+
+    /// A long speech has to be trimmed, and visibly so.
+    #[test]
+    fn a_long_caption_is_elided() {
+        let name = layer_name_for(&TextBlock {
+            text: "a".repeat(200),
+            ..TextBlock::default()
+        });
+        assert!(
+            name.chars().count() <= NAME_FROM_TEXT_CHARS + 1,
+            "got {name:?}"
+        );
+        assert!(
+            name.ends_with('\u{2026}'),
+            "the trim should be visible: {name:?}"
+        );
+    }
+
+    /// Trimming counts characters, not bytes, or a caption in any non-Latin script would be cut
+    /// through the middle of one.
+    #[test]
+    fn eliding_does_not_split_a_character() {
+        let name = layer_name_for(&TextBlock {
+            text: "\u{3053}".repeat(100),
+            ..TextBlock::default()
+        });
+        assert!(name.chars().count() <= NAME_FROM_TEXT_CHARS + 1);
+        assert!(name.chars().all(|c| c == '\u{3053}' || c == '\u{2026}'));
     }
 
     #[test]

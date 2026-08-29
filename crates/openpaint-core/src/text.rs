@@ -25,7 +25,11 @@
 //! exactly that reason: glyph ids are meaningless without the font that produced them, so the
 //! library's types would have leaked across.
 
+use std::collections::HashMap;
+
 use crate::color::opaque_srgb8_to_linear_premul;
+use crate::page::PageRect;
+use crate::tile::{Tile, TileCoord, TILE_SIZE};
 
 /// Which font to draw with. A *request*, not a resolution.
 ///
@@ -325,6 +329,71 @@ impl RenderedText {
     }
 }
 
+/// Turn a rendered mask and a colour into the tiles a layer is made of.
+///
+/// This is the whole of "text becomes pixels", and it is deliberately unremarkable: coverage scales
+/// a premultiplied colour, which is what coverage means in the engine's convention (§4b). Because
+/// the colour is already premultiplied and opaque, every channel scales by the same factor and
+/// there is no un-premultiply/re-premultiply round trip to get wrong.
+///
+/// **These tiles replace the layer's contents rather than compositing over them.** A text layer's
+/// pixels are derived, so re-rendering is not an edit — it is recomputing a cache. Compositing
+/// instead would leave the previous wording underneath every time someone fixed a typo.
+///
+/// Clipped to `page`, because a caption dragged half off the edge should cost the tiles it is
+/// actually on. Tiles that would be entirely empty are not produced at all.
+#[must_use]
+pub fn tiles_from_mask(
+    rendered: &RenderedText,
+    color_linear_premul: [f32; 4],
+    page: PageRect,
+) -> HashMap<TileCoord, Tile> {
+    let mut tiles: HashMap<TileCoord, Tile> = HashMap::new();
+    if rendered.is_empty() {
+        return tiles;
+    }
+
+    let side = TILE_SIZE as i32;
+    let (px0, py0) = page.origin();
+    let (px1, py1) = page.end();
+    let x0 = rendered.x.max(px0);
+    let y0 = rendered.y.max(py0);
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "mask sides are bounded well inside i32"
+    )]
+    let x1 = (rendered.x + rendered.width as i32).min(px1);
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "mask sides are bounded well inside i32"
+    )]
+    let y1 = (rendered.y + rendered.height as i32).min(py1);
+
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let coverage = rendered.coverage_at(x, y);
+            if coverage == 0 {
+                continue;
+            }
+            let coord = (x.div_euclid(side), y.div_euclid(side));
+            let lx = x.rem_euclid(side) as usize;
+            let ly = y.rem_euclid(side) as usize;
+            let a = f32::from(coverage) / 255.0;
+            let texel = [
+                color_linear_premul[0] * a,
+                color_linear_premul[1] * a,
+                color_linear_premul[2] * a,
+                color_linear_premul[3] * a,
+            ];
+            tiles
+                .entry(coord)
+                .or_insert_with(Tile::transparent)
+                .set_texel(lx, ly, texel);
+        }
+    }
+    tiles
+}
+
 /// Why a text block could not be laid out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayoutError {
@@ -546,6 +615,116 @@ mod tests {
             r.font.is_substituted(),
             "a blank layer still knows its font is missing"
         );
+    }
+
+    fn page() -> PageRect {
+        PageRect::from_size(512, 512)
+    }
+
+    /// Opaque black, in the engine's convention.
+    const INK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+    fn inked(x: i32, y: i32, width: u32, height: u32, value: u8) -> RenderedText {
+        RenderedText::new(
+            x,
+            y,
+            width,
+            height,
+            vec![value; width as usize * height as usize],
+            FontResolution::default(),
+        )
+    }
+
+    #[test]
+    fn coverage_scales_the_colour() {
+        let tiles = tiles_from_mask(&inked(10, 10, 2, 2, 255), INK, page());
+        let tile = tiles.get(&(0, 0)).expect("tile 0,0 should exist");
+        assert_eq!(
+            tile.texel(10, 10),
+            INK,
+            "full coverage is the colour itself"
+        );
+
+        let tiles = tiles_from_mask(&inked(10, 10, 2, 2, 128), INK, page());
+        let tile = tiles.get(&(0, 0)).expect("tile 0,0");
+        let t = tile.texel(10, 10);
+        assert!(
+            (t[3] - 128.0 / 255.0).abs() < 1e-2,
+            "half coverage should give about half alpha, got {t:?}"
+        );
+    }
+
+    /// Premultiplied means every channel scales together. A colour channel left unscaled is the
+    /// classic premultiplication bug, and it shows up as a bright fringe around every glyph.
+    #[test]
+    fn colour_channels_scale_with_alpha() {
+        // Opaque red, premultiplied: still [1, 0, 0, 1].
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let tiles = tiles_from_mask(&inked(5, 5, 1, 1, 128), red, page());
+        let t = tiles.get(&(0, 0)).expect("tile").texel(5, 5);
+        assert!(
+            (t[0] - t[3]).abs() < 1e-3,
+            "red should equal alpha in premultiplied opaque ink, got {t:?}"
+        );
+    }
+
+    /// Only the tiles the text actually reaches get made, or a caption on a large page would cost
+    /// the page.
+    #[test]
+    fn only_touched_tiles_are_produced() {
+        let tiles = tiles_from_mask(&inked(300, 20, 4, 4, 255), INK, page());
+        assert_eq!(tiles.len(), 1, "one small word, one tile");
+        assert!(
+            tiles.contains_key(&(1, 0)),
+            "x=300 is the second tile column"
+        );
+    }
+
+    /// Text spanning a tile seam lands in both, which is the case a naive divide gets wrong.
+    #[test]
+    fn text_across_a_seam_touches_both_tiles() {
+        let tiles = tiles_from_mask(&inked(TILE_SIZE as i32 - 2, 10, 4, 4, 255), INK, page());
+        assert_eq!(tiles.len(), 2);
+        assert!(tiles.contains_key(&(0, 0)) && tiles.contains_key(&(1, 0)));
+        assert_eq!(
+            tiles[&(0, 0)].texel(TILE_SIZE - 1, 10),
+            INK,
+            "left of the seam"
+        );
+        assert_eq!(tiles[&(1, 0)].texel(0, 10), INK, "right of the seam");
+    }
+
+    /// A caption dragged off the edge costs the part that is on the page, and nothing else.
+    #[test]
+    fn ink_outside_the_page_is_clipped_not_wrapped() {
+        let tiles = tiles_from_mask(&inked(-3, -3, 6, 6, 255), INK, page());
+        let tile = tiles.get(&(0, 0)).expect("the part still on the page");
+        assert_eq!(tiles.len(), 1, "nothing should exist off the page");
+        assert_eq!(tile.texel(0, 0), INK, "the on-page corner is inked");
+        assert_eq!(
+            tile.texel(3, 3),
+            [0.0; 4],
+            "and the mask should not have wrapped round to here"
+        );
+    }
+
+    #[test]
+    fn an_empty_mask_produces_no_tiles() {
+        let empty = RenderedText::empty(FontResolution::default());
+        assert!(tiles_from_mask(&empty, INK, page()).is_empty());
+    }
+
+    /// Zero coverage is not ink. Writing it anyway would allocate a tile for every glyph's
+    /// bounding box rather than for its ink.
+    #[test]
+    fn uncovered_pixels_stay_transparent() {
+        let mut mask = inked(10, 10, 4, 4, 0);
+        mask.coverage[0] = 255;
+        let tiles = tiles_from_mask(&mask, INK, page());
+        let tile = tiles.get(&(0, 0)).expect("the one inked pixel");
+        assert_eq!(tile.texel(10, 10), INK);
+        assert_eq!(tile.texel(11, 10), [0.0; 4]);
+        assert_eq!(tile.texel(13, 13), [0.0; 4]);
     }
 
     /// Errors have to read as sentences, because they reach the user.

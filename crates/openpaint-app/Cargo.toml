@@ -13,6 +13,9 @@ path = "src/main.rs"
 [dependencies]
 openpaint-core = { path = "../openpaint-core" }
 openpaint-file = { path = "../openpaint-file" }
+# Text layout and glyph rasterization. The app never talks to a font library directly -- this
+# crate is the seam, so swapping the text stack cannot reach anything here.
+openpaint-text = { path = "../openpaint-text" }
 winit = "0.30"
 # GPU rendering. wgpu 22 is compatible with winit 0.30 and auto-selects a
 # backend at runtime (D3D12/Vulkan on Windows, Vulkan on Linux).

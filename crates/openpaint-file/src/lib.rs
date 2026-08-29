@@ -41,7 +41,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use openpaint_core::tile::{Tile, TileCoord, TILE_BYTES};
-use openpaint_core::{Blend, Document, Layer, Page, PageRect};
+use openpaint_core::{
+    text::{Align, FontSpec, TextBlock, WritingMode},
+    Blend, Document, Layer, Page, PageRect,
+};
 
 /// Schema version this build writes, and the newest it can read.
 ///
@@ -54,7 +57,7 @@ use openpaint_core::{Blend, Document, Layer, Page, PageRect};
 /// the counter proved derivable from the layers themselves. Both were `NOT NULL`, so a version-1
 /// *writer* cannot fill a version-2 file -- hence the bump. Reading needs no branch at all: a
 /// version-2 reader simply stops asking for them, which works on both.
-pub const SCHEMA_VERSION: i32 = 5;
+pub const SCHEMA_VERSION: i32 = 6;
 
 /// How a tile's bytes are encoded in the file.
 ///
@@ -166,6 +169,38 @@ fn blend_from_name(s: &str) -> Option<Blend> {
     }
 }
 
+fn align_name(a: Align) -> &'static str {
+    match a {
+        Align::Start => "start",
+        Align::Center => "center",
+        Align::End => "end",
+    }
+}
+
+fn align_from_name(s: &str) -> Option<Align> {
+    match s {
+        "start" => Some(Align::Start),
+        "center" => Some(Align::Center),
+        "end" => Some(Align::End),
+        _ => None,
+    }
+}
+
+fn writing_mode_name(m: WritingMode) -> &'static str {
+    match m {
+        WritingMode::Horizontal => "horizontal",
+        WritingMode::VerticalRightToLeft => "vertical-rl",
+    }
+}
+
+fn writing_mode_from_name(s: &str) -> Option<WritingMode> {
+    match s {
+        "horizontal" => Some(WritingMode::Horizontal),
+        "vertical-rl" => Some(WritingMode::VerticalRightToLeft),
+        _ => None,
+    }
+}
+
 /// Compress a tile, keeping whichever result is smaller.
 ///
 /// Deflate is a clear win on a partly-painted tile and a small loss on a dense one, so the
@@ -237,6 +272,38 @@ const STRUCTURE_SCHEMA: &str = "
             clip_below INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (page_idx, idx)
         );
+        CREATE TABLE layer_text (
+            page_idx      INTEGER NOT NULL,
+            layer_idx     INTEGER NOT NULL,
+            body          TEXT    NOT NULL,
+            family        TEXT    NOT NULL,
+            weight        INTEGER NOT NULL,
+            italic        INTEGER NOT NULL,
+            size          REAL    NOT NULL,
+            line_height   REAL    NOT NULL,
+            letter_spacing REAL   NOT NULL,
+            r             INTEGER NOT NULL,
+            g             INTEGER NOT NULL,
+            b             INTEGER NOT NULL,
+            x             REAL    NOT NULL,
+            y             REAL    NOT NULL,
+            wrap_width    REAL,
+            align         TEXT    NOT NULL,
+            writing_mode  TEXT    NOT NULL,
+            PRIMARY KEY (page_idx, layer_idx)
+        );
+        ";
+
+/// Drop every structure table, so [`STRUCTURE_SCHEMA`] can recreate them.
+///
+/// One list rather than a copy in each migration branch. A table added to `STRUCTURE_SCHEMA` and
+/// not to this makes *every* migration fail with "table already exists" — which is how the need for
+/// this was found, when `layer_text` arrived at v6.
+const DROP_STRUCTURE: &str = "
+        DROP TABLE IF EXISTS layer_text;
+        DROP TABLE IF EXISTS layer;
+        DROP TABLE IF EXISTS page;
+        DROP TABLE IF EXISTS document;
         ";
 
 /// Free-form document metadata.
@@ -280,30 +347,28 @@ fn create_schema(db: &rusqlite::Connection) -> Result<(), Error> {
 /// changes their shape can simply drop and recreate them. **Tiles are untouched** -- they are the
 /// expensive part and no migration so far has needed to.
 fn migrate(db: &rusqlite::Connection, from: i32) -> Result<(), Error> {
-    if from < 2 {
-        // v1 had `document.mode` and `page.next_layer_id`, both since found to mean nothing.
-        db.execute_batch(
-            "DROP TABLE IF EXISTS layer;
-             DROP TABLE IF EXISTS page;
-             DROP TABLE IF EXISTS document;",
-        )?;
-        db.execute_batch(STRUCTURE_SCHEMA)?;
-    }
-    if from < 5 {
-        // v5 added `layer.clip_below`; v4 added `layer.lock_alpha`. Same treatment, and one branch
-        // because recreating the structure tables brings them both to the current shape at once. The structure tables are rewritten by every save regardless,
-        // so recreating them is cheaper than an ALTER and keeps one definition of their shape.
-        db.execute_batch(
-            "DROP TABLE IF EXISTS layer;
-             DROP TABLE IF EXISTS page;
-             DROP TABLE IF EXISTS document;",
-        )?;
+    // Every structure change so far has been the same migration: throw the structure tables away
+    // and let `STRUCTURE_SCHEMA` build them again. That is not laziness — the structure tables are
+    // kilobytes and are rewritten wholesale by every save regardless, so recreating them is cheaper
+    // than an `ALTER` and keeps exactly one definition of their shape. **Tiles are untouched**,
+    // which is the part that would actually cost something.
+    //
+    // What each version did, so a reader can tell whether a file predates a feature:
+    //   v2 dropped `document.mode` and `page.next_layer_id`, both found to mean nothing.
+    //   v3 added `meta`.
+    //   v4 added `layer.lock_alpha`; v5 added `layer.clip_below`.
+    //   v6 added `layer_text`.
+    //
+    // Nothing is migrated *into* the new shapes, and nothing needs to be: a file written before a
+    // flag existed did not have that flag set, and one written before `layer_text` had no text
+    // layers — whatever captions it has are already flattened into tiles.
+    if from < SCHEMA_VERSION {
+        db.execute_batch(DROP_STRUCTURE)?;
         db.execute_batch(STRUCTURE_SCHEMA)?;
     }
     if from < 3 {
-        // v3 added `meta`. Nothing to move into it, so this is purely additive -- which is why it
-        // is `CREATE TABLE IF NOT EXISTS` rather than a drop-and-recreate like the structure
-        // tables: there is no old shape to discard.
+        // `meta` is the exception: purely additive, with no old shape to discard, which is why it
+        // is `CREATE TABLE IF NOT EXISTS` and lives outside the block above.
         db.execute_batch(META_SCHEMA)?;
     }
     db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -347,6 +412,7 @@ pub fn save(
             rusqlite::params![key, value],
         )?;
     }
+    tx.execute("DELETE FROM layer_text", [])?;
     tx.execute("DELETE FROM layer", [])?;
     tx.execute("DELETE FROM page", [])?;
     tx.execute("DELETE FROM document", [])?;
@@ -393,6 +459,34 @@ pub fn save(
                     i64::from(layer.clip_below),
                 ],
             )?;
+            if let Some(block) = layer.text() {
+                tx.execute(
+                    "INSERT INTO layer_text
+                         (page_idx, layer_idx, body, family, weight, italic, size, line_height,
+                          letter_spacing, r, g, b, x, y, wrap_width, align, writing_mode)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                             ?16, ?17)",
+                    rusqlite::params![
+                        index as i64,
+                        li as i64,
+                        block.text,
+                        block.font.family,
+                        i64::from(block.font.weight),
+                        i64::from(block.font.italic),
+                        block.size,
+                        block.line_height,
+                        block.letter_spacing,
+                        i64::from(block.color_srgb8[0]),
+                        i64::from(block.color_srgb8[1]),
+                        i64::from(block.color_srgb8[2]),
+                        block.x,
+                        block.y,
+                        block.wrap_width,
+                        align_name(block.align),
+                        writing_mode_name(block.writing_mode),
+                    ],
+                )?;
+            }
         }
     }
 
@@ -486,6 +580,16 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
             )
         })?;
 
+    // Absence reads as "no text layers", the same tolerance `lock_alpha` established: a file
+    // written before v6 has no such table, and that is not a malformed document.
+    let mut text_stmt = db
+        .prepare(
+            "SELECT layer_idx, body, family, weight, italic, size, line_height, letter_spacing,
+                    r, g, b, x, y, wrap_width, align, writing_mode
+         FROM layer_text WHERE page_idx = ?1",
+        )
+        .ok();
+
     let rows = page_stmt.query_map([], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -497,6 +601,41 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
 
     for row in rows {
         let (idx, rect, dpi, active_layer) = row?;
+        let mut blocks: HashMap<usize, TextBlock> = HashMap::new();
+        if let Some(stmt) = text_stmt.as_mut() {
+            let found = stmt.query_map([idx], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as usize,
+                    TextBlock {
+                        text: r.get(1)?,
+                        font: FontSpec {
+                            family: r.get(2)?,
+                            weight: r.get::<_, i64>(3)? as u16,
+                            italic: r.get::<_, i64>(4)? != 0,
+                        },
+                        size: r.get::<_, f64>(5)? as f32,
+                        line_height: r.get::<_, f64>(6)? as f32,
+                        letter_spacing: r.get::<_, f64>(7)? as f32,
+                        color_srgb8: [
+                            r.get::<_, i64>(8)? as u8,
+                            r.get::<_, i64>(9)? as u8,
+                            r.get::<_, i64>(10)? as u8,
+                        ],
+                        x: r.get::<_, f64>(11)? as f32,
+                        y: r.get::<_, f64>(12)? as f32,
+                        wrap_width: r.get::<_, Option<f64>>(13)?.map(|w| w as f32),
+                        align: align_from_name(&r.get::<_, String>(14)?).unwrap_or_default(),
+                        writing_mode: writing_mode_from_name(&r.get::<_, String>(15)?)
+                            .unwrap_or_default(),
+                    },
+                ))
+            })?;
+            for entry in found {
+                let (layer_idx, block) = entry?;
+                blocks.insert(layer_idx, block);
+            }
+        }
+
         let layers: Vec<Layer> = layer_stmt
             .query_map([idx], |r| {
                 let blend_text: String = r.get(3)?;
@@ -510,13 +649,17 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
                     r.get::<_, i64>(6)? != 0,
                 ))
             })?
-            .map(|row| {
+            .enumerate()
+            .map(|(layer_idx, row)| {
                 let (id, name, opacity, blend_text, visible, lock_alpha, clip_below) = row?;
                 let blend = blend_from_name(&blend_text)
                     .ok_or_else(|| Error::Malformed(format!("unknown blend {blend_text:?}")))?;
-                Ok(Layer::restored(
-                    id, name, opacity, blend, visible, lock_alpha, clip_below,
-                ))
+                let layer =
+                    Layer::restored(id, name, opacity, blend, visible, lock_alpha, clip_below);
+                Ok(match blocks.remove(&layer_idx) {
+                    Some(block) => layer.with_text(block),
+                    None => layer,
+                })
             })
             .collect::<Result<_, Error>>()?;
 
