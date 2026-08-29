@@ -1652,6 +1652,38 @@ impl Ui {
                                 .small()
                                 .weak(),
                             );
+                            // The step-6 readout: how many samples the input path is actually
+                            // handing us, and how far the pen moved between them.
+                            match status.perf.rate {
+                                Some(hz) => {
+                                    let verdict = if hz >= 120.0 {
+                                        "full pen rate"
+                                    } else if hz >= 90.0 {
+                                        "some samples lost"
+                                    } else {
+                                        "about one a frame -- samples are being dropped"
+                                    };
+                                    ui.label(format!("Pen {hz:.0} samples/s ({verdict})"));
+                                }
+                                None => {
+                                    ui.label("Pen rate -- draw for a second");
+                                }
+                            }
+                            if let Some((mean, peak)) = status.perf.step {
+                                ui.label(format!(
+                                    "Step {mean:.1} px, peak {peak:.1} (page pixels between samples)"
+                                ));
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "A tablet reports around 200 times a second. Near that means \
+                                     nothing is being lost; near 60 means we are only seeing one \
+                                     sample a frame, which is what makes a fast curve come out \
+                                     faceted.",
+                                )
+                                .small()
+                                .weak(),
+                            );
                             ui.label(status.autosave);
                             ui.separator();
                             ui.heading("Export");

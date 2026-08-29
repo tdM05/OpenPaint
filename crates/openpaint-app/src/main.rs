@@ -211,6 +211,12 @@ struct OpenPaint {
     /// Taken by the frame that presents it, so a frame drawn for some other reason cannot claim
     /// an input latency it had no input for.
     pending_sample_ms: Option<f64>,
+    /// Where the previous sample of this stroke landed, in page pixels, for the step measurement.
+    ///
+    /// Cleared at the start of each stroke, so the jump from where the last stroke ended to where
+    /// this one begins is not counted as pen motion — it is not, and it would be the largest
+    /// "step" in every session.
+    last_sample_at: Option<(f32, f32)>,
     /// Rolling latency and frame-time measurements.
     perf: perf::Perf,
     /// Periodic recovery copies, and the abandoned one found at startup.
@@ -676,6 +682,7 @@ impl Default for OpenPaint {
             after_save: None,
             file_dialog: None,
             pending_sample_ms: None,
+            last_sample_at: None,
             perf: perf::Perf::default(),
             autosave: autosave::Autosave::new(),
             recovery: None,
@@ -713,6 +720,8 @@ impl OpenPaint {
                                 sample.tilt_from_vertical(),
                                 sample.time_ms(),
                             );
+                            self.last_sample_at = None;
+                            self.note_input_sample(sample, (cx, cy));
                             self.note_latency_input(sample);
                             self.request_redraw();
                         }
@@ -769,6 +778,7 @@ impl OpenPaint {
                                     sample.tilt_from_vertical(),
                                     sample.time_ms(),
                                 );
+                                self.note_input_sample(sample, (cx, cy));
                             }
                         }
                         // The newest sample in the batch sits at the tip of the stroke, which is
@@ -1030,6 +1040,21 @@ impl OpenPaint {
     /// Mark this sample as the one whose latency the next presented frame will measure.
     fn note_latency_input(&mut self, sample: &PenSample) {
         self.pending_sample_ms = Some(sample.time_ms());
+    }
+
+    /// Record that a sample arrived while drawing, and how far the pen moved to get there.
+    ///
+    /// Every sample, not the last of a batch: the whole question this answers is **how many
+    /// samples there are**, so counting one per frame would measure the frame rate and call it the
+    /// pen's (Phase 0, step 6). That is also why the step distance is in *page* pixels rather than
+    /// screen ones — it is the gap the brush engine has to interpolate across, and zooming in must
+    /// not make the input look worse than it is.
+    fn note_input_sample(&mut self, sample: &PenSample, at: (f32, f32)) {
+        self.perf.rate.push(sample.time_ms());
+        if let Some((px, py)) = self.last_sample_at {
+            self.perf.step.push((at.0 - px).hypot(at.1 - py));
+        }
+        self.last_sample_at = Some(at);
     }
 
     /// The brush ring to draw at the pointer, if there should be one.

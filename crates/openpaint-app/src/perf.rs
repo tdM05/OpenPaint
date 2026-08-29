@@ -18,6 +18,19 @@
 //! So these are a *lower bound* on what the artist experiences, covering the part we can act on.
 //! Measuring the whole pen-to-photon path needs a high-speed camera. Measuring our share of it
 //! needs only this, so this comes first.
+//!
+//! # Sample rate, which answers a different question
+//!
+//! Latency asks *how late* a sample is. Rate asks **how many of them we get at all**, and that is
+//! the question Phase 0's step 6 left open: a pen reports around 200 times a second while a
+//! display refreshes 60, so an input path that hands over one sample per frame is discarding two
+//! thirds of the pen's motion. That does not show up as lag — it shows up as a fast curve coming
+//! out faceted, which is easy to blame on the brush engine.
+//!
+//! Two numbers settle it. **Rate** is device-facing: near the tablet's own report rate means
+//! nothing is being lost, near the frame rate means it is. **Step** is artist-facing: how far the
+//! pen moved between consecutive samples, in page pixels, which is the distance the brush engine
+//! then has to interpolate across and therefore the thing that actually becomes a flat spot.
 
 /// A fixed-size window of millisecond timings.
 ///
@@ -69,6 +82,60 @@ impl Rolling {
     }
 }
 
+/// How often samples arrive, over a rolling window of them.
+///
+/// A rate, not a duration, so it cannot reuse [`Rolling`]: averaging the gaps between samples
+/// gives the wrong answer when they arrive in bursts, which is exactly what a polled backend
+/// produces. Several samples land within microseconds of each other and then nothing comes for a
+/// frame — the mean gap says "very fast" and the truth is "sixty bursts a second". Counting over
+/// elapsed wall-clock time is immune to that.
+#[derive(Clone, Debug, Default)]
+pub struct Rate {
+    /// When the window opened, on the input clock.
+    started_ms: Option<f64>,
+    /// When the most recent sample arrived.
+    latest_ms: f64,
+    count: u32,
+    /// The last completed window's rate, so the readout does not flicker to zero between windows.
+    last: Option<f32>,
+}
+
+impl Rate {
+    /// How much wall-clock time a window covers before it is reported and restarted.
+    ///
+    /// Long enough that a burst does not dominate it, short enough to react while you watch.
+    const WINDOW_MS: f64 = 500.0;
+
+    /// Note a sample that arrived at `time_ms` on the input clock.
+    pub fn push(&mut self, time_ms: f64) {
+        let started = *self.started_ms.get_or_insert(time_ms);
+        self.latest_ms = time_ms;
+        self.count += 1;
+        let elapsed = time_ms - started;
+        if elapsed >= Self::WINDOW_MS {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a rate in hertz, far inside f32"
+            )]
+            {
+                self.last = Some((f64::from(self.count) / elapsed * 1000.0) as f32);
+            }
+            self.started_ms = Some(time_ms);
+            self.count = 0;
+        }
+    }
+
+    /// Samples per second over the last completed window, or `None` before one has closed.
+    ///
+    /// Goes stale rather than resetting when drawing stops: the number describes the last stroke,
+    /// which is the one worth reading. A zero here would mean "the pen reports nothing", which is
+    /// a different and much more alarming claim than "you are not drawing right now".
+    #[must_use]
+    pub fn per_second(&self) -> Option<f32> {
+        self.last
+    }
+}
+
 /// The timings the readout shows.
 #[derive(Clone, Debug, Default)]
 pub struct Perf {
@@ -80,6 +147,13 @@ pub struct Perf {
     pub input: Rolling,
     /// How long producing each frame took.
     pub frame: Rolling,
+    /// How many pen samples arrive per second while drawing.
+    pub rate: Rate,
+    /// How far the pen moved between consecutive samples, in page pixels.
+    ///
+    /// The peak is the number that matters and the mean is context: one long step in a stroke is a
+    /// flat spot in a curve, and an average over a slow stroke would hide it completely.
+    pub step: Rolling,
 }
 
 impl Perf {
@@ -92,6 +166,8 @@ impl Perf {
         PerfSnapshot {
             input: self.input.summary(),
             frame: self.frame.summary(),
+            rate: self.rate.per_second(),
+            step: self.step.summary(),
         }
     }
 }
@@ -101,6 +177,10 @@ impl Perf {
 pub struct PerfSnapshot {
     pub input: Option<(f32, f32)>,
     pub frame: Option<(f32, f32)>,
+    /// Pen samples per second, over the last completed window.
+    pub rate: Option<f32>,
+    /// Page pixels between consecutive samples: mean and peak.
+    pub step: Option<(f32, f32)>,
 }
 
 #[cfg(test)]
@@ -110,6 +190,63 @@ mod tests {
     #[test]
     fn nothing_measured_reports_nothing() {
         assert_eq!(Rolling::default().summary(), None);
+        assert_eq!(Rate::default().per_second(), None);
+    }
+
+    /// Bursty arrival must not read as a high rate.
+    ///
+    /// **The whole reason this is not a `Rolling` of gaps.** A polled backend delivers several
+    /// samples within microseconds and then nothing for a frame; averaging the gaps would call
+    /// that thousands of samples a second, which is the opposite of the truth and would answer
+    /// step 6 backwards. Sixty bursts of three is a hundred and eighty a second, and that is what
+    /// this has to say.
+    #[test]
+    fn a_bursty_stream_reports_its_real_rate() {
+        let mut rate = Rate::default();
+        let mut t = 0.0_f64;
+        // 60 bursts of 3, one burst every 16.67 ms: 180 samples per second.
+        for _ in 0..60 {
+            for _ in 0..3 {
+                rate.push(t);
+                t += 0.05;
+            }
+            t += 16.6;
+        }
+        let hz = rate.per_second().expect("a window closed");
+        assert!(
+            (150.0..=210.0).contains(&hz),
+            "sixty bursts of three is about 180 a second, got {hz}"
+        );
+    }
+
+    /// One sample per frame reads as the frame rate, which is the failure step 6 is looking for.
+    #[test]
+    fn one_sample_per_frame_reads_as_the_frame_rate() {
+        let mut rate = Rate::default();
+        let mut t = 0.0_f64;
+        for _ in 0..120 {
+            rate.push(t);
+            t += 16.67;
+        }
+        let hz = rate.per_second().expect("a window closed");
+        assert!(
+            (50.0..=70.0).contains(&hz),
+            "one a frame at 60 Hz is about 60 a second, got {hz}"
+        );
+    }
+
+    /// The rate goes stale rather than resetting, because zero would be a different claim.
+    #[test]
+    fn the_rate_survives_the_pen_being_lifted() {
+        let mut rate = Rate::default();
+        let mut t = 0.0_f64;
+        for _ in 0..200 {
+            rate.push(t);
+            t += 5.0;
+        }
+        let during = rate.per_second().expect("a window closed");
+        // Nothing more arrives. The number still describes the stroke that happened.
+        assert_eq!(rate.per_second(), Some(during));
     }
 
     #[test]
