@@ -136,8 +136,11 @@ Every panel has a header, always, so there is no panel this cannot reach --- whi
 that put the panel list inside a closable Menu. Right-click stays as the fast path for anyone with
 a pen or mouse.
 
-**Not built yet.** `Flow` ships as a per-panel default from the `PANELS` table; the gesture and the
-per-instance override come next.
+**Where it has got to.** `Flow` ships as a per-panel *kind* default from the `PANELS` table:
+`Auto` for the menu, `Wrap` for the tool rail, `Column` for the rest. What is still missing is the
+part that makes it a setting rather than a decision --- storing it **per panel instance**, saved
+with the workspace, and the hold gesture to reach it. That is the next batch, and it is the point
+of the whole exercise: until then these are defaults, not choices.
 
 ## 1. The descriptor engine — and this is what replaces egui
 

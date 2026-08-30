@@ -3182,6 +3182,19 @@ impl OpenPaint {
                     }
                     // Undo a layout change, on its own stack: Ctrl+Z belongs to the artwork, and
                     // rearranging panels must never take an undo step away from painting.
+                    // **Ctrl first.** The plain-F3 arm below used to come first and matched
+                    // regardless of the modifier, so Ctrl+F3 was silently an undo and the reset it
+                    // claims to be was unreachable. A guard that does not exclude the case above it
+                    // is not a guard.
+                    Key::Named(NamedKey::F3)
+                        if pressed && self.workspace_mode && self.nav.modifiers.control_key() =>
+                    {
+                        self.workspace.reset();
+                        self.status_message =
+                            Some("Layout reset. F3 takes that back too.".to_owned());
+                        self.request_redraw();
+                        true
+                    }
                     Key::Named(NamedKey::F3) if pressed && self.workspace_mode => {
                         let moved = if self.nav.modifiers.shift_key() {
                             self.workspace.redo()
@@ -3206,18 +3219,6 @@ impl OpenPaint {
                     // The way back from any arrangement at all, including one with no menu bar
                     // left to reach a command from.
                     //
-                    // **Not Ctrl+Shift+Z**, which was the first choice and never fired once:
-                    // `handle_history` runs earlier and that combination is redo. Picking a
-                    // shortcut without checking what already owns it is its own small lesson.
-                    Key::Named(NamedKey::F3)
-                        if pressed && self.workspace_mode && self.nav.modifiers.control_key() =>
-                    {
-                        self.workspace.reset();
-                        self.status_message =
-                            Some("Layout reset. F3 takes that back too.".to_owned());
-                        self.request_redraw();
-                        true
-                    }
                     Key::Character(c) if pressed && !self.nav.modifiers.control_key() => {
                         match c.as_str() {
                             "0" => {

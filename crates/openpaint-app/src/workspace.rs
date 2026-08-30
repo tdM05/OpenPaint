@@ -64,7 +64,7 @@ pub const PANELS: &[PanelKind] = &[
         id: PanelId(1),
         name: "Tools",
         header: HeaderStyle::Compact,
-        flow: Flow::Auto,
+        flow: Flow::Wrap,
     },
     PanelKind {
         id: PanelId(2),
@@ -293,7 +293,7 @@ impl Workspace {
     /// costs nothing, because nothing has happened to the layout until you let go.
     pub fn cancel_drag(&mut self) -> bool {
         let was = self.drag.active() || self.panel_list.is_some();
-        self.drag.cancel();
+        self.drag.cancel(&mut self.layout);
         self.panel_list = None;
         was
     }
@@ -887,7 +887,7 @@ impl Workspace {
         let Some((x, y)) = pointer else {
             // Nowhere to press, drop or follow to. A gesture in flight with no pointer is one
             // whose pointer has gone, whatever this frame claims.
-            self.drag.cancel();
+            self.drag.cancel(&mut self.layout);
             return None;
         };
         match pulse {
@@ -916,7 +916,7 @@ impl Workspace {
             }
             Pulse::Track => self.drag.drag(&mut self.layout, screen, x, y, now_ms),
             Pulse::Lost => {
-                self.drag.cancel();
+                self.drag.cancel(&mut self.layout);
                 None
             }
         }
@@ -1013,6 +1013,14 @@ fn measure(ctx: &egui::Context, label: f32, panel: Option<PanelId>) -> f32 {
 /// unreachable. Decided from the panels rather than from the leaf, so it is still a property of
 /// panels and not a rule about places.
 fn style_of(slot: &crate::layout::Placed) -> HeaderStyle {
+    // **More than one panel in a leaf means tabs, whatever the panels would have preferred.**
+    // A compact header spends no room on names, which also means it draws no tabs -- so stacking
+    // the Menu and the Tools rail together showed one of them and hid the other with no way to
+    // reach it. A header's job is to let you choose what the leaf shows; with two things in it,
+    // that job needs tabs.
+    if slot.tabs.len() > 1 {
+        return HeaderStyle::Named;
+    }
     if slot
         .tabs
         .iter()
@@ -1162,6 +1170,33 @@ mod tests {
         }
     }
 
+    /// **Two panels in one leaf always show tabs**, however compact they would rather be.
+    ///
+    /// Stacking the Menu with the Tools rail hid one of them completely: both prefer a compact
+    /// header, a compact header draws no tabs, and so there was nothing to press to get the other
+    /// one back.
+    #[test]
+    fn a_leaf_holding_two_panels_shows_tabs() {
+        let mut layout = Layout::single(MENU);
+        layout.insert(&[], Zone::Center, TOOLS);
+        let placed = layout.resolve(Rect::new(0.0, 0.0, 800.0, 600.0));
+        let slot = placed.first().expect("one leaf");
+        assert_eq!(slot.tabs.len(), 2, "both should be in the same leaf");
+        assert_eq!(
+            style_of(slot),
+            HeaderStyle::Named,
+            "with two panels there must be tabs to choose between them"
+        );
+
+        // On its own each is still compact: this is about how many, not about which.
+        let alone = Layout::single(TOOLS);
+        let placed = alone.resolve(Rect::new(0.0, 0.0, 800.0, 600.0));
+        assert_eq!(
+            style_of(placed.first().expect("leaf")),
+            HeaderStyle::Compact
+        );
+    }
+
     /// Which way a panel's controls run comes from the panel table, not from one answer given to
     /// everything.
     #[test]
@@ -1278,6 +1313,268 @@ mod tests {
         assert_ne!(
             brush_before, brush_after,
             "the drop did nothing: the panel is exactly where it started"
+        );
+    }
+
+    /// **A move can be taken back.** The whole point of the layout having its own undo stack.
+    #[test]
+    fn a_move_can_be_undone() {
+        use crate::panel_drag::{pulse, Target, HOLD_MS};
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let mut ws = bare();
+        let before = ws.layout.clone();
+        let placed = ws.layout.resolve(screen);
+        let brush = placed
+            .iter()
+            .find(|p| p.tabs.contains(&BRUSH))
+            .expect("brush");
+        let target = Target::Tab {
+            path: brush.path.clone(),
+            tab: brush.active,
+        };
+        let canvas = placed
+            .iter()
+            .find(|p| p.tabs.contains(&CANVAS))
+            .expect("canvas");
+        let (dx, dy) = (
+            canvas.rect.x + canvas.rect.w / 2.0,
+            canvas.rect.y + canvas.rect.h - 8.0,
+        );
+
+        ws.gesture(
+            screen,
+            pulse(true, false, true),
+            Some((10.0, 10.0)),
+            0.0,
+            |_, _| target.clone(),
+        );
+        ws.gesture(
+            screen,
+            pulse(false, false, true),
+            Some((10.0, 10.0)),
+            HOLD_MS + 1.0,
+            |_, _| unreachable!(),
+        );
+        ws.gesture(
+            screen,
+            pulse(false, false, true),
+            Some((dx, dy)),
+            HOLD_MS + 2.0,
+            |_, _| unreachable!(),
+        );
+        ws.gesture(
+            screen,
+            pulse(false, true, false),
+            Some((dx, dy)),
+            HOLD_MS + 3.0,
+            |_, _| unreachable!(),
+        );
+        assert_ne!(
+            ws.layout, before,
+            "nothing moved, so there is nothing to undo"
+        );
+
+        assert!(ws.undo(), "there should be a layout change to take back");
+        assert_eq!(ws.layout, before, "undo did not put it back");
+        assert!(ws.redo(), "and it should be redoable");
+        assert_ne!(ws.layout, before);
+    }
+
+    /// A resize can be taken back too. It is applied live while the divider is dragged, which is
+    /// exactly why it is easy to forget to record.
+    #[test]
+    fn a_resize_can_be_undone() {
+        use crate::panel_drag::{pulse, Target, HOLD_MS};
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let mut ws = bare();
+        let before = ws.layout.clone();
+        let s0 = ws.layout.splitters(screen, ws.theme.metrics.splitter_grab);
+        // A divider of a horizontal split, so dragging in x actually moves it. Picking the first
+        // one gave a vertical split's divider, which x does not touch: the test moved nothing and
+        // said so.
+        let sp = s0
+            .iter()
+            .find(|s| s.rect.h > s.rect.w)
+            .expect("a vertical divider")
+            .clone();
+        let target = Target::Splitter {
+            path: sp.path.clone(),
+            index: sp.index,
+        };
+        let (px, py) = (sp.rect.x + sp.rect.w / 2.0, sp.rect.y + sp.rect.h / 2.0);
+
+        ws.gesture(
+            screen,
+            pulse(true, false, true),
+            Some((px, py)),
+            0.0,
+            |_, _| target.clone(),
+        );
+        ws.gesture(
+            screen,
+            pulse(false, false, true),
+            Some((px, py)),
+            HOLD_MS + 1.0,
+            |_, _| unreachable!(),
+        );
+        ws.gesture(
+            screen,
+            pulse(false, false, true),
+            Some((px + 80.0, py)),
+            HOLD_MS + 2.0,
+            |_, _| unreachable!(),
+        );
+        ws.gesture(
+            screen,
+            pulse(false, true, false),
+            Some((px + 80.0, py)),
+            HOLD_MS + 3.0,
+            |_, _| unreachable!(),
+        );
+        assert_ne!(ws.layout, before, "the divider did not move");
+
+        assert!(ws.undo(), "there should be a resize to take back");
+        assert_eq!(ws.layout, before, "undo did not put the divider back");
+    }
+
+    /// **Escape during a divider drag puts the divider back.**
+    ///
+    /// A divider moves live, so by the time Escape arrives the layout has already changed. Without
+    /// restoring it, "a gesture you have thought better of costs nothing" (§5e) was simply untrue
+    /// for the one gesture that shows its work as you make it.
+    #[test]
+    fn escape_during_a_resize_puts_the_divider_back() {
+        use crate::panel_drag::{pulse, Target, HOLD_MS};
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let mut ws = bare();
+        let before = ws.layout.clone();
+        let s0 = ws.layout.splitters(screen, ws.theme.metrics.splitter_grab);
+        let sp = s0
+            .iter()
+            .find(|s| s.rect.h > s.rect.w)
+            .expect("a vertical divider")
+            .clone();
+        let target = Target::Splitter {
+            path: sp.path.clone(),
+            index: sp.index,
+        };
+        let (px, py) = (sp.rect.x + sp.rect.w / 2.0, sp.rect.y + sp.rect.h / 2.0);
+
+        ws.gesture(
+            screen,
+            pulse(true, false, true),
+            Some((px, py)),
+            0.0,
+            |_, _| target.clone(),
+        );
+        ws.gesture(
+            screen,
+            pulse(false, false, true),
+            Some((px, py)),
+            HOLD_MS + 1.0,
+            |_, _| unreachable!(),
+        );
+        ws.gesture(
+            screen,
+            pulse(false, false, true),
+            Some((px + 120.0, py)),
+            HOLD_MS + 2.0,
+            |_, _| unreachable!(),
+        );
+        assert_ne!(ws.layout, before, "the divider did not move");
+
+        assert!(ws.cancel_drag(), "there was a gesture to abandon");
+        assert_eq!(
+            ws.layout, before,
+            "Escape left the divider where it had got to"
+        );
+    }
+
+    /// A divider held but never moved is not a change, and does not eat an undo step.
+    ///
+    /// The common case by a distance: hold a divider, think better of it, let go. Recording that
+    /// would mean the next undo spends itself restoring something that already looks right, which
+    /// reads as undo being broken.
+    ///
+    /// Deliberately *held and released*, not moved-and-returned. Dragging out and back does not
+    /// come home to the same floating-point weights, so no exact-equality check could promise it
+    /// and a test asserting otherwise would only be describing luck.
+    #[test]
+    fn a_divider_held_but_never_moved_is_not_a_change() {
+        use crate::panel_drag::{pulse, Target, HOLD_MS};
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let mut ws = bare();
+        let sp = ws
+            .layout
+            .splitters(screen, ws.theme.metrics.splitter_grab)
+            .into_iter()
+            .find(|s| s.rect.h > s.rect.w)
+            .expect("a vertical divider");
+        let target = Target::Splitter {
+            path: sp.path.clone(),
+            index: sp.index,
+        };
+        let (px, py) = (sp.rect.x + sp.rect.w / 2.0, sp.rect.y + sp.rect.h / 2.0);
+
+        ws.gesture(
+            screen,
+            pulse(true, false, true),
+            Some((px, py)),
+            0.0,
+            |_, _| target.clone(),
+        );
+        for (t, x) in [(1.0, px), (2.0, px), (3.0, px)] {
+            ws.gesture(
+                screen,
+                pulse(false, false, true),
+                Some((x, py)),
+                HOLD_MS + t,
+                |_, _| unreachable!(),
+            );
+        }
+        ws.gesture(
+            screen,
+            pulse(false, true, false),
+            Some((px, py)),
+            HOLD_MS + 4.0,
+            |_, _| unreachable!(),
+        );
+        assert!(
+            !ws.undo(),
+            "holding a divider without moving it is not something to undo"
+        );
+    }
+
+    /// A gesture that never armed abandons only itself.
+    ///
+    /// It has changed nothing, so cancelling it must change nothing either -- including anything
+    /// that happened in the meantime. Restoring the layout unconditionally would let a stray press
+    /// quietly roll back a panel opened from the list a moment later.
+    #[test]
+    fn abandoning_an_unarmed_gesture_takes_nothing_with_it() {
+        use crate::panel_drag::{pulse, Target};
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let mut ws = bare();
+        ws.toggle(HISTORY);
+        let (path, _) = ws.layout.find(BRUSH).expect("brush");
+        let target = Target::Tab { path, tab: 0 };
+
+        ws.gesture(
+            screen,
+            pulse(true, false, true),
+            Some((10.0, 10.0)),
+            0.0,
+            |_, _| target.clone(),
+        );
+        // Something else changes the arrangement while the press is still waiting.
+        ws.toggle(HISTORY);
+        let after = ws.layout.clone();
+        assert!(ws.is_open(HISTORY));
+
+        ws.cancel_drag();
+        assert_eq!(
+            ws.layout, after,
+            "abandoning a press that never armed rolled back an unrelated change"
         );
     }
 

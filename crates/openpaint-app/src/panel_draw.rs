@@ -268,6 +268,26 @@ fn draw(
                 color(if *on { pal.on_state } else { pal.dim }),
             );
         }
+        Control::Choice { text, selected, .. } => {
+            painter.rect_filled(
+                to_egui(r),
+                m.radius,
+                color(if *selected {
+                    pal.state
+                } else if lit {
+                    pal.edge
+                } else {
+                    pal.header
+                }),
+            );
+            painter.text(
+                egui::pos2(r.x + r.w / 2.0, r.y + r.h / 2.0),
+                egui::Align2::CENTER_CENTER,
+                text,
+                body,
+                color(if *selected { pal.on_state } else { pal.text }),
+            );
+        }
         Control::Row {
             text,
             selected,
@@ -307,6 +327,7 @@ fn text_width(ctx: &egui::Context, size: f32, control: &Control) -> f32 {
         | Control::Button { text, .. }
         | Control::Slider { text, .. }
         | Control::Toggle { text, .. }
+        | Control::Choice { text, .. }
         | Control::Row { text, .. } => text.as_str(),
         Control::Separator => return 0.0,
     };

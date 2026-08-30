@@ -70,6 +70,19 @@ pub enum Control {
         text: String,
         on: bool,
     },
+    /// One of a set, shown as a button that says whether it is the current one.
+    ///
+    /// A tool in the rail, a blend mode, the shape of a colour wheel. Distinct from [`Row`] in
+    /// presentation rather than meaning: a row is an item in a list you read down, a choice is one
+    /// of a handful you pick between, and drawing them the same way would make a tool rail look
+    /// like a list of files.
+    ///
+    /// [`Row`]: Control::Row
+    Choice {
+        id: ControlId,
+        text: String,
+        selected: bool,
+    },
     /// A row in a list: layers, presets, pages.
     Row {
         id: ControlId,
@@ -89,6 +102,7 @@ impl Control {
             Self::Button { id, .. }
             | Self::Slider { id, .. }
             | Self::Toggle { id, .. }
+            | Self::Choice { id, .. }
             | Self::Row { id, .. } => Some(*id),
         }
     }
@@ -122,6 +136,8 @@ impl Control {
             // A slider needs somewhere to slide. Below about six rows it is a button that lies.
             Self::Slider { .. } => (text + metrics.row * 4.0).max(metrics.row * 6.0),
             Self::Toggle { .. } => text + metrics.row * 1.6 + metrics.padding * 2.0,
+            // Square at least, so a single glyph is still a target rather than a sliver.
+            Self::Choice { .. } => (text + metrics.padding * 2.0).max(metrics.row),
             Self::Button { .. } | Self::Row { .. } => text + metrics.padding * 2.0,
         }
     }
@@ -145,6 +161,13 @@ pub enum Flow {
     /// Across if it fits, down if it does not.
     #[default]
     Auto,
+    /// Across, onto more lines as needed.
+    ///
+    /// **Only honest when the items are the same width.** A wrapped row of words leaves a ragged
+    /// edge and a last line with one item on it; a wrapped grid of equal square buttons is what
+    /// every tool rail in every paint application already is, and reads as deliberate because it
+    /// is. So this exists, and it is not the default for anything with a label in it.
+    Wrap,
 }
 
 /// A control and where it sits.
@@ -173,7 +196,7 @@ pub fn place<'a>(
     text_of: impl Fn(&Control) -> f32,
 ) -> Vec<Placed<'a>> {
     let across = match flow {
-        Flow::Row => true,
+        Flow::Row | Flow::Wrap => true,
         Flow::Column => false,
         // The whole point of Auto: it decides once, for the whole list. A per-control decision is
         // what produces a wrapped row, which is the thing being avoided.
@@ -186,6 +209,10 @@ pub fn place<'a>(
             // Everything in a row is one row tall, including the labels and the rules, or the
             // strip has no baseline to read along.
             let w = control.width(metrics, text_of(control));
+            if flow == Flow::Wrap && x > content.x && x + w > content.x + content.w {
+                x = content.x;
+                y += metrics.row + metrics.gap;
+            }
             let r = Rect::new(x, y, w, metrics.row);
             x += w + metrics.gap;
             r
@@ -271,7 +298,7 @@ pub fn change_at(control: &Control, rect: Rect, x: f32) -> Option<Change> {
     match control {
         Control::Button { id, .. } => Some(Change::Pressed(*id)),
         Control::Toggle { id, on, .. } => Some(Change::Toggled(*id, !on)),
-        Control::Row { id, .. } => Some(Change::Chose(*id)),
+        Control::Choice { id, .. } | Control::Row { id, .. } => Some(Change::Chose(*id)),
         Control::Slider {
             id, min, max, log, ..
         } => {
@@ -601,6 +628,58 @@ mod tests {
                 cols.len()
             );
         }
+    }
+
+    /// **Wrap is for items of one width**, and then it is a grid rather than a ragged row.
+    ///
+    /// This is the one case where wrapping reads as deliberate: a tool rail of equal square
+    /// buttons is what every paint application already has. It is not the default for anything
+    /// carrying a label of its own.
+    #[test]
+    fn wrap_fills_lines_and_starts_a_new_one() {
+        let m = metrics();
+        let tools: Vec<Control> = (0..6)
+            .map(|i| Control::Choice {
+                id: i,
+                text: "Tool".to_owned(),
+                selected: false,
+            })
+            .collect();
+        let one = tools[0].width(&m, text(&tools[0]));
+        // Room for three across, so six should land on two lines.
+        let content = Rect::new(0.0, 0.0, one * 3.0 + m.gap * 2.0, 300.0);
+        let laid = place(&tools, content, &m, Flow::Wrap, text);
+
+        let lines: std::collections::BTreeSet<i32> = laid.iter().map(|p| p.rect.y as i32).collect();
+        assert_eq!(lines.len(), 2, "six buttons, three to a line");
+        for p in &laid {
+            assert!(
+                p.rect.x + p.rect.w <= content.x + content.w + 0.001,
+                "a button ran off the edge and can never be pressed"
+            );
+        }
+        // And no two overlap.
+        for (i, a) in laid.iter().enumerate() {
+            for b in laid.iter().skip(i + 1) {
+                let apart = a.rect.x + a.rect.w <= b.rect.x + 0.001
+                    || b.rect.x + b.rect.w <= a.rect.x + 0.001
+                    || a.rect.y + a.rect.h <= b.rect.y + 0.001
+                    || b.rect.y + b.rect.h <= a.rect.y + 0.001;
+                assert!(apart, "two buttons overlap: {:?} and {:?}", a.rect, b.rect);
+            }
+        }
+    }
+
+    /// A choice is square at least, so a single glyph is still something you can hit.
+    #[test]
+    fn a_choice_is_never_thinner_than_it_is_tall() {
+        let m = metrics();
+        let c = Control::Choice {
+            id: 0,
+            text: String::new(),
+            selected: false,
+        };
+        assert!(c.width(&m, 0.0) >= m.row);
     }
 
     /// A row does not overlap itself, and everything in it shares a baseline.

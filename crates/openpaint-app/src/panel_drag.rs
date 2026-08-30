@@ -156,6 +156,14 @@ struct Grab {
     strayed: bool,
     /// Where the pointer was last, for the incremental divider drag.
     last: (f32, f32),
+    /// The arrangement as it stood when the gesture began.
+    ///
+    /// **Captured at the press, not at the release, because a divider moves live.** A move is
+    /// applied all at once when you let go, so it could clone the layout on the way out; a resize
+    /// has already happened by then, and cloning at that point would record the change as though
+    /// it were the state before it. That is why a divider drag was never undoable, and why Escape
+    /// during one left the divider where it had got to despite this module promising otherwise.
+    before: Layout,
 }
 
 /// The panel-dragging state machine.
@@ -223,6 +231,7 @@ impl PanelDrag {
             armed: false,
             strayed: false,
             last: (x, y),
+            before: layout.clone(),
         });
         self.grab.is_some()
     }
@@ -333,7 +342,15 @@ impl PanelDrag {
         }
 
         match grab.kind {
-            Kind::Splitter { .. } => Outcome::Resized,
+            Kind::Splitter { .. } => {
+                // The divider has already moved; what is recorded is where it started. A drag that
+                // ended where it began is not a change and does not deserve an undo step.
+                if *layout == grab.before {
+                    return Outcome::Nothing;
+                }
+                history.record(grab.before);
+                Outcome::Resized
+            }
             Kind::Tab { panel, .. } => {
                 let Some(placed) = layout.leaf_at(area, x, y) else {
                     return Outcome::Floated(panel);
@@ -352,7 +369,7 @@ impl PanelDrag {
                     return Outcome::Nothing;
                 };
 
-                let before = layout.clone();
+                let before = grab.before;
                 layout.remove(panel);
                 let Some((fresh, _)) = layout.find(anchor) else {
                     // The anchor vanished, which should be impossible — it was a different panel
@@ -368,8 +385,16 @@ impl PanelDrag {
     }
 
     /// Abandon a gesture without applying it, for Escape or a lost pointer.
-    pub fn cancel(&mut self) {
-        self.grab = None;
+    pub fn cancel(&mut self, layout: &mut Layout) {
+        // Put the arrangement back where it was when the gesture began. A move has changed nothing
+        // yet so this is a no-op for one; a divider has been moving live, and without this Escape
+        // left it wherever the pointer had dragged it to -- which is not "nothing has happened
+        // until you let go", however firmly the comment above says so.
+        if let Some(grab) = self.grab.take() {
+            if grab.armed {
+                *layout = grab.before;
+            }
+        }
     }
 }
 
@@ -774,7 +799,7 @@ mod tests {
 
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
         arm(&mut d, &mut l, 700.0, 10.0);
-        d.cancel();
+        d.cancel(&mut l);
 
         assert!(!d.active());
         assert_eq!(

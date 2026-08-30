@@ -75,13 +75,25 @@ pub fn panel(
         (placed.rect.h - metrics.gutter).max(0.0),
     );
 
+    // **A compact header goes down the short side of the panel.**
+    //
+    // A tool rail laid out across the bottom is a strip a couple of rows tall; a header band on
+    // top of it costs more height than the tools do, and the grab surface ends up nowhere near
+    // where the strip begins. On its side it costs a sliver of width instead, and the handle sits
+    // at the start of the strip where the eye already is.
+    //
+    // Only compact headers: a named header carries tabs, and tabs need width to be readable.
+    // Deliberately decided from the panel's shape rather than from which panel it is -- a wide
+    // panel is a strip whatever it happens to contain (§1c).
+    let side = style == HeaderStyle::Compact && outer.w > outer.h;
+
     let bar = match style {
         HeaderStyle::Named => metrics.header,
         HeaderStyle::Compact => metrics.header_compact,
     }
     // A panel dragged down to a sliver keeps a header and loses its content, rather than the other
     // way round: the header is the only part that can be grabbed to undo the drag by hand.
-    .min(outer.h);
+    .min(if side { outer.w } else { outer.h });
 
     let mut tabs = Vec::new();
     let mut rows = 1.0_f32;
@@ -118,14 +130,28 @@ pub fn panel(
     // room. Never past the panel itself: a header taller than its panel would leave no content at
     // all, and a panel squeezed to a sliver keeps its header because that is the only part that
     // can be grabbed to undo the squeeze.
-    let bar_total = (bar * rows).min(outer.h);
-    let header = Rect::new(outer.x, outer.y, outer.w, bar_total);
-    let content = Rect::new(
-        outer.x,
-        outer.y + bar_total,
-        outer.w,
-        (outer.h - bar_total).max(0.0),
-    );
+    let bar_total = (bar * rows).min(if side { outer.w } else { outer.h });
+    let (header, content) = if side {
+        (
+            Rect::new(outer.x, outer.y, bar_total, outer.h),
+            Rect::new(
+                outer.x + bar_total,
+                outer.y,
+                (outer.w - bar_total).max(0.0),
+                outer.h,
+            ),
+        )
+    } else {
+        (
+            Rect::new(outer.x, outer.y, outer.w, bar_total),
+            Rect::new(
+                outer.x,
+                outer.y + bar_total,
+                outer.w,
+                (outer.h - bar_total).max(0.0),
+            ),
+        )
+    };
 
     PanelChrome {
         outer,
@@ -301,6 +327,26 @@ mod tests {
     const LAYERS: PanelId = PanelId(2);
     const HISTORY: PanelId = PanelId(3);
 
+    /// A panel wider than it is tall: a strip along the bottom.
+    fn wide() -> Placed {
+        Placed {
+            path: vec![],
+            rect: Rect::new(0.0, 0.0, 900.0, 60.0),
+            tabs: vec![CANVAS],
+            active: 0,
+        }
+    }
+
+    /// A panel taller than it is wide: a rail down the side.
+    fn tall() -> Placed {
+        Placed {
+            path: vec![],
+            rect: Rect::new(0.0, 0.0, 220.0, 700.0),
+            tabs: vec![CANVAS],
+            active: 0,
+        }
+    }
+
     fn area() -> Rect {
         Rect::new(0.0, 0.0, 1000.0, 800.0)
     }
@@ -454,10 +500,10 @@ mod tests {
     /// A compact header has no tabs and takes less room, but is still a header.
     #[test]
     fn a_compact_header_is_shorter_and_nameless() {
-        let l = Layout::single(CANVAS);
-        let placed = l.resolve(area());
-        let named = panel(&placed[0], &metrics(), HeaderStyle::Named, |_| 40.0);
-        let compact = panel(&placed[0], &metrics(), HeaderStyle::Compact, |_| 40.0);
+        // A tall panel, so the header is the band across the top.
+        let placed = tall();
+        let named = panel(&placed, &metrics(), HeaderStyle::Named, |_| 40.0);
+        let compact = panel(&placed, &metrics(), HeaderStyle::Compact, |_| 40.0);
 
         assert!(compact.tabs.is_empty());
         assert!(compact.header.h < named.header.h);
@@ -466,6 +512,45 @@ mod tests {
             compact.content.h > named.content.h,
             "and gives back the room"
         );
+    }
+
+    /// **A compact header runs down the short side of the panel.**
+    ///
+    /// A tool rail laid across the bottom is a strip a couple of rows tall, and a header band on
+    /// top of it costs more height than the tools do. On its side it costs a sliver of width, and
+    /// the handle sits at the start of the strip rather than above it.
+    #[test]
+    fn a_compact_header_runs_along_the_short_side() {
+        let m = metrics();
+
+        let strip = panel(&wide(), &m, HeaderStyle::Compact, |_| 40.0);
+        assert!(
+            strip.header.w < strip.header.h,
+            "on a wide panel the header should be a vertical bar, got {:?}",
+            strip.header
+        );
+        assert!(
+            (strip.header.h - strip.outer.h).abs() < 0.001,
+            "full height"
+        );
+        assert!(
+            (strip.header.w + strip.content.w - strip.outer.w).abs() < 0.001,
+            "and the content gives up exactly that width"
+        );
+        assert!(
+            (strip.content.h - strip.outer.h).abs() < 0.001,
+            "a strip must lose no height at all: that was the complaint"
+        );
+
+        let rail = panel(&tall(), &m, HeaderStyle::Compact, |_| 40.0);
+        assert!(
+            rail.header.h < rail.header.w,
+            "on a tall panel it stays across the top"
+        );
+
+        // Named headers carry tabs, and tabs need width, so they never turn.
+        let named = panel(&wide(), &m, HeaderStyle::Named, |_| 40.0);
+        assert!(named.header.w > named.header.h, "tabs stay across the top");
     }
 
     /// **Dividers win over panels**, because a divider's grab width is wider than the gutter and
@@ -590,14 +675,18 @@ mod tests {
     fn a_compact_header_can_still_be_grabbed() {
         let l = Layout::single(CANVAS);
         let placed = l.resolve(area());
+        // Pressed where the header is actually drawn, rather than at a point that happened to be
+        // right while headers were always on top. A test that hardcodes the geometry it is meant
+        // to be checking stops checking anything the day the geometry moves.
+        let c = panel(&placed[0], &metrics(), HeaderStyle::Compact, |_| 40.0);
         let target = target_at(
             &placed,
             &[],
             &metrics(),
             |_| HeaderStyle::Compact,
             |_, _| 40.0,
-            500.0,
-            2.0,
+            c.header.x + c.header.w / 2.0,
+            c.header.y + c.header.h / 2.0,
         );
         assert_eq!(
             target,

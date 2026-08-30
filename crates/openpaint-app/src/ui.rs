@@ -706,53 +706,59 @@ fn workspace_panel(
             }
         }
         ws::TOOLS => {
-            // A wrapped grid, so the rail works whether it is a column on the left or a strip
-            // along the bottom. Nothing here knows which it currently is.
+            // A wrapped grid, so the rail works whether it is a column down the side or a strip
+            // along the bottom. Nothing here knows which it currently is: `Flow::Wrap` is the
+            // panel's default in the table, and wrapping is honest here because every button is
+            // the same width.
             //
-            // Painting tools and selection tools are one row on purpose: to the artist they are
-            // all "what the pen does next", and the fact that one set lives on `Editor` and the
-            // other on `Select` is our bookkeeping, not theirs.
-            ui.horizontal_wrapped(|ui| {
-                for (glyph, hint, what) in [
-                    ("\u{270E}", "Brush", Picked::Paint(Tool::Brush)),
-                    ("\u{232B}", "Eraser", Picked::Paint(Tool::Eraser)),
-                    (
-                        "\u{2b1a}",
-                        "Lasso select",
-                        Picked::Select(SelectTool::Lasso),
-                    ),
-                    (
-                        "\u{25A1}",
-                        "Rectangle select",
-                        Picked::Select(SelectTool::Rect),
-                    ),
-                    ("\u{2726}", "Wand", Picked::Select(SelectTool::Wand)),
-                    (
-                        "\u{271B}",
-                        "Move selection",
-                        Picked::Select(SelectTool::Move),
-                    ),
-                ] {
-                    let on = match what {
+            // Painting tools and selection tools are one set on purpose: to the artist they are
+            // all "what the pen does next", and the fact that one lives on `Editor` and the other
+            // on `Select` is our bookkeeping, not theirs.
+            //
+            // Named rather than drawn with glyphs, for now. The glyphs needed a tooltip to be
+            // readable at all, and a tooltip is something only a pointer that hovers can reach --
+            // which is the thing this UI is explicitly not built around (§1b). Icons replace the
+            // words when there are icons worth using.
+            use crate::panel_ui::{Change, Control};
+            let items: [(&str, Picked); 6] = [
+                ("Brush", Picked::Paint(Tool::Brush)),
+                ("Eraser", Picked::Paint(Tool::Eraser)),
+                ("Lasso", Picked::Select(SelectTool::Lasso)),
+                ("Rect", Picked::Select(SelectTool::Rect)),
+                ("Wand", Picked::Select(SelectTool::Wand)),
+                ("Move", Picked::Select(SelectTool::Move)),
+            ];
+            let controls: Vec<Control> = items
+                .iter()
+                .enumerate()
+                .map(|(i, (name, what))| Control::Choice {
+                    id: u32::try_from(i).unwrap_or(u32::MAX),
+                    text: (*name).to_owned(),
+                    selected: match what {
                         // A paint tool reads as chosen only when no selection tool is up, since a
                         // selection tool is what the pen is currently doing.
-                        Picked::Paint(t) => select_tool.is_none() && tool == t,
-                        Picked::Select(t) => select_tool == Some(t),
-                        // Not something the tool rail offers, so never one of its lit buttons.
+                        Picked::Paint(t) => select_tool.is_none() && tool == *t,
+                        Picked::Select(t) => select_tool == Some(*t),
                         Picked::Layer(_) | Picked::PanelList => false,
-                    };
-                    if ui
-                        .add_sized(
-                            [30.0, 30.0],
-                            egui::SelectableLabel::new(on, egui::RichText::new(glyph).size(15.0)),
-                        )
-                        .on_hover_text(hint)
-                        .clicked()
-                    {
-                        picked = Some(what);
+                    },
+                })
+                .collect();
+
+            for change in crate::panel_draw::show(
+                ui,
+                &controls,
+                theme,
+                crate::workspace::flow_of(panel),
+                input,
+            ) {
+                picked = match change {
+                    Change::Chose(i) => items.get(i as usize).map(|(_, what)| what.clone()),
+                    other => {
+                        eprintln!("tools panel: unexpected {other:?}");
+                        None
                     }
-                }
-            });
+                };
+            }
         }
         ws::BRUSH => {
             // **The first panel described rather than drawn.** Nothing below says what a slider
