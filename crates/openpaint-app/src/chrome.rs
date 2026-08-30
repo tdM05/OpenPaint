@@ -85,14 +85,15 @@ impl Controls {
 ///
 /// **It follows the direction the panel's controls run, not the shape of the panel.** A panel set
 /// to run its controls down has its handle across the top; one set to run them across has it down
-/// the right-hand side. Deciding by shape instead was nearly right and read as arbitrary: the same
+/// the left-hand side --- the same corner either way, which is what makes the two look like one
+/// rule rather than two. Deciding by shape instead was nearly right and read as arbitrary: the same
 /// panel would move its handle when a neighbour was resized, which is not something the artist
 /// asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Along {
     /// Controls run down the panel; the handle is the bar across the top.
     Down,
-    /// Controls run across it; the handle is the bar down the right.
+    /// Controls run across it; the handle is the bar down the left.
     Across,
 }
 
@@ -120,13 +121,12 @@ pub fn panel(
         (placed.rect.h - metrics.gutter).max(0.0),
     );
 
-    // **The handle goes down the right when the controls run across.**
+    // **The handle goes down the left when the controls run across.**
     //
     // A tool rail laid out across the bottom is a strip a couple of rows tall; a handle band on
     // top of it costs more height than the tools do. On its side it costs a sliver of width
-    // instead. On the *right* rather than the left, because a strip is read from the left like
-    // everything else: its first control belongs at the start and its handle out of the way at the
-    // end, which is where a tall panel's handle sits too -- above its first control, not beside it.
+    // instead. On the left, which is the same corner a panel running down puts it in: the handle
+    // is always at the beginning, so the two arrangements read as one rule rather than two.
     //
     // Only compact headers: a named header carries tabs, and tabs need width to be readable.
     let side = style == HeaderStyle::Compact && along == Along::Across;
@@ -166,7 +166,10 @@ pub fn panel(
                 rect: Rect::new(x, y, w, bar),
                 active: index == placed.active,
             });
-            x += w;
+            // A gap, because each tab is its own button. Run together they read as one long
+            // control and pressing any of them looks like pressing all of them -- which is
+            // exactly how it was reported.
+            x += w + metrics.gap;
         }
     }
 
@@ -177,8 +180,13 @@ pub fn panel(
     let bar_total = (bar * rows).min(if side { outer.w } else { outer.h });
     let (header, content) = if side {
         (
-            Rect::new(outer.x + outer.w - bar_total, outer.y, bar_total, outer.h),
-            Rect::new(outer.x, outer.y, (outer.w - bar_total).max(0.0), outer.h),
+            Rect::new(outer.x, outer.y, bar_total, outer.h),
+            Rect::new(
+                outer.x + bar_total,
+                outer.y,
+                (outer.w - bar_total).max(0.0),
+                outer.h,
+            ),
         )
     } else {
         (
@@ -257,16 +265,24 @@ pub fn target_at(
 
 /// Which tab of a header was pressed, or the one on show.
 fn header_target(p: &Placed, chrome: &PanelChrome, x: f32, y: f32) -> Target {
-    // A compact header has no tabs, but it is still a grab surface — pressing it takes the panel
-    // it belongs to. That is what makes the tool rail movable.
-    let tab = chrome
-        .tabs
-        .iter()
-        .find(|t| t.rect.contains(x, y))
-        .map_or(p.active, |t| t.index);
+    if let Some(tab) = chrome.tabs.iter().find(|t| t.rect.contains(x, y)) {
+        return Target::Tab {
+            path: p.path.clone(),
+            tab: tab.index,
+        };
+    }
+    // **Between tabs means nothing, once there is more than one.** Each tab is its own button, and
+    // a press on the bar beside them picking whichever happened to be on show is the behaviour
+    // that made a strip of tabs look like a single control.
+    //
+    // With one tab -- or none, which is what a compact header is -- the whole bar is that panel's
+    // handle. That is what makes the tool rail movable, and there is nothing else it could mean.
+    if chrome.tabs.len() > 1 {
+        return Target::Elsewhere;
+    }
     Target::Tab {
         path: p.path.clone(),
-        tab,
+        tab: p.active,
     }
 }
 
@@ -494,9 +510,12 @@ mod tests {
         assert_eq!(c.tabs.len(), 2);
         assert!((c.tabs[0].rect.w - (50.0 + metrics().tab_padding * 2.0)).abs() < 0.001);
         assert!((c.tabs[1].rect.w - (90.0 + metrics().tab_padding * 2.0)).abs() < 0.001);
+        // A gap between them, because each tab is its own button. Run together they read as one
+        // long control, and pressing one looked like pressing the whole strip.
         assert!(
-            (c.tabs[1].rect.x - (c.tabs[0].rect.x + c.tabs[0].rect.w)).abs() < 0.001,
-            "tabs must meet, not overlap or gap"
+            (c.tabs[1].rect.x - (c.tabs[0].rect.x + c.tabs[0].rect.w) - metrics().gap).abs()
+                < 0.001,
+            "tabs must be a gap apart, not touching and not overlapping"
         );
         assert!(c.tabs[1].active, "the shown panel is the marked tab");
     }
@@ -639,12 +658,12 @@ mod tests {
             strip.header
         );
         assert!(
-            (strip.header.x + strip.header.w - (strip.outer.x + strip.outer.w)).abs() < 0.001,
-            "and it belongs at the far end, out of the way of the first control"
+            (strip.header.x - strip.outer.x).abs() < 0.001,
+            "and it belongs at the beginning, the same corner a panel running down puts it in"
         );
         assert!(
-            (strip.content.x - strip.outer.x).abs() < 0.001,
-            "so the content starts where reading starts"
+            (strip.content.x - (strip.outer.x + strip.header.w)).abs() < 0.001,
+            "so the content starts just after it"
         );
         assert!(
             (strip.header.h - strip.outer.h).abs() < 0.001,
@@ -825,15 +844,19 @@ mod tests {
         );
     }
 
-    /// Pressing past the last tab, but still on the header, picks up the panel on show rather than
-    /// declining. The header is one grab surface; the tabs are labels on it.
+    /// **Between tabs means nothing, once there is more than one.**
+    ///
+    /// Each tab is its own button. A press on the bar beside them picking whichever happened to be
+    /// on show is what made a strip of tabs look like a single control -- press one and the whole
+    /// bar answered.
     #[test]
-    fn the_empty_part_of_a_header_grabs_the_shown_panel() {
-        let l = workspace();
+    fn the_bar_beside_several_tabs_grabs_nothing() {
+        let mut l = Layout::single(CANVAS);
+        l.insert(&[], Zone::Center, LAYERS);
         let placed = l.resolve(area());
-        let leaf = placed[1].clone();
-        let c = panel(&leaf, &metrics(), HeaderStyle::Named, Along::Down, |_| 30.0);
-        let past = c.tabs.last().expect("tabs").rect;
+        let leaf = placed[0].clone();
+        let c = panel(&leaf, &metrics(), HeaderStyle::Named, Along::Down, |_| 40.0);
+        let past = c.tabs.last().expect("two tabs").rect;
 
         assert_eq!(
             target_at(
@@ -841,14 +864,62 @@ mod tests {
                 &[],
                 &metrics(),
                 |_| (HeaderStyle::Named, Along::Down),
-                |_, _| 30.0,
+                |_, _| 40.0,
                 past.x + past.w + 15.0,
                 past.y + 5.0
             ),
+            Target::Elsewhere,
+            "the bar beside two tabs belongs to neither"
+        );
+        // And each tab still answers for itself.
+        for tab in &c.tabs {
+            assert_eq!(
+                target_at(
+                    &placed,
+                    &[],
+                    &metrics(),
+                    |_| (HeaderStyle::Named, Along::Down),
+                    |_, _| 40.0,
+                    tab.rect.x + tab.rect.w / 2.0,
+                    tab.rect.y + tab.rect.h / 2.0
+                ),
+                Target::Tab {
+                    path: leaf.path.clone(),
+                    tab: tab.index
+                },
+            );
+        }
+    }
+
+    /// With one panel the whole bar is its handle, and with none -- a compact header -- likewise.
+    ///
+    /// There is nothing else the bar could mean, and it is what makes the tool rail movable.
+    #[test]
+    fn the_whole_bar_grabs_a_lone_panel() {
+        let l = Layout::single(CANVAS);
+        let placed = l.resolve(area());
+        let c = panel(
+            &placed[0],
+            &metrics(),
+            HeaderStyle::Named,
+            Along::Down,
+            |_| 40.0,
+        );
+        let past = c.tabs[0].rect;
+        assert_eq!(
+            target_at(
+                &placed,
+                &[],
+                &metrics(),
+                |_| (HeaderStyle::Named, Along::Down),
+                |_, _| 40.0,
+                past.x + past.w + 40.0,
+                past.y + 5.0
+            ),
             Target::Tab {
-                path: leaf.path,
-                tab: leaf.active
-            }
+                path: vec![],
+                tab: 0
+            },
         );
     }
 

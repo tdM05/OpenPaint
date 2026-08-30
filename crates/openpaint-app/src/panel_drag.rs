@@ -80,6 +80,7 @@ pub enum Target {
 pub enum Held {
     Panel {
         path: Path,
+        tab: usize,
     },
     Divider {
         path: Path,
@@ -227,19 +228,6 @@ impl PanelDrag {
         self.grab.is_some()
     }
 
-    /// Which panel this gesture has hold of, if it has hold of one.
-    ///
-    /// For a drop that lands in a *different* arrangement than it started in: this module moves
-    /// nodes around one tree, and moving between two is the caller's business -- but only this one
-    /// knows what is in the air.
-    #[must_use]
-    pub fn carrying(&self) -> Option<PanelId> {
-        self.grab.as_ref().and_then(|g| match &g.kind {
-            Kind::Tab { panel, .. } => g.moved.then_some(*panel),
-            Kind::Splitter { .. } | Kind::Frame => None,
-        })
-    }
-
     /// Abandon the gesture without touching anything, for a drop the caller has taken over.
     pub fn let_go(&mut self) {
         self.grab = None;
@@ -325,7 +313,10 @@ impl PanelDrag {
                 return Some(Preview::Waiting {
                     progress,
                     on: match &grab.kind {
-                        Kind::Tab { path, .. } => Held::Panel { path: path.clone() },
+                        Kind::Tab { path, tab, .. } => Held::Panel {
+                            path: path.clone(),
+                            tab: *tab,
+                        },
                         Kind::Splitter { path, index, .. } => Held::Divider {
                             path: path.clone(),
                             index: *index,
@@ -755,7 +746,13 @@ mod tests {
             (0.2..0.3).contains(&progress),
             "80 of 320 ms is about a quarter, got {progress}"
         );
-        assert_eq!(on, Held::Panel { path: vec![1] });
+        assert_eq!(
+            on,
+            Held::Panel {
+                path: vec![1],
+                tab: 0
+            }
+        );
     }
 
     /// A still press asks for the frames that let its hold fire, and stops once it has fired.
@@ -963,42 +960,6 @@ mod tests {
             d.release(&mut l, &mut h, area(), 100.0, 100.0),
             Outcome::Nothing
         );
-    }
-
-    /// **Nothing is being carried until it has actually moved.**
-    ///
-    /// A press that has not gone anywhere is a tap or a hold, and treating it as a drag would let
-    /// a tap on a tab drop the panel into whatever the pointer happened to be over.
-    #[test]
-    fn nothing_is_carried_until_it_moves() {
-        let mut l = workspace();
-        let mut d = PanelDrag::default();
-        assert_eq!(d.carrying(), None, "nothing is happening yet");
-
-        d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
-        assert_eq!(d.carrying(), None, "a press alone carries nothing");
-
-        d.drag(&mut l, area(), 700.0, 300.0, 1.0);
-        assert_eq!(
-            d.carrying(),
-            Some(LAYERS),
-            "once it moves, it is in the air"
-        );
-
-        // A divider is never "carried": there is nothing to put anywhere else.
-        let mut d2 = PanelDrag::default();
-        d2.press(
-            &l,
-            &Target::Splitter {
-                path: vec![],
-                index: 0,
-            },
-            500.0,
-            400.0,
-            0.0,
-        );
-        d2.drag(&mut l, area(), 560.0, 400.0, 1.0);
-        assert_eq!(d2.carrying(), None);
     }
 
     /// **A hold that drifted a little is still a hold.**

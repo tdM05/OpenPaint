@@ -164,7 +164,8 @@ is left is calling them.
 | touch a tab or a divider and move | moves or resizes, **at once** |
 | touch and hold still | that panel's settings |
 | tap a tab | shows it |
-| touch a floating window's body and move | moves the window |
+| drag anything in a floating window | **moves the window**, following the pointer |
+| drop a floating window on another | docks into it, at the five zones |
 | secondary press on a header | the same settings, for a pointer that has one |
 | secondary press anywhere else | the workspace's panel list |
 
@@ -185,10 +186,16 @@ already had, and none of which the copy inherited. The hold in particular never 
 because painting is demand-driven and only the docked path asked for the frames that let a timer
 run.
 
+**Floating and docked are two modes, and dragging never crosses between them.** The way between
+is the panel's own settings --- "Float", and "Put back into". A floating window dropped on the
+arrangement would otherwise dock itself the moment it was moved anywhere useful, which makes
+moving one impossible.
+
+Inside the floating mode, dragging a window follows the pointer and dropping it on *another*
+window docks it in at the five zones, exactly as a docked panel behaves among docked panels.
+
 A gesture keeps the arrangement it began in; with nothing in flight, the surface is whatever is
-under the pointer, so the hover marks show what a press *would* take hold of. Let go over a
-different arrangement and the panel goes there, which is what makes dragging a panel from one
-window into another work at all.
+under the pointer, so the hover marks show what a press *would* take hold of.
 
 Above the arrangement rather than outside the application's window: a separate operating-system
 window needs a second surface for the GPU and a second path through the event loop. Nothing here

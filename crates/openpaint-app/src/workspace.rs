@@ -259,6 +259,9 @@ pub struct Workspace {
     grab_surface: Surface,
     /// The next window's name.
     next_float: u32,
+    /// Where inside a floating window the pointer took hold of it, so a dragged window does not
+    /// jump its own corner up to the pointer.
+    grip: (f32, f32),
     /// The window as it was last drawn.
     ///
     /// Kept because floating a panel has to put it *somewhere*, and the request can arrive from a
@@ -430,6 +433,7 @@ impl Default for Workspace {
             floating,
             grab_surface: Surface::Docked,
             next_float: 0,
+            grip: (0.0, 0.0),
             screen: Rect::new(0.0, 0.0, 1280.0, 800.0),
         }
     }
@@ -933,6 +937,15 @@ impl Workspace {
         if let Some(Preview::MovingWindow { dx, dy }) = preview {
             self.push_window(working, dx, dy);
         }
+        // **Dragging anything in a floating window moves the window.** A floating panel is a
+        // window, and a window that could not be moved by the thing you naturally take hold of --
+        // its tab -- could not be moved at all. Docking somewhere else is what *releasing* it over
+        // another window means; on the way there it simply follows the pointer.
+        if carry_moves_window(working, preview.as_ref()) {
+            if let Some(at) = pointer {
+                self.drag_window_to(working, (at.x, at.y));
+            }
+        }
         if matches!(preview, Some(Preview::AskingFrame)) {
             self.frame_asked(working);
         }
@@ -1098,7 +1111,7 @@ impl Workspace {
                 alpha,
             );
             match on {
-                Held::Panel { path } => {
+                Held::Panel { path, tab } => {
                     // Against the arrangement the gesture is *in*, not the docked one. A path
                     // indexes one tree, and a floating window's path found nothing here -- so the
                     // hold on a floating panel showed no sign of running at all, which is
@@ -1111,7 +1124,7 @@ impl Workspace {
                             along_of(slot, self.direction_of(showing_of(slot))),
                             |i| measure(ctx, m.label, slot.tabs.get(i).copied()),
                         );
-                        marks.rect_filled(to_egui(c.header), m.radius, tint);
+                        marks.rect_filled(to_egui(hold_mark(&c, *tab)), m.radius, tint);
                     }
                 }
                 Held::Divider { path, index } => {
@@ -1161,6 +1174,26 @@ impl Workspace {
 
         // --- the drop overlay, on top of everything ---
         if let Some(Preview::Carrying { panel, over }) = preview {
+            // **A floating window shows its zones on whatever it is over, not on itself.** The
+            // window is following the pointer, so its own leaf is always under it; drawing that
+            // would offer to drop it into the thing being dragged.
+            let over = if working == Surface::Docked {
+                over
+            } else {
+                pointer
+                    .and_then(|q| self.window_at(q.x, q.y))
+                    .filter(|id| Surface::Floating(*id) != working)
+                    .and_then(|id| {
+                        let area = self.area_of(Surface::Floating(id))?;
+                        let layout = self.layout_of(Surface::Floating(id))?;
+                        let at = pointer?;
+                        let leaf = layout.leaf_at(area, at.x, at.y)?;
+                        Some(crate::panel_drag::Landing {
+                            rect: leaf.rect,
+                            zone: Layout::zone_at(leaf.rect, at.x, at.y),
+                        })
+                    })
+            };
             // The panel that has come loose, marked at its source. Without this the hold arms
             // invisibly and the only way to know it worked is to move and find out -- which makes
             // a learnable gesture into one you have to discover. One fill; iPadOS does the same
@@ -1519,6 +1552,37 @@ impl Workspace {
         self.remember();
     }
 
+    /// Take note of where inside a window the pointer landed, so a drag can keep it there.
+    ///
+    /// Without it the window's corner jumps to the pointer the moment it moves, which reads as the
+    /// window having been thrown rather than picked up.
+    fn take_grip(&mut self, which: Surface, at: (f32, f32)) {
+        let origin = match which {
+            Surface::Docked => (0.0, 0.0),
+            Surface::Floating(id) => self
+                .floating
+                .iter()
+                .find(|f| f.id == id)
+                .map_or((0.0, 0.0), |f| (f.rect.x, f.rect.y)),
+        };
+        self.grip = (at.0 - origin.0, at.1 - origin.1);
+    }
+
+    /// Carry a floating window to where the pointer is, keeping the grip.
+    fn drag_window_to(&mut self, which: Surface, at: (f32, f32)) {
+        let Surface::Floating(id) = which else {
+            return;
+        };
+        let (screen, m, grip) = (self.screen, self.theme.metrics, self.grip);
+        if let Some(held) = self.floating.iter_mut().find(|f| f.id == id) {
+            held.rect = hold_on_screen(
+                Rect::new(at.0 - grip.0, at.1 - grip.1, held.rect.w, held.rect.h),
+                screen,
+                &m,
+            );
+        }
+    }
+
     /// Push a floating window about by however far the pointer went.
     ///
     /// Where a window may go is the workspace's business: `panel_drag` reports the movement and
@@ -1559,34 +1623,49 @@ impl Workspace {
     /// The source is emptied first and the destination looked up afterwards, because removing can
     /// collapse a tree and shift every path in it -- the same ordering hazard a move within one
     /// arrangement has, and the same answer: anchor to a panel, not to a path.
-    fn move_across(&mut self, panel: PanelId, to: Surface, x: f32, y: f32) {
-        let Some(area) = self.area_of(to) else {
+    fn merge_window(&mut self, from: FloatId, to: FloatId, x: f32, y: f32) {
+        let Some(area) = self.area_of(Surface::Floating(to)) else {
             return;
         };
-        let Some(landing) = self.layout_of(to).and_then(|l| l.leaf_at(area, x, y)) else {
+        let Some(landing) = self
+            .layout_of(Surface::Floating(to))
+            .and_then(|l| l.leaf_at(area, x, y))
+        else {
             return;
         };
         let zone = Layout::zone_at(landing.rect, x, y);
-        // Anchored to a panel that is already there, so the path can be found again after the
-        // source has been emptied -- which may have taken a whole window down with it.
+        // Anchored to a panel already there, so the path can be found again after the source
+        // window has been taken down -- the same ordering hazard a move within one arrangement
+        // has, and the same answer: anchor to a panel, not to a path.
         let Some(anchor) = landing.tabs.first().copied() else {
             return;
         };
-        let before = self.layout.clone();
-        self.take_from_floating(panel);
-        self.layout.remove(panel);
-        let Some((path, _)) = self.layout_of(to).and_then(|l| l.find(anchor)) else {
-            // The place it was going has gone. Put it back rather than lose it (DECISIONS 6b).
-            self.layout = before;
-            self.open(panel);
+        let Some(moving) = self
+            .floating
+            .iter()
+            .find(|f| f.id == from)
+            .map(|f| f.layout.panels())
+        else {
             return;
         };
-        self.history.record(before);
-        if let Some(layout) = self.layout_of_mut(to) {
-            layout.insert(&path, zone, panel);
+        if moving.is_empty() {
+            return;
         }
-        // No second sweep for emptied windows: `take_from_floating` above is the one place that
-        // takes a window down, and a guard that cannot change the outcome only looks load-bearing.
+        self.floating.retain(|f| f.id != from);
+        for panel in moving {
+            let Some((path, _)) = self
+                .layout_of(Surface::Floating(to))
+                .and_then(|l| l.find(anchor))
+            else {
+                // The window it was going into has gone. Put the panel back in the arrangement
+                // rather than lose it, which is the worst possible answer (DECISIONS 6b).
+                self.open(panel);
+                continue;
+            };
+            if let Some(layout) = self.layout_of_mut(Surface::Floating(to)) {
+                layout.insert(&path, zone, panel);
+            }
+        }
         self.remember();
     }
 
@@ -1836,6 +1915,7 @@ impl Workspace {
             Pulse::Press => {
                 let target = target_at(x, y);
                 let layout = self.layout_of(self.grab_surface)?.clone();
+                self.take_grip(self.grab_surface, (x, y));
                 self.drag.press(&layout, &target, x, y, now_ms);
                 None
             }
@@ -1844,12 +1924,30 @@ impl Workspace {
                 // started in one floating window and ended in another is the whole reason windows
                 // hold arrangements rather than single panels; without this they could only ever
                 // hold one thing each.
-                if over != self.grab_surface {
-                    if let Some(panel) = self.drag.carrying() {
+                // **Floating and docked never mix by dragging.** They are two modes, and the way
+                // between them is the panel's own settings -- "Float", and "Put back into". A
+                // floating window dropped on the arrangement would otherwise dock itself the
+                // moment it was moved anywhere useful, which makes moving one impossible.
+                // No guard on "has it actually moved": being over a *different* arrangement is
+                // itself the answer, since the pointer cannot get there without moving. A guard
+                // that cannot change the outcome only looks load-bearing, and a sabotage removing
+                // this one changed nothing at all.
+                if let (Surface::Floating(from), Surface::Floating(to)) = (self.grab_surface, over)
+                {
+                    if from != to {
                         self.drag.let_go();
-                        self.move_across(panel, over, x, y);
+                        self.merge_window(from, to, x, y);
                         return None;
                     }
+                }
+                if over != self.grab_surface {
+                    // Different modes: the window has already been carried to where it was let go,
+                    // and that is all that was asked for.
+                    self.drag.let_go();
+                    if self.grab_surface != Surface::Docked {
+                        self.remember();
+                    }
+                    return None;
                 }
                 let mut history = std::mem::take(&mut self.history);
                 let mut drag = std::mem::take(&mut self.drag);
@@ -1972,8 +2070,20 @@ fn draw_tab(
     m: &Metrics,
     p: &crate::theme::Palette,
 ) {
+    // **Every tab is drawn as its own button**, whether or not it is the one on show. Only the
+    // active one used to be filled, so the rest were bare text on the bar and a press on one
+    // looked like a press on the whole strip.
+    painter.rect_filled(
+        to_egui(tab.rect),
+        m.radius,
+        rgb(if tab.active { p.panel } else { p.header }),
+    );
+    painter.rect_stroke(
+        to_egui(tab.rect),
+        m.radius,
+        egui::Stroke::new(1.0_f32, rgb(p.edge)),
+    );
     if tab.active {
-        painter.rect_filled(to_egui(tab.rect), m.radius, rgb(p.panel));
         // A line under the one on show, which is how a tab strip says which it is without
         // spending a colour on it.
         painter.line_segment(
@@ -2092,6 +2202,31 @@ fn measure(ctx: &egui::Context, label: f32, panel: Option<PanelId>) -> f32 {
             .size()
             .x
     })
+}
+
+/// The rectangle a hold marks: the tab, or the whole bar when there are no tabs.
+///
+/// **The tab, not the bar it sits in.** Tinting the whole header made a strip of tabs look like
+/// one control, which is exactly what pressing one appeared to do. A compact header carries no
+/// tabs and is itself the handle, so there it takes the mark.
+#[must_use]
+fn hold_mark(chrome: &crate::chrome::PanelChrome, tab: usize) -> Rect {
+    chrome
+        .tabs
+        .iter()
+        .find(|t| t.index == tab)
+        .map_or(chrome.header, |t| t.rect)
+}
+
+/// Whether carrying something means moving the whole window.
+///
+/// **In a floating window it always does.** A floating panel *is* a window, and a window that
+/// could not be moved by the thing you naturally take hold of -- its tab -- could not be moved at
+/// all. Docking somewhere else is what *releasing* it over another window means; on the way there
+/// it simply follows the pointer.
+#[must_use]
+fn carry_moves_window(working: Surface, preview: Option<&Preview>) -> bool {
+    working != Surface::Docked && matches!(preview, Some(Preview::Carrying { .. }))
 }
 
 /// Which arrangement a gesture belongs to.
@@ -2238,6 +2373,7 @@ mod tests {
             floating: Vec::new(),
             grab_surface: Surface::Docked,
             next_float: 0,
+            grip: (0.0, 0.0),
             screen: Rect::new(0.0, 0.0, 1280.0, 800.0),
         }
     }
@@ -2693,8 +2829,7 @@ mod tests {
         );
     }
 
-    /// **A panel dragged from one floating window into another goes there**, at the zone it was
-    /// dropped on.
+    /// **A floating window dragged onto another goes into it**, at the zone it was dropped on.
     ///
     /// This is why a window holds an arrangement rather than a single panel: without it, windows
     /// could only ever hold one thing each and there would be nothing to drop onto.
@@ -2750,6 +2885,199 @@ mod tests {
             vec![BRUSH, COLOUR],
             "both should be in the one window"
         );
+    }
+
+    /// **A hold marks the tab, not the bar it sits in.**
+    ///
+    /// Tinting the whole header made a strip of tabs look like one control, which is exactly what
+    /// pressing one appeared to do.
+    #[test]
+    fn a_hold_marks_the_tab_it_is_on() {
+        let m = crate::theme::Theme::default().metrics;
+        let mut l = Layout::single(LAYERS);
+        l.insert(&[], Zone::Center, HISTORY);
+        let placed = l.resolve(Rect::new(0.0, 0.0, 800.0, 600.0));
+        let slot = placed.first().expect("a leaf");
+        let c = crate::chrome::panel(slot, &m, HeaderStyle::Named, Along::Down, |_| 40.0);
+        assert_eq!(c.tabs.len(), 2);
+
+        for tab in &c.tabs {
+            let at = hold_mark(&c, tab.index);
+            assert_eq!(at, tab.rect, "tab {} was not the thing marked", tab.index);
+            assert!(at.w < c.header.w, "it marked the whole bar");
+        }
+
+        // A compact header carries no tabs and is itself the handle, so it takes the mark.
+        let alone = Layout::single(TOOLS);
+        let placed = alone.resolve(Rect::new(0.0, 0.0, 90.0, 600.0));
+        let slot = placed.first().expect("a leaf");
+        let c = crate::chrome::panel(slot, &m, HeaderStyle::Compact, Along::Down, |_| 0.0);
+        assert!(c.tabs.is_empty());
+        assert_eq!(hold_mark(&c, 0), c.header);
+    }
+
+    /// **Carrying something in a floating window moves the window.**
+    ///
+    /// A floating panel is a window, and a window that could not be moved by the thing you
+    /// naturally take hold of could not be moved at all.
+    #[test]
+    fn carrying_in_a_window_moves_the_window() {
+        let carrying = Preview::Carrying {
+            panel: BRUSH,
+            over: None,
+        };
+        assert!(carry_moves_window(
+            Surface::Floating(FloatId(0)),
+            Some(&carrying)
+        ));
+        // In the arrangement, carrying means what it always did: the panel is looking for a home.
+        assert!(!carry_moves_window(Surface::Docked, Some(&carrying)));
+        // And nothing else moves a window.
+        assert!(!carry_moves_window(
+            Surface::Floating(FloatId(0)),
+            Some(&Preview::Resizing {
+                path: vec![],
+                index: 0
+            })
+        ));
+        assert!(!carry_moves_window(Surface::Floating(FloatId(0)), None));
+    }
+
+    /// **Floating and docked never mix by dragging.** They are two modes, and the way between
+    /// them is the panel's own settings.
+    ///
+    /// A floating window dropped on the arrangement would otherwise dock itself the moment it was
+    /// moved anywhere useful, which makes moving one impossible -- and that is exactly what
+    /// happened when a drag was allowed to cross.
+    #[test]
+    fn dragging_never_crosses_between_floating_and_docked() {
+        use crate::panel_drag::{pulse, Target};
+        let mut ws = bare();
+        ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.float(BRUSH);
+        let id = ws.floating[0].id;
+        let source = ws.area_of(Surface::Floating(id)).expect("the window");
+        let target = Target::Tab {
+            path: vec![],
+            tab: 0,
+        };
+
+        // Dragged right into the middle of the docked arrangement and let go.
+        let onto = ws.layout.resolve(ws.screen);
+        let canvas = onto
+            .iter()
+            .find(|p| p.tabs.contains(&CANVAS))
+            .expect("the canvas");
+        let drop = (
+            canvas.rect.x + canvas.rect.w / 2.0,
+            canvas.rect.y + canvas.rect.h / 2.0,
+        );
+
+        ws.grab_surface = Surface::Floating(id);
+        ws.gesture(
+            source,
+            pulse(true, false, true),
+            Some((source.x + 8.0, source.y + 6.0)),
+            0.0,
+            Surface::Floating(id),
+            |_, _| target.clone(),
+        );
+        ws.gesture(
+            source,
+            pulse(false, false, true),
+            Some(drop),
+            1.0,
+            Surface::Docked,
+            |_, _| unreachable!(),
+        );
+        ws.gesture(
+            source,
+            pulse(false, true, false),
+            Some(drop),
+            2.0,
+            Surface::Docked,
+            |_, _| unreachable!(),
+        );
+
+        assert!(
+            ws.is_floating(BRUSH),
+            "a floating window dropped on the arrangement should stay floating"
+        );
+        assert!(!ws.is_docked(BRUSH), "and must not have docked itself");
+        // It went where it was dropped, which is what dragging one is *for*.
+        let moved = ws.floating[0].rect;
+        assert!(
+            (moved.x - source.x).abs() > 1.0 || (moved.y - source.y).abs() > 1.0,
+            "the window did not move: it was dragged across the whole screen"
+        );
+    }
+
+    /// **A floating window follows the pointer**, keeping the place it was taken hold of.
+    ///
+    /// Without the grip the window's corner jumps to the pointer the moment it moves, which reads
+    /// as having thrown it rather than picked it up.
+    #[test]
+    fn a_dragged_window_follows_the_pointer_by_its_grip() {
+        let mut ws = bare();
+        ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.float(BRUSH);
+        let id = ws.floating[0].id;
+        let at = ws.floating[0].rect;
+
+        // Taken hold of forty units in from its corner.
+        let grabbed = (at.x + 40.0, at.y + 10.0);
+        ws.take_grip(Surface::Floating(id), grabbed);
+        ws.drag_window_to(
+            Surface::Floating(id),
+            (grabbed.0 + 200.0, grabbed.1 + 120.0),
+        );
+
+        let now = ws.floating[0].rect;
+        assert!(
+            (now.x - (at.x + 200.0)).abs() < 0.001 && (now.y - (at.y + 120.0)).abs() < 0.001,
+            "it should have moved by what the pointer did, not jumped to it: {now:?}"
+        );
+        assert!(
+            (now.w - at.w).abs() < 0.001 && (now.h - at.h).abs() < 0.001,
+            "and kept its size"
+        );
+    }
+
+    /// A tap on a floating window's tab is not a drag, and merges nothing.
+    #[test]
+    fn tapping_a_floating_tab_does_not_move_it_anywhere() {
+        use crate::panel_drag::{pulse, Target};
+        let mut ws = bare();
+        ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.float(BRUSH);
+        ws.float(COLOUR);
+        let (a, b) = (ws.floating[0].id, ws.floating[1].id);
+        let source = ws.area_of(Surface::Floating(a)).expect("a");
+        let at = (source.x + 8.0, source.y + 6.0);
+        let target = Target::Tab {
+            path: vec![],
+            tab: 0,
+        };
+
+        ws.grab_surface = Surface::Floating(a);
+        ws.gesture(
+            source,
+            pulse(true, false, true),
+            Some(at),
+            0.0,
+            Surface::Floating(a),
+            |_, _| target.clone(),
+        );
+        // Released without moving, but reported as being over the other window.
+        ws.gesture(
+            source,
+            pulse(false, true, false),
+            Some(at),
+            1.0,
+            Surface::Floating(b),
+            |_, _| unreachable!(),
+        );
+        assert_eq!(ws.floating.len(), 2, "a tap merged two windows");
     }
 
     /// A window whose last panel leaves is taken down.
