@@ -15,3 +15,6 @@ openpaint-document.openpaint*
 # Test exports. `Ctrl+S` writes next to the working directory, so a few of these got
 # committed by accident -- they are 350 KB each of nothing.
 /openpaint-*.png
+
+# Scratch checkouts for background agents; never part of the project.
+.claude/worktrees/
