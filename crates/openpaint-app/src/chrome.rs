@@ -264,7 +264,11 @@ pub fn panel(
         // **Room the tabs may not have.** The strip beside them is the panel's own handle, and it
         // has to exist however many tabs there are -- otherwise a panel with enough tabs to fill
         // its bar could not be picked up at all.
-        let room = (outer.w - strip_width(metrics)).max(1.0);
+        // **Nothing, if that is what is left.** The floor here used to be one unit, so a panel narrower
+        // than the strip itself still gave the first tab a sliver -- and the one promise the strip
+        // makes is that it is *always* there, at every width and every number of tabs. A tab too narrow
+        // to press is worth nothing; a strip is worth the settings of everything in the panel.
+        let room = (outer.w - strip_width(metrics)).max(0.0);
         let widths: Vec<f32> = (0..placed.tabs.len())
             .map(|i| (measure(i) + metrics.tab_padding * 2.0).min(room))
             .collect();
@@ -1241,24 +1245,50 @@ mod tests {
         // **Widths chosen so a tab would land in the reserve if nothing stopped it.** The first
         // version of this used numbers where the tabs happened to wrap before the strip anyway, so
         // removing the reservation changed nothing and the test agreed with the bug.
-        for width in [150.0_f32, 180.0, 200.0, 260.0, 300.0, 420.0] {
+        //
+        // **And widths no window should ever be**, down to the smallest one is allowed to be: the
+        // requirement is that the strip is there when there are too many tabs *and* the window is
+        // too small, and a sweep that starts at 150 units has not been asked the second half of
+        // that question.
+        let least = m.header.max(m.row);
+        for width in [
+            least,
+            least + 6.0,
+            40.0,
+            80.0,
+            150.0,
+            180.0,
+            200.0,
+            260.0,
+            300.0,
+            420.0,
+        ] {
             for label in [30.0_f32, 45.0, 66.0, 90.0] {
                 for count in [1_u32, 2, 3, 8] {
                     let leaf = Placed {
                         path: vec![],
-                        rect: Rect::new(0.0, 0.0, width, 400.0),
+                        rect: Rect::new(0.0, 0.0, width, least.max(400.0)),
                         tabs: (0..count).map(PanelId).collect(),
                         active: 0,
                     };
                     let c = panel(&leaf, &m, HeaderStyle::Named, Along::Down, |_| label);
+                    let reserve = (c.outer.w - strip_width(&m)).max(0.0);
                     for tab in &c.tabs {
                         assert!(
-                            tab.rect.x + tab.rect.w
-                                <= c.outer.x + c.outer.w - strip_width(&m) + 0.001,
+                            tab.rect.x + tab.rect.w <= c.outer.x + reserve + 0.001,
                             "at {width} wide with {count} tabs of {label}, tab {} ate the strip",
                             tab.index
                         );
                     }
+                    // Said the other way round, which is the way the promise is made: whatever the
+                    // tabs did, the run of bar past them is a whole strip -- or the whole panel,
+                    // when the panel is narrower than a strip and the tabs have given up entirely.
+                    let free = c.outer.x + c.outer.w
+                        - c.tabs.last().map_or(c.header.x, |t| t.rect.x + t.rect.w);
+                    assert!(
+                        free >= strip_width(&m).min(c.outer.w) - 0.001,
+                        "at {width} wide with {count} tabs of {label}, only {free} was left to press"
+                    );
                     // And the strip answers as the strip, wherever the tabs ended up.
                     let past = c.tabs.last().map_or(c.header.x, |t| t.rect.x + t.rect.w);
                     let at = (
