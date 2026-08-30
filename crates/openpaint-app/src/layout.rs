@@ -461,6 +461,28 @@ impl Layout {
         }
     }
 
+    /// Every panel in this arrangement, in the order the tree holds them.
+    ///
+    /// For a floating window, which must be taken down when the last panel leaves it: a window
+    /// with nothing in it is a rectangle of chrome with no way to tell it is not broken.
+    #[must_use]
+    pub fn panels(&self) -> Vec<PanelId> {
+        let mut out = Vec::new();
+        Self::gather(&self.root, &mut out);
+        out
+    }
+
+    fn gather(node: &Node, out: &mut Vec<PanelId>) {
+        match node {
+            Node::Leaf { tabs, .. } => out.extend(tabs.iter().copied()),
+            Node::Split { children, .. } => {
+                for c in children {
+                    Self::gather(&c.node, out);
+                }
+            }
+        }
+    }
+
     /// Where a panel currently is, as `(leaf path, tab index)`.
     #[must_use]
     pub fn find(&self, panel: PanelId) -> Option<(Path, usize)> {
@@ -1198,6 +1220,34 @@ mod tests {
             placed[0].rect.w
         );
         assert!(placed[0].rect.w < area().w * 0.05, "but really a sliver");
+    }
+
+    /// **Every panel, including the ones inside splits.**
+    ///
+    /// A floating window is taken down when this comes back empty, so a version that only looked
+    /// at the top of the tree would take down a window still holding a split full of panels.
+    #[test]
+    fn every_panel_is_counted_however_deep_it_is() {
+        let mut l = three_across();
+        // Two deep: a split inside a split inside the root.
+        l.insert(&[2], Zone::Bottom, HISTORY);
+        l.insert(&[2, 1], Zone::Right, COLOUR);
+        l.insert(&[0], Zone::Center, PanelId(9));
+
+        let mut found = l.panels();
+        found.sort_by_key(|p| p.0);
+        let mut expected = vec![PanelId(1), CANVAS, LAYERS, HISTORY, COLOUR, PanelId(9)];
+        expected.sort_by_key(|p| p.0);
+        assert_eq!(found, expected);
+
+        // And each appears once, however the tree is shaped.
+        for panel in &expected {
+            assert_eq!(
+                found.iter().filter(|p| *p == panel).count(),
+                1,
+                "{panel:?} was counted more than once"
+            );
+        }
     }
 
     /// **A minimum survives being saved.** Otherwise a workspace reopens with its menu bar as a

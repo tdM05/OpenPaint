@@ -164,13 +164,36 @@ is left is calling them.
 | touch a tab or a divider and move | moves or resizes, **at once** |
 | touch and hold still | that panel's settings |
 | tap a tab | shows it |
+| touch a floating window's body and move | moves the window |
 | secondary press on a header | the same settings, for a pointer that has one |
 | secondary press anywhere else | the workspace's panel list |
 
 Holding *first* was tried and was wrong. The reason it existed was to stop a stroke that began on
-some chrome from drawing on the canvas -- except that a press on a tab or a divider never reaches
+some chrome from drawing on the canvas --- except that a press on a tab or a divider never reaches
 the canvas, so the third of a second before anything answered was a cost with no benefit. Holding
 is now what asks a question, which is the one thing left over once moving means moving.
+
+## Floating windows
+
+**A floating window is not a special kind of panel; it is a second workspace in a rectangle.** It
+holds a `Layout` exactly as the docked arrangement does, so it gets chrome, tabs, holds, drags and
+the five-zone drop from the same code.
+
+It was a single panel with its own gesture code first, and that was the fault behind every
+complaint about it: no tab to press, no hold, no drop zones --- each of which the docked panels
+already had, and none of which the copy inherited. The hold in particular never fired at all,
+because painting is demand-driven and only the docked path asked for the frames that let a timer
+run.
+
+A gesture keeps the arrangement it began in; with nothing in flight, the surface is whatever is
+under the pointer, so the hover marks show what a press *would* take hold of. Let go over a
+different arrangement and the panel goes there, which is what makes dragging a panel from one
+window into another work at all.
+
+Above the arrangement rather than outside the application's window: a separate operating-system
+window needs a second surface for the GPU and a second path through the event loop. Nothing here
+forecloses it --- a floating window is already an arrangement with its own rectangle, which is what
+an OS window would give it.
 
 ## Looking at it
 

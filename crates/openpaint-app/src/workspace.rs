@@ -252,8 +252,13 @@ pub struct Workspace {
     ///
     /// In front-to-back order, so the last one drawn is the one pressed.
     floating: Vec<Floating>,
-    /// A floating panel being carried, if one is.
-    carrying: Option<Carry>,
+    /// Which arrangement the gesture in flight belongs to.
+    ///
+    /// The drag machinery works in paths, and a path means nothing without knowing whose tree it
+    /// indexes. Recorded on the press and read until the release.
+    grab_surface: Surface,
+    /// The next window's name.
+    next_float: u32,
     /// The window as it was last drawn.
     ///
     /// Kept because floating a panel has to put it *somewhere*, and the request can arrive from a
@@ -262,30 +267,45 @@ pub struct Workspace {
     screen: Rect,
 }
 
-/// A panel lifted out of the arrangement.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A window floating above the arrangement, holding an arrangement of its own.
+///
+/// **A floating window is not a special kind of panel; it is a second workspace in a rectangle.**
+/// It was a single panel with its own gesture code at first, and that was the fault behind every
+/// complaint about it: no tab to press, no hold, no drop zones -- each of which the docked panels
+/// already had, and none of which the copy inherited. Giving it a `Layout` means it gets chrome,
+/// tabs, holds, drags and the five-zone drop from the same code, and nothing has to be taught
+/// twice.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Floating {
-    pub panel: PanelId,
+    /// Stable across the life of the window, because a position in a list is not.
+    pub id: FloatId,
     pub rect: Rect,
+    pub layout: Layout,
 }
 
-/// A floating panel on its way to disk, named rather than numbered for the same reason the
-/// arrangement is: an id is a position in a table, and a table changes.
+/// A floating window's name, for as long as it exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FloatId(pub u32);
+
+/// Which arrangement a gesture is working in.
+///
+/// A path means nothing without knowing whose tree it indexes, and there is more than one tree the
+/// moment anything floats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Surface {
+    /// The arrangement filling the window.
+    Docked,
+    /// A floating window.
+    Floating(FloatId),
+}
+
+/// A floating window on its way to disk. Its arrangement is saved exactly as the docked one is,
+/// by panel name, for the same reason: an id is a position in a table, and a table changes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SavedFloating {
-    panel: String,
     rect: Rect,
-}
-
-/// A floating panel under the pointer, and where it was taken hold of.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Carry {
-    panel: PanelId,
-    /// Where inside the panel the pointer landed, so it does not jump to the corner.
-    grip: (f32, f32),
-    press_ms: f64,
-    moved: bool,
-    asked: bool,
+    #[serde(flatten)]
+    layout: crate::layout::SavedLayout,
 }
 
 /// What a floating list is showing.
@@ -408,7 +428,8 @@ impl Default for Workspace {
             popup_wanted: None,
             options,
             floating,
-            carrying: None,
+            grab_surface: Surface::Docked,
+            next_float: 0,
             screen: Rect::new(0.0, 0.0, 1280.0, 800.0),
         }
     }
@@ -423,11 +444,9 @@ impl Default for Workspace {
 fn floating_to_saved(floating: &[Floating]) -> Vec<SavedFloating> {
     floating
         .iter()
-        .filter_map(|f| {
-            name_for(f.panel).map(|panel| SavedFloating {
-                panel,
-                rect: f.rect,
-            })
+        .map(|f| SavedFloating {
+            rect: f.rect,
+            layout: f.layout.to_saved(name_for),
         })
         .collect()
 }
@@ -437,10 +456,15 @@ fn floating_to_saved(floating: &[Floating]) -> Vec<SavedFloating> {
 fn floating_from_saved(saved: &[SavedFloating]) -> Vec<Floating> {
     saved
         .iter()
-        .filter_map(|f| {
-            id_for(&f.panel).map(|panel| Floating {
-                panel,
+        .enumerate()
+        .filter_map(|(i, f)| {
+            let layout = Layout::from_saved(&f.layout, id_for);
+            // A window whose every panel this build has forgotten is dropped rather than reopened
+            // empty: an empty window is a rectangle of chrome with no way to tell it is not broken.
+            (!layout.panels().is_empty()).then(|| Floating {
+                id: FloatId(u32::try_from(i).unwrap_or(0)),
                 rect: f.rect,
+                layout,
             })
         })
         .collect()
@@ -795,7 +819,6 @@ impl Workspace {
         self.screen = screen;
 
         let placed = self.layout.resolve(screen);
-        let splitters = self.layout.splitters(screen, m.splitter_grab);
 
         // --- input, before drawing, so the drop overlay reflects this frame's pointer ---
         let (pointer, pressed, released, down, now_ms) = ctx.input(|i| {
@@ -856,15 +879,6 @@ impl Workspace {
                 self.open_popup_at(ctx, kind, pos.x, pos.y, screen);
             }
         }
-        // A floating panel sits above the arrangement, so it answers before the arrangement does.
-        // Its own small gesture rather than `panel_drag`'s: that one moves nodes around a tree,
-        // and this one moves a rectangle.
-        let float_pulse = crate::panel_drag::pulse(pressed, released, down);
-        self.carry_floating(float_pulse, pointer.map(|q| (q.x, q.y)), now_ms);
-        let on_float = pressed
-            && self.popup.is_none()
-            && pointer.is_some_and(|q| self.floating_at(q.x, q.y).is_some());
-
         let on_popup = popup_press(
             self.popup.map(|p| p.rect),
             pressed,
@@ -874,33 +888,54 @@ impl Workspace {
             self.popup = None;
         }
 
-        let preview = if on_float {
-            // The floating panel took it. Nothing beneath may also have it, or a press on a
-            // palette would move whatever happened to be docked behind it.
-            None
-        } else if on_popup == PopupPress::Consume {
+        // **Which arrangement is under the pointer**, floating windows first because they are
+        // above. A press picks one; everything after it stays with whatever the press picked, or a
+        // drag that wandered over another window would start rearranging that one instead.
+        let over = pointer
+            .and_then(|q| self.window_at(q.x, q.y))
+            .map_or(Surface::Docked, Surface::Floating);
+        self.grab_surface = working_surface(self.drag.armed(), over, self.grab_surface);
+        let working = self.grab_surface;
+        let area = self.surface(working).map_or(screen, |(_, area)| area);
+        let (here, seams) = self
+            .surface(working)
+            .map(|(l, area)| (l.resolve(area), l.splitters(area, m.splitter_grab)))
+            .unwrap_or_default();
+        // A press on a floating window's frame, rather than on anything inside it, moves the
+        // window. Every window needs somewhere to be picked up that is not one of its tabs.
+        let frame_of = working != Surface::Docked;
+
+        let preview = if on_popup == PopupPress::Consume {
             // The list owns this press. A drag already in flight still gets its release, which is
             // why only the press is withheld and not the whole frame.
             None
         } else {
             self.gesture(
-                screen,
+                area,
                 crate::panel_drag::pulse(pressed, released, down),
                 pointer.map(|p| (p.x, p.y)),
                 now_ms,
+                over,
                 |x, y| {
-                    chrome::target_at(
-                        &placed,
-                        &splitters,
+                    let target = chrome::target_at(
+                        &here,
+                        &seams,
                         &m,
                         |pl| (style_of(pl), along_of(pl, direction_for(pl))),
                         |pl, i| measure(ctx, label, pl.tabs.get(i).copied()),
                         x,
                         y,
-                    )
+                    );
+                    window_target(target, frame_of)
                 },
             )
         };
+        if let Some(Preview::MovingWindow { dx, dy }) = preview {
+            self.push_window(working, dx, dy);
+        }
+        if matches!(preview, Some(Preview::AskingFrame)) {
+            self.frame_asked(working);
+        }
 
         // --- draw, from the layout as it now stands ---
         let placed = self.layout.resolve(screen);
@@ -1043,6 +1078,17 @@ impl Workspace {
         // The whole gesture now begins with a hold, so it *must* be visible: a hold with no
         // feedback is indistinguishable from a dead control, which is how this felt before. The
         // mark grows with the wait, so the artist can see it coming rather than guessing.
+        // **On the layer the gesture's own arrangement is drawn on.** A hold inside a floating
+        // window marked on the background layer is painted over by the window itself, which looks
+        // exactly like a hold that never ran.
+        let marks = if working == Surface::Docked {
+            painter.clone()
+        } else {
+            ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("floating-marks"),
+            ))
+        };
         if let Some(Preview::Waiting { progress, on }) = &preview {
             let alpha = (140.0 * progress).clamp(0.0, 140.0) as u8;
             let tint = egui::Color32::from_rgba_unmultiplied(
@@ -1053,7 +1099,11 @@ impl Workspace {
             );
             match on {
                 Held::Panel { path } => {
-                    if let Some(slot) = placed.iter().find(|s| &s.path == path) {
+                    // Against the arrangement the gesture is *in*, not the docked one. A path
+                    // indexes one tree, and a floating window's path found nothing here -- so the
+                    // hold on a floating panel showed no sign of running at all, which is
+                    // indistinguishable from a hold that does not work.
+                    if let Some(slot) = here.iter().find(|s| &s.path == path) {
                         let c = chrome::panel(
                             slot,
                             &m,
@@ -1061,18 +1111,21 @@ impl Workspace {
                             along_of(slot, self.direction_of(showing_of(slot))),
                             |i| measure(ctx, m.label, slot.tabs.get(i).copied()),
                         );
-                        painter.rect_filled(to_egui(c.header), m.radius, tint);
+                        marks.rect_filled(to_egui(c.header), m.radius, tint);
                     }
                 }
                 Held::Divider { path, index } => {
-                    if let Some(s) = splitters
-                        .iter()
-                        .find(|s| &s.path == path && s.index == *index)
-                    {
+                    if let Some(s) = seams.iter().find(|s| &s.path == path && s.index == *index) {
                         // Grows from the hairline to the full grab width as the hold completes,
                         // so the target you are about to get is the thing you watch appear.
                         let t = m.splitter_hover.mul_add(*progress, m.gutter);
-                        painter.rect_filled(to_egui(centred(s.rect, s.axis, t)), t / 2.0, tint);
+                        marks.rect_filled(to_egui(centred(s.rect, s.axis, t)), t / 2.0, tint);
+                    }
+                }
+                // The whole window, so a hold on its body is as visible as a hold on a tab.
+                Held::Frame => {
+                    if let Some(at) = self.area_of(working) {
+                        marks.rect_filled(to_egui(at), m.radius, tint);
                     }
                 }
             }
@@ -1084,7 +1137,7 @@ impl Workspace {
         // pointer is close: at rest the gutter is a hairline and the workspace stays quiet.
         if let Some(pos) = pointer {
             if preview.is_none() || matches!(preview, Some(Preview::Resizing { .. })) {
-                for s in &splitters {
+                for s in &seams {
                     if !s.rect.contains(pos.x, pos.y) {
                         continue;
                     }
@@ -1093,19 +1146,16 @@ impl Workspace {
                     // finger gets nothing here and does not need to, because the hold is what
                     // actually starts the gesture.
                     let t = m.splitter_hover;
-                    painter.rect_filled(to_egui(centred(s.rect, s.axis, t)), t / 2.0, rgb(p.edge));
+                    marks.rect_filled(to_egui(centred(s.rect, s.axis, t)), t / 2.0, rgb(p.edge));
                     break;
                 }
             }
         }
 
         if let Some(Preview::Resizing { path, index }) = &preview {
-            if let Some(s) = splitters
-                .iter()
-                .find(|s| &s.path == path && s.index == *index)
-            {
+            if let Some(s) = seams.iter().find(|s| &s.path == path && s.index == *index) {
                 let t = m.splitter_hover;
-                painter.rect_filled(to_egui(centred(s.rect, s.axis, t)), t / 2.0, rgb(p.state));
+                marks.rect_filled(to_egui(centred(s.rect, s.axis, t)), t / 2.0, rgb(p.state));
             }
         }
 
@@ -1180,61 +1230,65 @@ impl Workspace {
             }
         }
 
-        // --- floating panels, above the arrangement and below the popup ---
+        // --- floating windows, above the arrangement and below the popup ---
         //
-        // Drawn with the same chrome as a docked panel, deliberately: a floating palette that
-        // looked like a different kind of object would be a second UI to learn, and it is the same
-        // panel -- only its rectangle comes from somewhere else.
+        // Drawn by the same code as the arrangement itself, from the same `chrome` and the same
+        // descriptor layer. That is the whole point of a window holding a `Layout`: a floating
+        // panel has a tab that looks like a tab, a hold that behaves like a hold, and drop zones
+        // that work, none of which had to be written a second time.
         for held in &self.floating {
-            let slot = crate::layout::Placed {
-                path: Vec::new(),
-                rect: held.rect,
-                tabs: vec![held.panel],
-                active: 0,
-            };
-            let c = chrome::panel(
-                &slot,
-                &m,
-                style_of(&slot),
-                along_of(&slot, self.direction_of(held.panel)),
-                |i| measure(ctx, m.label, slot.tabs.get(i).copied()),
-            );
-            // **One layer for every floating panel**, not one each. egui orders layers within an
+            // One layer for every floating window, not one each: egui orders layers within an
             // Order by when they were registered, and a raw layer painter registers no area -- so
-            // two panels' layers could interleave, and one panel's background painted over
-            // another's contents. Inside a single layer, what is added last is on top, which is
-            // exactly the rule wanted here.
+            // two windows' layers could interleave and one's background paint over another's
+            // contents.
             let top = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Middle,
                 egui::Id::new("floating"),
             ));
-            top.rect_filled(to_egui(c.outer), m.radius, rgb(p.panel));
+            // The frame: a bar along the top that is the window's own handle, and a border.
+            top.rect_filled(to_egui(held.rect), m.radius, rgb(p.panel));
             top.rect_stroke(
-                to_egui(c.outer),
+                to_egui(held.rect),
                 m.radius,
                 egui::Stroke::new(1.0_f32, rgb(p.edge)),
             );
-            top.rect_filled(to_egui(c.header), m.radius, rgb(p.header));
-            top.text(
-                egui::pos2(c.header.x + m.tab_padding, c.header.y + c.header.h / 2.0),
-                egui::Align2::LEFT_CENTER,
-                name_of(held.panel),
-                egui::FontId::proportional(m.label),
-                rgb(p.text),
-            );
-            let mut ui = egui::Ui::new(
-                ctx.clone(),
-                egui::LayerId::new(egui::Order::Middle, egui::Id::new("floating")),
-                egui::Id::new(("floating-body", held.panel.0)),
-                egui::UiBuilder::new().max_rect(to_egui(c.controls.rect())),
-            );
-            ui.set_clip_rect(to_egui(c.controls.rect()));
-            contents(
-                held.panel,
-                &mut ui,
-                self.direction_of(held.panel),
-                Place::Panel,
-            );
+
+            for slot in held.layout.resolve(inset(held.rect, m.gutter)) {
+                let showing = showing_of(&slot);
+                let c = chrome::panel(
+                    &slot,
+                    &m,
+                    style_of(&slot),
+                    along_of(&slot, self.direction_of(showing)),
+                    |i| measure(ctx, m.label, slot.tabs.get(i).copied()),
+                );
+                top.rect_filled(to_egui(c.header), m.radius, rgb(p.header));
+                for tab in &c.tabs {
+                    draw_tab(&top, tab, &slot, &m, &p);
+                }
+                if c.tabs.is_empty() {
+                    // A compact header shows no names, so the panel's own is drawn on the frame
+                    // instead: a window you cannot identify is a window you will not trust.
+                    top.text(
+                        egui::pos2(c.header.x + m.tab_padding, c.header.y + c.header.h / 2.0),
+                        egui::Align2::LEFT_CENTER,
+                        name_of(showing),
+                        egui::FontId::proportional(m.label),
+                        rgb(p.text),
+                    );
+                }
+                if showing == CANVAS {
+                    continue;
+                }
+                let mut ui = egui::Ui::new(
+                    ctx.clone(),
+                    egui::LayerId::new(egui::Order::Middle, egui::Id::new("floating")),
+                    egui::Id::new(("floating-body", held.id.0, showing.0)),
+                    egui::UiBuilder::new().max_rect(to_egui(c.controls.rect())),
+                );
+                ui.set_clip_rect(to_egui(c.controls.rect()));
+                contents(showing, &mut ui, self.direction_of(showing), Place::Panel);
+            }
         }
 
         // --- the popup, above everything, drawn by the same descriptor layer as any panel ---
@@ -1397,76 +1451,6 @@ impl Workspace {
             .unwrap_or_else(|| default_direction(panel))
     }
 
-    /// Move a floating panel with the pointer, and let a hold ask it for its settings.
-    ///
-    /// The same two rules as a docked panel, for the same reason: a hand already on the thing is
-    /// not asking permission to move it, and holding still is the one gesture left over.
-    fn carry_floating(
-        &mut self,
-        pulse: crate::panel_drag::Pulse,
-        pointer: Option<(f32, f32)>,
-        now_ms: f64,
-    ) {
-        use crate::panel_drag::{Pulse, HOLD_MS, SLOP};
-        let Some((x, y)) = pointer else {
-            self.carrying = None;
-            return;
-        };
-        match pulse {
-            Pulse::Press => {
-                if self.popup.is_some() {
-                    return;
-                }
-                // Front-most first, and brought to the front, so a press on an overlapping pair
-                // picks the one you can see and leaves it where you can see it.
-                let Some(panel) = self.floating_at(x, y) else {
-                    return;
-                };
-                let Some(index) = self.floating.iter().position(|f| f.panel == panel) else {
-                    return;
-                };
-                let held = self.floating.remove(index);
-                self.floating.push(held);
-                self.carrying = Some(Carry {
-                    panel,
-                    grip: (x - held.rect.x, y - held.rect.y),
-                    press_ms: now_ms,
-                    moved: false,
-                    asked: false,
-                });
-            }
-            Pulse::Track => {
-                let Some(carry) = self.carrying.as_mut() else {
-                    return;
-                };
-                let Some(held) = self.floating.iter_mut().find(|f| f.panel == carry.panel) else {
-                    return;
-                };
-                let want = (x - carry.grip.0, y - carry.grip.1);
-                carry.moved =
-                    carry.moved || (want.0 - held.rect.x).hypot(want.1 - held.rect.y) >= SLOP;
-                if carry.moved {
-                    held.rect = hold_on_screen(
-                        Rect::new(want.0, want.1, held.rect.w, held.rect.h),
-                        self.screen,
-                        &self.theme.metrics,
-                    );
-                } else if !carry.asked && now_ms - carry.press_ms >= HOLD_MS {
-                    carry.asked = true;
-                    let panel = carry.panel;
-                    self.carrying = None;
-                    self.popup_wanted = Some(PopupKind::Settings(panel));
-                }
-            }
-            Pulse::Release => {
-                if self.carrying.take().is_some_and(|c| c.moved) {
-                    self.remember();
-                }
-            }
-            Pulse::Lost => self.carrying = None,
-        }
-    }
-
     /// Put everything a saved workspace could have supplied back to the built-in answer.
     ///
     /// One function rather than a list of fields at each call site: a field added later is a field
@@ -1477,15 +1461,15 @@ impl Workspace {
         self.theme = Theme::default();
         self.options.clear();
         self.floating.clear();
-        self.carrying = None;
+        self.grab_surface = Surface::Docked;
         self.popup = None;
         self.popup_wanted = None;
     }
 
-    /// Whether a panel is floating above the arrangement.
+    /// Whether a panel is in a floating window.
     #[must_use]
     pub fn is_floating(&self, panel: PanelId) -> bool {
-        self.floating.iter().any(|f| f.panel == panel)
+        self.floating.iter().any(|f| f.layout.find(panel).is_some())
     }
 
     /// Whether a panel is in the arrangement itself.
@@ -1494,7 +1478,7 @@ impl Workspace {
         self.layout.find(panel).is_some()
     }
 
-    /// Lift a panel out of the arrangement and leave it floating.
+    /// Lift a panel out of the arrangement into a window of its own.
     ///
     /// Undoable like any other change to the arrangement, because it *is* one: the panel has left
     /// the tree, and getting it back should not need remembering where it was.
@@ -1504,9 +1488,13 @@ impl Workspace {
         }
         self.history.record(self.layout.clone());
         self.layout.remove(panel);
-        let screen = self.screen;
-        let at = first_float(screen, self.floating.len(), &self.theme.metrics);
-        self.floating.push(Floating { panel, rect: at });
+        let at = first_float(self.screen, self.floating.len(), &self.theme.metrics);
+        let id = self.take_float_id();
+        self.floating.push(Floating {
+            id,
+            rect: at,
+            layout: Layout::single(panel),
+        });
         self.popup = None;
         self.remember();
     }
@@ -1525,23 +1513,173 @@ impl Workspace {
             return;
         };
         self.history.record(self.layout.clone());
-        self.floating.retain(|f| f.panel != panel);
+        self.take_from_floating(panel);
         self.layout.insert(&path, Zone::Center, panel);
         self.popup = None;
         self.remember();
     }
 
-    /// Which floating panel is under a point, if any. Front-most first.
+    /// Push a floating window about by however far the pointer went.
+    ///
+    /// Where a window may go is the workspace's business: `panel_drag` reports the movement and
+    /// this decides whether the window may have it.
+    fn push_window(&mut self, which: Surface, dx: f32, dy: f32) {
+        let Surface::Floating(id) = which else {
+            return;
+        };
+        let (screen, m) = (self.screen, self.theme.metrics);
+        if let Some(held) = self.floating.iter_mut().find(|f| f.id == id) {
+            held.rect = hold_on_screen(
+                Rect::new(held.rect.x + dx, held.rect.y + dy, held.rect.w, held.rect.h),
+                screen,
+                &m,
+            );
+        }
+    }
+
+    /// A window's frame was held still: ask about the panel it is showing.
+    ///
+    /// A frame belongs to no one panel, so it stands for the one on show -- which is the panel
+    /// whose settings carry "put it back", the reason to ask a window anything at all.
+    fn frame_asked(&mut self, which: Surface) {
+        let Some(area) = self.area_of(which) else {
+            return;
+        };
+        if let Some(slot) = self
+            .layout_of(which)
+            .and_then(|l| l.resolve(area).into_iter().next())
+        {
+            self.popup_wanted = Some(PopupKind::Settings(showing_of(&slot)));
+        }
+    }
+
+    /// Move a panel out of the arrangement it is in and into another, at the drop zone under the
+    /// pointer.
+    ///
+    /// The source is emptied first and the destination looked up afterwards, because removing can
+    /// collapse a tree and shift every path in it -- the same ordering hazard a move within one
+    /// arrangement has, and the same answer: anchor to a panel, not to a path.
+    fn move_across(&mut self, panel: PanelId, to: Surface, x: f32, y: f32) {
+        let Some(area) = self.area_of(to) else {
+            return;
+        };
+        let Some(landing) = self.layout_of(to).and_then(|l| l.leaf_at(area, x, y)) else {
+            return;
+        };
+        let zone = Layout::zone_at(landing.rect, x, y);
+        // Anchored to a panel that is already there, so the path can be found again after the
+        // source has been emptied -- which may have taken a whole window down with it.
+        let Some(anchor) = landing.tabs.first().copied() else {
+            return;
+        };
+        let before = self.layout.clone();
+        self.take_from_floating(panel);
+        self.layout.remove(panel);
+        let Some((path, _)) = self.layout_of(to).and_then(|l| l.find(anchor)) else {
+            // The place it was going has gone. Put it back rather than lose it (DECISIONS 6b).
+            self.layout = before;
+            self.open(panel);
+            return;
+        };
+        self.history.record(before);
+        if let Some(layout) = self.layout_of_mut(to) {
+            layout.insert(&path, zone, panel);
+        }
+        // No second sweep for emptied windows: `take_from_floating` above is the one place that
+        // takes a window down, and a guard that cannot change the outcome only looks load-bearing.
+        self.remember();
+    }
+
+    /// The rectangle a surface fills.
     #[must_use]
-    fn floating_at(&self, x: f32, y: f32) -> Option<PanelId> {
+    fn area_of(&self, which: Surface) -> Option<Rect> {
+        match which {
+            Surface::Docked => Some(self.screen),
+            Surface::Floating(id) => self
+                .floating
+                .iter()
+                .find(|f| f.id == id)
+                .map(|f| inset(f.rect, self.theme.metrics.gutter)),
+        }
+    }
+
+    /// A name no window has had before.
+    fn take_float_id(&mut self) -> FloatId {
+        let id = FloatId(self.next_float);
+        self.next_float = self.next_float.wrapping_add(1);
+        id
+    }
+
+    /// Remove a panel from whichever floating window holds it, taking the window down if that was
+    /// the last thing in it.
+    fn take_from_floating(&mut self, panel: PanelId) {
+        for held in &mut self.floating {
+            if held.layout.find(panel).is_some() {
+                held.layout.remove(panel);
+            }
+        }
+        self.floating.retain(|f| !f.layout.panels().is_empty());
+    }
+
+    /// Which floating window is under a point, front-most first.
+    #[must_use]
+    fn window_at(&self, x: f32, y: f32) -> Option<FloatId> {
         self.floating
             .iter()
             .rev()
             .find(|f| f.rect.contains(x, y))
-            .map(|f| f.panel)
+            .map(|f| f.id)
     }
 
-    /// Choose the icon set, and write the look out.
+    /// The arrangement a surface holds, and the rectangle it fills.
+    #[must_use]
+    fn surface(&self, which: Surface) -> Option<(&Layout, Rect)> {
+        match which {
+            Surface::Docked => Some((&self.layout, self.screen)),
+            Surface::Floating(id) => self
+                .floating
+                .iter()
+                .find(|f| f.id == id)
+                .map(|f| (&f.layout, inset(f.rect, self.theme.metrics.gutter))),
+        }
+    }
+
+    /// The arrangement a surface holds. **The rectangle comes from the caller**, because the caller
+    /// is the one that worked out which surface it was talking to and where that surface was --
+    /// asking twice would be two answers to drift apart, and a `gesture` that took an area and
+    /// then ignored it in favour of its own is exactly how that goes wrong.
+    #[must_use]
+    fn layout_of(&self, which: Surface) -> Option<&Layout> {
+        match which {
+            Surface::Docked => Some(&self.layout),
+            Surface::Floating(id) => self.floating.iter().find(|f| f.id == id).map(|f| &f.layout),
+        }
+    }
+
+    fn layout_of_mut(&mut self, which: Surface) -> Option<&mut Layout> {
+        match which {
+            Surface::Docked => Some(&mut self.layout),
+            Surface::Floating(id) => self
+                .floating
+                .iter_mut()
+                .find(|f| f.id == id)
+                .map(|f| &mut f.layout),
+        }
+    }
+
+    fn surface_mut(&mut self, which: Surface) -> Option<(&mut Layout, Rect)> {
+        let gutter = self.theme.metrics.gutter;
+        let screen = self.screen;
+        match which {
+            Surface::Docked => Some((&mut self.layout, screen)),
+            Surface::Floating(id) => self.floating.iter_mut().find(|f| f.id == id).map(|f| {
+                let area = inset(f.rect, gutter);
+                (&mut f.layout, area)
+            }),
+        }
+    }
+
+    /// Choose the icon set, and write the look out.    /// Choose the icon set, and write the look out.
     ///
     /// Part of the theme, so it lives in the same file and is hand-editable like every other part
     /// of the look. An unknown id is refused rather than stored: a theme file naming a set this
@@ -1674,29 +1812,53 @@ impl Workspace {
     /// costs a text measurement per tab, and only a press needs the answer.
     fn gesture(
         &mut self,
-        screen: Rect,
+        area: Rect,
         pulse: crate::panel_drag::Pulse,
         pointer: Option<(f32, f32)>,
         now_ms: f64,
+        over: Surface,
         target_at: impl FnOnce(f32, f32) -> crate::panel_drag::Target,
     ) -> Option<crate::panel_drag::Preview> {
         use crate::panel_drag::Pulse;
         let Some((x, y)) = pointer else {
             // Nowhere to press, drop or follow to. A gesture in flight with no pointer is one
             // whose pointer has gone, whatever this frame claims.
-            self.drag.cancel(&mut self.layout);
+            let mut drag = std::mem::take(&mut self.drag);
+            if let Some((layout, _)) = self.surface_mut(self.grab_surface) {
+                drag.cancel(layout);
+            } else {
+                drag.cancel(&mut Layout::single(CANVAS));
+            }
+            self.drag = drag;
             return None;
         };
         match pulse {
             Pulse::Press => {
                 let target = target_at(x, y);
-                self.drag.press(&self.layout, &target, x, y, now_ms);
+                let layout = self.layout_of(self.grab_surface)?.clone();
+                self.drag.press(&layout, &target, x, y, now_ms);
                 None
             }
             Pulse::Release => {
-                let outcome = self
-                    .drag
-                    .release(&mut self.layout, &mut self.history, screen, x, y);
+                // **Let go over a different arrangement and the panel goes there.** A drag that
+                // started in one floating window and ended in another is the whole reason windows
+                // hold arrangements rather than single panels; without this they could only ever
+                // hold one thing each.
+                if over != self.grab_surface {
+                    if let Some(panel) = self.drag.carrying() {
+                        self.drag.let_go();
+                        self.move_across(panel, over, x, y);
+                        return None;
+                    }
+                }
+                let mut history = std::mem::take(&mut self.history);
+                let mut drag = std::mem::take(&mut self.drag);
+                let outcome = match self.layout_of_mut(self.grab_surface) {
+                    Some(layout) => drag.release(layout, &mut history, area, x, y),
+                    None => Outcome::Nothing,
+                };
+                self.drag = drag;
+                self.history = history;
                 if saves(&outcome) {
                     self.remember();
                 }
@@ -1712,7 +1874,12 @@ impl Workspace {
                 None
             }
             Pulse::Track => {
-                let preview = self.drag.drag(&mut self.layout, screen, x, y, now_ms);
+                let mut drag = std::mem::take(&mut self.drag);
+                let preview = match self.layout_of_mut(self.grab_surface) {
+                    Some(layout) => drag.drag(layout, area, x, y, now_ms),
+                    None => None,
+                };
+                self.drag = drag;
                 // A hold that completed asks the panel what it offers, straight away rather than
                 // on release: a menu that only appeared once you let go could not be dismissed by
                 // letting go.
@@ -1723,7 +1890,13 @@ impl Workspace {
                 preview
             }
             Pulse::Lost => {
-                self.drag.cancel(&mut self.layout);
+                let mut drag = std::mem::take(&mut self.drag);
+                if let Some(layout) = self.layout_of_mut(self.grab_surface) {
+                    drag.cancel(layout);
+                } else {
+                    drag.cancel(&mut Layout::single(CANVAS));
+                }
+                self.drag = drag;
                 None
             }
         }
@@ -1786,6 +1959,42 @@ const DOCK_BASE: u32 = 1 << 18;
 
 /// Where the icon-set choices start, out of the way of anything else a workspace popup offers.
 const ICON_SET_BASE: u32 = 1 << 16;
+
+/// Draw one tab: a shape you can see, in the same place you would press.
+///
+/// Shared by the arrangement and by floating windows, because "which of these is a handle" has to
+/// look the same in both -- the complaint that started this was that a floating panel had no
+/// button-looking thing to press, and a second drawing routine is how that happens again.
+fn draw_tab(
+    painter: &egui::Painter,
+    tab: &crate::chrome::Tab,
+    slot: &crate::layout::Placed,
+    m: &Metrics,
+    p: &crate::theme::Palette,
+) {
+    if tab.active {
+        painter.rect_filled(to_egui(tab.rect), m.radius, rgb(p.panel));
+        // A line under the one on show, which is how a tab strip says which it is without
+        // spending a colour on it.
+        painter.line_segment(
+            [
+                egui::pos2(tab.rect.x + m.tab_padding, tab.rect.y + tab.rect.h - 1.0),
+                egui::pos2(
+                    tab.rect.x + tab.rect.w - m.tab_padding,
+                    tab.rect.y + tab.rect.h - 1.0,
+                ),
+            ],
+            egui::Stroke::new(2.0_f32, rgb(p.state)),
+        );
+    }
+    painter.text(
+        egui::pos2(tab.rect.x + m.tab_padding, tab.rect.y + tab.rect.h / 2.0),
+        egui::Align2::LEFT_CENTER,
+        slot.tabs.get(tab.index).copied().map_or("", name_of),
+        egui::FontId::proportional(m.label),
+        rgb(if tab.active { p.text } else { p.dim }),
+    );
+}
 
 /// Where a floating panel goes when it is first lifted out.
 ///
@@ -1883,6 +2092,37 @@ fn measure(ctx: &egui::Context, label: f32, panel: Option<PanelId>) -> f32 {
             .size()
             .x
     })
+}
+
+/// Which arrangement a gesture belongs to.
+///
+/// **A gesture keeps the arrangement it began in; with nothing in flight it is whatever is under
+/// the pointer.** A drag that followed the pointer would start rearranging a window it was merely
+/// passing across, and one that always assumed the docked arrangement would rearrange that instead
+/// of the window it began in. Both were tried by a sabotage and neither is hypothetical.
+///
+/// Between gestures it follows the pointer, because that is what the hover marks are for: showing
+/// what a press *would* take hold of.
+#[must_use]
+fn working_surface(in_flight: bool, over: Surface, current: Surface) -> Surface {
+    if in_flight {
+        current
+    } else {
+        over
+    }
+}
+
+/// What a press inside a floating window, but on none of its chrome, means.
+///
+/// Every window needs somewhere to be picked up that is not one of its tabs, or dragging it would
+/// always threaten to pull a panel out of it. In the docked arrangement the same press means
+/// nothing -- there is no window to move.
+#[must_use]
+fn window_target(target: crate::panel_drag::Target, in_window: bool) -> crate::panel_drag::Target {
+    match target {
+        crate::panel_drag::Target::Elsewhere if in_window => crate::panel_drag::Target::Frame,
+        other => other,
+    }
 }
 
 /// Which panel a leaf is showing, which is the one whose settings its handle obeys.
@@ -1996,7 +2236,8 @@ mod tests {
             popup_wanted: None,
             options: std::collections::HashMap::new(),
             floating: Vec::new(),
-            carrying: None,
+            grab_surface: Surface::Docked,
+            next_float: 0,
             screen: Rect::new(0.0, 0.0, 1280.0, 800.0),
         }
     }
@@ -2271,6 +2512,259 @@ mod tests {
         );
     }
 
+    /// **A gesture stays in the arrangement it began in.**
+    ///
+    /// Following the pointer instead would rearrange a window it was merely passing across;
+    /// always assuming the docked one would rearrange that instead of the window it began in.
+    #[test]
+    fn a_gesture_stays_where_it_started() {
+        let a = Surface::Floating(FloatId(1));
+        let b = Surface::Floating(FloatId(2));
+        // With nothing in flight it follows the pointer, which is what the hover marks need.
+        assert_eq!(working_surface(false, a, Surface::Docked), a);
+        assert_eq!(working_surface(false, Surface::Docked, a), Surface::Docked);
+        // Once a gesture is running it keeps its own, whatever the pointer has wandered over.
+        assert_eq!(working_surface(true, b, a), a);
+        assert_eq!(working_surface(true, Surface::Docked, a), a);
+    }
+
+    /// A press inside a floating window on none of its chrome is the window itself.
+    ///
+    /// Every window needs somewhere to be picked up that is not one of its tabs, or dragging it
+    /// would always threaten to pull a panel out of it.
+    #[test]
+    fn a_press_on_a_windows_own_body_moves_the_window() {
+        use crate::panel_drag::Target;
+        assert_eq!(window_target(Target::Elsewhere, true), Target::Frame);
+        // In the arrangement there is no window to move, so it still means nothing.
+        assert_eq!(window_target(Target::Elsewhere, false), Target::Elsewhere);
+        // And it never steals a press that belonged to something.
+        let tab = Target::Tab {
+            path: vec![1],
+            tab: 0,
+        };
+        assert_eq!(window_target(tab.clone(), true), tab);
+        let seam = Target::Splitter {
+            path: vec![],
+            index: 0,
+        };
+        assert_eq!(window_target(seam.clone(), true), seam);
+    }
+
+    /// A window pushed about goes where it was pushed, and stays reachable.
+    #[test]
+    fn a_window_moves_by_what_it_was_pushed() {
+        let mut ws = bare();
+        ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.float(BRUSH);
+        let id = ws.floating[0].id;
+        let before = ws.floating[0].rect;
+
+        ws.push_window(Surface::Floating(id), 40.0, 25.0);
+        let after = ws.floating[0].rect;
+        assert!(
+            (after.x - before.x - 40.0).abs() < 0.001 && (after.y - before.y - 25.0).abs() < 0.001,
+            "pushed 40,25 and moved {},{}",
+            after.x - before.x,
+            after.y - before.y
+        );
+
+        // Thrown at the far corner, it still keeps a handle on screen.
+        ws.push_window(Surface::Floating(id), 9000.0, 9000.0);
+        let far = ws.floating[0].rect;
+        assert!(far.x < ws.screen.x + ws.screen.w, "it went off the right");
+        assert!(far.y < ws.screen.y + ws.screen.h, "it went off the bottom");
+
+        // The docked arrangement is not a window and cannot be pushed.
+        let docked = ws.layout.clone();
+        ws.push_window(Surface::Docked, 100.0, 100.0);
+        assert_eq!(ws.layout, docked);
+    }
+
+    /// Holding a window's frame asks about the panel it is showing.
+    #[test]
+    fn holding_a_windows_frame_asks_about_what_it_shows() {
+        let mut ws = bare();
+        ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.float(BRUSH);
+        let id = ws.floating[0].id;
+
+        ws.frame_asked(Surface::Floating(id));
+        assert_eq!(
+            ws.popup_wanted,
+            Some(PopupKind::Settings(BRUSH)),
+            "a window's frame should ask about the panel it is showing"
+        );
+    }
+
+    /// **A floating window has a tab you can see, in the place you press it.**
+    ///
+    /// The complaint that started this: a floating panel had no button-looking thing, so there was
+    /// nothing to aim at and no way to tell where holding would work. It has the same chrome as a
+    /// docked one now, from the same code, because the window holds an arrangement rather than a
+    /// single panel.
+    #[test]
+    fn a_floating_window_has_a_tab_like_any_other() {
+        let mut ws = bare();
+        ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.float(BRUSH);
+        let held = ws.floating.first().expect("a window").clone();
+
+        let m = ws.theme.metrics;
+        let inner = inset(held.rect, m.gutter);
+        let slot = held
+            .layout
+            .resolve(inner)
+            .into_iter()
+            .next()
+            .expect("a leaf");
+        let c = crate::chrome::panel(
+            &slot,
+            &m,
+            style_of(&slot),
+            along_of(&slot, ws.direction_of(BRUSH)),
+            |_| 40.0,
+        );
+        assert_eq!(c.tabs.len(), 1, "a floating panel should have a tab");
+        let tab = &c.tabs[0];
+        assert!(
+            tab.rect.w > 0.0 && tab.rect.h > 0.0,
+            "and it must be something you can see"
+        );
+        assert!(
+            held.rect.contains(tab.rect.x + 1.0, tab.rect.y + 1.0),
+            "the tab should be inside the window it belongs to"
+        );
+    }
+
+    /// **Holding a floating panel's tab asks for its settings**, while the finger is down.
+    ///
+    /// It never fired before, and the reason is worth keeping: painting is demand-driven, so a
+    /// hold with the pointer still produces no frames and the timer is never read. The docked
+    /// panels asked for those frames; the floating ones had their own gesture code and did not
+    /// inherit it. One code path, one answer.
+    #[test]
+    fn holding_a_floating_tab_asks_for_its_settings() {
+        use crate::panel_drag::{pulse, Target, HOLD_MS};
+        let mut ws = bare();
+        ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.float(BRUSH);
+        let id = ws.floating[0].id;
+        let area = ws.area_of(Surface::Floating(id)).expect("the window");
+        let slot = ws
+            .layout_of(Surface::Floating(id))
+            .expect("its arrangement")
+            .resolve(area)
+            .into_iter()
+            .next()
+            .expect("a leaf");
+        let target = Target::Tab {
+            path: slot.path.clone(),
+            tab: 0,
+        };
+        let at = (slot.rect.x + 8.0, slot.rect.y + 6.0);
+
+        ws.grab_surface = Surface::Floating(id);
+        ws.gesture(
+            area,
+            pulse(true, false, true),
+            Some(at),
+            0.0,
+            Surface::Floating(id),
+            |_, _| target.clone(),
+        );
+        // The frames a demand-driven UI would otherwise never draw.
+        assert!(
+            ws.drag.waiting_ms(1.0).is_some(),
+            "a floating panel's hold must ask for the frames that let it fire"
+        );
+        ws.gesture(
+            area,
+            pulse(false, false, true),
+            Some(at),
+            HOLD_MS + 1.0,
+            Surface::Floating(id),
+            |_, _| unreachable!(),
+        );
+        assert_eq!(
+            ws.popup_wanted,
+            Some(PopupKind::Settings(BRUSH)),
+            "holding a floating panel's tab should ask it what it offers"
+        );
+    }
+
+    /// **A panel dragged from one floating window into another goes there**, at the zone it was
+    /// dropped on.
+    ///
+    /// This is why a window holds an arrangement rather than a single panel: without it, windows
+    /// could only ever hold one thing each and there would be nothing to drop onto.
+    #[test]
+    fn a_panel_can_be_dragged_from_one_window_into_another() {
+        use crate::panel_drag::{pulse, Target};
+        let mut ws = bare();
+        ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.float(BRUSH);
+        ws.float(COLOUR);
+        let (from, to) = (ws.floating[0].id, ws.floating[1].id);
+        let source = ws.area_of(Surface::Floating(from)).expect("source");
+        let target = Target::Tab {
+            path: vec![],
+            tab: 0,
+        };
+
+        ws.grab_surface = Surface::Floating(from);
+        ws.gesture(
+            source,
+            pulse(true, false, true),
+            Some((source.x + 8.0, source.y + 6.0)),
+            0.0,
+            Surface::Floating(from),
+            |_, _| target.clone(),
+        );
+        // Carried into the middle of the other window and let go.
+        let dest = ws.area_of(Surface::Floating(to)).expect("destination");
+        let drop = (dest.x + dest.w / 2.0, dest.y + dest.h / 2.0);
+        ws.gesture(
+            source,
+            pulse(false, false, true),
+            Some(drop),
+            1.0,
+            Surface::Floating(to),
+            |_, _| unreachable!(),
+        );
+        ws.gesture(
+            source,
+            pulse(false, true, false),
+            Some(drop),
+            2.0,
+            Surface::Floating(to),
+            |_, _| unreachable!(),
+        );
+
+        assert_eq!(ws.floating.len(), 1, "the emptied window should be gone");
+        let left = &ws.floating[0];
+        let mut in_it = left.layout.panels();
+        in_it.sort_by_key(|p| p.0);
+        assert_eq!(
+            in_it,
+            vec![BRUSH, COLOUR],
+            "both should be in the one window"
+        );
+    }
+
+    /// A window whose last panel leaves is taken down.
+    ///
+    /// An empty window is a rectangle of chrome with no way to tell it is not broken.
+    #[test]
+    fn a_window_goes_when_the_last_panel_leaves_it() {
+        let mut ws = bare();
+        ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.float(BRUSH);
+        assert_eq!(ws.floating.len(), 1);
+        ws.dock(BRUSH, LAYERS);
+        assert!(ws.floating.is_empty(), "the emptied window should be gone");
+    }
+
     /// **Floating takes a panel out of the arrangement, and docking puts it back.**
     ///
     /// A panel is in exactly one of the two places at any moment. Being in both would mean two
@@ -2428,7 +2922,7 @@ mod tests {
         let back: SavedWorkspace = serde_json::from_str(&text).expect("parse");
         let restored = floating_from_saved(&back.floating);
         assert_eq!(restored.len(), 1);
-        assert_eq!(restored[0].panel, BRUSH);
+        assert_eq!(restored[0].layout.panels(), vec![BRUSH]);
         assert_eq!(restored[0].rect, where_it_was);
 
         // A name this build does not know is dropped, not turned into some other panel.
@@ -2436,7 +2930,7 @@ mod tests {
         let back: SavedWorkspace = serde_json::from_str(&text).expect("parse");
         assert!(
             floating_from_saved(&back.floating).is_empty(),
-            "a panel this build does not know should be dropped, not turned into another one"
+            "a window of panels this build does not know should be dropped, not reopened empty"
         );
     }
 
@@ -2482,6 +2976,7 @@ mod tests {
             pulse(true, false, true),
             Some((10.0, 10.0)),
             0.0,
+            Surface::Docked,
             |_, _| target.clone(),
         );
         // Part-way through the hold: still nothing.
@@ -2490,6 +2985,7 @@ mod tests {
             pulse(false, false, true),
             Some((10.0, 10.0)),
             HOLD_MS / 2.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         assert_eq!(ws.popup_wanted, None, "it asked before the hold was done");
@@ -2499,6 +2995,7 @@ mod tests {
             pulse(false, false, true),
             Some((10.0, 10.0)),
             HOLD_MS + 1.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         assert_eq!(
@@ -2907,6 +3404,7 @@ mod tests {
             pulse(true, false, true),
             Some((px, py)),
             0.0,
+            Surface::Docked,
             |_, _| target.clone(),
         );
         // Frame 2: still held, still there, past the hold.
@@ -2915,6 +3413,7 @@ mod tests {
             pulse(false, false, true),
             Some((px, py)),
             1.0,
+            Surface::Docked,
             |_, _| unreachable!("only a press asks what is under the pointer"),
         );
         assert!(
@@ -2927,6 +3426,7 @@ mod tests {
             pulse(false, false, true),
             Some((dx, dy)),
             2.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         // Frame 4: let go. egui reports the release *and* the button already up, together.
@@ -2936,6 +3436,7 @@ mod tests {
             pulse(false, true, false),
             Some((dx, dy)),
             3.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
 
@@ -2976,6 +3477,7 @@ mod tests {
             pulse(true, false, true),
             Some((10.0, 10.0)),
             0.0,
+            Surface::Docked,
             |_, _| target.clone(),
         );
         ws.gesture(
@@ -2983,6 +3485,7 @@ mod tests {
             pulse(false, false, true),
             Some((10.0, 10.0)),
             1.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         ws.gesture(
@@ -2990,6 +3493,7 @@ mod tests {
             pulse(false, false, true),
             Some((dx, dy)),
             2.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         ws.gesture(
@@ -2997,6 +3501,7 @@ mod tests {
             pulse(false, true, false),
             Some((dx, dy)),
             3.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         assert_ne!(
@@ -3038,6 +3543,7 @@ mod tests {
             pulse(true, false, true),
             Some((px, py)),
             0.0,
+            Surface::Docked,
             |_, _| target.clone(),
         );
         ws.gesture(
@@ -3045,6 +3551,7 @@ mod tests {
             pulse(false, false, true),
             Some((px, py)),
             1.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         ws.gesture(
@@ -3052,6 +3559,7 @@ mod tests {
             pulse(false, false, true),
             Some((px + 80.0, py)),
             2.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         ws.gesture(
@@ -3059,6 +3567,7 @@ mod tests {
             pulse(false, true, false),
             Some((px + 80.0, py)),
             3.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         assert_ne!(ws.layout, before, "the divider did not move");
@@ -3095,6 +3604,7 @@ mod tests {
             pulse(true, false, true),
             Some((px, py)),
             0.0,
+            Surface::Docked,
             |_, _| target.clone(),
         );
         ws.gesture(
@@ -3102,6 +3612,7 @@ mod tests {
             pulse(false, false, true),
             Some((px, py)),
             1.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         ws.gesture(
@@ -3109,6 +3620,7 @@ mod tests {
             pulse(false, false, true),
             Some((px + 120.0, py)),
             2.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         assert_ne!(ws.layout, before, "the divider did not move");
@@ -3151,6 +3663,7 @@ mod tests {
             pulse(true, false, true),
             Some((px, py)),
             0.0,
+            Surface::Docked,
             |_, _| target.clone(),
         );
         for (t, x) in [(1.0, px), (2.0, px), (3.0, px)] {
@@ -3159,6 +3672,7 @@ mod tests {
                 pulse(false, false, true),
                 Some((x, py)),
                 HOLD_MS + t,
+                Surface::Docked,
                 |_, _| unreachable!(),
             );
         }
@@ -3167,6 +3681,7 @@ mod tests {
             pulse(false, true, false),
             Some((px, py)),
             HOLD_MS + 4.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         assert!(
@@ -3194,6 +3709,7 @@ mod tests {
             pulse(true, false, true),
             Some((10.0, 10.0)),
             0.0,
+            Surface::Docked,
             |_, _| target.clone(),
         );
         // Something else changes the arrangement while the press is still waiting.
@@ -3226,6 +3742,7 @@ mod tests {
             pulse(true, false, true),
             Some((10.0, 10.0)),
             0.0,
+            Surface::Docked,
             |_, _| target.clone(),
         );
         ws.gesture(
@@ -3233,6 +3750,7 @@ mod tests {
             pulse(false, false, true),
             Some((10.0, 10.0)),
             1.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         assert!(ws.drag.active(), "there should be a gesture to lose");
@@ -3243,6 +3761,7 @@ mod tests {
             pulse(false, false, false),
             Some((700.0, 700.0)),
             2.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         assert!(!ws.drag.active(), "the gesture should have been abandoned");
@@ -3267,6 +3786,7 @@ mod tests {
             pulse(true, false, true),
             Some((10.0, 10.0)),
             0.0,
+            Surface::Docked,
             |_, _| target.clone(),
         );
         ws.gesture(
@@ -3274,6 +3794,7 @@ mod tests {
             pulse(false, false, true),
             Some((10.0, 10.0)),
             1.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         // Well outside the window.
@@ -3283,6 +3804,7 @@ mod tests {
             pulse(false, false, true),
             Some((ox, oy)),
             2.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         ws.gesture(
@@ -3290,6 +3812,7 @@ mod tests {
             pulse(false, true, false),
             Some((ox, oy)),
             3.0,
+            Surface::Docked,
             |_, _| unreachable!(),
         );
         assert!(

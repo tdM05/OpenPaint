@@ -68,13 +68,25 @@ pub enum Target {
     Splitter { path: Path, index: usize },
     /// Anywhere else — the panel's own content, which this module does not touch.
     Elsewhere,
+    /// The frame of a floating window: dragging it moves the window rather than anything in it.
+    ///
+    /// A window needs somewhere to be picked up that is not one of its tabs, or dragging it would
+    /// always threaten to pull a panel out of it.
+    Frame,
 }
 
 /// What the pointer is held on, so the caller can show the wait on the right thing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Held {
-    Panel { path: Path },
-    Divider { path: Path, index: usize },
+    Panel {
+        path: Path,
+    },
+    Divider {
+        path: Path,
+        index: usize,
+    },
+    /// A floating window's frame.
+    Frame,
 }
 
 /// What a gesture in progress wants drawn.
@@ -102,6 +114,10 @@ pub enum Preview {
     /// Reported rather than performed: what a panel offers is the panel's business and the
     /// workspace's to place, and this module knows about neither.
     Asking(PanelId),
+    /// A floating window is being pushed about; the caller moves it by this much.
+    MovingWindow { dx: f32, dy: f32 },
+    /// A floating window's frame was held still: the caller decides what that asks about.
+    AskingFrame,
 }
 
 /// The drop a release would perform, and the rectangle to light up for it.
@@ -143,6 +159,8 @@ enum Kind {
         index: usize,
         axis: Axis,
     },
+    /// A floating window's frame, which moves the window.
+    Frame,
 }
 
 /// One press, and everything that has happened to it since.
@@ -209,6 +227,24 @@ impl PanelDrag {
         self.grab.is_some()
     }
 
+    /// Which panel this gesture has hold of, if it has hold of one.
+    ///
+    /// For a drop that lands in a *different* arrangement than it started in: this module moves
+    /// nodes around one tree, and moving between two is the caller's business -- but only this one
+    /// knows what is in the air.
+    #[must_use]
+    pub fn carrying(&self) -> Option<PanelId> {
+        self.grab.as_ref().and_then(|g| match &g.kind {
+            Kind::Tab { panel, .. } => g.moved.then_some(*panel),
+            Kind::Splitter { .. } | Kind::Frame => None,
+        })
+    }
+
+    /// Abandon the gesture without touching anything, for a drop the caller has taken over.
+    pub fn let_go(&mut self) {
+        self.grab = None;
+    }
+
     /// How long until the hold completes, if one is waiting.
     ///
     /// **Painting is demand-driven**, so a hold that nobody asks to draw simply never fires: with
@@ -242,6 +278,7 @@ impl PanelDrag {
                     axis,
                 })
             }
+            Target::Frame => Some(Kind::Frame),
             Target::Elsewhere => None,
         };
         self.grab = kind.map(|kind| Grab {
@@ -293,6 +330,9 @@ impl PanelDrag {
                             path: path.clone(),
                             index: *index,
                         },
+                        // A window's frame is drawn by whoever owns the window; there is no node
+                        // in this layout to mark.
+                        Kind::Frame => Held::Frame,
                     },
                 });
             }
@@ -301,6 +341,9 @@ impl PanelDrag {
             // arrangement must not keep following a finger that is now reading a menu.
             let asking = match &grab.kind {
                 Kind::Tab { panel, .. } => Some(*panel),
+                // A frame belongs to a window rather than a panel, so the caller decides what its
+                // hold asks about -- it knows which window, and this does not.
+                Kind::Frame => None,
                 // A divider belongs to no one panel, so there is nothing to ask. It keeps waiting,
                 // which costs nothing: the drag is still live and still resizes on the next move.
                 Kind::Splitter { .. } => None,
@@ -309,10 +352,21 @@ impl PanelDrag {
                 self.grab = None;
                 return Some(Preview::Asking(panel));
             }
+            if matches!(grab.kind, Kind::Frame) {
+                self.grab = None;
+                return Some(Preview::AskingFrame);
+            }
             return None;
         }
 
         match &grab.kind {
+            // The window moves by however far the pointer has, and the caller applies it: where a
+            // window may go is the workspace's business, not this module's.
+            Kind::Frame => {
+                let (dx, dy) = (x - grab.last.0, y - grab.last.1);
+                grab.last = (x, y);
+                Some(Preview::MovingWindow { dx, dy })
+            }
             Kind::Splitter { path, index, axis } => {
                 let (dx, dy) = (x - grab.last.0, y - grab.last.1);
                 grab.last = (x, y);
@@ -361,6 +415,16 @@ impl PanelDrag {
         let Some(grab) = self.grab.take() else {
             return Outcome::Nothing;
         };
+        if matches!(grab.kind, Kind::Frame) {
+            // A window that was pushed about has changed the arrangement; one merely touched has
+            // not. Where it ended up is the caller's to remember, since it was the caller moving
+            // it.
+            return if grab.moved {
+                Outcome::Moved
+            } else {
+                Outcome::Nothing
+            };
+        }
         if !grab.moved {
             // Pressed and let go without moving. On a tab that is a tap, and it switches to it;
             // on a divider it asked for nothing.
@@ -371,11 +435,13 @@ impl PanelDrag {
                     layout.set_active(&path, tab);
                     Outcome::Switched
                 }
-                Kind::Splitter { .. } => Outcome::Nothing,
+                Kind::Splitter { .. } | Kind::Frame => Outcome::Nothing,
             };
         }
 
         match grab.kind {
+            // Already answered above; a frame never reaches here.
+            Kind::Frame => Outcome::Nothing,
             Kind::Splitter { .. } => {
                 // The divider has already moved; what is recorded is where it started. A drag that
                 // ended where it began is not a change and does not deserve an undo step.
@@ -853,6 +919,86 @@ mod tests {
             None,
             "the hold has run; there is nothing left to wait for"
         );
+    }
+
+    /// **A window's frame reports how far it went, and nothing else.**
+    ///
+    /// Where a window may go belongs to whoever owns the window; this only says how far the
+    /// pointer moved since it was last asked.
+    #[test]
+    fn a_frame_reports_the_distance_and_lets_the_caller_place_it() {
+        let mut l = workspace();
+        let mut h = LayoutHistory::default();
+        let mut d = PanelDrag::default();
+        let before = l.clone();
+
+        d.press(&l, &Target::Frame, 100.0, 100.0, 0.0);
+        assert_eq!(
+            d.drag(&mut l, area(), 140.0, 130.0, 1.0),
+            Some(Preview::MovingWindow { dx: 40.0, dy: 30.0 })
+        );
+        // The next step is measured from where it got to, not from the press: adding them up again
+        // would move a window twice as far as the hand did.
+        assert_eq!(
+            d.drag(&mut l, area(), 150.0, 130.0, 2.0),
+            Some(Preview::MovingWindow { dx: 10.0, dy: 0.0 })
+        );
+        assert_eq!(l, before, "a frame must not rearrange anything");
+
+        assert_eq!(
+            d.release(&mut l, &mut h, area(), 150.0, 130.0),
+            Outcome::Moved,
+            "a window that was pushed about has changed the arrangement"
+        );
+    }
+
+    /// A frame that was touched and let go changed nothing.
+    #[test]
+    fn a_frame_merely_touched_is_not_a_change() {
+        let mut l = workspace();
+        let mut h = LayoutHistory::default();
+        let mut d = PanelDrag::default();
+        d.press(&l, &Target::Frame, 100.0, 100.0, 0.0);
+        assert_eq!(
+            d.release(&mut l, &mut h, area(), 100.0, 100.0),
+            Outcome::Nothing
+        );
+    }
+
+    /// **Nothing is being carried until it has actually moved.**
+    ///
+    /// A press that has not gone anywhere is a tap or a hold, and treating it as a drag would let
+    /// a tap on a tab drop the panel into whatever the pointer happened to be over.
+    #[test]
+    fn nothing_is_carried_until_it_moves() {
+        let mut l = workspace();
+        let mut d = PanelDrag::default();
+        assert_eq!(d.carrying(), None, "nothing is happening yet");
+
+        d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
+        assert_eq!(d.carrying(), None, "a press alone carries nothing");
+
+        d.drag(&mut l, area(), 700.0, 300.0, 1.0);
+        assert_eq!(
+            d.carrying(),
+            Some(LAYERS),
+            "once it moves, it is in the air"
+        );
+
+        // A divider is never "carried": there is nothing to put anywhere else.
+        let mut d2 = PanelDrag::default();
+        d2.press(
+            &l,
+            &Target::Splitter {
+                path: vec![],
+                index: 0,
+            },
+            500.0,
+            400.0,
+            0.0,
+        );
+        d2.drag(&mut l, area(), 560.0, 400.0, 1.0);
+        assert_eq!(d2.carrying(), None);
     }
 
     /// **A hold that drifted a little is still a hold.**
