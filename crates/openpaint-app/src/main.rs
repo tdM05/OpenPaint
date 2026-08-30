@@ -714,6 +714,26 @@ impl Default for OpenPaint {
     }
 }
 
+/// Which dialog a menu command opens, if it opens one.
+///
+/// Its own function because it is a table, and a table can be checked. Wiring Save As to Save is a
+/// one-character mistake that reads perfectly correctly and silently overwrites somebody's file.
+#[must_use]
+fn dialog_for(command: ui::Command) -> Option<Dialog> {
+    use ui::Command;
+    match command {
+        Command::New => Some(Dialog::New { confirmed: false }),
+        Command::Open => Some(Dialog::Open { confirmed: false }),
+        Command::Save => Some(Dialog::Save),
+        Command::SaveAs => Some(Dialog::SaveAs),
+        Command::ExportPng
+        | Command::Undo
+        | Command::Redo
+        | Command::ZoomFit
+        | Command::ZoomActual => None,
+    }
+}
+
 impl OpenPaint {
     /// Apply a decoded pen event, mapping window coordinates to canvas space.
     ///
@@ -2908,6 +2928,36 @@ impl OpenPaint {
     /// new/open/save/save-as; Ctrl+E exports a PNG; Ctrl+A, Ctrl+D and Ctrl+Shift+I select all,
     /// deselect and invert -- the bindings every art app shares. Hardcoded for now, like navigation
     /// (OPEN_QUESTIONS Q16).
+    /// Carry out a menu command.
+    ///
+    /// **The same handlers the keyboard shortcuts use**, deliberately: a menu that reimplemented
+    /// Save would be a second Save, and the two would drift. Every command here is something a
+    /// shortcut already did; the menu is a second way in, not a second implementation.
+    fn run_command(&mut self, command: ui::Command) {
+        use ui::Command;
+        match command {
+            Command::New | Command::Open | Command::Save | Command::SaveAs => {
+                if let Some(dialog) = dialog_for(command) {
+                    self.request_dialog(dialog);
+                }
+            }
+            Command::ExportPng => self.export_png(),
+            Command::Undo => self.history_step(false),
+            Command::Redo => self.history_step(true),
+            Command::ZoomFit => {
+                self.view.request_fit();
+                self.request_redraw();
+            }
+            Command::ZoomActual => {
+                if let Some(renderer) = self.renderer.as_ref() {
+                    let (w, h) = renderer.size_px();
+                    self.view.set_scale_about(1.0, self.nav.anchor(w, h), w, h);
+                    self.request_redraw();
+                }
+            }
+        }
+    }
+
     fn handle_history(&mut self, event: &WindowEvent) -> bool {
         use winit::event::ElementState;
         use winit::keyboard::Key;
@@ -2971,28 +3021,34 @@ impl OpenPaint {
                     _ => return false,
                 };
 
-                // Refuse mid-stroke. The in-progress stroke is not in history yet
-                // and is still accumulating, so undoing here would revert the
-                // *previous* stroke and then bake the current one on top of the
-                // restored image -- a state the user never asked for and cannot
-                // reason about.
-                if self.editor.is_drawing() {
-                    return true;
-                }
-
-                let Some(renderer) = self.renderer.as_mut() else {
-                    return true;
-                };
-                let change = if redo {
-                    renderer.redo()
-                } else {
-                    renderer.undo()
-                };
-                self.apply_history_change(change);
+                self.history_step(redo);
                 true
             }
             _ => false,
         }
+    }
+
+    /// Walk one step through the artwork's history.
+    ///
+    /// Shared by Ctrl+Z and the Edit menu, because two ways in must not become two behaviours ---
+    /// and this one has a rule worth not forgetting twice.
+    ///
+    /// **Refused mid-stroke.** The stroke in progress is not in history yet and is still
+    /// accumulating, so undoing here would revert the *previous* stroke and then bake the current
+    /// one on top of the restored image: a state nobody asked for and nobody can reason about.
+    fn history_step(&mut self, redo: bool) {
+        if self.editor.is_drawing() {
+            return;
+        }
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let change = if redo {
+            renderer.redo()
+        } else {
+            renderer.undo()
+        };
+        self.apply_history_change(change);
     }
 
     /// Export the flattened canvas to a PNG in the working directory.
@@ -3345,6 +3401,7 @@ impl OpenPaint {
         let mut confirm_request = None;
         let mut recovery_request = None;
         let mut select_request = None;
+        let mut command_request = None;
         let mut page_request = None;
         let history_status = renderer.history_status();
         let residency = renderer.residency();
@@ -3443,6 +3500,7 @@ impl OpenPaint {
                 confirm_request = out.confirm;
                 recovery_request = out.recovery;
                 select_request = out.select;
+                command_request = out.command;
                 self.wand = out.wand;
                 text_request = out.text;
                 text_changed = out.text_changed;
@@ -3497,6 +3555,10 @@ impl OpenPaint {
         if let Some(choice) = confirm_request {
             self.answer_confirm(choice);
         }
+        if let Some(command) = command_request {
+            self.run_command(command);
+        }
+
         if let Some(action) = select_request {
             self.apply_select_action(action);
         }
@@ -3887,6 +3949,45 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// **Every dialog-opening command opens its own dialog.**
+    ///
+    /// Wiring Save As to Save is a one-character mistake that reads correctly and silently
+    /// overwrites somebody's file, so the mapping is checked rather than trusted.
+    #[test]
+    fn each_file_command_opens_its_own_dialog() {
+        use ui::Command;
+        assert_eq!(dialog_for(Command::Save), Some(Dialog::Save));
+        assert_eq!(dialog_for(Command::SaveAs), Some(Dialog::SaveAs));
+        assert_eq!(
+            dialog_for(Command::New),
+            Some(Dialog::New { confirmed: false })
+        );
+        assert_eq!(
+            dialog_for(Command::Open),
+            Some(Dialog::Open { confirmed: false })
+        );
+        // New and Open ask about unsaved work first; arriving already confirmed would skip that.
+        for c in [Command::New, Command::Open] {
+            assert!(
+                matches!(
+                    dialog_for(c),
+                    Some(Dialog::New { confirmed: false } | Dialog::Open { confirmed: false })
+                ),
+                "{c:?} must not arrive pre-confirmed"
+            );
+        }
+        // And the commands that are not dialogs do not open one.
+        for c in [
+            Command::ExportPng,
+            Command::Undo,
+            Command::Redo,
+            Command::ZoomFit,
+            Command::ZoomActual,
+        ] {
+            assert_eq!(dialog_for(c), None, "{c:?} should not open a dialog");
+        }
+    }
     use super::*;
 
     /// Hovering must not turn into an unbounded repaint loop.

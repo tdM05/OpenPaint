@@ -98,6 +98,25 @@ pub enum PageAction {
     Move { from: usize, to: usize },
 }
 
+/// Something a menu asked the application to do.
+///
+/// Reported rather than performed, like every other panel action: these open dialogs, touch GPU
+/// tiles and walk the undo stack, none of which the closure drawing the frame can reach. Every one
+/// of them is something a keyboard shortcut already did --- the menu is a second way in, not a
+/// second implementation, which is why they all land on the same handlers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    New,
+    Open,
+    Save,
+    SaveAs,
+    ExportPng,
+    Undo,
+    Redo,
+    ZoomFit,
+    ZoomActual,
+}
+
 /// A change the layer panel wants made to the stack.
 ///
 /// Returned rather than applied, like every other panel action: layer operations touch GPU
@@ -641,6 +660,72 @@ struct PanelState<'a> {
     select_tool: Option<SelectTool>,
 }
 
+/// The menus, and what each one is called.
+///
+/// The names live here and the commands live in [`menu_items`], because a menu's contents depend
+/// on the document -- Delete is not offered when there is one layer left -- and a table cannot
+/// know that.
+const MENUS: &[(&str, ())] = &[
+    ("File", ()),
+    ("Edit", ()),
+    ("Layer", ()),
+    ("Select", ()),
+    ("View", ()),
+];
+
+/// What one menu offers, given the document it is offering it for.
+///
+/// **Commands that cannot be carried out are not offered.** Deleting the last layer would leave
+/// nothing to paint on, and a menu entry that refuses when pressed teaches you not to trust the
+/// menu (DECISIONS 6b).
+fn menu_items(which: u32, active_layer: usize, layers: usize) -> Vec<(String, Picked)> {
+    let named = |name: &str, what: Picked| (name.to_owned(), what);
+    match which {
+        0 => vec![
+            named("New", Picked::Command(Command::New)),
+            named("Open", Picked::Command(Command::Open)),
+            named("Save", Picked::Command(Command::Save)),
+            named("Save As", Picked::Command(Command::SaveAs)),
+            named("Export PNG", Picked::Command(Command::ExportPng)),
+        ],
+        1 => vec![
+            named("Undo", Picked::Command(Command::Undo)),
+            named("Redo", Picked::Command(Command::Redo)),
+            named("Fill selection", Picked::Selection(SelectAction::Fill)),
+        ],
+        2 => {
+            let mut items = vec![
+                named("Add", Picked::Layer(LayerAction::Add)),
+                named(
+                    "Duplicate",
+                    Picked::Layer(LayerAction::Duplicate(active_layer)),
+                ),
+                named(
+                    "Merge down",
+                    Picked::Layer(LayerAction::MergeDown(active_layer)),
+                ),
+            ];
+            if layers > 1 {
+                items.push(named(
+                    "Delete",
+                    Picked::Layer(LayerAction::Delete(active_layer)),
+                ));
+            }
+            items
+        }
+        3 => vec![
+            named("All", Picked::Selection(SelectAction::All)),
+            named("Deselect", Picked::Selection(SelectAction::None)),
+            named("Invert", Picked::Selection(SelectAction::Invert)),
+            named("Clear", Picked::Selection(SelectAction::Clear)),
+        ],
+        _ => vec![
+            named("Fit", Picked::Command(Command::ZoomFit)),
+            named("Actual size", Picked::Command(Command::ZoomActual)),
+        ],
+    }
+}
+
 /// Everything a described panel needs in order to be drawn.
 ///
 /// A struct for the same reason `PanelState` is one: the argument list grew past the lint, and
@@ -650,6 +735,11 @@ struct Painting<'a> {
     theme: &'a crate::theme::Theme,
     direction: crate::panel_ui::Direction,
     input: &'a mut crate::panel_draw::PanelInput,
+    /// Which menu is drilled into, if any.
+    ///
+    /// Only the menu panel uses it, but it lives here for the same reason the rest does: it is
+    /// state a panel is part-way through, and it has to survive between frames.
+    menu: &'a mut Option<u32>,
 }
 
 impl Painting<'_> {
@@ -683,41 +773,74 @@ fn workspace_panel(
 
     match panel {
         ws::MENU => {
-            // **A row or a column, never a half-broken row.** The menu is a panel like any other
-            // and can be dragged somewhere narrow; wrapping it onto a second line leaves a ragged
-            // edge and a last line with one item on it, which no arrangement makes look
-            // deliberate. Turning the whole strip on its side does. That is `Direction::Auto`, and it
-            // is a setting on the panel rather than a rule about menus.
+            // **A menu drills in rather than dropping down.** Pressing File replaces the strip
+            // with File's commands and a way back, so there is no floating layer to place, nothing
+            // to close by pressing elsewhere, and no difference between how it behaves under a pen
+            // and under a finger. A drop-down would have needed all three, and touch would have
+            // been the one that suffered.
+            //
+            // It also means the menu obeys its own direction setting like everything else: a
+            // vertical menu drills in vertically, and nothing here knows which way it is running.
             use crate::panel_ui::{Change, Control};
-            const PANELS_LIST: u32 = 1 << 20;
+            const BACK: u32 = 1 << 20;
+            const PANELS_LIST: u32 = BACK + 1;
+            const FIRST_ITEM: u32 = 1 << 21;
 
-            let mut controls = vec![Control::Label {
-                text: "OpenPaint".to_owned(),
-            }];
-            // The menus themselves do not exist yet, so they are named rather than offered.
-            // A button that does nothing when pressed is worse than a label that never claimed
-            // it would (DECISIONS 6b).
-            for item in ["File", "Edit", "Layer", "Select", "View"] {
-                controls.push(Control::Label {
-                    text: item.to_owned(),
-                });
-            }
-            controls.push(Control::Separator);
-            controls.push(Control::Button {
-                id: PANELS_LIST,
-                text: "Panels".to_owned(),
-            });
-
-            for change in paint.show(ui, &controls) {
-                picked = match change {
-                    // The list itself belongs to the workspace, not here: this is a second way to
-                    // reach it, because a right-click is not discoverable on its own.
-                    Change::Pressed(PANELS_LIST) => Some(Picked::PanelList),
-                    other => {
-                        eprintln!("menu panel: unexpected {other:?}");
-                        None
+            let mut controls = Vec::new();
+            match *paint.menu {
+                None => {
+                    controls.push(Control::Label {
+                        text: "OpenPaint".to_owned(),
+                    });
+                    for (i, (name, _)) in MENUS.iter().enumerate() {
+                        controls.push(Control::Button {
+                            id: u32::try_from(i).unwrap_or(u32::MAX),
+                            text: (*name).to_owned(),
+                        });
                     }
-                };
+                    controls.push(Control::Separator);
+                    controls.push(Control::Button {
+                        id: PANELS_LIST,
+                        text: "Panels".to_owned(),
+                    });
+                }
+                Some(which) => {
+                    controls.push(Control::Button {
+                        id: BACK,
+                        // Not a bare arrow: the way back should say where it goes.
+                        text: format!("\u{2190} {}", MENUS[which as usize].0),
+                    });
+                    for (i, item) in menu_items(which, active_layer, layers.len())
+                        .iter()
+                        .enumerate()
+                    {
+                        controls.push(Control::Button {
+                            id: FIRST_ITEM + u32::try_from(i).unwrap_or(0),
+                            text: item.0.clone(),
+                        });
+                    }
+                }
+            }
+
+            let opened = *paint.menu;
+            for change in paint.show(ui, &controls) {
+                match change {
+                    Change::Pressed(PANELS_LIST) => picked = Some(Picked::PanelList),
+                    Change::Pressed(BACK) => *paint.menu = None,
+                    Change::Pressed(id) if id >= FIRST_ITEM => {
+                        if let Some(which) = opened {
+                            let items = menu_items(which, active_layer, layers.len());
+                            picked = items
+                                .get((id - FIRST_ITEM) as usize)
+                                .map(|(_, what)| what.clone());
+                            // Back to the top once a command has been given: a menu left open over
+                            // the canvas is a menu in the way.
+                            *paint.menu = None;
+                        }
+                    }
+                    Change::Pressed(which) => *paint.menu = Some(which),
+                    other => eprintln!("menu panel: unexpected {other:?}"),
+                }
             }
         }
         ws::TOOLS => {
@@ -754,7 +877,10 @@ fn workspace_panel(
                         // selection tool is what the pen is currently doing.
                         Picked::Paint(t) => select_tool.is_none() && tool == *t,
                         Picked::Select(t) => select_tool == Some(*t),
-                        Picked::Layer(_) | Picked::PanelList => false,
+                        Picked::Layer(_)
+                        | Picked::PanelList
+                        | Picked::Selection(_)
+                        | Picked::Command(_) => false,
                     },
                 })
                 .collect();
@@ -964,6 +1090,10 @@ enum Picked {
     PanelList,
     /// A layer command, from the described Layers panel.
     Layer(LayerAction),
+    /// A selection command, from a menu.
+    Selection(SelectAction),
+    /// Something the application has to do: open a dialog, walk history, fit the view.
+    Command(Command),
 }
 
 /// Draw a box with its eight handles.
@@ -1049,6 +1179,8 @@ pub struct Outcome {
     pub transform: Option<TransformAction>,
     /// The transform in flight, as the panel now holds it.
     pub transform_state: Option<TransformState>,
+    /// A menu command, at most one per frame.
+    pub command: Option<Command>,
 }
 
 pub struct Ui {
@@ -1082,6 +1214,8 @@ pub struct Ui {
     /// nothing to say about the other. Keyed by panel id rather than by position, so rearranging
     /// the workspace does not shuffle the offsets between panels.
     panel_input: std::collections::HashMap<u32, crate::panel_draw::PanelInput>,
+    /// Which menu the menu strip is drilled into, if any.
+    menu_open: Option<u32>,
 }
 
 impl Ui {
@@ -1112,6 +1246,7 @@ impl Ui {
             extend_amount: DEFAULT_EXTEND,
             preset_name: String::new(),
             panel_input: std::collections::HashMap::new(),
+            menu_open: None,
         }
     }
 
@@ -1191,6 +1326,7 @@ impl Ui {
         let mut confirm_choice = None;
         let mut recovery_choice = None;
         let mut select_action = None;
+        let mut command: Option<Command> = None;
         let mut wand = status.wand;
 
         let mut panel_rect = egui::Rect::NOTHING;
@@ -1199,6 +1335,7 @@ impl Ui {
         // Taken for the duration of the frame because `self.ctx.run` has `self` borrowed, and put
         // back the moment it does not.
         let mut panel_input = std::mem::take(&mut self.panel_input);
+        let mut menu_open = self.menu_open;
         let output = self.ctx.run(input, |ctx| {
             // The panel workspace, when it is switched on. Drawn *instead of* the side panel
             // rather than beside it: they are two answers to the same question, and showing both
@@ -1228,6 +1365,7 @@ impl Ui {
                                 theme: &theme,
                                 direction,
                                 input: panel_input.entry(panel.0).or_default(),
+                                menu: &mut menu_open,
                             },
                         )
                     {
@@ -1247,6 +1385,8 @@ impl Ui {
                             // toggle is remembered and done the moment that borrow ends.
                             Picked::PanelList => show_panel_list = true,
                             Picked::Layer(a) => layer_action = Some(a),
+                            Picked::Selection(a) => select_action = Some(a),
+                            Picked::Command(c) => command = Some(c),
                         }
                     }
                 });
@@ -2441,6 +2581,7 @@ impl Ui {
         // made it span half the screen and shoved the canvas sideways. The inset means "how much
         // of the left edge the panel covers", and only the panel can answer that.
         self.panel_input = panel_input;
+        self.menu_open = menu_open;
         let scale = self.ctx.pixels_per_point();
         let used = panel_rect;
         self.occupied = egui::Rect::from_min_max(
@@ -2528,6 +2669,61 @@ impl Ui {
             preset_name,
             transform: transform_action,
             transform_state,
+            command,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A menu never offers something it would refuse.** Deleting the last layer would leave
+    /// nothing to paint on, and an entry that refuses when pressed teaches you not to trust the
+    /// menu at all.
+    #[test]
+    fn the_layer_menu_hides_delete_when_there_is_one_layer_left() {
+        let names = |items: &[(String, Picked)]| -> Vec<String> {
+            items.iter().map(|(n, _)| n.clone()).collect()
+        };
+        assert!(!names(&menu_items(2, 0, 1)).contains(&"Delete".to_owned()));
+        assert!(names(&menu_items(2, 0, 2)).contains(&"Delete".to_owned()));
+    }
+
+    /// Every menu offers something, and every entry is named.
+    ///
+    /// A menu that drilled into an empty strip would be a dead end with only the way back in it,
+    /// and there would be no telling that from a menu that failed to load.
+    #[test]
+    fn every_menu_offers_something_you_can_press() {
+        for (which, (name, ())) in MENUS.iter().enumerate() {
+            let items = menu_items(u32::try_from(which).expect("small"), 0, 4);
+            assert!(!items.is_empty(), "the {name} menu is empty");
+            for (label, _) in &items {
+                assert!(!label.is_empty(), "an unnamed entry in the {name} menu");
+            }
+        }
+    }
+
+    /// A menu's entries act on the layer that is actually active.
+    ///
+    /// The index is baked in when the entry is built, so building it against the wrong one would
+    /// send Duplicate at whichever layer happened to be first.
+    #[test]
+    fn layer_menu_entries_act_on_the_active_layer() {
+        let items = menu_items(2, 3, 5);
+        assert!(
+            items
+                .iter()
+                .any(|(n, what)| n == "Duplicate"
+                    && *what == Picked::Layer(LayerAction::Duplicate(3))),
+            "Duplicate does not name the active layer"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|(n, what)| n == "Delete" && *what == Picked::Layer(LayerAction::Delete(3))),
+            "Delete does not name the active layer"
+        );
     }
 }
