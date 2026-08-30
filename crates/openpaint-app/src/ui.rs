@@ -28,6 +28,8 @@
 //! it.
 
 use crate::editor::Tool;
+use crate::panel_ui::Direction;
+use crate::workspace::{Anchor, Place};
 use egui::ViewportId;
 use openpaint_core::{Blend, Brush, Curve, Layer, Response, Source};
 use winit::window::Window;
@@ -673,6 +675,26 @@ const MENUS: &[(&str, ())] = &[
     ("View", ()),
 ];
 
+/// How big a menu's drop-down needs to be.
+///
+/// Measured from the items it is about to show, because the workspace places the popup before the
+/// panel draws into it: a guess would either clip the longest command or leave a margin of nothing
+/// beside the shortest.
+fn menu_size(which: u32, active_layer: usize, layers: usize, paint: &Painting<'_>) -> (f32, f32) {
+    let m = &paint.theme.metrics;
+    let controls: Vec<crate::panel_ui::Control> = menu_items(which, active_layer, layers)
+        .into_iter()
+        .map(|(name, _)| crate::panel_ui::Control::Button { id: 0, text: name })
+        .collect();
+    let text_of =
+        |c: &crate::panel_ui::Control| crate::panel_draw::text_width(paint.ctx, m.body, c);
+    let widest = controls.iter().map(&text_of).fold(0.0_f32, f32::max);
+    let origin = crate::layout::Rect::new(0.0, 0.0, widest + m.padding * 2.0, 4000.0);
+    let laid = crate::panel_ui::place(&controls, origin, m, Direction::Column, text_of);
+    let tall = crate::panel_ui::extent(&laid, origin).1;
+    (widest + m.padding * 4.0, tall + m.padding * 2.0)
+}
+
 /// What one menu offers, given the document it is offering it for.
 ///
 /// **Commands that cannot be carried out are not offered.** Deleting the last layer would leave
@@ -740,6 +762,8 @@ struct Painting<'a> {
     /// Only the menu panel uses it, but it lives here for the same reason the rest does: it is
     /// state a panel is part-way through, and it has to survive between frames.
     menu: &'a mut Option<u32>,
+    /// For measuring text, which only something holding the fonts can do.
+    ctx: &'a egui::Context,
 }
 
 impl Painting<'_> {
@@ -760,6 +784,7 @@ fn workspace_panel(
     color_srgb: &mut [u8; 3],
     state: &PanelState<'_>,
     paint: &mut Painting<'_>,
+    place: Place,
 ) -> Option<Picked> {
     let PanelState {
         layers,
@@ -773,29 +798,31 @@ fn workspace_panel(
 
     match panel {
         ws::MENU => {
-            // **A menu drills in rather than dropping down.** Pressing File replaces the strip
-            // with File's commands and a way back, so there is no floating layer to place, nothing
-            // to close by pressing elsewhere, and no difference between how it behaves under a pen
-            // and under a finger. A drop-down would have needed all three, and touch would have
-            // been the one that suffered.
+            // **A menu drops down under its own button.** It replaced the strip's contents at
+            // first, which was a mistake: the menu bar is a landmark, and replacing it makes you
+            // lose your place. Touch-friendliness comes from the size of the targets and from
+            // being able to dismiss it by pressing anywhere else, not from refusing to float
+            // anything -- the menus on a phone are overlays too.
             //
-            // It also means the menu obeys its own direction setting like everything else: a
-            // vertical menu drills in vertically, and nothing here knows which way it is running.
+            // The floating part is the workspace's popup, the same object the panel list and the
+            // panel settings use. What is in it is this panel's business; where it goes, what
+            // closes it and what a press inside it means are the workspace's.
             use crate::panel_ui::{Change, Control};
-            const BACK: u32 = 1 << 20;
-            const PANELS_LIST: u32 = BACK + 1;
+            const PANELS_LIST: u32 = 1 << 20;
             const FIRST_ITEM: u32 = 1 << 21;
 
-            let mut controls = Vec::new();
-            match *paint.menu {
-                None => {
-                    controls.push(Control::Label {
+            match place {
+                Place::Panel => {
+                    let mut controls = vec![Control::Label {
                         text: "OpenPaint".to_owned(),
-                    });
+                    }];
                     for (i, (name, _)) in MENUS.iter().enumerate() {
-                        controls.push(Control::Button {
+                        controls.push(Control::Choice {
                             id: u32::try_from(i).unwrap_or(u32::MAX),
                             text: (*name).to_owned(),
+                            // Lit while its menu is down, so there is never any doubt which list
+                            // you are looking at.
+                            selected: *paint.menu == Some(u32::try_from(i).unwrap_or(u32::MAX)),
                         });
                     }
                     controls.push(Control::Separator);
@@ -803,43 +830,65 @@ fn workspace_panel(
                         id: PANELS_LIST,
                         text: "Panels".to_owned(),
                     });
-                }
-                Some(which) => {
-                    controls.push(Control::Button {
-                        id: BACK,
-                        // Not a bare arrow: the way back should say where it goes.
-                        text: format!("\u{2190} {}", MENUS[which as usize].0),
-                    });
-                    for (i, item) in menu_items(which, active_layer, layers.len())
-                        .iter()
-                        .enumerate()
-                    {
-                        controls.push(Control::Button {
-                            id: FIRST_ITEM + u32::try_from(i).unwrap_or(0),
-                            text: item.0.clone(),
-                        });
-                    }
-                }
-            }
 
-            let opened = *paint.menu;
-            for change in paint.show(ui, &controls) {
-                match change {
-                    Change::Pressed(PANELS_LIST) => picked = Some(Picked::PanelList),
-                    Change::Pressed(BACK) => *paint.menu = None,
-                    Change::Pressed(id) if id >= FIRST_ITEM => {
-                        if let Some(which) = opened {
-                            let items = menu_items(which, active_layer, layers.len());
-                            picked = items
-                                .get((id - FIRST_ITEM) as usize)
-                                .map(|(_, what)| what.clone());
-                            // Back to the top once a command has been given: a menu left open over
-                            // the canvas is a menu in the way.
-                            *paint.menu = None;
+                    let direction = paint.direction;
+                    for change in paint.show(ui, &controls) {
+                        match change {
+                            Change::Pressed(PANELS_LIST) => picked = Some(Picked::PanelList),
+                            Change::Chose(which) if *paint.menu == Some(which) => {
+                                // Pressing the open menu's own button puts it away, which is what
+                                // every menu bar does and the only way to close one without
+                                // choosing something from it.
+                                *paint.menu = None;
+                                picked = Some(Picked::CloseMenu);
+                            }
+                            Change::Chose(which) => {
+                                *paint.menu = Some(which);
+                                if let Some(at) = paint.input.pressed_rect {
+                                    let size = menu_size(which, active_layer, layers.len(), paint);
+                                    picked = Some(Picked::OpenMenu {
+                                        at,
+                                        size,
+                                        // A menu bar running down the side drops its items out to
+                                        // the side; one running across drops them below. The panel
+                                        // does not decide which way it runs, so it asks.
+                                        side: if direction == Direction::Column {
+                                            Anchor::Right
+                                        } else {
+                                            Anchor::Below
+                                        },
+                                    });
+                                }
+                            }
+                            other => eprintln!("menu panel: unexpected {other:?}"),
                         }
                     }
-                    Change::Pressed(which) => *paint.menu = Some(which),
-                    other => eprintln!("menu panel: unexpected {other:?}"),
+                }
+                Place::Popup => {
+                    let Some(which) = *paint.menu else {
+                        return picked;
+                    };
+                    let items = menu_items(which, active_layer, layers.len());
+                    let controls: Vec<Control> = items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| Control::Button {
+                            id: FIRST_ITEM + u32::try_from(i).unwrap_or(0),
+                            text: item.0.clone(),
+                        })
+                        .collect();
+                    for change in paint.show(ui, &controls) {
+                        match change {
+                            Change::Pressed(id) if id >= FIRST_ITEM => {
+                                picked = items
+                                    .get((id - FIRST_ITEM) as usize)
+                                    .map(|(_, what)| what.clone());
+                                // A menu left open over the canvas is a menu in the way.
+                                *paint.menu = None;
+                            }
+                            other => eprintln!("menu popup: unexpected {other:?}"),
+                        }
+                    }
                 }
             }
         }
@@ -880,7 +929,9 @@ fn workspace_panel(
                         Picked::Layer(_)
                         | Picked::PanelList
                         | Picked::Selection(_)
-                        | Picked::Command(_) => false,
+                        | Picked::Command(_)
+                        | Picked::OpenMenu { .. }
+                        | Picked::CloseMenu => false,
                     },
                 })
                 .collect();
@@ -1088,6 +1139,14 @@ enum Picked {
     Select(SelectTool),
     /// Open the workspace's panel list.
     PanelList,
+    /// Drop a menu down under the button that asked for it.
+    OpenMenu {
+        at: crate::layout::Rect,
+        size: (f32, f32),
+        side: Anchor,
+    },
+    /// Put the open menu away.
+    CloseMenu,
     /// A layer command, from the described Layers panel.
     Layer(LayerAction),
     /// A selection command, from a menu.
@@ -1355,10 +1414,12 @@ impl Ui {
                     select_tool: status.select_tool,
                 };
                 let mut show_panel_list = false;
+                let mut menu_request: Option<(crate::layout::Rect, (f32, f32), Anchor)> = None;
+                let mut close_menu = false;
                 // Copied out because `ws` is borrowed for the whole of `show`, and the panel that
                 // wants the theme runs inside it.
                 let theme = ws.theme;
-                ws.show(ctx, area, |panel, ui, direction| {
+                ws.show(ctx, area, |panel, ui, direction, place| {
                     if let Some(picked) =
                         workspace_panel(panel, ui, brush, &mut color_srgb, &state,
                             &mut Painting {
@@ -1366,7 +1427,9 @@ impl Ui {
                                 direction,
                                 input: panel_input.entry(panel.0).or_default(),
                                 menu: &mut menu_open,
+                                ctx,
                             },
+                            place,
                         )
                     {
                         match picked {
@@ -1387,11 +1450,29 @@ impl Ui {
                             Picked::Layer(a) => layer_action = Some(a),
                             Picked::Selection(a) => select_action = Some(a),
                             Picked::Command(c) => command = Some(c),
+                            // Deferred like the panel list, and for the same reason: `ws` is
+                            // borrowed for the whole of `show`, and this is asked for from inside
+                            // it.
+                            Picked::OpenMenu { at, size, side } => {
+                                menu_request = Some((at, size, side));
+                            }
+                            Picked::CloseMenu => close_menu = true,
                         }
                     }
                 });
                 if show_panel_list {
                     ws.open_panel_list();
+                }
+                if close_menu {
+                    ws.close_popup();
+                }
+                if let Some((at, size, side)) = menu_request {
+                    ws.open_popup_for(crate::workspace::MENU, at, size, side, area);
+                }
+                // A menu whose popup has been dismissed some other way -- a press elsewhere,
+                // Escape -- must not leave its button lit claiming to be open.
+                if menu_open.is_some() && !ws.popup_is_for(crate::workspace::MENU) && menu_request.is_none() {
+                    menu_open = None;
                 }
                 let scale = ctx.pixels_per_point();
                 let canvas = ws.canvas_rect().unwrap_or(crate::layout::Rect::new(

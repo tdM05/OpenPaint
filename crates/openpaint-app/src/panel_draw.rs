@@ -32,6 +32,12 @@ pub struct PanelInput {
     pub latch: Option<ControlId>,
     /// How far down a list taller than its panel has been scrolled.
     pub scroll: f32,
+    /// Where the control that was last pressed sits.
+    ///
+    /// For anchoring something to the control that opened it -- a menu belongs under its own
+    /// button, not wherever the pointer happened to be. Reported rather than guessed, because the
+    /// panel that wants it has no idea where its controls were laid out.
+    pub pressed_rect: Option<Rect>,
 }
 
 type Latch = Option<ControlId>;
@@ -125,6 +131,7 @@ pub fn show(
         if let Some(p) = pointer {
             if let Some((control, rect)) = hit(&placed, p.x, p.y) {
                 if !matches!(control, Control::Slider { .. }) {
+                    input.pressed_rect = Some(rect);
                     changes.extend(change_at(control, rect, m, p.x, p.y));
                 }
             }

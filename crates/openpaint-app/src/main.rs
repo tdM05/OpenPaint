@@ -51,6 +51,8 @@ mod panel_ui;
 mod perf;
 mod presets;
 mod renderer;
+#[cfg(test)]
+mod screenshot;
 mod stroke_exec;
 mod stroke_layer;
 #[cfg(test)]

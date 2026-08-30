@@ -212,6 +212,74 @@ pub enum PopupKind {
     Panels,
     /// One panel's own settings.
     Settings(PanelId),
+    /// A panel drawing something of its own: a menu's items, say.
+    ///
+    /// The workspace owns where it is, what closes it and what a press inside it means; the panel
+    /// owns what is in it. Building a second floating list for menus would have meant two answers
+    /// to all three.
+    Panel(PanelId),
+}
+
+/// Where a panel is being drawn.
+///
+/// A panel draws itself into its slot in the workspace, and sometimes into a popup instead -- a
+/// menu's items, a section's overflow. Passed rather than inferred so the panel can lay itself out
+/// differently in each without the workspace knowing anything about menus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// The panel's own slot in the arrangement.
+    Panel,
+    /// A popup floating above everything.
+    Popup,
+}
+
+/// Which way a popup opens from the control it belongs to.
+///
+/// **Not `Side`**: `openpaint_core::Side` already means an edge of the canvas, and this file has
+/// been bitten once already by giving a second meaning to a word the domain had spoken for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Anchor {
+    /// Under the control, for a menu bar running across.
+    Below,
+    /// Beside it, for a menu bar running down.
+    Right,
+}
+
+/// Where a popup goes when it belongs to a particular control.
+///
+/// **It flips rather than sliding.** Clamping a menu to the bottom of the window would slide it up
+/// over the button that opened it, hiding the one thing that tells you which menu you are looking
+/// at; opening upwards instead keeps the button visible and is what every menu bar does near the
+/// foot of a screen. Sliding is only the last resort, for a popup taller than the window itself.
+#[must_use]
+fn anchored_rect(anchor: Rect, size: (f32, f32), side: Anchor, screen: Rect) -> Rect {
+    let (w, h) = (size.0.min(screen.w), size.1.min(screen.h));
+    let (x, y) = match side {
+        Anchor::Below => {
+            let below = anchor.y + anchor.h;
+            let y = if below + h <= screen.y + screen.h || anchor.y - h < screen.y {
+                below
+            } else {
+                anchor.y - h
+            };
+            (anchor.x, y)
+        }
+        Anchor::Right => {
+            let right = anchor.x + anchor.w;
+            let x = if right + w <= screen.x + screen.w || anchor.x - w < screen.x {
+                right
+            } else {
+                anchor.x - w
+            };
+            (x, anchor.y)
+        }
+    };
+    Rect::new(
+        x.min(screen.x + screen.w - w).max(screen.x),
+        y.min(screen.y + screen.h - h).max(screen.y),
+        w,
+        h,
+    )
 }
 
 /// An open popup and where it is.
@@ -532,7 +600,7 @@ impl Workspace {
         &mut self,
         ctx: &egui::Context,
         screen: Rect,
-        mut contents: impl FnMut(PanelId, &mut egui::Ui, Direction),
+        mut contents: impl FnMut(PanelId, &mut egui::Ui, Direction, Place),
     ) {
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Background,
@@ -749,7 +817,7 @@ impl Workspace {
             ui.set_clip_rect(content);
             // The direction is worked out here and handed over, because the panel that wants it
             // runs inside a borrow of the workspace that holds the setting.
-            contents(showing, &mut ui, self.direction_of(showing));
+            contents(showing, &mut ui, self.direction_of(showing), Place::Panel);
         }
 
         // --- the wait, drawn on the thing being held ---
@@ -888,7 +956,6 @@ impl Workspace {
 
         // --- the popup, above everything, drawn by the same descriptor layer as any panel ---
         if let Some(popup) = self.popup {
-            let controls = self.popup_controls(popup.kind);
             let theme = self.theme;
             let mut ui = egui::Ui::new(
                 ctx.clone(),
@@ -906,15 +973,25 @@ impl Workspace {
                 m.radius,
                 egui::Stroke::new(1.0_f32, rgb(p.edge)),
             );
-            let changes = crate::panel_draw::show(
-                &mut ui,
-                &controls,
-                &theme,
-                Direction::Column,
-                &mut self.popup_input,
-            );
-            for change in changes {
-                self.apply_popup(popup.kind, change);
+            match popup.kind {
+                // The panel draws its own popup. Nothing here knows what is in it, which is what
+                // keeps menus out of the workspace and the workspace out of menus.
+                PopupKind::Panel(panel) => {
+                    contents(panel, &mut ui, Direction::Column, Place::Popup);
+                }
+                kind => {
+                    let controls = self.popup_controls(kind);
+                    let changes = crate::panel_draw::show(
+                        &mut ui,
+                        &controls,
+                        &theme,
+                        Direction::Column,
+                        &mut self.popup_input,
+                    );
+                    for change in changes {
+                        self.apply_popup(kind, change);
+                    }
+                }
             }
         }
     }
@@ -924,6 +1001,8 @@ impl Workspace {
     fn popup_controls(&self, kind: PopupKind) -> Vec<crate::panel_ui::Control> {
         use crate::panel_ui::Control;
         match kind {
+            // A panel's own popup is drawn by the panel; this is never asked about one.
+            PopupKind::Panel(_) => Vec::new(),
             PopupKind::Panels => panel_list_controls(self),
             PopupKind::Settings(panel) => {
                 let mut controls = vec![Control::Label {
@@ -972,6 +1051,36 @@ impl Workspace {
     pub fn set_direction(&mut self, panel: PanelId, direction: Direction) {
         self.options.entry(panel.0).or_default().direction = Some(direction);
         self.remember();
+    }
+
+    /// Open a panel's own popup, anchored to the control that asked for it.
+    ///
+    /// The panel supplies the size, because it is the one that knows what it is about to draw.
+    pub fn open_popup_for(
+        &mut self,
+        panel: PanelId,
+        at: Rect,
+        size: (f32, f32),
+        side: Anchor,
+        screen: Rect,
+    ) {
+        self.popup = Some(Popup {
+            kind: PopupKind::Panel(panel),
+            rect: anchored_rect(at, size, side, screen),
+        });
+        self.popup_input = crate::panel_draw::PanelInput::default();
+    }
+
+    /// Whether a panel currently owns the open popup.
+    #[must_use]
+    pub fn popup_is_for(&self, panel: PanelId) -> bool {
+        self.popup
+            .is_some_and(|p| p.kind == PopupKind::Panel(panel))
+    }
+
+    /// Put any popup away.
+    pub fn close_popup(&mut self) {
+        self.popup = None;
     }
 
     /// Ask for the panel list without saying where.
@@ -1441,6 +1550,77 @@ mod tests {
             .filter_map(|(n, o)| id_for(n).map(|id| (id.0, *o)))
             .collect();
         assert!(options.is_empty());
+    }
+
+    /// **A drop-down opens under its button, and flips rather than sliding.**
+    ///
+    /// Clamping it to the bottom of the window would slide it up over the button that opened it,
+    /// hiding the one thing that says which menu you are looking at. Every menu bar in existence
+    /// opens upwards near the foot of a screen instead.
+    #[test]
+    fn a_menu_opens_under_its_button_and_flips_when_there_is_no_room() {
+        let screen = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        let size = (160.0, 200.0);
+
+        // Room below: directly under it, left edges lined up.
+        let button = Rect::new(120.0, 30.0, 60.0, 24.0);
+        let under = anchored_rect(button, size, Anchor::Below, screen);
+        assert!(
+            (under.y - (button.y + button.h)).abs() < 0.001,
+            "not under the button"
+        );
+        assert!((under.x - button.x).abs() < 0.001, "not lined up with it");
+
+        // No room below: above, and the button stays visible.
+        let low = Rect::new(120.0, 700.0, 60.0, 24.0);
+        let over = anchored_rect(low, size, Anchor::Below, screen);
+        assert!(
+            over.y + over.h <= low.y + 0.001,
+            "it should have opened upwards, not slid over the button"
+        );
+        assert!(over.y >= screen.y - 0.001);
+
+        // A menu bar running down the side opens out to the side instead.
+        let side = Rect::new(10.0, 200.0, 90.0, 24.0);
+        let beside = anchored_rect(side, size, Anchor::Right, screen);
+        assert!((beside.x - (side.x + side.w)).abs() < 0.001);
+        assert!((beside.y - side.y).abs() < 0.001);
+
+        // And against the right edge it opens leftwards.
+        let far = Rect::new(940.0, 200.0, 50.0, 24.0);
+        let left = anchored_rect(far, size, Anchor::Right, screen);
+        assert!(
+            left.x + left.w <= far.x + 0.001,
+            "it should have opened leftwards"
+        );
+    }
+
+    /// A popup always ends up on screen, whatever it is anchored to.
+    ///
+    /// Including one bigger than the window: sliding is the last resort, but it is still better
+    /// than a list whose first entry is off the top.
+    #[test]
+    fn a_popup_is_always_somewhere_you_can_reach() {
+        let screen = Rect::new(0.0, 0.0, 400.0, 300.0);
+        for anchor in [Anchor::Below, Anchor::Right] {
+            for at in [
+                Rect::new(-50.0, -50.0, 20.0, 20.0),
+                Rect::new(390.0, 290.0, 20.0, 20.0),
+                Rect::new(200.0, 150.0, 20.0, 20.0),
+            ] {
+                for size in [(100.0, 80.0), (1000.0, 900.0)] {
+                    let r = anchored_rect(at, size, anchor, screen);
+                    assert!(
+                        r.x >= screen.x - 0.001
+                            && r.y >= screen.y - 0.001
+                            && r.x + r.w <= screen.x + screen.w + 0.001
+                            && r.y + r.h <= screen.y + screen.h + 0.001,
+                        "{anchor:?} at {at:?} size {size:?} landed off screen: {r:?}"
+                    );
+                    assert!(r.w > 0.0 && r.h > 0.0, "and it must have some size");
+                }
+            }
+        }
     }
 
     /// **A setting overrides its panel's default, and only for that panel.**
