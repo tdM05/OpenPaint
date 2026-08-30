@@ -81,11 +81,112 @@ impl Controls {
     }
 }
 
-/// How much of a header is kept for the panel strip, whatever the tabs want.
+/// Which edges of a rectangle a point takes hold of.
 ///
-/// Wide enough to press with a pen, since it is a target like any other: the 4 mm floor the rest
-/// of the chrome is held to. See `theme::every_grab_surface_is_big_enough_for_a_pen`.
+/// One number per axis rather than a list of eight named edges and corners: `-1` is the near side,
+/// `1` the far side, `0` neither. A corner is simply both at once, so there is no corner case to
+/// write, nothing to keep in step with a table of names, and the resize that follows is the same
+/// two lines of arithmetic whichever of the eight the artist grabbed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pull {
+    pub x: i8,
+    pub y: i8,
+}
+
+/// Which edges of `rect` a point takes hold of, or `None` if it is not near the boundary.
+///
+/// **The band straddles the boundary, exactly as a divider's does.** Half of `grab` lies outside
+/// and half inside, for the same reason and at the same width: the line you see is a hairline and
+/// the thing you aim at has to be a target. That is why a window's touchable extent reaches a
+/// little past its own rectangle.
+///
+/// **Except that the inside half gives way on a small window.** Two opposite borders 13 units deep
+/// leave nothing between them on a window 28 units tall -- and what is between them is the header,
+/// which is how the window is *moved*. A window that could only be resized would be one that had
+/// eaten its own handle. So the inner reach shrinks to keep `least` units of interior, reaching
+/// zero exactly at the smallest a window is allowed to be, where the border is entirely outside
+/// it. `least` is the same floor the resize itself stops at, asked once.
 #[must_use]
+pub fn edge_at(rect: Rect, grab: f32, least: f32, x: f32, y: f32) -> Option<Pull> {
+    let outer = grab / 2.0;
+    let near = |v: f32, low: f32, size: f32| -> Option<i8> {
+        let high = low + size;
+        let inner = ((size - least) / 2.0).clamp(0.0, outer);
+        if v >= low - outer && v <= low + inner {
+            Some(-1)
+        } else if v >= high - inner && v <= high + outer {
+            Some(1)
+        } else if v > low && v < high {
+            Some(0)
+        } else {
+            // Past the boundary and not within reach of it: not this rectangle at all.
+            None
+        }
+    };
+    let px = near(x, rect.x, rect.w)?;
+    let py = near(y, rect.y, rect.h)?;
+    // The middle of both axes is the inside of the panel, which is nobody's edge.
+    (px != 0 || py != 0).then_some(Pull { x: px, y: py })
+}
+
+/// Move the edges a `Pull` names by `(dx, dy)`, keeping the opposite ones where they are.
+///
+/// `least` is the size below which the rectangle stops shrinking, on both axes -- the same
+/// something-left-to-grab rule a window is already held to when it is moved. The side that stops
+/// is the one being dragged, so the fixed edge never creeps: a window dragged past its floor and
+/// back comes out where it went in.
+#[must_use]
+pub fn pull_edges(rect: Rect, pull: Pull, dx: f32, dy: f32, least: f32) -> Rect {
+    let along = |low: f32, size: f32, side: i8, d: f32| -> (f32, f32) {
+        match side {
+            -1 => {
+                let want = (size - d).max(least);
+                (low + size - want, want)
+            }
+            1 => (low, (size + d).max(least)),
+            _ => (low, size),
+        }
+    };
+    let (x, w) = along(rect.x, rect.w, pull.x, dx);
+    let (y, h) = along(rect.y, rect.h, pull.y, dy);
+    Rect::new(x, y, w, h)
+}
+
+/// The bars to draw for a [`Pull`]: one along each edge it names, `t` thick and centred on the
+/// boundary, exactly as a divider's hint is drawn.
+///
+/// A corner gives two, which is what "both axes at once" looks like and needs no case of its own.
+#[must_use]
+pub fn edge_bands(rect: Rect, pull: Pull, t: f32) -> Vec<Rect> {
+    let half = t / 2.0;
+    let mut out = Vec::new();
+    match pull.x {
+        -1 => out.push(Rect::new(rect.x - half, rect.y, t, rect.h)),
+        1 => out.push(Rect::new(rect.x + rect.w - half, rect.y, t, rect.h)),
+        _ => {}
+    }
+    match pull.y {
+        -1 => out.push(Rect::new(rect.x, rect.y - half, rect.w, t)),
+        1 => out.push(Rect::new(rect.x, rect.y + rect.h - half, rect.w, t)),
+        _ => {}
+    }
+    out
+}
+
+/// How much of a header is reserved for the panel strip.
+///
+/// **Reserved before the tabs are laid out, never after.** This is the one place a press always
+/// means "this panel as a whole" -- its settings, and moving the window it is in -- so it has to
+/// exist at every width and at every number of tabs. Tabs wrap onto another row rather than eat
+/// it; nothing else in the header gets that promise.
+///
+/// It is a header's own height, which `theme::every_grab_surface_is_big_enough_for_a_pen` already
+/// holds to the 4 mm floor: the strip inherits that floor rather than keeping a second number of
+/// its own that could quietly fall below it.
+///
+/// It carries no mark of its own. It used to draw three short rules, and they read as a button --
+/// so pressing beside them, which worked identically, looked like a mistake that happened to work.
+/// The tabs are the buttons; the strip is what is left, and that is what it should look like.
 pub fn strip_width(metrics: &Metrics) -> f32 {
     metrics.header
 }
@@ -715,6 +816,170 @@ mod tests {
     /// **Dividers win over panels**, because a divider's grab width is wider than the gutter and
     /// so overlaps its neighbours. Test the panels first and a divider can only be caught on the
     /// hairline it draws, which is the thing that makes splitters elsewhere feel unhittable.
+    /// **Nine regions, and only the middle one is not an edge.**
+    ///
+    /// Written as a sweep over the whole rectangle rather than eight named probes: a table of
+    /// eight has eight chances to name the wrong side, and it cannot notice a gap between two of
+    /// them or an overlap where they meet.
+    #[test]
+    fn every_edge_and_corner_answers_for_itself() {
+        let m = metrics();
+        let r = Rect::new(100.0, 200.0, 300.0, 260.0);
+        let (grab, least) = (m.splitter_grab, m.header.max(m.row));
+        let half = grab / 2.0;
+
+        // One unit inside each boundary, and the middle: nine probes that between them name every
+        // combination.
+        let xs = [
+            (r.x + 1.0, -1_i8),
+            (r.x + r.w / 2.0, 0),
+            (r.x + r.w - 1.0, 1),
+        ];
+        let ys = [
+            (r.y + 1.0, -1_i8),
+            (r.y + r.h / 2.0, 0),
+            (r.y + r.h - 1.0, 1),
+        ];
+        for (x, px) in xs {
+            for (y, py) in ys {
+                let got = edge_at(r, grab, least, x, y);
+                let want = (px != 0 || py != 0).then_some(Pull { x: px, y: py });
+                assert_eq!(got, want, "at ({x}, {y})");
+            }
+        }
+
+        // Outside the reach on either axis is nobody's edge at all, not a `Pull` of zeroes.
+        for at in [
+            (r.x - half - 1.0, r.y + r.h / 2.0),
+            (r.x + r.w / 2.0, r.y - half - 1.0),
+            (r.x + r.w + half + 1.0, r.y + r.h / 2.0),
+            (r.x + r.w / 2.0, r.y + r.h + half + 1.0),
+        ] {
+            assert_eq!(edge_at(r, grab, least, at.0, at.1), None, "at {at:?}");
+        }
+    }
+
+    /// **The border always leaves `least` units of interior**, because that interior is the handle.
+    ///
+    /// Two borders 13 units deep leave two units between them on a window 28 units tall, and those
+    /// two units are the header -- the bar the window is dragged by. So the inner half gives way,
+    /// reaching nothing at all at the floor.
+    ///
+    /// Stated as the *interior that survives*, not as "the middle is free": on a window a little
+    /// larger than the floor the middle is free either way, and a sabotage removing the clamp
+    /// outright went unnoticed by a test that only probed the centre.
+    #[test]
+    fn the_border_always_leaves_a_handle_behind() {
+        let m = metrics();
+        let (grab, least) = (m.splitter_grab, m.header.max(m.row));
+        for size in [
+            least,
+            least + 1.0,
+            least + 8.0,
+            least + 26.0,
+            least + 40.0,
+            300.0,
+        ] {
+            let r = Rect::new(50.0, 50.0, size, size);
+            // The centred square of side `least`: every point of it must be interior, on both
+            // axes, or the handle has been eaten.
+            let lo = (size - least) / 2.0;
+            for (dx, dy) in [
+                (lo + 0.1, lo + 0.1),
+                (size - lo - 0.1, lo + 0.1),
+                (lo + 0.1, size - lo - 0.1),
+                (size - lo - 0.1, size - lo - 0.1),
+                (size / 2.0, size / 2.0),
+            ] {
+                assert_eq!(
+                    edge_at(r, grab, least, r.x + dx, r.y + dy),
+                    None,
+                    "a {size}-unit window lost its handle at ({dx}, {dy})"
+                );
+            }
+            // And the outside is always reachable, whatever the size.
+            assert!(
+                edge_at(r, grab, least, r.x - 2.0, r.y + size / 2.0).is_some(),
+                "the outer half should not give way"
+            );
+        }
+    }
+
+    /// The edges a pull names move; the others stay exactly where they were.
+    #[test]
+    fn pulling_an_edge_leaves_the_opposite_one_alone() {
+        let r = Rect::new(100.0, 200.0, 300.0, 260.0);
+        let least = 28.0;
+        for (pull, dx, dy) in [
+            (Pull { x: -1, y: 0 }, 40.0, 0.0),
+            (Pull { x: 1, y: 0 }, 40.0, 0.0),
+            (Pull { x: 0, y: -1 }, 0.0, 40.0),
+            (Pull { x: 0, y: 1 }, 0.0, 40.0),
+            (Pull { x: -1, y: -1 }, -30.0, -20.0),
+            (Pull { x: 1, y: 1 }, -30.0, -20.0),
+        ] {
+            let got = pull_edges(r, pull, dx, dy, least);
+            // The far edge is fixed when the near one is pulled, and the near one when the far.
+            let far_x = |q: Rect| q.x + q.w;
+            let far_y = |q: Rect| q.y + q.h;
+            match pull.x {
+                -1 => assert!(
+                    (far_x(got) - far_x(r)).abs() < 0.01,
+                    "{pull:?} moved the right"
+                ),
+                1 => assert!((got.x - r.x).abs() < 0.01, "{pull:?} moved the left"),
+                _ => assert_eq!((got.x, got.w), (r.x, r.w), "{pull:?} touched x at all"),
+            }
+            match pull.y {
+                -1 => assert!(
+                    (far_y(got) - far_y(r)).abs() < 0.01,
+                    "{pull:?} moved the bottom"
+                ),
+                1 => assert!((got.y - r.y).abs() < 0.01, "{pull:?} moved the top"),
+                _ => assert_eq!((got.y, got.h), (r.y, r.h), "{pull:?} touched y at all"),
+            }
+            assert!(
+                got.w >= least - 0.01 && got.h >= least - 0.01,
+                "{pull:?} went under the floor"
+            );
+        }
+    }
+
+    /// **A pull stopped at the floor still holds its fixed edge.**
+    ///
+    /// The whole point of a floor is that it stops the edge being dragged, not that it drags the
+    /// other one along: a window shrunk to nothing from the left must still have its right edge
+    /// where it always was, or the window walks across the screen as it shrinks.
+    #[test]
+    fn a_pull_stopped_at_the_floor_does_not_walk() {
+        let r = Rect::new(100.0, 200.0, 300.0, 260.0);
+        let least = 28.0;
+        let from_left = pull_edges(r, Pull { x: -1, y: 0 }, 9000.0, 0.0, least);
+        assert!((from_left.w - least).abs() < 0.01);
+        assert!(
+            (from_left.x + from_left.w - (r.x + r.w)).abs() < 0.01,
+            "the right edge walked: {from_left:?}"
+        );
+        let from_top = pull_edges(r, Pull { x: 0, y: -1 }, 0.0, 9000.0, least);
+        assert!((from_top.h - least).abs() < 0.01);
+        assert!(
+            (from_top.y + from_top.h - (r.y + r.h)).abs() < 0.01,
+            "the bottom edge walked: {from_top:?}"
+        );
+    }
+
+    /// A corner draws two bands; an edge draws one; the middle draws none.
+    #[test]
+    fn the_bands_drawn_are_the_edges_being_pulled() {
+        let r = Rect::new(100.0, 200.0, 300.0, 260.0);
+        assert_eq!(edge_bands(r, Pull { x: 0, y: 0 }, 5.0).len(), 0);
+        assert_eq!(edge_bands(r, Pull { x: 1, y: 0 }, 5.0).len(), 1);
+        assert_eq!(edge_bands(r, Pull { x: -1, y: 1 }, 5.0).len(), 2);
+        // Centred on the boundary, like a divider's hint.
+        let right = edge_bands(r, Pull { x: 1, y: 0 }, 5.0)[0];
+        assert!((right.x + right.w / 2.0 - (r.x + r.w)).abs() < 0.01);
+    }
+
     #[test]
     fn a_divider_is_reachable_where_it_overlaps_a_panel() {
         let l = workspace();

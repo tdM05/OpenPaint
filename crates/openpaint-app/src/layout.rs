@@ -401,6 +401,12 @@ impl Layout {
                 vec![displaced, arriving]
             },
         };
+        // **The tree never carries a node holding nothing**, whichever operation left it. Removing
+        // has always collapsed; inserting had one way to produce the same thing and did not. An
+        // edge drop into an *empty* workspace -- which is a state the artist can reach, by closing
+        // everything -- wrapped the empty root leaf in a split, and half the screen became bare
+        // ground with no header, no fill and no way to tell it was not broken.
+        Self::collapse(&mut self.root);
         true
     }
 
@@ -1063,6 +1069,37 @@ mod tests {
 
     /// Removing the last panel of a leaf collapses it, and a split down to one child dissolves.
     /// Otherwise the tree accumulates empty nodes that still take space and still answer hit tests.
+    /// **An edge drop into an empty workspace does not leave half of it bare.**
+    ///
+    /// Closing everything is a state the artist can reach and is meant to be able to come back
+    /// from. The way back is to put a panel somewhere -- and pointing at an edge of the nothing
+    /// wrapped the empty root in a split, leaving a child that holds no panel: no header, no fill,
+    /// and nothing to tell it apart from a workspace that had broken.
+    #[test]
+    fn a_drop_into_nothing_leaves_no_empty_half() {
+        for zone in [
+            Zone::Left,
+            Zone::Right,
+            Zone::Top,
+            Zone::Bottom,
+            Zone::Center,
+        ] {
+            let mut l = Layout::single(PanelId(0));
+            l.remove(PanelId(0));
+            assert!(l.panels().is_empty(), "the workspace should be empty");
+
+            assert!(l.insert(&[], zone, PanelId(3)), "{zone:?} was refused");
+            let area = Rect::new(0.0, 0.0, 800.0, 600.0);
+            let placed = l.resolve(area);
+            assert_eq!(placed.len(), 1, "{zone:?} left an empty leaf beside it");
+            assert_eq!(placed[0].tabs, vec![PanelId(3)]);
+            assert_eq!(
+                placed[0].rect, area,
+                "{zone:?} gave part of the workspace to nothing"
+            );
+        }
+    }
+
     #[test]
     fn emptied_nodes_collapse_instead_of_lingering() {
         let mut l = three_across();

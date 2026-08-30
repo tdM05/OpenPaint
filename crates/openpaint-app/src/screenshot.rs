@@ -614,6 +614,22 @@ mod tests {
         shoot("floating", Rect::new(0.0, 0.0, 1400.0, 900.0), &[], &mut ws);
     }
 
+    /// A panel in the air, waiting for the artist to say where it goes.
+    ///
+    /// Worth looking at rather than only asserting: the whole of this feature is that the
+    /// arrangement itself is the menu, so what it looks like *is* the interface.
+    #[test]
+    #[ignore = "writes a PNG to look at rather than asserting anything"]
+    fn shot_placing() {
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let mut ws = plain_workspace();
+        ws.float(crate::workspace::COLOUR);
+        // Taken out, and the pointer resting where it would land: over the left band of the
+        // canvas, which would split it.
+        ws.start_placing(crate::workspace::COLOUR);
+        shoot("placing", screen, &[Poke::Move(420.0, 500.0)], &mut ws);
+    }
+
     /// **A drag that wanders off the hue ring keeps setting the hue.**
     ///
     /// The same latch a slider has, and for the same reason: a hand sweeping round a ring does not

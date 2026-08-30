@@ -100,3 +100,105 @@ Earlier tests called the gesture handler directly with a hand-computed idea of w
 pointer was over — which is exactly the thing that was broken, so they agreed with the bug. `Workspace::input_frame` is now the one entry point: `show`
 calls it, and so do the tests, so a test cannot disagree with the application about what is under
 the pointer.
+
+## The scroll wheel
+
+A scroll is aimed at whatever is under the pointer, exactly as a press is. **Over a floating
+window it belongs to that window and goes no further.** The canvas zooms on scroll, and a floating
+window sits over the canvas, so without this a scroll meant for a panel zoomed the drawing behind
+it — which is the one thing the user was not looking at.
+
+There is nothing special about floating here, and the rule is not written for floating. It is the
+same rule the press already follows: the topmost thing under the pointer takes the input. Floating
+windows are simply the only chrome that overlaps the canvas, so they are where the missing rule
+showed.
+
+## Resizing
+
+Two panels side by side are resized by the divider between them. **A floating window is resized by
+its edges**, and by the same controls in every respect: the same grab thickness, the same minimum
+touch target, the same instant grab on press, the same live movement, the same minimum size a
+panel is allowed to shrink to.
+
+- Every edge and every corner. A corner moves both.
+- This is true of a window holding one panel and of a window holding several. A window with two
+  panels stacked already had the divider between them; that resizes *them*, and the edges resize
+  *the window* — the two do not overlap and neither replaces the other.
+- Nothing about it is a floating-window special case at the level of the gesture: it is a splitter
+  whose other side is the screen.
+- **A header beats the border where they meet**, exactly as it beats a divider. Both targets have
+  to be generous, so they overlap along the top; the one you can see wins. The border is still
+  reached from *outside* the window, which is where every other windowing system puts it.
+- **The border never eats the handle.** Its inner half gives way on a small window so that at
+  least a header's worth of interior survives, reaching nothing at all at the smallest a window
+  may be. Otherwise a window could be shrunk and then never moved again.
+- A window you can see never loses a press to the invisible outer half of one you cannot: window
+  rectangles are all asked first, and only then their borders.
+- A resize keeps something on screen, the same as a move does — and it does so by stopping the
+  edge being pulled, never by sliding the one nobody touched.
+
+## No hamburger
+
+There is no three-lines glyph, and there never should have been one. It read as a button but the
+space beside it worked too, so it taught the wrong thing about where to press.
+
+What it was standing in for is real and stays: **there is always a touchable space for the
+window's own settings**, however many tabs there are and however small the window is. That space
+is the panel strip, which is why the strip is reserved before the tabs are laid out rather than
+after — tabs wrap or give up room; the strip never does. Its size is the same 4 mm floor every
+other grab target has.
+
+The strip is not drawn as a button because it is not one button: it is the part of the header that
+is not a tab, and it means "this panel as a whole".
+
+## Choosing where something goes
+
+Nothing lands anywhere by default. When a panel needs a home, **the user points at one.**
+
+This happens in two places, and it is the same thing both times:
+
+- *Put back into* in a floating window's settings. It does **not** offer a list of places. The
+  window stops floating, and the next place tapped is where it goes.
+- Switching a panel **on** in the panel list. It does not appear somewhere of the workspace's
+  choosing; the same pick follows, and the user says where.
+
+While a pick is waiting:
+
+- The workspace shows it is waiting, and shows what would happen where the pointer is — the same
+  five zones a drag lands in, drawn the same way.
+- The next primary press commits it. Nothing else in the workspace answers that press: no panel's
+  controls, no popup, no drag.
+- **Cancelling is Escape or a secondary press**, and a press with nowhere to land — the gap around
+  a floating window, off the workspace entirely — cancels too rather than dropping the panel
+  somewhere arbitrary. Cancelling a *Put back into* leaves the window floating exactly where it
+  was; cancelling an enable leaves the panel off.
+
+One pick is waiting at a time. Starting another replaces it, and **any change to the arrangement
+underneath ends it** — undo, reset, floating something else. The way back is a snapshot of the
+arrangement the panel came out of, and a snapshot of an arrangement that has since changed is not
+a way back; the version that ignored this let undo restore a tree still holding the panel in the
+air, so answering the pick put a second copy in.
+
+## Removing a panel
+
+Every settings popup — a panel's own, and a window's — offers **Remove this panel**.
+
+It is the same act as switching the panel off in the panel list, down to the same function: one
+way in the code, two ways to reach it. A panel removed this way comes back the same way any other
+does, and undo takes it back.
+
+Every panel, the canvas included. Nothing in the workspace is exempt from being closed — that is
+what makes "everything closed" a state an artist can reach and come back from rather than a
+theoretical one, and the panel list is always a secondary press away.
+
+## One gesture, one step
+
+Every drag records **one** entry on the undo stack, taken at the press and written at the release,
+and only if the arrangement actually ended up different. Not two — pulling a tab out of a window
+and dropping it somewhere is one thing the artist did, and needing two presses of undo to get back
+is a workspace that does not remember what happened, it remembers how it was implemented. And not
+none: moving a window used to record nothing at all while resizing one recorded a step, which is
+worse than either rule applied consistently.
+
+Escape and a lost pointer put back the **whole** arrangement, floating windows and their sizes
+included — not just the tree the drag was told about.

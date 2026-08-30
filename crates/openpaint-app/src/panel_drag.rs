@@ -79,6 +79,12 @@ pub enum Target {
     /// What that means is the caller's: a floating window moves, and a docked panel does nothing
     /// at all until there is something worth putting here.
     Strip { path: Path },
+    /// The edge or corner of a floating window, which resizes it.
+    ///
+    /// A divider whose other side is the screen. Everything a divider does, it does: grabbed the
+    /// instant it is touched, follows the pointer live, asks nothing on a hold, and puts itself
+    /// back on Escape.
+    Edge { pull: crate::chrome::Pull },
 }
 
 /// What the pointer is held on, so the caller can show the wait on the right thing.
@@ -94,6 +100,10 @@ pub enum Held {
     },
     /// A floating window's frame.
     Frame,
+    /// A floating window's edge or corner.
+    Edge {
+        pull: crate::chrome::Pull,
+    },
 }
 
 /// What a gesture in progress wants drawn.
@@ -116,6 +126,13 @@ pub enum Preview {
     },
     /// A divider is armed, and the layout is following the pointer.
     Resizing { path: Path, index: usize },
+    /// A floating window's edge is armed, and the window is following the pointer.
+    ///
+    /// **No distance**, for the same reason [`Preview::MovingWindow`] carries none: the size is
+    /// clamped at a floor, and a delta applied each frame against a clamp is a delta the clamp
+    /// silently eats -- drag past the floor and back and the window would come out smaller than it
+    /// went in. The caller knows the window as it was at the press and where the pointer is now.
+    ResizingWindow { pull: crate::chrome::Pull },
     /// A panel was held still long enough to be asked what it offers.
     ///
     /// Reported rather than performed: what a panel offers is the panel's business and the
@@ -132,6 +149,13 @@ pub enum Preview {
     /// A floating window's frame was held still: the caller decides what that asks about. The
     /// leaf whose strip was held, so a window holding several says which one.
     AskingFrame { path: Path },
+}
+
+/// What a gesture is doing to a floating window: moving all of it, or pulling some of its edges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowMove {
+    Whole,
+    Edges(crate::chrome::Pull),
 }
 
 /// The drop a release would perform, and the rectangle to light up for it.
@@ -176,6 +200,8 @@ enum Kind {
     /// A floating window's frame, which moves the window. The leaf whose strip was held, so a
     /// window holding several can say which one asked.
     Frame { path: Path },
+    /// A floating window's edge or corner, which resizes it.
+    Edge { pull: crate::chrome::Pull },
 }
 
 /// One press, and everything that has happened to it since.
@@ -291,6 +317,9 @@ impl PanelDrag {
                 })
             }
             Target::Frame { path } => Some(Kind::Frame { path: path.clone() }),
+            // Nothing in the layout to check it against: a window's edge is the workspace's
+            // boundary, not one of this arrangement's. The caller hit-tested a rectangle it owns.
+            Target::Edge { pull } => Some(Kind::Edge { pull: *pull }),
             // The strip means nothing on its own: whoever hit-tested it decides whether this
             // arrangement has anything for it to do, and turns it into a `Frame` if so.
             Target::Strip { .. } => None,
@@ -349,8 +378,9 @@ impl PanelDrag {
                             index: *index,
                         },
                         // A window's frame is drawn by whoever owns the window; there is no node
-                        // in this layout to mark.
+                        // in this layout to mark. Nor is its edge.
                         Kind::Frame { .. } => Held::Frame,
+                        Kind::Edge { pull } => Held::Edge { pull: *pull },
                     },
                 });
             }
@@ -364,7 +394,8 @@ impl PanelDrag {
                 Kind::Frame { .. } => None,
                 // A divider belongs to no one panel, so there is nothing to ask. It keeps waiting,
                 // which costs nothing: the drag is still live and still resizes on the next move.
-                Kind::Splitter { .. } => None,
+                // An edge is a divider, and answers the same.
+                Kind::Splitter { .. } | Kind::Edge { .. } => None,
             };
             if let Some(panel) = asking {
                 self.grab = None;
@@ -384,6 +415,13 @@ impl PanelDrag {
             Kind::Frame { .. } => {
                 grab.last = (x, y);
                 Some(Preview::MovingWindow)
+            }
+            // Same shape as the frame, and for the same reason: where a window may be and how
+            // small it may get is the workspace's business.
+            Kind::Edge { pull } => {
+                let pull = *pull;
+                grab.last = (x, y);
+                Some(Preview::ResizingWindow { pull })
             }
             Kind::Splitter { path, index, axis } => {
                 let (dx, dy) = (x - grab.last.0, y - grab.last.1);
@@ -446,13 +484,17 @@ impl PanelDrag {
                     layout.set_active(&path, tab);
                     Outcome::Switched
                 }
-                Kind::Splitter { .. } | Kind::Frame { .. } => Outcome::Nothing,
+                Kind::Splitter { .. } | Kind::Frame { .. } | Kind::Edge { .. } => Outcome::Nothing,
             };
         }
 
         match grab.kind {
             // Already answered above; a frame never reaches here.
             Kind::Frame { .. } => Outcome::Nothing,
+            // The window has been resizing live and this layout knows nothing about it, so there
+            // is no `before` here to compare against. The caller kept the window as it was at the
+            // press and decides whether anything actually changed.
+            Kind::Edge { .. } => Outcome::Resized,
             Kind::Splitter { .. } => {
                 // The divider has already moved; what is recorded is where it started. A drag that
                 // ended where it began is not a change and does not deserve an undo step.
@@ -489,6 +531,36 @@ impl PanelDrag {
                 layout.insert(&fresh, zone, panel);
                 Outcome::Moved
             }
+        }
+    }
+
+    /// Whether the gesture in flight is *carrying* the window it started in.
+    ///
+    /// A window that follows the pointer always contains the pointer, so it has to be left out of
+    /// the hit test or it wins its own test and can never be dropped on anything. A window being
+    /// **sized** is a different matter: it does not follow the pointer, the pointer is on its edge
+    /// where it belongs, and leaving that one out meant the frame that ends the gesture could not
+    /// find the window it had been sizing -- so the release was read as one in another arrangement
+    /// and the size was never recorded. The same is true of a divider inside a window.
+    #[must_use]
+    pub fn carries_window(&self) -> bool {
+        self.grab.as_ref().is_some_and(|g| {
+            g.moved && !matches!(g.kind, Kind::Edge { .. } | Kind::Splitter { .. })
+        })
+    }
+
+    /// What the gesture in flight is doing to the window that holds it, if anything.
+    ///
+    /// **Asked on the release frame, which never reaches `drag`.** A release carries a position of
+    /// its own and it is the last one there is; a tab's drop already uses it, and without this the
+    /// window kept whatever the previous frame said instead.
+    #[must_use]
+    pub fn window_move(&self) -> Option<WindowMove> {
+        let grab = self.grab.as_ref().filter(|g| g.moved)?;
+        match &grab.kind {
+            Kind::Frame { .. } => Some(WindowMove::Whole),
+            Kind::Edge { pull } => Some(WindowMove::Edges(*pull)),
+            Kind::Tab { .. } | Kind::Splitter { .. } => None,
         }
     }
 

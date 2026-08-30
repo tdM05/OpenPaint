@@ -1218,6 +1218,33 @@ fn workspace_panel(
     picked
 }
 
+/// Whether the workspace's own chrome claims a point, rather than the canvas.
+///
+/// A free function so that it can be tested. It used to be three lines inside `blocks_point`,
+/// which needs a live egui context to reach -- and the one thing it had wrong was checked by
+/// nothing at all: being inside the canvas rectangle is not the same as the canvas *getting* the
+/// input, because floating windows and popups are drawn on top of it. The symptom was scrolling a
+/// floating panel zooming the drawing behind it.
+///
+/// **`canvas` is an `Option` on purpose.** `None` is the canvas panel closed, which the artist can
+/// do like any other -- and then there is no canvas on screen at all: the workspace fills the
+/// window with ground, so the artwork is not visible anywhere. Answering that with "the whole
+/// surface, then" let the pen paint on a drawing nobody could see. An `Option` cannot be got wrong
+/// at the call site the way a fallback rectangle could.
+///
+/// `over` is front to back, though the order makes no difference to the answer.
+#[must_use]
+fn chrome_takes_point(
+    canvas: Option<(f32, f32, f32, f32)>,
+    over: &[(f32, f32, f32, f32)],
+    x: f32,
+    y: f32,
+) -> bool {
+    let inside =
+        |(rx, ry, rw, rh): (f32, f32, f32, f32)| x >= rx && y >= ry && x < rx + rw && y < ry + rh;
+    canvas.is_none_or(|c| !inside(c)) || over.iter().copied().any(inside)
+}
+
 /// What a workspace panel asked for.
 #[derive(Clone, Debug, PartialEq)]
 enum Picked {
@@ -1337,10 +1364,18 @@ pub struct Ui {
     /// Screen-space rect (physical pixels) egui is currently occupying, so canvas
     /// input can be excluded from it.
     occupied: egui::Rect,
-    /// In the workspace, the canvas panel in physical pixels; `None` with the old side panel.
+    /// In the workspace, where the canvas panel is in physical pixels; `None` with the old side
+    /// panel. The inner `None` is the workspace with its canvas panel closed.
     ///
     /// Used to answer `blocks_point` by complement — see where it is set.
-    workspace_canvas: Option<(f32, f32, f32, f32)>,
+    workspace_canvas: Option<Option<(f32, f32, f32, f32)>>,
+    /// The workspace chrome drawn *over* the canvas, in physical pixels, front to back.
+    ///
+    /// The complement of the canvas rectangle answers for everything laid out beside it, and only
+    /// for that. A floating window sits on top of the canvas, so by the rectangle alone the
+    /// pointer was over the canvas while it was plainly on a panel -- and the wheel zoomed the
+    /// drawing behind whatever was being scrolled.
+    workspace_over: Vec<(f32, f32, f32, f32)>,
     /// Where the canvas may draw, in physical pixels.
     ///
     /// The whole surface minus the side panel in the old layout; the canvas *panel's* rectangle
@@ -1394,6 +1429,7 @@ impl Ui {
             occupied: egui::Rect::NOTHING,
             canvas_viewport: (0.0, 0.0, 1.0, 1.0),
             workspace_canvas: None,
+            workspace_over: Vec::new(),
             extend_amount: DEFAULT_EXTEND,
             preset_name: String::new(),
             panel_input: std::collections::HashMap::new(),
@@ -1421,12 +1457,15 @@ impl Ui {
     /// Used to keep pen strokes from painting underneath the UI. egui's own
     /// pointer handling cannot do this for us because it never sees pen input.
     pub fn blocks_point(&self, x: f64, y: f64) -> bool {
-        if let Some((cx, cy, cw, ch)) = self.workspace_canvas {
-            // Everything that is not the canvas is a panel, so the pen is refused there.
-            let (x, y) = (x as f32, y as f32);
-            return !(x >= cx && y >= cy && x < cx + cw && y < cy + ch);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "window coordinates, which are far inside f32"
+        )]
+        let (x, y) = (x as f32, y as f32);
+        if let Some(canvas) = self.workspace_canvas {
+            return chrome_takes_point(canvas, &self.workspace_over, x, y);
         }
-        self.occupied.contains(egui::pos2(x as f32, y as f32))
+        self.occupied.contains(egui::pos2(x, y))
     }
 
     /// Build the panel, render it over the frame, and apply any edits to `brush`.
@@ -1484,7 +1523,8 @@ impl Ui {
 
         let mut panel_rect = egui::Rect::NOTHING;
         let mut panel_canvas: Option<(f32, f32, f32, f32)> = None;
-        let mut workspace_canvas_px: Option<(f32, f32, f32, f32)> = None;
+        let mut workspace_canvas_px: Option<Option<(f32, f32, f32, f32)>> = None;
+        let mut workspace_over_px: Vec<(f32, f32, f32, f32)> = Vec::new();
         // Taken for the duration of the frame because `self.ctx.run` has `self` borrowed, and put
         // back the moment it does not.
         let mut panel_input = std::mem::take(&mut self.panel_input);
@@ -1578,21 +1618,30 @@ impl Ui {
                     menu_open = None;
                 }
                 let scale = ctx.pixels_per_point();
-                let canvas = ws.canvas_rect().unwrap_or(crate::layout::Rect::new(
+                let px = |r: crate::layout::Rect| (r.x * scale, r.y * scale, r.w * scale, r.h * scale);
+                let canvas = ws.canvas_rect();
+                // The renderer still needs somewhere to draw even with the canvas panel closed,
+                // and the whole surface is the only honest fallback.
+                panel_canvas = Some(px(canvas.unwrap_or(crate::layout::Rect::new(
                     0.0,
                     0.0,
                     screen.width(),
                     screen.height(),
-                ));
-                panel_canvas = Some((
-                    canvas.x * scale,
-                    canvas.y * scale,
-                    canvas.w * scale,
-                    canvas.h * scale,
-                ));
+                ))));
                 // Nothing is "the panel" any more, so the pen must be refused only where a panel
-                // actually is -- which is everywhere except the canvas.
-                workspace_canvas_px = panel_canvas;
+                // actually is -- which is everywhere except the canvas, and everywhere the
+                // workspace draws on top of it.
+                //
+                // **With no canvas panel there is no canvas anywhere.** The workspace fills the
+                // window with ground in that case, so the artwork is not on screen at all; falling
+                // back to "the whole surface is canvas" let the pen paint on a drawing nobody
+                // could see.
+                workspace_canvas_px = Some(canvas.map(px));
+                workspace_over_px = ws
+                    .over_canvas()
+                    .into_iter()
+                    .map(|r| (r.x * scale, r.y * scale, r.w * scale, r.h * scale))
+                    .collect();
                 return;
             }
 
@@ -2784,6 +2833,7 @@ impl Ui {
         // UI. Expressed as the complement rather than as a list of panel rectangles: one
         // answer cannot drift from another, and a new panel needs no bookkeeping here.
         self.workspace_canvas = workspace_canvas_px;
+        self.workspace_over = workspace_over_px;
 
         self.state
             .handle_platform_output(window, output.platform_output);
@@ -2911,5 +2961,50 @@ mod tests {
                 .any(|(n, what)| n == "Delete" && *what == Picked::Layer(LayerAction::Delete(3))),
             "Delete does not name the active layer"
         );
+    }
+
+    /// **What is drawn over the canvas is not the canvas.**
+    ///
+    /// The workspace lays the canvas out as a panel among panels, so "not inside the canvas
+    /// rectangle" answers for everything beside it. Floating windows and popups are the exception:
+    /// they are painted on top, and by the rectangle alone the pen and the wheel were told they
+    /// were over the artwork while they were plainly on a panel. Reported as scrolling a floating
+    /// panel zooming the drawing behind it.
+    #[test]
+    fn a_panel_drawn_over_the_canvas_still_takes_the_pointer() {
+        let canvas = Some((200.0, 100.0, 800.0, 600.0));
+        let window = (300.0, 200.0, 240.0, 180.0);
+
+        // Beside the canvas: the workspace's, window or no window.
+        assert!(chrome_takes_point(canvas, &[], 50.0, 50.0));
+        assert!(chrome_takes_point(canvas, &[window], 50.0, 50.0));
+
+        // On the canvas with nothing over it: the canvas's.
+        assert!(!chrome_takes_point(canvas, &[], 600.0, 400.0));
+        assert!(!chrome_takes_point(canvas, &[window], 900.0, 650.0));
+
+        // **And with the canvas panel closed there is no canvas anywhere.** The workspace fills
+        // the window with ground in that case, so the artwork is not on screen at all -- answering
+        // "the whole surface is canvas, then" let the pen paint on a drawing nobody could see.
+        assert!(chrome_takes_point(None, &[], 600.0, 400.0));
+        assert!(chrome_takes_point(None, &[], 0.0, 0.0));
+
+        // On the canvas, under a floating window: the window's.
+        assert!(
+            chrome_takes_point(canvas, &[window], 400.0, 300.0),
+            "a floating window over the canvas did not take the pointer"
+        );
+        // Every corner of it, and not one unit past.
+        assert!(chrome_takes_point(canvas, &[window], window.0, window.1));
+        assert!(!chrome_takes_point(
+            canvas,
+            &[window],
+            window.0 + window.2,
+            window.1 + window.3
+        ));
+        // And any of them, not just the first.
+        let popup = (700.0, 500.0, 120.0, 90.0);
+        assert!(chrome_takes_point(canvas, &[popup, window], 400.0, 300.0));
+        assert!(chrome_takes_point(canvas, &[popup, window], 750.0, 540.0));
     }
 }
