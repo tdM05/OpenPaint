@@ -27,7 +27,7 @@
 //! rectangle. That is the narrow seam promised when this was planned: swapping egui for our own
 //! widgets later changes what the callback does and nothing here.
 
-use crate::chrome::{self, HeaderStyle};
+use crate::chrome::{self, Along, HeaderStyle};
 use crate::layout::{Layout, LayoutHistory, PanelId, Rect, Zone};
 use crate::panel_drag::{Held, Outcome, PanelDrag, Preview};
 use crate::panel_ui::Direction;
@@ -556,7 +556,12 @@ fn rail_content_min(m: &Metrics) -> f32 {
 /// How wide the *slot* holding the tool rail has to be, gutter included.
 #[must_use]
 fn rail_min(m: &Metrics) -> f32 {
-    rail_content_min(m) + m.gutter
+    // The handle too. The rail's controls run across, so its handle is the bar down the right and
+    // costs width rather than height -- which the menu strip's minimum, being a height, does not
+    // have to pay for. Generous if the artist later sets the rail to run its controls down and the
+    // handle moves back to the top; a few spare units of rail is a much smaller problem than a
+    // clipped button.
+    rail_content_min(m) + m.gutter + m.header_compact
 }
 
 /// The arrangement a first-time artist finds.
@@ -815,6 +820,18 @@ impl Workspace {
         // Pulled out of `self` before the call: the closure below must not hold a borrow of the
         // workspace the gesture is about to change.
         let label = m.label;
+        // The handle's side follows the shown panel's own setting, so it is worked out before the
+        // closure below borrows the workspace it would otherwise have to ask.
+        let sides: std::collections::HashMap<u32, Direction> = PANELS
+            .iter()
+            .map(|k| (k.id.0, self.direction_of(k.id)))
+            .collect();
+        let direction_for = |pl: &crate::layout::Placed| {
+            sides
+                .get(&showing_of(pl).0)
+                .copied()
+                .unwrap_or(Direction::Column)
+        };
         // The panel list: opened by a secondary press anywhere, closed by a primary press outside
         // it. Anywhere, because it must not depend on any panel being open -- least of all the one
         // it used to live in.
@@ -876,7 +893,7 @@ impl Workspace {
                         &placed,
                         &splitters,
                         &m,
-                        style_of,
+                        |pl| (style_of(pl), along_of(pl, direction_for(pl))),
                         |pl, i| measure(ctx, label, pl.tabs.get(i).copied()),
                         x,
                         y,
@@ -897,9 +914,13 @@ impl Workspace {
         // panel's own content is never painted.
         self.canvas_rect = placed.iter().find_map(|slot| {
             (slot.tabs.get(slot.active) == Some(&CANVAS)).then(|| {
-                chrome::panel(slot, &m, style_of(slot), |i| {
-                    measure(ctx, m.label, slot.tabs.get(i).copied())
-                })
+                chrome::panel(
+                    slot,
+                    &m,
+                    style_of(slot),
+                    along_of(slot, self.direction_of(showing_of(slot))),
+                    |i| measure(ctx, m.label, slot.tabs.get(i).copied()),
+                )
                 .content
             })
         });
@@ -930,9 +951,13 @@ impl Workspace {
                 continue;
             };
             let style = style_of(slot);
-            let c = chrome::panel(slot, &m, style, |i| {
-                measure(ctx, m.label, slot.tabs.get(i).copied())
-            });
+            let c = chrome::panel(
+                slot,
+                &m,
+                style,
+                along_of(slot, self.direction_of(showing_of(slot))),
+                |i| measure(ctx, m.label, slot.tabs.get(i).copied()),
+            );
 
             // The header always; the body only for panels that draw something in it. The canvas
             // panel's body is the artwork underneath.
@@ -1029,9 +1054,13 @@ impl Workspace {
             match on {
                 Held::Panel { path } => {
                     if let Some(slot) = placed.iter().find(|s| &s.path == path) {
-                        let c = chrome::panel(slot, &m, style_of(slot), |i| {
-                            measure(ctx, m.label, slot.tabs.get(i).copied())
-                        });
+                        let c = chrome::panel(
+                            slot,
+                            &m,
+                            style_of(slot),
+                            along_of(slot, self.direction_of(showing_of(slot))),
+                            |i| measure(ctx, m.label, slot.tabs.get(i).copied()),
+                        );
                         painter.rect_filled(to_egui(c.header), m.radius, tint);
                     }
                 }
@@ -1088,9 +1117,13 @@ impl Workspace {
             // thing by lifting the tile before you move it.
             if let Some((path, _)) = self.layout.find(panel) {
                 if let Some(slot) = placed.iter().find(|s| s.path == path) {
-                    let c = chrome::panel(slot, &m, style_of(slot), |i| {
-                        measure(ctx, m.label, slot.tabs.get(i).copied())
-                    });
+                    let c = chrome::panel(
+                        slot,
+                        &m,
+                        style_of(slot),
+                        along_of(slot, self.direction_of(showing_of(slot))),
+                        |i| measure(ctx, m.label, slot.tabs.get(i).copied()),
+                    );
                     painter.rect_filled(
                         to_egui(c.header),
                         m.radius,
@@ -1159,9 +1192,13 @@ impl Workspace {
                 tabs: vec![held.panel],
                 active: 0,
             };
-            let c = chrome::panel(&slot, &m, style_of(&slot), |i| {
-                measure(ctx, m.label, slot.tabs.get(i).copied())
-            });
+            let c = chrome::panel(
+                &slot,
+                &m,
+                style_of(&slot),
+                along_of(&slot, self.direction_of(held.panel)),
+                |i| measure(ctx, m.label, slot.tabs.get(i).copied()),
+            );
             // **One layer for every floating panel**, not one each. egui orders layers within an
             // Order by when they were registered, and a raw layer painter registers no area -- so
             // two panels' layers could interleave, and one panel's background painted over
@@ -1792,7 +1829,7 @@ fn hold_on_screen(rect: Rect, screen: Rect, m: &Metrics) -> Rect {
 #[must_use]
 fn header_under(placed: &[crate::layout::Placed], m: &Metrics, x: f32, y: f32) -> Option<PanelId> {
     placed.iter().find_map(|slot| {
-        let c = chrome::panel(slot, m, style_of(slot), |_| 0.0);
+        let c = chrome::panel(slot, m, style_of(slot), Along::Down, |_| 0.0);
         c.header
             .contains(x, y)
             .then(|| slot.tabs.get(slot.active).copied())
@@ -1846,6 +1883,36 @@ fn measure(ctx: &egui::Context, label: f32, panel: Option<PanelId>) -> f32 {
             .size()
             .x
     })
+}
+
+/// Which panel a leaf is showing, which is the one whose settings its handle obeys.
+#[must_use]
+fn showing_of(slot: &crate::layout::Placed) -> PanelId {
+    slot.tabs.get(slot.active).copied().unwrap_or(CANVAS)
+}
+
+/// Which side a leaf's handle sits on: the direction its panel's controls run.
+///
+/// A leaf can hold several panels, and they can disagree. The *shown* one decides, because the
+/// handle belongs to what you are looking at -- and a handle that jumped sides when you switched
+/// tab would be worse than either answer.
+///
+/// `Direction::Auto` has no answer until the controls have been measured, which is something
+/// `chrome` cannot do. It is read from the shape instead, which is what `place` will decide too in
+/// every case but a near-tie.
+#[must_use]
+fn along_of(slot: &crate::layout::Placed, direction: Direction) -> Along {
+    match direction {
+        Direction::Column => Along::Down,
+        Direction::Row | Direction::Wrap => Along::Across,
+        Direction::Auto => {
+            if slot.rect.w > slot.rect.h {
+                Along::Across
+            } else {
+                Along::Down
+            }
+        }
+    }
 }
 
 /// A leaf's header style: compact only when *every* panel in it wants that.
@@ -2592,7 +2659,16 @@ mod tests {
                     .iter()
                     .find(|p| p.tabs.contains(&panel))
                     .unwrap_or_else(|| panic!("{} is not in the default layout", name_of(panel)));
-                crate::chrome::panel(slot, &m, style_of(slot), |_| LABEL).content
+                crate::chrome::panel(
+                    slot,
+                    &m,
+                    style_of(slot),
+                    // The rule the application uses, not a fixed side: the menu's handle is down
+                    // its right, so a test that put it on top would be measuring the wrong strip.
+                    along_of(slot, default_direction(showing_of(slot))),
+                    |_| LABEL,
+                )
+                .content
             };
 
             // The menu is a strip across the top: it needs the height of one row plus its padding.
@@ -2653,6 +2729,61 @@ mod tests {
             "the menu bar was {small} tall in a short window and {large} in a tall one"
         );
         assert!(small >= strip_min(&m));
+    }
+
+    /// **A panel's handle follows the direction its controls run**, and moves when that changes.
+    ///
+    /// Set a panel to run its controls down and the handle is the bar across the top; set it to
+    /// run them across and the handle is the bar down the right. Deciding by the panel's shape
+    /// instead was nearly right and read as arbitrary -- the handle moved when a *neighbour* was
+    /// resized.
+    #[test]
+    fn the_handle_follows_the_direction_the_controls_run() {
+        let slot = crate::layout::Placed {
+            path: vec![],
+            rect: Rect::new(0.0, 0.0, 900.0, 60.0),
+            tabs: vec![TOOLS],
+            active: 0,
+        };
+        assert_eq!(along_of(&slot, Direction::Column), Along::Down);
+        assert_eq!(along_of(&slot, Direction::Row), Along::Across);
+        assert_eq!(along_of(&slot, Direction::Wrap), Along::Across);
+
+        // The same panel, the same shape, a different setting: the handle moves.
+        let m = crate::theme::Theme::default().metrics;
+        let down = crate::chrome::panel(&slot, &m, HeaderStyle::Compact, Along::Down, |_| 40.0);
+        let across = crate::chrome::panel(&slot, &m, HeaderStyle::Compact, Along::Across, |_| 40.0);
+        assert!(down.header.w > down.header.h, "down: a bar across the top");
+        assert!(
+            across.header.h > across.header.w,
+            "across: a bar down the side"
+        );
+
+        // And `Auto` has to guess, because resolving it needs the controls measured -- which is
+        // something `chrome` cannot do. It guesses from the shape, which is what `place` will
+        // decide too in every case but a near-tie.
+        assert_eq!(along_of(&slot, Direction::Auto), Along::Across);
+        let tall = crate::layout::Placed {
+            rect: Rect::new(0.0, 0.0, 60.0, 900.0),
+            ..slot.clone()
+        };
+        assert_eq!(along_of(&tall, Direction::Auto), Along::Down);
+    }
+
+    /// A leaf's handle obeys the panel it is *showing*, not whichever happens to be first.
+    ///
+    /// A handle that jumped sides when you switched tab would be worse than either answer.
+    #[test]
+    fn the_handle_obeys_the_panel_on_show() {
+        let slot = crate::layout::Placed {
+            path: vec![],
+            rect: Rect::new(0.0, 0.0, 900.0, 60.0),
+            tabs: vec![LAYERS, TOOLS],
+            active: 1,
+        };
+        assert_eq!(showing_of(&slot), TOOLS);
+        let first = crate::layout::Placed { active: 0, ..slot };
+        assert_eq!(showing_of(&first), LAYERS);
     }
 
     /// **Two panels in one leaf always show tabs**, however compact they would rather be.
@@ -2746,7 +2877,13 @@ mod tests {
             .iter()
             .find(|p| p.tabs.contains(&BRUSH))
             .expect("brush leaf");
-        let chrome = crate::chrome::panel(brush, &ws.theme.metrics, style_of(brush), |_| 46.0);
+        let chrome = crate::chrome::panel(
+            brush,
+            &ws.theme.metrics,
+            style_of(brush),
+            Along::Down,
+            |_| 46.0,
+        );
         let (px, py) = (
             chrome.header.x + chrome.header.w / 2.0,
             chrome.header.y + chrome.header.h / 2.0,
@@ -3193,14 +3330,24 @@ mod tests {
             .iter()
             .find(|p| p.tabs.contains(&BRUSH))
             .expect("the default layout has a Brush panel");
-        let chrome = crate::chrome::panel(brush, &m, style_of(brush), |i| measure(brush, i));
+        let chrome = crate::chrome::panel(brush, &m, style_of(brush), Along::Down, |i| {
+            measure(brush, i)
+        });
         let (px, py) = (
             chrome.header.x + chrome.header.w / 2.0,
             chrome.header.y + chrome.header.h / 2.0,
         );
 
         let splitters = layout.splitters(screen, m.splitter_grab);
-        let target = crate::chrome::target_at(&placed, &splitters, &m, style_of, measure, px, py);
+        let target = crate::chrome::target_at(
+            &placed,
+            &splitters,
+            &m,
+            |pl| (style_of(pl), Along::Down),
+            measure,
+            px,
+            py,
+        );
         assert!(
             matches!(target, crate::panel_drag::Target::Tab { .. }),
             "a press on a drawn header must be a tab: got {target:?}"

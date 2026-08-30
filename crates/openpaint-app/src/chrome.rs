@@ -81,6 +81,21 @@ impl Controls {
     }
 }
 
+/// Which side of a panel its handle sits on.
+///
+/// **It follows the direction the panel's controls run, not the shape of the panel.** A panel set
+/// to run its controls down has its handle across the top; one set to run them across has it down
+/// the right-hand side. Deciding by shape instead was nearly right and read as arbitrary: the same
+/// panel would move its handle when a neighbour was resized, which is not something the artist
+/// asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Along {
+    /// Controls run down the panel; the handle is the bar across the top.
+    Down,
+    /// Controls run across it; the handle is the bar down the right.
+    Across,
+}
+
 /// Lay out one panel slot.
 ///
 /// `measure` gives the width of a tab's label; the caller owns text, so it owns measurement.
@@ -94,6 +109,7 @@ pub fn panel(
     placed: &Placed,
     metrics: &Metrics,
     style: HeaderStyle,
+    along: Along,
     mut measure: impl FnMut(usize) -> f32,
 ) -> PanelChrome {
     let half = metrics.gutter / 2.0;
@@ -104,19 +120,16 @@ pub fn panel(
         (placed.rect.h - metrics.gutter).max(0.0),
     );
 
-    // **A compact header goes down the short side of the panel, on the far edge.**
+    // **The handle goes down the right when the controls run across.**
     //
-    // A tool rail laid out across the bottom is a strip a couple of rows tall; a header band on
+    // A tool rail laid out across the bottom is a strip a couple of rows tall; a handle band on
     // top of it costs more height than the tools do. On its side it costs a sliver of width
-    // instead. On the *right* rather than the left: a strip is read from the left like everything
-    // else, so its first control belongs at the start and its handle out of the way at the end --
-    // the same place a tall panel's handle sits, which is above its first control and not beside
-    // it.
+    // instead. On the *right* rather than the left, because a strip is read from the left like
+    // everything else: its first control belongs at the start and its handle out of the way at the
+    // end, which is where a tall panel's handle sits too -- above its first control, not beside it.
     //
     // Only compact headers: a named header carries tabs, and tabs need width to be readable.
-    // Deliberately decided from the panel's shape rather than from which panel it is -- a wide
-    // panel is a strip whatever it happens to contain (§1c).
-    let side = style == HeaderStyle::Compact && outer.w > outer.h;
+    let side = style == HeaderStyle::Compact && along == Along::Across;
 
     let bar = match style {
         HeaderStyle::Named => metrics.header,
@@ -209,12 +222,15 @@ pub fn panel(
 /// The first version had it the other way, so that a divider could be caught anywhere. It could —
 /// including over the first few characters of the neighbouring tab's name, which is precisely
 /// where anyone aiming for that tab would press.
+/// `chrome_of` says what kind of chrome a leaf gets: whether its header carries names, and which
+/// side it sits on. One question rather than two closures, because they are answered from the same
+/// place and were only ever passed together.
 #[must_use]
 pub fn target_at(
     placed: &[Placed],
     splitters: &[crate::layout::Splitter],
     metrics: &Metrics,
-    style_of: impl Fn(&Placed) -> HeaderStyle,
+    chrome_of: impl Fn(&Placed) -> (HeaderStyle, Along),
     mut measure: impl FnMut(&Placed, usize) -> f32,
     x: f32,
     y: f32,
@@ -222,7 +238,8 @@ pub fn target_at(
     // Headers first, and every panel's header — not just the one whose slot contains the point,
     // since a header can reach a little past its own slot once the gutter is taken out.
     for p in placed {
-        let chrome = panel(p, metrics, style_of(p), |i| measure(p, i));
+        let (style, along) = chrome_of(p);
+        let chrome = panel(p, metrics, style, along, |i| measure(p, i));
         if chrome.header.contains(x, y) {
             return header_target(p, &chrome, x, y);
         }
@@ -399,7 +416,9 @@ mod tests {
     fn the_header_and_content_tile_the_panel() {
         let l = workspace();
         for placed in l.resolve(area()) {
-            let c = panel(&placed, &metrics(), HeaderStyle::Named, |_| 40.0);
+            let c = panel(&placed, &metrics(), HeaderStyle::Named, Along::Down, |_| {
+                40.0
+            });
             assert!((c.header.y - c.outer.y).abs() < 0.001);
             assert!(
                 (c.content.y - (c.header.y + c.header.h)).abs() < 0.001,
@@ -417,8 +436,20 @@ mod tests {
     fn neighbouring_panels_are_a_gutter_apart() {
         let l = workspace();
         let placed = l.resolve(area());
-        let a = panel(&placed[0], &metrics(), HeaderStyle::Named, |_| 40.0);
-        let b = panel(&placed[1], &metrics(), HeaderStyle::Named, |_| 40.0);
+        let a = panel(
+            &placed[0],
+            &metrics(),
+            HeaderStyle::Named,
+            Along::Down,
+            |_| 40.0,
+        );
+        let b = panel(
+            &placed[1],
+            &metrics(),
+            HeaderStyle::Named,
+            Along::Down,
+            |_| 40.0,
+        );
         let gap = b.outer.x - (a.outer.x + a.outer.w);
         assert!(
             (gap - metrics().gutter).abs() < 0.001,
@@ -437,7 +468,9 @@ mod tests {
             tabs: vec![LAYERS],
             active: 0,
         };
-        let c = panel(&placed, &metrics(), HeaderStyle::Named, |_| 40.0);
+        let c = panel(&placed, &metrics(), HeaderStyle::Named, Along::Down, |_| {
+            40.0
+        });
         assert!(c.header.h > 0.0, "there is still something to grab");
         assert!(c.content.h >= 0.0, "and content never goes negative");
         assert!(
@@ -455,7 +488,9 @@ mod tests {
         assert_eq!(leaf.tabs.len(), 2);
 
         let widths = [50.0_f32, 90.0];
-        let c = panel(leaf, &metrics(), HeaderStyle::Named, |i| widths[i]);
+        let c = panel(leaf, &metrics(), HeaderStyle::Named, Along::Down, |i| {
+            widths[i]
+        });
         assert_eq!(c.tabs.len(), 2);
         assert!((c.tabs[0].rect.w - (50.0 + metrics().tab_padding * 2.0)).abs() < 0.001);
         assert!((c.tabs[1].rect.w - (90.0 + metrics().tab_padding * 2.0)).abs() < 0.001);
@@ -480,7 +515,9 @@ mod tests {
             active: 0,
         };
         // Four tabs of ~64 units each against a 160-unit panel: two per row.
-        let c = panel(&placed, &metrics(), HeaderStyle::Named, |_| 40.0);
+        let c = panel(&placed, &metrics(), HeaderStyle::Named, Along::Down, |_| {
+            40.0
+        });
         assert_eq!(c.tabs.len(), 4);
 
         let rows: std::collections::BTreeSet<i32> =
@@ -518,7 +555,9 @@ mod tests {
             tabs: vec![CANVAS, LAYERS, HISTORY, PanelId(9), PanelId(10)],
             active: 0,
         };
-        let c = panel(&placed, &metrics(), HeaderStyle::Named, |_| 40.0);
+        let c = panel(&placed, &metrics(), HeaderStyle::Named, Along::Down, |_| {
+            40.0
+        });
         assert!(
             c.header.h <= c.outer.h + 0.001,
             "header {} of {}",
@@ -538,7 +577,7 @@ mod tests {
         let m = metrics();
         for slot in [wide(), tall()] {
             for style in [HeaderStyle::Named, HeaderStyle::Compact] {
-                let c = panel(&slot, &m, style, |_| 40.0);
+                let c = panel(&slot, &m, style, Along::Down, |_| 40.0);
                 let controls = c.controls.rect();
                 assert!((controls.x - c.content.x - m.padding).abs() < 0.001);
                 assert!((controls.y - c.content.y - m.padding).abs() < 0.001);
@@ -554,7 +593,7 @@ mod tests {
             tabs: vec![CANVAS],
             active: 0,
         };
-        let c = panel(&sliver, &m, HeaderStyle::Named, |_| 40.0);
+        let c = panel(&sliver, &m, HeaderStyle::Named, Along::Down, |_| 40.0);
         assert!(c.controls.rect().w >= 0.0 && c.controls.rect().h >= 0.0);
     }
 
@@ -563,8 +602,16 @@ mod tests {
     fn a_compact_header_is_shorter_and_nameless() {
         // A tall panel, so the header is the band across the top.
         let placed = tall();
-        let named = panel(&placed, &metrics(), HeaderStyle::Named, |_| 40.0);
-        let compact = panel(&placed, &metrics(), HeaderStyle::Compact, |_| 40.0);
+        let named = panel(&placed, &metrics(), HeaderStyle::Named, Along::Down, |_| {
+            40.0
+        });
+        let compact = panel(
+            &placed,
+            &metrics(),
+            HeaderStyle::Compact,
+            Along::Down,
+            |_| 40.0,
+        );
 
         assert!(compact.tabs.is_empty());
         assert!(compact.header.h < named.header.h);
@@ -575,16 +622,17 @@ mod tests {
         );
     }
 
-    /// **A compact header runs down the short side of the panel.**
+    /// **The handle follows the direction the controls run, not the shape of the panel.**
     ///
-    /// A tool rail laid across the bottom is a strip a couple of rows tall, and a header band on
-    /// top of it costs more height than the tools do. On its side it costs a sliver of width, and
-    /// the handle sits at the start of the strip rather than above it.
+    /// A rail whose controls run across is a strip a couple of rows tall, and a handle band on top
+    /// of it costs more height than the controls do; on its side it costs a sliver of width. It
+    /// used to be decided by shape, which read as arbitrary: the same panel moved its handle when
+    /// a neighbour was resized, which is not something anybody asked for.
     #[test]
     fn a_compact_header_runs_along_the_short_side() {
         let m = metrics();
 
-        let strip = panel(&wide(), &m, HeaderStyle::Compact, |_| 40.0);
+        let strip = panel(&wide(), &m, HeaderStyle::Compact, Along::Across, |_| 40.0);
         assert!(
             strip.header.w < strip.header.h,
             "on a wide panel the header should be a vertical bar, got {:?}",
@@ -611,14 +659,18 @@ mod tests {
             "a strip must lose no height at all: that was the complaint"
         );
 
-        let rail = panel(&tall(), &m, HeaderStyle::Compact, |_| 40.0);
+        // Named headers carry tabs, and tabs need width, so they never turn.
+        // A tall panel keeps its handle on top even if something asks for across, because a
+        // panel whose controls run across is by definition not a tall one -- but the rule is the
+        // direction, so this is what it says.
+        let rail = panel(&tall(), &m, HeaderStyle::Compact, Along::Down, |_| 40.0);
         assert!(
             rail.header.h < rail.header.w,
-            "on a tall panel it stays across the top"
+            "on a panel whose controls run down it stays across the top"
         );
 
         // Named headers carry tabs, and tabs need width, so they never turn.
-        let named = panel(&wide(), &m, HeaderStyle::Named, |_| 40.0);
+        let named = panel(&wide(), &m, HeaderStyle::Named, Along::Across, |_| 40.0);
         assert!(named.header.w > named.header.h, "tabs stay across the top");
     }
 
@@ -643,7 +695,7 @@ mod tests {
                 &placed,
                 &splitters,
                 &metrics(),
-                |_| HeaderStyle::Named,
+                |_| (HeaderStyle::Named, Along::Down),
                 |_, _| 40.0,
                 x,
                 y
@@ -662,14 +714,14 @@ mod tests {
         let placed = l.resolve(area());
         let splitters = l.splitters(area(), metrics().splitter_grab);
         let leaf = placed[1].clone();
-        let c = panel(&leaf, &metrics(), HeaderStyle::Named, |_| 40.0);
+        let c = panel(&leaf, &metrics(), HeaderStyle::Named, Along::Down, |_| 40.0);
 
         let hit = |x: f32, y: f32| {
             target_at(
                 &placed,
                 &splitters,
                 &metrics(),
-                |_| HeaderStyle::Named,
+                |_| (HeaderStyle::Named, Along::Down),
                 |_, _| 40.0,
                 x,
                 y,
@@ -710,7 +762,7 @@ mod tests {
         let placed = l.resolve(area());
         let splitters = l.splitters(area(), metrics().splitter_grab);
         let leaf = placed[1].clone();
-        let c = panel(&leaf, &metrics(), HeaderStyle::Named, |_| 40.0);
+        let c = panel(&leaf, &metrics(), HeaderStyle::Named, Along::Down, |_| 40.0);
         let first = c.tabs[0].rect;
 
         // Right at the tab's leading edge, well inside the divider's grab width.
@@ -725,7 +777,7 @@ mod tests {
                 &placed,
                 &splitters,
                 &metrics(),
-                |_| HeaderStyle::Named,
+                |_| (HeaderStyle::Named, Along::Down),
                 |_, _| 40.0,
                 x,
                 first.y + 4.0
@@ -747,12 +799,18 @@ mod tests {
         // Pressed where the header is actually drawn, rather than at a point that happened to be
         // right while headers were always on top. A test that hardcodes the geometry it is meant
         // to be checking stops checking anything the day the geometry moves.
-        let c = panel(&placed[0], &metrics(), HeaderStyle::Compact, |_| 40.0);
+        let c = panel(
+            &placed[0],
+            &metrics(),
+            HeaderStyle::Compact,
+            Along::Down,
+            |_| 40.0,
+        );
         let target = target_at(
             &placed,
             &[],
             &metrics(),
-            |_| HeaderStyle::Compact,
+            |_| (HeaderStyle::Compact, Along::Down),
             |_, _| 40.0,
             c.header.x + c.header.w / 2.0,
             c.header.y + c.header.h / 2.0,
@@ -774,7 +832,7 @@ mod tests {
         let l = workspace();
         let placed = l.resolve(area());
         let leaf = placed[1].clone();
-        let c = panel(&leaf, &metrics(), HeaderStyle::Named, |_| 30.0);
+        let c = panel(&leaf, &metrics(), HeaderStyle::Named, Along::Down, |_| 30.0);
         let past = c.tabs.last().expect("tabs").rect;
 
         assert_eq!(
@@ -782,7 +840,7 @@ mod tests {
                 &placed,
                 &[],
                 &metrics(),
-                |_| HeaderStyle::Named,
+                |_| (HeaderStyle::Named, Along::Down),
                 |_, _| 30.0,
                 past.x + past.w + 15.0,
                 past.y + 5.0
