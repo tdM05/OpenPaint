@@ -157,6 +157,21 @@ is left is calling them.
 3. **The remaining ports**: History, and the old side panel's sections --- transform, text, pages,
    export, crop, wand. egui leaves when the last one lands.
 
+## The gestures, as they now stand
+
+| you do | it does |
+|---|---|
+| touch a tab or a divider and move | moves or resizes, **at once** |
+| touch and hold still | that panel's settings |
+| tap a tab | shows it |
+| secondary press on a header | the same settings, for a pointer that has one |
+| secondary press anywhere else | the workspace's panel list |
+
+Holding *first* was tried and was wrong. The reason it existed was to stop a stroke that began on
+some chrome from drawing on the canvas -- except that a press on a tab or a divider never reaches
+the canvas, so the third of a second before anything answered was a cost with no benefit. Holding
+is now what asks a question, which is the one thing left over once moving means moving.
+
 ## Looking at it
 
 `screenshot.rs` renders the workspace headlessly and writes PNGs:

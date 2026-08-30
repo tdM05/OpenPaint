@@ -46,8 +46,30 @@ pub struct PanelKind {
     ///
     /// **A default, not a rule.** It lives beside the name because it is the panel's own business
     /// which way it reads: a menu is a strip and a layer list is a list, and neither is a fact
-    /// about the layout. When per-panel settings arrive this is what they start from.
+    /// about the layout.
     pub direction: Direction,
+    /// What this panel offers to be changed.
+    ///
+    /// **Empty is the common case and an honest answer.** Offering every panel the same list made
+    /// the canvas advertise a choice between running its controls across or down, which it has
+    /// none of; a settings menu full of settings that mean nothing teaches you not to open it.
+    pub settings: &'static [Setting],
+}
+
+/// Something about a panel that can be changed.
+///
+/// A list per panel rather than one list for all of them, so a panel that gains a setting says so
+/// itself and a panel with nothing to offer says that too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Setting {
+    /// Which way the controls run. Worth offering to a strip; meaningless to a list, and to the
+    /// canvas, which has no controls at all.
+    Direction,
+    /// Lift this panel out of the arrangement, or put it back.
+    ///
+    /// One setting for both directions, because they are one question: a docked panel is offered
+    /// somewhere to go, and a floating one is offered somewhere to return to.
+    Floating,
 }
 
 /// Every panel, in the order they appear in a menu.
@@ -60,42 +82,49 @@ pub const PANELS: &[PanelKind] = &[
         name: "Menu",
         header: HeaderStyle::Compact,
         direction: Direction::Auto,
+        settings: &[Setting::Direction, Setting::Floating],
     },
     PanelKind {
         id: PanelId(1),
         name: "Tools",
         header: HeaderStyle::Compact,
         direction: Direction::Wrap,
+        settings: &[Setting::Direction, Setting::Floating],
     },
     PanelKind {
         id: PanelId(2),
         name: "Canvas",
         header: HeaderStyle::Named,
         direction: Direction::Column,
+        settings: &[],
     },
     PanelKind {
         id: PanelId(3),
         name: "Brush",
         header: HeaderStyle::Named,
         direction: Direction::Column,
+        settings: &[Setting::Floating],
     },
     PanelKind {
         id: PanelId(4),
         name: "Layers",
         header: HeaderStyle::Named,
         direction: Direction::Column,
+        settings: &[Setting::Floating],
     },
     PanelKind {
         id: PanelId(5),
         name: "Colour",
         header: HeaderStyle::Named,
         direction: Direction::Column,
+        settings: &[Setting::Floating],
     },
     PanelKind {
         id: PanelId(6),
         name: "History",
         header: HeaderStyle::Named,
         direction: Direction::Column,
+        settings: &[Setting::Floating],
     },
 ];
 
@@ -128,6 +157,14 @@ fn id_for(name: &str) -> Option<PanelId> {
 
 /// Where the saved workspace lives, beside the brush library and the theme.
 fn layout_path() -> Option<std::path::PathBuf> {
+    // **Never during tests.** A test that floats a panel would otherwise rewrite the workspace of
+    // whoever is running it -- and, worse the other way round, a test that builds a "default"
+    // workspace would read their saved one and quietly test their arrangement instead of the
+    // built-in one. Both happened: a floating test passed against a fixture that was already
+    // floating, because the state came off disk.
+    if cfg!(test) {
+        return None;
+    }
     let dir = dirs::data_local_dir()?.join("OpenPaint");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("workspace.json"))
@@ -138,13 +175,20 @@ fn layout_path() -> Option<std::path::PathBuf> {
 /// A missing file is the ordinary case. A broken one is reported and the default used, rather
 /// than opening into some half-parsed workspace — the same tolerance the brush library and the
 /// theme take with theirs.
-fn load_layout() -> Option<(Layout, std::collections::HashMap<u32, PanelOptions>)> {
+type Loaded = (
+    Layout,
+    std::collections::HashMap<u32, PanelOptions>,
+    Vec<Floating>,
+);
+
+fn load_layout() -> Option<Loaded> {
     let path = layout_path()?;
     let text = std::fs::read_to_string(&path).ok()?;
     match serde_json::from_str::<SavedWorkspace>(&text) {
         Ok(saved) => {
             let layout = Layout::from_saved(&saved.layout, id_for);
             let options = options_from_saved(&saved.panels);
+            let floating = floating_from_saved(&saved.floating);
             // A file that resolved to nothing at all -- every panel in it renamed away, say --
             // would open into an empty window with no way back but a shortcut. The default is the
             // better answer, and it is not silent.
@@ -157,7 +201,7 @@ fn load_layout() -> Option<(Layout, std::collections::HashMap<u32, PanelOptions>
                 );
                 return None;
             }
-            Some((layout, options))
+            Some((layout, options, floating))
         }
         Err(e) => {
             eprintln!(
@@ -198,6 +242,50 @@ pub struct Workspace {
     /// -- moving one that is already open moves it rather than making a second. Saved with the
     /// arrangement, under the panel's name for the same reason the layout is (§ persistence).
     options: std::collections::HashMap<u32, PanelOptions>,
+    /// Panels lifted out of the arrangement and left floating above it.
+    ///
+    /// **Above the arrangement, not outside the window.** A separate operating-system window needs
+    /// a second surface for the GPU to draw into and a second path through the event loop; a
+    /// floating rectangle needs neither and is what a floating palette was in every paint
+    /// application before they became windows. Nothing here forecloses the window: a floating
+    /// panel is already a panel with its own rectangle, which is what a window would give it.
+    ///
+    /// In front-to-back order, so the last one drawn is the one pressed.
+    floating: Vec<Floating>,
+    /// A floating panel being carried, if one is.
+    carrying: Option<Carry>,
+    /// The window as it was last drawn.
+    ///
+    /// Kept because floating a panel has to put it *somewhere*, and the request can arrive from a
+    /// menu that has no idea how big the window is. Written every frame; the default is only ever
+    /// seen before the first one.
+    screen: Rect,
+}
+
+/// A panel lifted out of the arrangement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Floating {
+    pub panel: PanelId,
+    pub rect: Rect,
+}
+
+/// A floating panel on its way to disk, named rather than numbered for the same reason the
+/// arrangement is: an id is a position in a table, and a table changes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SavedFloating {
+    panel: String,
+    rect: Rect,
+}
+
+/// A floating panel under the pointer, and where it was taken hold of.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Carry {
+    panel: PanelId,
+    /// Where inside the panel the pointer landed, so it does not jump to the corner.
+    grip: (f32, f32),
+    press_ms: f64,
+    moved: bool,
+    asked: bool,
 }
 
 /// What a floating list is showing.
@@ -307,7 +395,8 @@ impl Default for Workspace {
         // The arrangement and the settings come out of the same file together, because a setting
         // belongs to a panel and the panels are the arrangement: loading one without the other
         // would open a workspace half of which was somebody's and half of which was the default's.
-        let (layout, options) = load_layout().unwrap_or_else(|| (default_layout(), <_>::default()));
+        let (layout, options, floating) =
+            load_layout().unwrap_or_else(|| (default_layout(), <_>::default(), Vec::new()));
         Self {
             layout,
             history: LayoutHistory::default(),
@@ -318,8 +407,43 @@ impl Default for Workspace {
             popup_input: crate::panel_draw::PanelInput::default(),
             popup_wanted: None,
             options,
+            floating,
+            carrying: None,
+            screen: Rect::new(0.0, 0.0, 1280.0, 800.0),
         }
     }
+}
+
+/// Floating panels on their way to disk, keyed by name for the same reason everything else is.
+///
+/// Its own function because a test can see it and cannot see a file being written -- the same
+/// split that made `saves` and `options_to_saved` testable, and the same gap that let a sabotage
+/// of this mapping go unnoticed the first time.
+#[must_use]
+fn floating_to_saved(floating: &[Floating]) -> Vec<SavedFloating> {
+    floating
+        .iter()
+        .filter_map(|f| {
+            name_for(f.panel).map(|panel| SavedFloating {
+                panel,
+                rect: f.rect,
+            })
+        })
+        .collect()
+}
+
+/// Floating panels on their way back, dropping any name this build does not know.
+#[must_use]
+fn floating_from_saved(saved: &[SavedFloating]) -> Vec<Floating> {
+    saved
+        .iter()
+        .filter_map(|f| {
+            id_for(&f.panel).map(|panel| Floating {
+                panel,
+                rect: f.rect,
+            })
+        })
+        .collect()
 }
 
 /// Panel settings on their way to disk: keyed by name, and only where something was actually set.
@@ -361,10 +485,17 @@ struct SavedWorkspace {
     layout: crate::layout::SavedLayout,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     panels: std::collections::BTreeMap<String, PanelOptions>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    floating: Vec<SavedFloating>,
 }
 
 /// Where a hand-edited theme lives, beside the brush library.
 fn theme_path() -> Option<std::path::PathBuf> {
+    // Not during tests, for the same reason as `layout_path`: choosing an icon set in a test must
+    // not change the look of the application on the machine running it.
+    if cfg!(test) {
+        return None;
+    }
     let dir = dirs::data_local_dir()?.join("OpenPaint");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("theme.json"))
@@ -548,6 +679,7 @@ impl Workspace {
         let saved = SavedWorkspace {
             layout: self.layout.to_saved(name_for),
             panels: options_to_saved(&self.options),
+            floating: floating_to_saved(&self.floating),
         };
         match serde_json::to_string_pretty(&saved)
             .map_err(|e| e.to_string())
@@ -655,6 +787,7 @@ impl Workspace {
         ));
         let m = self.theme.metrics;
         let p = self.theme.palette;
+        self.screen = screen;
 
         let placed = self.layout.resolve(screen);
         let splitters = self.layout.splitters(screen, m.splitter_grab);
@@ -706,6 +839,15 @@ impl Workspace {
                 self.open_popup_at(ctx, kind, pos.x, pos.y, screen);
             }
         }
+        // A floating panel sits above the arrangement, so it answers before the arrangement does.
+        // Its own small gesture rather than `panel_drag`'s: that one moves nodes around a tree,
+        // and this one moves a rectangle.
+        let float_pulse = crate::panel_drag::pulse(pressed, released, down);
+        self.carry_floating(float_pulse, pointer.map(|q| (q.x, q.y)), now_ms);
+        let on_float = pressed
+            && self.popup.is_none()
+            && pointer.is_some_and(|q| self.floating_at(q.x, q.y).is_some());
+
         let on_popup = popup_press(
             self.popup.map(|p| p.rect),
             pressed,
@@ -715,7 +857,11 @@ impl Workspace {
             self.popup = None;
         }
 
-        let preview = if on_popup == PopupPress::Consume {
+        let preview = if on_float {
+            // The floating panel took it. Nothing beneath may also have it, or a press on a
+            // palette would move whatever happened to be docked behind it.
+            None
+        } else if on_popup == PopupPress::Consume {
             // The list owns this press. A drag already in flight still gets its release, which is
             // why only the press is withheld and not the whole frame.
             None
@@ -1001,6 +1147,59 @@ impl Workspace {
             }
         }
 
+        // --- floating panels, above the arrangement and below the popup ---
+        //
+        // Drawn with the same chrome as a docked panel, deliberately: a floating palette that
+        // looked like a different kind of object would be a second UI to learn, and it is the same
+        // panel -- only its rectangle comes from somewhere else.
+        for held in &self.floating {
+            let slot = crate::layout::Placed {
+                path: Vec::new(),
+                rect: held.rect,
+                tabs: vec![held.panel],
+                active: 0,
+            };
+            let c = chrome::panel(&slot, &m, style_of(&slot), |i| {
+                measure(ctx, m.label, slot.tabs.get(i).copied())
+            });
+            // **One layer for every floating panel**, not one each. egui orders layers within an
+            // Order by when they were registered, and a raw layer painter registers no area -- so
+            // two panels' layers could interleave, and one panel's background painted over
+            // another's contents. Inside a single layer, what is added last is on top, which is
+            // exactly the rule wanted here.
+            let top = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Middle,
+                egui::Id::new("floating"),
+            ));
+            top.rect_filled(to_egui(c.outer), m.radius, rgb(p.panel));
+            top.rect_stroke(
+                to_egui(c.outer),
+                m.radius,
+                egui::Stroke::new(1.0_f32, rgb(p.edge)),
+            );
+            top.rect_filled(to_egui(c.header), m.radius, rgb(p.header));
+            top.text(
+                egui::pos2(c.header.x + m.tab_padding, c.header.y + c.header.h / 2.0),
+                egui::Align2::LEFT_CENTER,
+                name_of(held.panel),
+                egui::FontId::proportional(m.label),
+                rgb(p.text),
+            );
+            let mut ui = egui::Ui::new(
+                ctx.clone(),
+                egui::LayerId::new(egui::Order::Middle, egui::Id::new("floating")),
+                egui::Id::new(("floating-body", held.panel.0)),
+                egui::UiBuilder::new().max_rect(to_egui(c.controls.rect())),
+            );
+            ui.set_clip_rect(to_egui(c.controls.rect()));
+            contents(
+                held.panel,
+                &mut ui,
+                self.direction_of(held.panel),
+                Place::Panel,
+            );
+        }
+
         // --- the popup, above everything, drawn by the same descriptor layer as any panel ---
         if let Some(popup) = self.popup {
             let theme = self.theme;
@@ -1045,9 +1244,9 @@ impl Workspace {
 
     /// The controls a popup is showing.
     #[must_use]
-    fn popup_controls(&self, kind: PopupKind) -> Vec<crate::panel_ui::Control> {
+    fn popup_controls(&self, showing: PopupKind) -> Vec<crate::panel_ui::Control> {
         use crate::panel_ui::Control;
-        match kind {
+        match showing {
             // A panel's own popup is drawn by the panel; this is never asked about one.
             PopupKind::Panel(_) => Vec::new(),
             PopupKind::Panels => panel_list_controls(self),
@@ -1070,13 +1269,57 @@ impl Workspace {
                 let mut controls = vec![Control::Label {
                     text: format!("{} settings", name_of(panel)),
                 }];
-                let current = self.direction_of(panel);
-                controls.extend(DIRECTIONS.iter().map(|(id, name, d)| Control::Choice {
-                    id: *id,
-                    text: (*name).to_owned(),
-                    selected: current == *d,
-                    icon: None,
-                }));
+                let offered = kind(panel).map_or(&[][..], |k| k.settings);
+                if offered.is_empty() {
+                    // Said out loud rather than shown as an empty box. An empty popup is
+                    // indistinguishable from one that failed to open (DECISIONS 6b), and it
+                    // leaves the artist pressing again to see whether they missed something.
+                    controls.push(Control::Label {
+                        text: "Nothing to set here yet.".to_owned(),
+                    });
+                    return controls;
+                }
+                for setting in offered {
+                    match setting {
+                        Setting::Floating => {
+                            if self.is_floating(panel) {
+                                controls.push(Control::Label {
+                                    text: "Put back into".to_owned(),
+                                });
+                                // Only panels still in the arrangement: docking into another
+                                // floating one would leave both floating and nothing docked, which
+                                // is not what "put back" means to anybody.
+                                controls.extend(
+                                    PANELS.iter().filter(|k| self.is_docked(k.id)).map(|k| {
+                                        Control::Button {
+                                            id: DOCK_BASE + k.id.0,
+                                            text: k.name.to_owned(),
+                                        }
+                                    }),
+                                );
+                            } else {
+                                controls.push(Control::Button {
+                                    id: FLOAT_ID,
+                                    text: "Float".to_owned(),
+                                });
+                            }
+                        }
+                        Setting::Direction => {
+                            controls.push(Control::Label {
+                                text: "Controls run".to_owned(),
+                            });
+                            let current = self.direction_of(panel);
+                            controls.extend(DIRECTIONS.iter().map(|(id, name, d)| {
+                                Control::Choice {
+                                    id: *id,
+                                    text: (*name).to_owned(),
+                                    selected: current == *d,
+                                    icon: None,
+                                }
+                            }));
+                        }
+                    }
+                }
                 controls
             }
         }
@@ -1091,6 +1334,10 @@ impl Workspace {
             (PopupKind::Panels, Change::Toggled(id, _)) => self.toggle(PanelId(id)),
             (PopupKind::Workspace, Change::Chose(id)) if id >= ICON_SET_BASE => {
                 self.set_icons(id - ICON_SET_BASE);
+            }
+            (PopupKind::Settings(panel), Change::Pressed(FLOAT_ID)) => self.float(panel),
+            (PopupKind::Settings(panel), Change::Pressed(id)) if id >= DOCK_BASE => {
+                self.dock(panel, PanelId(id - DOCK_BASE));
             }
             (PopupKind::Settings(panel), Change::Chose(id)) => {
                 if let Some((_, _, d)) = DIRECTIONS.iter().find(|(i, _, _)| *i == id) {
@@ -1111,6 +1358,150 @@ impl Workspace {
             .get(&panel.0)
             .and_then(|o| o.direction)
             .unwrap_or_else(|| default_direction(panel))
+    }
+
+    /// Move a floating panel with the pointer, and let a hold ask it for its settings.
+    ///
+    /// The same two rules as a docked panel, for the same reason: a hand already on the thing is
+    /// not asking permission to move it, and holding still is the one gesture left over.
+    fn carry_floating(
+        &mut self,
+        pulse: crate::panel_drag::Pulse,
+        pointer: Option<(f32, f32)>,
+        now_ms: f64,
+    ) {
+        use crate::panel_drag::{Pulse, HOLD_MS, SLOP};
+        let Some((x, y)) = pointer else {
+            self.carrying = None;
+            return;
+        };
+        match pulse {
+            Pulse::Press => {
+                if self.popup.is_some() {
+                    return;
+                }
+                // Front-most first, and brought to the front, so a press on an overlapping pair
+                // picks the one you can see and leaves it where you can see it.
+                let Some(panel) = self.floating_at(x, y) else {
+                    return;
+                };
+                let Some(index) = self.floating.iter().position(|f| f.panel == panel) else {
+                    return;
+                };
+                let held = self.floating.remove(index);
+                self.floating.push(held);
+                self.carrying = Some(Carry {
+                    panel,
+                    grip: (x - held.rect.x, y - held.rect.y),
+                    press_ms: now_ms,
+                    moved: false,
+                    asked: false,
+                });
+            }
+            Pulse::Track => {
+                let Some(carry) = self.carrying.as_mut() else {
+                    return;
+                };
+                let Some(held) = self.floating.iter_mut().find(|f| f.panel == carry.panel) else {
+                    return;
+                };
+                let want = (x - carry.grip.0, y - carry.grip.1);
+                carry.moved =
+                    carry.moved || (want.0 - held.rect.x).hypot(want.1 - held.rect.y) >= SLOP;
+                if carry.moved {
+                    held.rect = hold_on_screen(
+                        Rect::new(want.0, want.1, held.rect.w, held.rect.h),
+                        self.screen,
+                        &self.theme.metrics,
+                    );
+                } else if !carry.asked && now_ms - carry.press_ms >= HOLD_MS {
+                    carry.asked = true;
+                    let panel = carry.panel;
+                    self.carrying = None;
+                    self.popup_wanted = Some(PopupKind::Settings(panel));
+                }
+            }
+            Pulse::Release => {
+                if self.carrying.take().is_some_and(|c| c.moved) {
+                    self.remember();
+                }
+            }
+            Pulse::Lost => self.carrying = None,
+        }
+    }
+
+    /// Put everything a saved workspace could have supplied back to the built-in answer.
+    ///
+    /// One function rather than a list of fields at each call site: a field added later is a field
+    /// somebody forgets to reset, and the symptom is a test drawing somebody else's workspace.
+    #[cfg(test)]
+    pub fn reset_to_built_in(&mut self) {
+        self.layout = default_layout();
+        self.theme = Theme::default();
+        self.options.clear();
+        self.floating.clear();
+        self.carrying = None;
+        self.popup = None;
+        self.popup_wanted = None;
+    }
+
+    /// Whether a panel is floating above the arrangement.
+    #[must_use]
+    pub fn is_floating(&self, panel: PanelId) -> bool {
+        self.floating.iter().any(|f| f.panel == panel)
+    }
+
+    /// Whether a panel is in the arrangement itself.
+    #[must_use]
+    pub fn is_docked(&self, panel: PanelId) -> bool {
+        self.layout.find(panel).is_some()
+    }
+
+    /// Lift a panel out of the arrangement and leave it floating.
+    ///
+    /// Undoable like any other change to the arrangement, because it *is* one: the panel has left
+    /// the tree, and getting it back should not need remembering where it was.
+    pub fn float(&mut self, panel: PanelId) {
+        if self.is_floating(panel) || !self.is_docked(panel) {
+            return;
+        }
+        self.history.record(self.layout.clone());
+        self.layout.remove(panel);
+        let screen = self.screen;
+        let at = first_float(screen, self.floating.len(), &self.theme.metrics);
+        self.floating.push(Floating { panel, rect: at });
+        self.popup = None;
+        self.remember();
+    }
+
+    /// Put a floating panel back, as a tab beside one that is still docked.
+    ///
+    /// **Refused rather than guessed at** when the destination is not somewhere it could go: a
+    /// panel that vanished because it was docked into something that was itself floating would be
+    /// the worst possible answer (DECISIONS 6b).
+    pub fn dock(&mut self, panel: PanelId, into: PanelId) {
+        if !self.is_floating(panel) {
+            return;
+        }
+        let Some((path, _)) = self.layout.find(into) else {
+            eprintln!("dock: {} is not in the arrangement", name_of(into));
+            return;
+        };
+        self.history.record(self.layout.clone());
+        self.floating.retain(|f| f.panel != panel);
+        self.layout.insert(&path, Zone::Center, panel);
+        self.popup = None;
+        self.remember();
+    }
+
+    /// Which floating panel is under a point, if any. Front-most first.
+    #[must_use]
+    fn floating_at(&self, x: f32, y: f32) -> Option<PanelId> {
+        self.floating
+            .iter()
+            .rev()
+            .find(|f| f.rect.contains(x, y))
+            .map(|f| f.panel)
     }
 
     /// Choose the icon set, and write the look out.
@@ -1279,14 +1670,21 @@ impl Workspace {
                         // (DECISIONS 6b).
                         self.open(panel);
                     }
-                    Outcome::Settings(panel) => {
-                        self.popup_wanted = Some(PopupKind::Settings(panel))
-                    }
                     Outcome::Moved | Outcome::Resized | Outcome::Nothing | Outcome::Switched => {}
                 }
                 None
             }
-            Pulse::Track => self.drag.drag(&mut self.layout, screen, x, y, now_ms),
+            Pulse::Track => {
+                let preview = self.drag.drag(&mut self.layout, screen, x, y, now_ms);
+                // A hold that completed asks the panel what it offers, straight away rather than
+                // on release: a menu that only appeared once you let go could not be dismissed by
+                // letting go.
+                if let Some(Preview::Asking(panel)) = preview {
+                    self.popup_wanted = Some(PopupKind::Settings(panel));
+                    return None;
+                }
+                preview
+            }
             Pulse::Lost => {
                 self.drag.cancel(&mut self.layout);
                 None
@@ -1344,8 +1742,48 @@ const DIRECTIONS: &[(u32, &str, Direction)] = &[
     (3, "Across, wrapping", Direction::Wrap),
 ];
 
+/// The id of the button that lifts a panel out of the arrangement.
+const FLOAT_ID: u32 = 1 << 17;
+/// Where the "put it back into ..." choices start, one per panel still docked.
+const DOCK_BASE: u32 = 1 << 18;
+
 /// Where the icon-set choices start, out of the way of anything else a workspace popup offers.
 const ICON_SET_BASE: u32 = 1 << 16;
+
+/// Where a floating panel goes when it is first lifted out.
+///
+/// Offset from the top-left rather than centred, so several lifted in a row do not land exactly on
+/// top of one another with no way to tell there is more than one.
+#[must_use]
+fn first_float(screen: Rect, already: usize, m: &Metrics) -> Rect {
+    let step = m.header * f32::from(u8::try_from(already % 6).unwrap_or(0));
+    let (w, h) = ((screen.w * 0.22).min(320.0), (screen.h * 0.35).min(420.0));
+    hold_on_screen(
+        Rect::new(screen.x + 60.0 + step, screen.y + 60.0 + step, w, h),
+        screen,
+        m,
+    )
+}
+
+/// Keep a floating panel somewhere it can be taken hold of again.
+///
+/// **Its header must stay reachable**, which is the same rule as the weight floor: a panel with
+/// nothing left to grab cannot be undone by hand. So it may hang off an edge -- that is often what
+/// you want, to get it out of the way -- but never so far that the bar you drag it by is gone.
+#[must_use]
+fn hold_on_screen(rect: Rect, screen: Rect, m: &Metrics) -> Rect {
+    let keep = m.header.max(m.row);
+    Rect::new(
+        rect.x
+            .min(screen.x + screen.w - keep)
+            .max(screen.x + keep - rect.w),
+        // Never above the top: the header is at the top of the panel, so letting it go up would
+        // put the one grabbable part off screen entirely.
+        rect.y.min(screen.y + screen.h - keep).max(screen.y),
+        rect.w.max(keep),
+        rect.h.max(keep),
+    )
+}
 
 /// Which panel's header is under a point, if any.
 ///
@@ -1392,7 +1830,7 @@ fn saves(outcome: &Outcome) -> bool {
     match outcome {
         Outcome::Moved | Outcome::Resized | Outcome::Floated(_) => true,
         // Asking a panel what it offers has not changed anything yet.
-        Outcome::Nothing | Outcome::Switched | Outcome::Settings(_) => false,
+        Outcome::Nothing | Outcome::Switched => false,
     }
 }
 
@@ -1490,6 +1928,9 @@ mod tests {
             popup_input: crate::panel_draw::PanelInput::default(),
             popup_wanted: None,
             options: std::collections::HashMap::new(),
+            floating: Vec::new(),
+            carrying: None,
+            screen: Rect::new(0.0, 0.0, 1280.0, 800.0),
         }
     }
 
@@ -1626,6 +2067,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            floating: Vec::new(),
         };
         let text = serde_json::to_string(&saved).expect("serialise");
         assert!(
@@ -1762,6 +2204,175 @@ mod tests {
         );
     }
 
+    /// **Floating takes a panel out of the arrangement, and docking puts it back.**
+    ///
+    /// A panel is in exactly one of the two places at any moment. Being in both would mean two
+    /// copies; being in neither would mean it had vanished, which is the failure this whole path
+    /// exists to avoid (DECISIONS 6b).
+    #[test]
+    fn a_panel_is_either_docked_or_floating_and_never_both_or_neither() {
+        let mut ws = bare();
+        assert!(ws.is_docked(BRUSH) && !ws.is_floating(BRUSH));
+
+        ws.float(BRUSH);
+        assert!(ws.is_floating(BRUSH), "it should be floating now");
+        assert!(!ws.is_docked(BRUSH), "and gone from the arrangement");
+
+        ws.dock(BRUSH, LAYERS);
+        assert!(ws.is_docked(BRUSH), "it should be back");
+        assert!(!ws.is_floating(BRUSH), "and no longer floating");
+        // Beside the panel it was docked into, which is what "put back into Layers" means.
+        let (brush, _) = ws.layout.find(BRUSH).expect("brush");
+        let (layers, _) = ws.layout.find(LAYERS).expect("layers");
+        assert_eq!(
+            brush, layers,
+            "it did not land beside the panel it was given"
+        );
+    }
+
+    /// Floating and docking are both undoable, because both are changes to the arrangement.
+    #[test]
+    fn floating_a_panel_can_be_taken_back() {
+        let mut ws = bare();
+        let before = ws.layout.clone();
+        ws.float(BRUSH);
+        assert!(ws.undo(), "there should be a change to take back");
+        assert_eq!(ws.layout, before, "the panel should be where it was");
+    }
+
+    /// **Nothing can be docked into something that is itself floating.**
+    ///
+    /// It would leave both floating and nothing docked, which is not what "put it back" means to
+    /// anybody -- and the destination list is built from the docked panels for exactly that
+    /// reason, so this is the belt to that list's braces.
+    #[test]
+    fn a_floating_panel_is_not_offered_as_somewhere_to_dock() {
+        let mut ws = bare();
+        ws.float(BRUSH);
+        ws.float(COLOUR);
+
+        let offered = ws.popup_controls(PopupKind::Settings(BRUSH));
+        assert!(
+            !offered.iter().any(|c| c.id() == Some(DOCK_BASE + COLOUR.0)),
+            "a floating panel was offered as somewhere to put another one back"
+        );
+        assert!(
+            offered.iter().any(|c| c.id() == Some(DOCK_BASE + LAYERS.0)),
+            "and a docked one should be"
+        );
+
+        // And asking directly is refused rather than obeyed.
+        ws.dock(BRUSH, COLOUR);
+        assert!(ws.is_floating(BRUSH), "it should still be floating");
+        assert!(!ws.is_docked(BRUSH));
+    }
+
+    /// A docked panel is offered somewhere to go; a floating one, somewhere to return to.
+    #[test]
+    fn the_settings_offer_the_direction_a_panel_can_actually_travel() {
+        let mut ws = bare();
+        let docked = ws.popup_controls(PopupKind::Settings(BRUSH));
+        assert!(
+            docked.iter().any(|c| c.id() == Some(FLOAT_ID)),
+            "a docked panel should be offered a way out"
+        );
+
+        ws.float(BRUSH);
+        let afloat = ws.popup_controls(PopupKind::Settings(BRUSH));
+        assert!(
+            !afloat.iter().any(|c| c.id() == Some(FLOAT_ID)),
+            "a floating panel should not be offered floating again"
+        );
+        assert!(
+            afloat
+                .iter()
+                .any(|c| c.id().is_some_and(|i| i >= DOCK_BASE)),
+            "it should be offered somewhere to go back to"
+        );
+    }
+
+    /// **A floating panel always keeps a handle on screen.**
+    ///
+    /// The same rule as the weight floor: something with nothing left to grab cannot be undone by
+    /// hand. It may hang off an edge -- that is often exactly what you want -- but never so far
+    /// that the bar you drag it by has gone with it.
+    #[test]
+    fn a_floating_panel_can_always_be_grabbed_again() {
+        let m = crate::theme::Theme::default().metrics;
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let keep = m.header.max(m.row);
+        for at in [
+            (-5000.0, -5000.0),
+            (5000.0, 5000.0),
+            (-5000.0, 5000.0),
+            (700.0, 400.0),
+        ] {
+            let r = hold_on_screen(Rect::new(at.0, at.1, 300.0, 400.0), screen, &m);
+            let on = Rect::new(
+                r.x.max(screen.x),
+                r.y.max(screen.y),
+                (r.x + r.w).min(screen.x + screen.w) - r.x.max(screen.x),
+                (r.y + r.h).min(screen.y + screen.h) - r.y.max(screen.y),
+            );
+            assert!(
+                on.w >= keep - 0.001 && on.h >= keep - 0.001,
+                "dropped at {at:?} it left only {}x{} on screen",
+                on.w,
+                on.h
+            );
+        }
+    }
+
+    /// Two panels lifted in a row do not land exactly on top of one another.
+    #[test]
+    fn floating_panels_do_not_hide_behind_each_other() {
+        let m = crate::theme::Theme::default().metrics;
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let a = first_float(screen, 0, &m);
+        let b = first_float(screen, 1, &m);
+        assert_ne!(a, b, "the second one landed exactly on the first");
+        assert!(
+            (a.x - b.x).abs() >= m.header - 0.001 || (a.y - b.y).abs() >= m.header - 0.001,
+            "and it should be offset by enough to see"
+        );
+    }
+
+    /// A floating panel survives being saved, under its name like everything else.
+    #[test]
+    fn a_floating_panel_survives_the_saved_form() {
+        let mut ws = bare();
+        ws.float(BRUSH);
+        let where_it_was = ws.floating[0].rect;
+
+        let saved = SavedWorkspace {
+            layout: ws.layout.to_saved(name_for),
+            panels: options_to_saved(&ws.options),
+            // The application's own mapping, not a copy of it written out again here: a test that
+            // reimplements the thing it is testing tests nothing, and a sabotage of the real
+            // mapping slipped past the first version of this for exactly that reason.
+            floating: floating_to_saved(&ws.floating),
+        };
+        let text = serde_json::to_string(&saved).expect("serialise");
+        assert!(
+            text.contains("Brush"),
+            "written by name, not by number: {text}"
+        );
+
+        let back: SavedWorkspace = serde_json::from_str(&text).expect("parse");
+        let restored = floating_from_saved(&back.floating);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].panel, BRUSH);
+        assert_eq!(restored[0].rect, where_it_was);
+
+        // A name this build does not know is dropped, not turned into some other panel.
+        let text = text.replace("Brush", "Sparkles");
+        let back: SavedWorkspace = serde_json::from_str(&text).expect("parse");
+        assert!(
+            floating_from_saved(&back.floating).is_empty(),
+            "a panel this build does not know should be dropped, not turned into another one"
+        );
+    }
+
     /// **A setting overrides its panel's default, and only for that panel.**
     ///
     /// This is what makes direction a setting rather than a decision somebody else made: the panel
@@ -1786,10 +2397,11 @@ mod tests {
         }
     }
 
-    /// Holding a panel's header and letting go without moving asks it what it offers.
+    /// **Holding a header still asks the panel what it offers, while the finger is still down.**
     ///
-    /// The one gesture left over once "hold then move" means move, so it costs no pixels and every
-    /// panel has a header to press.
+    /// Not on release: a menu that only appeared once you let go could not be dismissed by letting
+    /// go, and the artist would be holding a finger on a panel wondering whether anything was
+    /// going to happen. Every panel has a header, always, so there is no panel this cannot reach.
     #[test]
     fn holding_a_header_still_asks_the_panel_for_its_settings() {
         use crate::panel_drag::{pulse, Target, HOLD_MS};
@@ -1805,35 +2417,41 @@ mod tests {
             0.0,
             |_, _| target.clone(),
         );
-        for t in [1.0, 2.0] {
-            ws.gesture(
-                screen,
-                pulse(false, false, true),
-                Some((10.0, 10.0)),
-                HOLD_MS + t,
-                |_, _| unreachable!(),
-            );
-        }
+        // Part-way through the hold: still nothing.
         ws.gesture(
             screen,
-            pulse(false, true, false),
+            pulse(false, false, true),
             Some((10.0, 10.0)),
-            HOLD_MS + 3.0,
+            HOLD_MS / 2.0,
+            |_, _| unreachable!(),
+        );
+        assert_eq!(ws.popup_wanted, None, "it asked before the hold was done");
+
+        ws.gesture(
+            screen,
+            pulse(false, false, true),
+            Some((10.0, 10.0)),
+            HOLD_MS + 1.0,
             |_, _| unreachable!(),
         );
         assert_eq!(
             ws.popup_wanted,
             Some(PopupKind::Settings(BRUSH)),
-            "holding a header and letting go should ask the panel what it offers"
+            "holding a header should ask the panel what it offers"
+        );
+        // And the gesture is over: a finger now reading a menu must not still be dragging.
+        assert!(
+            !ws.drag.active(),
+            "the panel was still being carried while its menu was up"
         );
     }
 
-    /// A settings popup offers every direction, and marks the one in force.
+    /// A panel that offers a direction offers all of them, and marks the one in force.
     #[test]
     fn the_settings_popup_offers_every_direction() {
         let mut ws = bare();
-        ws.set_direction(LAYERS, Direction::Wrap);
-        let controls = ws.popup_controls(PopupKind::Settings(LAYERS));
+        ws.set_direction(TOOLS, Direction::Wrap);
+        let controls = ws.popup_controls(PopupKind::Settings(TOOLS));
         for (id, name, _) in DIRECTIONS {
             assert!(
                 controls.iter().any(|c| c.id() == Some(*id)),
@@ -1855,6 +2473,35 @@ mod tests {
             chosen,
             vec!["Across, wrapping"],
             "exactly one direction should read as chosen"
+        );
+    }
+
+    /// **A panel with nothing to set says so.**
+    ///
+    /// The canvas has no controls at all, so offering it a choice between running them across or
+    /// down was nonsense -- and an empty popup is indistinguishable from one that failed to open.
+    #[test]
+    fn a_panel_with_nothing_to_set_says_so() {
+        let ws = bare();
+        let controls = ws.popup_controls(PopupKind::Settings(CANVAS));
+        assert!(
+            controls
+                .iter()
+                .all(|c| matches!(c, crate::panel_ui::Control::Label { .. })),
+            "the canvas was offered something to change"
+        );
+        assert!(
+            controls
+                .iter()
+                .any(|c| matches!(c, crate::panel_ui::Control::Label { text } if text.contains("Nothing"))),
+            "and it should say so rather than showing an empty box"
+        );
+        // Whereas a strip does offer something.
+        assert!(
+            ws.popup_controls(PopupKind::Settings(TOOLS))
+                .iter()
+                .any(|c| c.id().is_some()),
+            "the tool rail should still offer its direction"
         );
     }
 
@@ -2090,7 +2737,7 @@ mod tests {
     /// that guard existed.
     #[test]
     fn a_move_survives_the_frame_the_pointer_is_released_on() {
-        use crate::panel_drag::{pulse, Pulse, Target, HOLD_MS};
+        use crate::panel_drag::{pulse, Pulse, Target};
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let mut ws = bare();
         let brush_before = ws.layout.find(BRUSH).expect("brush").0;
@@ -2130,16 +2777,19 @@ mod tests {
             screen,
             pulse(false, false, true),
             Some((px, py)),
-            HOLD_MS + 1.0,
+            1.0,
             |_, _| unreachable!("only a press asks what is under the pointer"),
         );
-        assert!(ws.drag.armed(), "the hold should have armed the move");
+        assert!(
+            ws.drag.armed(),
+            "the press should have taken hold of the panel at once"
+        );
         // Frame 3: carried over the canvas.
         ws.gesture(
             screen,
             pulse(false, false, true),
             Some((dx, dy)),
-            HOLD_MS + 2.0,
+            2.0,
             |_, _| unreachable!(),
         );
         // Frame 4: let go. egui reports the release *and* the button already up, together.
@@ -2148,7 +2798,7 @@ mod tests {
             screen,
             pulse(false, true, false),
             Some((dx, dy)),
-            HOLD_MS + 3.0,
+            3.0,
             |_, _| unreachable!(),
         );
 
@@ -2162,7 +2812,7 @@ mod tests {
     /// **A move can be taken back.** The whole point of the layout having its own undo stack.
     #[test]
     fn a_move_can_be_undone() {
-        use crate::panel_drag::{pulse, Target, HOLD_MS};
+        use crate::panel_drag::{pulse, Target};
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let mut ws = bare();
         let before = ws.layout.clone();
@@ -2195,21 +2845,21 @@ mod tests {
             screen,
             pulse(false, false, true),
             Some((10.0, 10.0)),
-            HOLD_MS + 1.0,
+            1.0,
             |_, _| unreachable!(),
         );
         ws.gesture(
             screen,
             pulse(false, false, true),
             Some((dx, dy)),
-            HOLD_MS + 2.0,
+            2.0,
             |_, _| unreachable!(),
         );
         ws.gesture(
             screen,
             pulse(false, true, false),
             Some((dx, dy)),
-            HOLD_MS + 3.0,
+            3.0,
             |_, _| unreachable!(),
         );
         assert_ne!(
@@ -2227,7 +2877,7 @@ mod tests {
     /// exactly why it is easy to forget to record.
     #[test]
     fn a_resize_can_be_undone() {
-        use crate::panel_drag::{pulse, Target, HOLD_MS};
+        use crate::panel_drag::{pulse, Target};
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let mut ws = bare();
         let before = ws.layout.clone();
@@ -2257,21 +2907,21 @@ mod tests {
             screen,
             pulse(false, false, true),
             Some((px, py)),
-            HOLD_MS + 1.0,
+            1.0,
             |_, _| unreachable!(),
         );
         ws.gesture(
             screen,
             pulse(false, false, true),
             Some((px + 80.0, py)),
-            HOLD_MS + 2.0,
+            2.0,
             |_, _| unreachable!(),
         );
         ws.gesture(
             screen,
             pulse(false, true, false),
             Some((px + 80.0, py)),
-            HOLD_MS + 3.0,
+            3.0,
             |_, _| unreachable!(),
         );
         assert_ne!(ws.layout, before, "the divider did not move");
@@ -2287,7 +2937,7 @@ mod tests {
     /// for the one gesture that shows its work as you make it.
     #[test]
     fn escape_during_a_resize_puts_the_divider_back() {
-        use crate::panel_drag::{pulse, Target, HOLD_MS};
+        use crate::panel_drag::{pulse, Target};
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let mut ws = bare();
         let before = ws.layout.clone();
@@ -2314,14 +2964,14 @@ mod tests {
             screen,
             pulse(false, false, true),
             Some((px, py)),
-            HOLD_MS + 1.0,
+            1.0,
             |_, _| unreachable!(),
         );
         ws.gesture(
             screen,
             pulse(false, false, true),
             Some((px + 120.0, py)),
-            HOLD_MS + 2.0,
+            2.0,
             |_, _| unreachable!(),
         );
         assert_ne!(ws.layout, before, "the divider did not move");
@@ -2427,7 +3077,7 @@ mod tests {
     /// workspace, which is indistinguishable from the app having gone mad.
     #[test]
     fn a_lost_pointer_abandons_the_gesture() {
-        use crate::panel_drag::{pulse, Target, HOLD_MS};
+        use crate::panel_drag::{pulse, Target};
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let mut ws = bare();
         let before = ws.layout.clone();
@@ -2445,7 +3095,7 @@ mod tests {
             screen,
             pulse(false, false, true),
             Some((10.0, 10.0)),
-            HOLD_MS + 1.0,
+            1.0,
             |_, _| unreachable!(),
         );
         assert!(ws.drag.active(), "there should be a gesture to lose");
@@ -2455,7 +3105,7 @@ mod tests {
             screen,
             pulse(false, false, false),
             Some((700.0, 700.0)),
-            HOLD_MS + 2.0,
+            2.0,
             |_, _| unreachable!(),
         );
         assert!(!ws.drag.active(), "the gesture should have been abandoned");
@@ -2469,7 +3119,7 @@ mod tests {
     /// the way to reopen things is itself movable.
     #[test]
     fn a_panel_let_go_outside_the_window_comes_back() {
-        use crate::panel_drag::{pulse, Target, HOLD_MS};
+        use crate::panel_drag::{pulse, Target};
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let mut ws = bare();
         let (path, _) = ws.layout.find(BRUSH).expect("brush");
@@ -2486,7 +3136,7 @@ mod tests {
             screen,
             pulse(false, false, true),
             Some((10.0, 10.0)),
-            HOLD_MS + 1.0,
+            1.0,
             |_, _| unreachable!(),
         );
         // Well outside the window.
@@ -2495,14 +3145,14 @@ mod tests {
             screen,
             pulse(false, false, true),
             Some((ox, oy)),
-            HOLD_MS + 2.0,
+            2.0,
             |_, _| unreachable!(),
         );
         ws.gesture(
             screen,
             pulse(false, true, false),
             Some((ox, oy)),
-            HOLD_MS + 3.0,
+            3.0,
             |_, _| unreachable!(),
         );
         assert!(
@@ -2521,8 +3171,6 @@ mod tests {
         // Which tab you are looking at is not part of the arrangement, the same reason it is not
         // recorded for undo.
         assert!(!saves(&Outcome::Switched));
-        // Nor is asking a panel what it offers: nothing has changed until something is chosen.
-        assert!(!saves(&Outcome::Settings(BRUSH)));
     }
 
     /// Press where a pointer would land, wait out the hold, move to another panel, let go.
@@ -2533,7 +3181,7 @@ mod tests {
     /// gap looks like.
     #[test]
     fn a_panel_can_be_moved_from_a_press_on_what_is_drawn() {
-        use crate::panel_drag::{Outcome, PanelDrag, HOLD_MS};
+        use crate::panel_drag::{Outcome, PanelDrag};
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let mut layout = default_layout();
         let m = crate::theme::Theme::default().metrics;
@@ -2562,7 +3210,7 @@ mod tests {
         let mut history = LayoutHistory::default();
         drag.press(&layout, &target, px, py, 0.0);
         // Held still past the hold, which is what arms it.
-        drag.drag(&mut layout, screen, px, py, HOLD_MS + 1.0);
+        drag.drag(&mut layout, screen, px, py, 1.0);
         assert!(drag.armed(), "the hold should have armed the move");
 
         // Onto the far side of the canvas, which is a different leaf.
@@ -2575,7 +3223,7 @@ mod tests {
             canvas.rect.x + canvas.rect.w / 2.0,
             canvas.rect.y + canvas.rect.h - 8.0,
         );
-        drag.drag(&mut layout, screen, dx, dy, HOLD_MS + 2.0);
+        drag.drag(&mut layout, screen, dx, dy, 2.0);
         let outcome = drag.release(&mut layout, &mut history, screen, dx, dy);
 
         assert_eq!(outcome, Outcome::Moved, "the drop did nothing");

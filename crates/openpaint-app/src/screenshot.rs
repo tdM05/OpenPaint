@@ -140,9 +140,12 @@ pub fn press_controls(
 /// machine running it happened to have saved, and would change under you for no reason.
 #[must_use]
 pub fn plain_workspace() -> Workspace {
+    // Everything the saved workspace could have supplied, put back to the built-in answer.
+    // Resetting only the layout was not enough: floating panels came off disk too, so a test that
+    // floated one found it already floating, quietly did nothing, and drew somebody else's
+    // workspace.
     let mut ws = Workspace::default();
-    ws.layout = crate::workspace::default_layout();
-    ws.theme = Theme::default();
+    ws.reset_to_built_in();
     ws
 }
 
@@ -513,6 +516,16 @@ mod tests {
             &ctx,
             output,
         );
+    }
+
+    /// A panel lifted out of the arrangement, floating above it.
+    #[test]
+    #[ignore = "writes a PNG to look at rather than asserting anything"]
+    fn shot_floating() {
+        let mut ws = plain_workspace();
+        ws.float(crate::workspace::BRUSH);
+        ws.float(crate::workspace::COLOUR);
+        shoot("floating", Rect::new(0.0, 0.0, 1400.0, 900.0), &[], &mut ws);
     }
 
     /// **A press on a control produces its change, all the way through egui.**

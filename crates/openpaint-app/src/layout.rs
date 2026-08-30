@@ -32,7 +32,10 @@
 pub struct PanelId(pub u32);
 
 /// A rectangle in logical UI units, y down.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// Serialisable because a floating panel's position is part of a saved workspace, and a rectangle
+/// is the whole of what "where it is" means.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,

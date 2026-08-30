@@ -97,6 +97,11 @@ pub enum Preview {
     },
     /// A divider is armed, and the layout is following the pointer.
     Resizing { path: Path, index: usize },
+    /// A panel was held still long enough to be asked what it offers.
+    ///
+    /// Reported rather than performed: what a panel offers is the panel's business and the
+    /// workspace's to place, and this module knows about neither.
+    Asking(PanelId),
 }
 
 /// The drop a release would perform, and the rectangle to light up for it.
@@ -123,8 +128,6 @@ pub enum Outcome {
     /// Reported rather than performed: floating is a second [`Layout`] in a second window, and
     /// whose window that is belongs to the shell.
     Floated(PanelId),
-    /// A panel was held still and let go: it is being asked what it offers.
-    Settings(PanelId),
 }
 
 /// What a grab is for.
@@ -152,15 +155,25 @@ struct Grab {
     kind: Kind,
     press: (f32, f32),
     press_ms: f64,
-    /// Set once the hold completes. Only then does anything move.
-    armed: bool,
-    /// Set if the pointer wandered before arming, which abandons the gesture for good.
-    strayed: bool,
-    /// Set if the pointer wandered *after* arming, which is what makes a hold into a drag.
+    /// Set once the pointer has moved far enough to count as a drag rather than a press.
     ///
-    /// The difference matters because holding still and letting go is its own gesture: it is how a
-    /// panel is asked what it offers, with no button spending pixels on the question.
+    /// **A tab and a divider are grabbed the instant they are touched**, so this is not a gate on
+    /// whether anything may move -- only on whether anything *has*. Holding first was tried and
+    /// was wrong: an artist who has already put a finger on a divider is not asking permission to
+    /// resize it, and the third of a second before it answered read as a dead control.
+    ///
+    /// The reason a hold was ever wanted was that pressing on chrome must not draw on the canvas.
+    /// It does not: a press on a tab or a divider never reaches the canvas at all, so the hold was
+    /// solving a problem that only existed for presses on the canvas itself.
     moved: bool,
+    /// Set once the hold has run.
+    ///
+    /// Not a guard on asking twice -- a tab's grab is dropped the moment it asks, and a divider
+    /// has nothing to ask -- which a sabotage proved by changing nothing when it was used as one.
+    /// What it is for is the *repaint*: painting is demand-driven, so a waiting hold keeps asking
+    /// for frames, and a finger resting on a divider would keep the application redrawing for as
+    /// long as it stayed there.
+    asked: bool,
     /// Where the pointer was last, for the incremental divider drag.
     last: (f32, f32),
     /// The arrangement as it stood when the gesture began.
@@ -193,7 +206,7 @@ impl PanelDrag {
     /// dead.
     #[must_use]
     pub fn armed(&self) -> bool {
-        self.grab.as_ref().is_some_and(|g| g.armed)
+        self.grab.is_some()
     }
 
     /// How long until the hold completes, if one is waiting.
@@ -204,7 +217,7 @@ impl PanelDrag {
     #[must_use]
     pub fn waiting_ms(&self, now_ms: f64) -> Option<f64> {
         self.grab.as_ref().and_then(|g| {
-            (!g.armed && !g.strayed).then(|| (HOLD_MS - (now_ms - g.press_ms)).max(0.0))
+            (!g.moved && !g.asked).then(|| (HOLD_MS - (now_ms - g.press_ms)).max(0.0))
         })
     }
 
@@ -235,9 +248,8 @@ impl PanelDrag {
             kind,
             press: (x, y),
             press_ms: now_ms,
-            armed: false,
-            strayed: false,
             moved: false,
+            asked: false,
             last: (x, y),
             before: layout.clone(),
         });
@@ -258,14 +270,15 @@ impl PanelDrag {
         now_ms: f64,
     ) -> Option<Preview> {
         let grab = self.grab.as_mut()?;
-        if !grab.armed {
-            // Wandering before the hold completes abandons it: this was a stroke that happened to
-            // start on some chrome, not a rearrangement. Latched, so it cannot come back to life
-            // by holding still somewhere else.
-            grab.strayed = grab.strayed || (x - grab.press.0).hypot(y - grab.press.1) >= SLOP;
-            if grab.strayed {
-                return None;
-            }
+        // **Moving at all commits this to being a drag**, and puts the hold out of reach for good.
+        // Latched, because a panel carried out and brought back is still a drag: a hand that has
+        // been across the window and returned is not asking a question.
+        grab.moved = grab.moved || (x - grab.press.0).hypot(y - grab.press.1) >= SLOP;
+
+        if !grab.moved {
+            // Still where it started. The hold is running, and when it completes it asks the thing
+            // being held what it offers -- *now*, not on release, because a menu that appears when
+            // you let go cannot be dismissed by letting go.
             if now_ms - grab.press_ms < HOLD_MS {
                 #[expect(
                     clippy::cast_possible_truncation,
@@ -283,15 +296,21 @@ impl PanelDrag {
                     },
                 });
             }
-            grab.armed = true;
-            // Movement counts from *here*, not from the press: the pointer drifts a few units
-            // during the hold, and counting that would make everything jump the instant it arms.
-            grab.last = (x, y);
-            grab.press = (x, y);
+            grab.asked = true;
+            // The gesture is over: whatever the pointer does next belongs to the popup, and the
+            // arrangement must not keep following a finger that is now reading a menu.
+            let asking = match &grab.kind {
+                Kind::Tab { panel, .. } => Some(*panel),
+                // A divider belongs to no one panel, so there is nothing to ask. It keeps waiting,
+                // which costs nothing: the drag is still live and still resizes on the next move.
+                Kind::Splitter { .. } => None,
+            };
+            if let Some(panel) = asking {
+                self.grab = None;
+                return Some(Preview::Asking(panel));
+            }
+            return None;
         }
-        // Whether this hold has become a drag. Latched, because a panel carried out and brought
-        // back is still a drag and must not be mistaken for a question.
-        grab.moved = grab.moved || (x - grab.press.0).hypot(y - grab.press.1) >= SLOP;
 
         match &grab.kind {
             Kind::Splitter { path, index, axis } => {
@@ -342,17 +361,17 @@ impl PanelDrag {
         let Some(grab) = self.grab.take() else {
             return Outcome::Nothing;
         };
-        if !grab.armed {
-            // Never armed. A still press on a tab is a tap and switches to it; anything else — a
-            // stray swipe, or a press on a divider that went nowhere — asked for nothing.
+        if !grab.moved {
+            // Pressed and let go without moving. On a tab that is a tap, and it switches to it;
+            // on a divider it asked for nothing.
             return match grab.kind {
-                Kind::Tab { tab, path, .. } if !grab.strayed => {
+                Kind::Tab { tab, path, .. } => {
                     // Deliberately not recorded: Ctrl+Z must walk back through arrangement, not
                     // through which tab you were looking at.
                     layout.set_active(&path, tab);
                     Outcome::Switched
                 }
-                _ => Outcome::Nothing,
+                Kind::Splitter { .. } => Outcome::Nothing,
             };
         }
 
@@ -365,15 +384,6 @@ impl PanelDrag {
                 }
                 history.record(grab.before);
                 Outcome::Resized
-            }
-            Kind::Tab { panel, .. } if !grab.moved => {
-                // **Held, and let go without moving.** The hold has already armed, so this is a
-                // deliberate press-and-wait rather than a tap -- and it is the one gesture left
-                // over once "hold then move" means move. So it asks the panel what it offers.
-                //
-                // Every panel has a header, always, so there is no panel this cannot reach: which
-                // is the mistake that once put the panel list inside a closable menu.
-                Outcome::Settings(panel)
             }
             Kind::Tab { panel, .. } => {
                 let Some(placed) = layout.leaf_at(area, x, y) else {
@@ -415,7 +425,7 @@ impl PanelDrag {
         // left it wherever the pointer had dragged it to -- which is not "nothing has happened
         // until you let go", however firmly the comment above says so.
         if let Some(grab) = self.grab.take() {
-            if grab.armed {
+            if grab.moved {
                 *layout = grab.before;
             }
         }
@@ -519,19 +529,14 @@ mod tests {
     }
 
     /// Hold still until it arms, which every gesture now has to do.
-    fn arm(d: &mut PanelDrag, l: &mut Layout, x: f32, y: f32) {
-        d.drag(l, area(), x, y, HOLD_MS + 1.0);
-    }
-
-    /// Arm a gesture and carry it to a point, which is what the app always does: a release is
-    /// preceded by the frames that got the pointer there.
+    /// Carry a gesture to a point, which is what the app always does: a release is preceded by
+    /// the frames that got the pointer there.
     ///
-    /// Tests that armed and released without the frames in between were letting go without ever
-    /// having moved, which is now its own gesture -- so they were quietly asking a panel for its
-    /// settings while claiming to test a drop.
-    fn carry(d: &mut PanelDrag, l: &mut Layout, from: (f32, f32), to: (f32, f32)) {
-        arm(d, l, from.0, from.1);
-        d.drag(l, area(), to.0, to.1, HOLD_MS + 2.0);
+    /// There is no arming step to imitate. A press is live the moment it lands, and moving is what
+    /// turns it from a tap into a drag -- so a test that pressed and released with no frames in
+    /// between was testing a tap while claiming to test a drop.
+    fn carry(d: &mut PanelDrag, l: &mut Layout, to: (f32, f32)) {
+        d.drag(l, area(), to.0, to.1, 1.0);
     }
 
     /// A quick press and release on a tab shows it — and records nothing, because Ctrl+Z must walk
@@ -554,53 +559,54 @@ mod tests {
         assert_eq!(h.depth(), (0, 0), "a tap is not an undoable edit");
     }
 
-    /// **Movement alone never starts a drag**, however far it goes and however long it takes.
+    /// **Moving lifts the panel at once**, which is the rule this module is now built on.
     ///
-    /// The rule the whole module is built on. A plain drag across a header does nothing, so a
-    /// stroke that happens to begin on some chrome cannot rearrange the workspace.
+    /// It used to be the opposite: movement alone did nothing until a hold had armed the gesture.
+    /// That protected the canvas from a stroke starting on a header, except that a press on a
+    /// header never reaches the canvas -- so it was a cost with no benefit.
     #[test]
-    fn movement_alone_never_starts_a_drag() {
+    fn moving_lifts_the_panel_at_once() {
         let mut l = workspace();
-        let before = l.clone();
         let mut d = PanelDrag::default();
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
 
-        // Right across the window, and well past the hold time.
-        for (x, t) in [(710.0, 20.0), (760.0, 60.0), (900.0, 400.0), (400.0, 900.0)] {
-            assert_eq!(
-                d.drag(&mut l, area(), x, 300.0, t),
-                None,
-                "moving to {x} at {t} ms must not lift anything"
-            );
-        }
-        assert_eq!(l, before, "and nothing about the layout changed");
+        assert!(
+            matches!(
+                d.drag(&mut l, area(), 700.0, 300.0, 1.0),
+                Some(Preview::Carrying { .. })
+            ),
+            "the panel should be in the air on the first move"
+        );
     }
 
-    /// **A divider obeys the same rule**, which is the half that had been missing: resizing used
-    /// to happen on any drag, so a stroke near a seam rearranged the workspace under the pen.
+    /// **A divider resizes on the first move, with no wait at all.**
+    ///
+    /// Holding first was tried and was wrong: an artist with a finger already on a divider is not
+    /// asking permission to resize it, and the third of a second before it answered read as a dead
+    /// control. The canvas the hold was protecting was never at risk -- a press on a divider does
+    /// not reach it.
     #[test]
-    fn a_divider_also_needs_the_hold() {
+    fn a_divider_resizes_at_once() {
         let mut l = workspace();
         let before = l.resolve(area())[0].rect.w;
         let mut d = PanelDrag::default();
-        let s = l.splitters(area(), 26.0)[0].clone();
+        let sp = l.splitters(area(), 26.0)[0].clone();
 
         d.press(
             &l,
             &Target::Splitter {
-                path: s.path.clone(),
-                index: s.index,
+                path: sp.path.clone(),
+                index: sp.index,
             },
-            s.rect.x,
+            sp.rect.x,
             400.0,
             0.0,
         );
-        // Dragged straight away: nothing moves, and it can never arm because it strayed.
-        d.drag(&mut l, area(), s.rect.x + 120.0, 400.0, 30.0);
-        d.drag(&mut l, area(), s.rect.x + 120.0, 400.0, 5000.0);
+        // One move, one millisecond later.
+        d.drag(&mut l, area(), sp.rect.x + 120.0, 400.0, 1.0);
         assert!(
-            (l.resolve(area())[0].rect.w - before).abs() < 0.01,
-            "a divider must not resize without the hold"
+            (l.resolve(area())[0].rect.w - before).abs() > 1.0,
+            "a divider should follow the pointer immediately"
         );
     }
 
@@ -623,7 +629,7 @@ mod tests {
             400.0,
             0.0,
         );
-        arm(&mut d, &mut l, s.rect.x, 400.0);
+        d.drag(&mut l, area(), s.rect.x, 400.0, 1.0);
         for step in 1..=3_u8 {
             d.drag(
                 &mut l,
@@ -644,26 +650,27 @@ mod tests {
         );
     }
 
-    /// Straying during the hold abandons the gesture, and it cannot arm later.
+    /// Straying makes it a drag rather than abandoning it, and the hold never comes back.
     ///
-    /// "Hold and keep it there" has to mean *there*, or a slow drag across a header would arm
-    /// halfway along and start carrying a panel nobody picked up.
+    /// "Hold still to ask, move to rearrange" has to mean *still*, or a slow drag that paused
+    /// would sprout a menu in the middle of itself.
     #[test]
-    fn straying_during_the_hold_abandons_it() {
+    fn straying_turns_the_hold_into_a_drag_for_good() {
         let mut l = workspace();
-        let mut h = LayoutHistory::default();
         let mut d = PanelDrag::default();
 
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
         d.drag(&mut l, area(), 700.0 + SLOP + 1.0, 10.0, 20.0);
-        // Now hold still for ages: it must not come back to life.
-        assert_eq!(d.drag(&mut l, area(), 760.0, 10.0, 5000.0), None);
-        assert_eq!(d.waiting_ms(5000.0), None, "and it is not waiting either");
         assert_eq!(
-            d.release(&mut l, &mut h, area(), 760.0, 10.0),
-            Outcome::Nothing,
-            "not a tap either -- it went somewhere"
+            d.waiting_ms(20.0),
+            None,
+            "it is no longer waiting to be asked"
         );
+        // Held still for ages: it must not come back to life as a question.
+        assert!(!matches!(
+            d.drag(&mut l, area(), 760.0, 10.0, 5000.0),
+            Some(Preview::Asking(_))
+        ));
     }
 
     /// The wait is reported so the caller can show it. A hold with no feedback is
@@ -685,9 +692,12 @@ mod tests {
         assert_eq!(on, Held::Panel { path: vec![1] });
     }
 
-    /// A waiting press asks for the frames that let it fire, and stops once it has.
+    /// A still press asks for the frames that let its hold fire, and stops once it has fired.
+    ///
+    /// **Painting is demand-driven**, so a hold with the pointer perfectly still would otherwise
+    /// never complete: no events, no frames, and the timer never read.
     #[test]
-    fn a_waiting_press_asks_for_frames() {
+    fn a_still_press_asks_for_frames() {
         let l = workspace();
         let mut d = PanelDrag::default();
         assert_eq!(d.waiting_ms(0.0), None, "nothing is waiting yet");
@@ -695,12 +705,11 @@ mod tests {
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
         let left = d.waiting_ms(50.0).expect("a press is waiting");
         assert!((left - (HOLD_MS - 50.0)).abs() < 0.001, "got {left}");
-        assert!(!d.armed(), "and nothing is moving yet");
 
+        // Once it has asked, there is nothing left to wait for.
         let mut l2 = workspace();
-        arm(&mut d, &mut l2, 700.0, 10.0);
-        assert_eq!(d.waiting_ms(HOLD_MS + 1.0), None, "armed, so nothing waits");
-        assert!(d.armed());
+        d.drag(&mut l2, area(), 700.0, 10.0, HOLD_MS + 1.0);
+        assert_eq!(d.waiting_ms(HOLD_MS + 2.0), None);
     }
 
     /// **The ordering hazard.** Applying a move removes the panel first, and removing can collapse
@@ -719,7 +728,7 @@ mod tests {
         let target = placed[2].rect;
 
         d.press(&l, &tab(&[0], 0), 10.0, 10.0, 0.0);
-        arm(&mut d, &mut l, 10.0, 10.0);
+        d.drag(&mut l, area(), 10.0, 10.0, 1.0);
         let drop = (target.x + target.w / 2.0, target.y + target.h / 2.0);
         d.drag(&mut l, area(), drop.0, drop.1, HOLD_MS + 40.0);
         assert_eq!(
@@ -747,7 +756,7 @@ mod tests {
 
         let canvas_rect = l.resolve(area())[0].rect;
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
-        arm(&mut d, &mut l, 700.0, 10.0);
+        d.drag(&mut l, area(), 700.0, 10.0, 1.0);
         let drop = (
             canvas_rect.x + canvas_rect.w / 2.0,
             canvas_rect.y + canvas_rect.h * 0.95,
@@ -774,7 +783,7 @@ mod tests {
         let home = l.resolve(area())[1].rect;
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
         let drop = (home.x + home.w / 2.0, home.y + home.h / 2.0);
-        carry(&mut d, &mut l, (700.0, 10.0), drop);
+        carry(&mut d, &mut l, drop);
         assert_eq!(
             d.release(&mut l, &mut h, area(), drop.0, drop.1),
             Outcome::Nothing
@@ -791,7 +800,7 @@ mod tests {
         let mut d = PanelDrag::default();
 
         d.press(&l, &tab(&[], 0), 10.0, 10.0, 0.0);
-        carry(&mut d, &mut l, (10.0, 10.0), (990.0, 400.0));
+        carry(&mut d, &mut l, (990.0, 400.0));
         assert_eq!(
             d.release(&mut l, &mut h, area(), 990.0, 400.0),
             Outcome::Nothing
@@ -807,7 +816,7 @@ mod tests {
         let mut d = PanelDrag::default();
 
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
-        carry(&mut d, &mut l, (700.0, 10.0), (-50.0, 400.0));
+        carry(&mut d, &mut l, (-50.0, 400.0));
         assert_eq!(
             d.release(&mut l, &mut h, area(), -50.0, 400.0),
             Outcome::Floated(LAYERS)
@@ -815,40 +824,118 @@ mod tests {
         assert_eq!(h.depth(), (0, 0), "nothing has happened to the layout yet");
     }
 
+    /// Once a hold has fired, it stops asking for frames.
+    ///
+    /// **Painting is demand-driven**, so a waiting hold keeps requesting them; a divider's hold
+    /// has nothing to ask -- it belongs to no one panel -- and without noticing that it had run,
+    /// a finger resting on a divider would keep the application redrawing for as long as it stayed
+    /// there.
+    #[test]
+    fn a_divider_stops_asking_for_frames_once_its_hold_has_run() {
+        let mut l = workspace();
+        let mut d = PanelDrag::default();
+        let sp = l.splitters(area(), 26.0)[0].clone();
+        d.press(
+            &l,
+            &Target::Splitter {
+                path: sp.path.clone(),
+                index: sp.index,
+            },
+            sp.rect.x,
+            400.0,
+            0.0,
+        );
+        assert!(d.waiting_ms(10.0).is_some(), "it should be waiting");
+
+        d.drag(&mut l, area(), sp.rect.x, 400.0, HOLD_MS + 1.0);
+        assert_eq!(
+            d.waiting_ms(HOLD_MS + 2.0),
+            None,
+            "the hold has run; there is nothing left to wait for"
+        );
+    }
+
     /// **A hold that drifted a little is still a hold.**
     ///
     /// The pointer never sits perfectly still through a third of a second, especially a pen on
-    /// glass. Counting movement from the original press would mean a hold that drifted almost to
-    /// the slop threshold turned into a drag on the first stray unit afterwards --- so the gesture
-    /// would work or not depending on how steady the hand was.
+    /// glass. If any movement at all counted, the gesture would work or not depending on how
+    /// steady the hand was.
     #[test]
-    fn a_hold_that_drifted_before_arming_is_still_a_hold() {
+    fn a_hold_that_drifted_a_little_still_asks() {
         let mut l = workspace();
-        let mut h = LayoutHistory::default();
         let mut d = PanelDrag::default();
 
         let start = (700.0, 10.0);
         d.press(&l, &tab(&[1], 0), start.0, start.1, 0.0);
-        // Drifts almost the whole way to the slop threshold while waiting.
+        // Drifts almost the whole way to the threshold while the hold runs.
         let drifted = (start.0 + SLOP * 0.9, start.1);
-        d.drag(&mut l, area(), drifted.0, drifted.1, HOLD_MS + 1.0);
-        assert!(d.armed(), "it should still have armed");
-
-        // Wobbles on a little further after arming. Measured from the original press that is now
-        // past the threshold; measured from where it armed, which is what a hold means, it is
-        // nowhere near.
-        let wobbled = (drifted.0 + SLOP * 0.2, drifted.1);
-        d.drag(&mut l, area(), wobbled.0, wobbled.1, HOLD_MS + 2.0);
         assert!(
-            (wobbled.0 - start.0).hypot(wobbled.1 - start.1) > SLOP,
-            "the fixture must pass the threshold as measured from the press, or it proves nothing"
+            matches!(
+                d.drag(&mut l, area(), drifted.0, drifted.1, HOLD_MS / 2.0),
+                Some(Preview::Waiting { .. })
+            ),
+            "a hand that wobbled should still be waiting"
         );
-
         assert_eq!(
-            d.release(&mut l, &mut h, area(), wobbled.0, wobbled.1),
-            Outcome::Settings(LAYERS),
-            "a hand that wobbled should still be asking, not dragging"
+            d.drag(&mut l, area(), drifted.0, drifted.1, HOLD_MS + 1.0),
+            Some(Preview::Asking(LAYERS)),
+            "and the hold should complete"
         );
+    }
+
+    /// **Moving past the threshold makes it a drag, and the hold can never come back.**
+    ///
+    /// Otherwise a slow drag that paused would sprout a menu in the middle of itself.
+    #[test]
+    fn moving_puts_the_hold_out_of_reach_for_good() {
+        let mut l = workspace();
+        let mut d = PanelDrag::default();
+
+        let start = (700.0, 10.0);
+        d.press(&l, &tab(&[1], 0), start.0, start.1, 0.0);
+        // Well past the threshold: this is a drag now.
+        let away = (start.0 + SLOP * 4.0, start.1 + 200.0);
+        assert!(matches!(
+            d.drag(&mut l, area(), away.0, away.1, 1.0),
+            Some(Preview::Carrying { .. })
+        ));
+        // Held still there, far longer than the hold, and it must not ask.
+        for t in [HOLD_MS, HOLD_MS * 4.0] {
+            assert!(
+                !matches!(
+                    d.drag(&mut l, area(), away.0, away.1, t),
+                    Some(Preview::Asking(_))
+                ),
+                "a drag that paused sprouted a menu"
+            );
+        }
+    }
+
+    /// **A tab and a divider move the instant they are touched.**
+    ///
+    /// Holding first was tried and was wrong: an artist with a finger already on a divider is not
+    /// asking permission to resize it, and the third of a second before it answered read as a dead
+    /// control. The hold that a press on chrome was protecting the canvas from never existed --- a
+    /// press on a tab or a divider does not reach the canvas at all.
+    #[test]
+    fn a_divider_resizes_on_the_first_move() {
+        let mut l = workspace();
+        let mut d = PanelDrag::default();
+        let before = l.clone();
+
+        d.press(
+            &l,
+            &Target::Splitter {
+                path: vec![],
+                index: 0,
+            },
+            500.0,
+            400.0,
+            0.0,
+        );
+        // One move, immediately, with no wait at all.
+        d.drag(&mut l, area(), 560.0, 400.0, 1.0);
+        assert_ne!(l, before, "the divider should have moved at once");
     }
 
     /// A press on a panel's content is declined, so the panel itself sees it.
@@ -869,7 +956,7 @@ mod tests {
         let mut d = PanelDrag::default();
 
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
-        arm(&mut d, &mut l, 700.0, 10.0);
+        d.drag(&mut l, area(), 700.0, 10.0, 1.0);
         d.cancel(&mut l);
 
         assert!(!d.active());

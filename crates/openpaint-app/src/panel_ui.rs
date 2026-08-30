@@ -250,6 +250,28 @@ pub fn place<'a>(
         };
         out.push(Placed { control, rect });
     }
+
+    // **Centred across the direction the controls run.** A row of buttons sits in the middle of
+    // its strip's height rather than pinned to the top of it, which is what a menu bar looks like
+    // everywhere; a wrapped grid runs both ways, so it is centred in its width too. *Along* the
+    // direction they run they start at the beginning, because a list you read must start where
+    // reading starts.
+    let (block_w, block_h) = extent(&out, content);
+    let dx = if across && direction == Direction::Wrap {
+        ((content.w - block_w) / 2.0).max(0.0)
+    } else {
+        0.0
+    };
+    let dy = if across {
+        ((content.h - block_h) / 2.0).max(0.0)
+    } else {
+        0.0
+    };
+    if dx > 0.0 || dy > 0.0 {
+        for p in &mut out {
+            p.rect = Rect::new(p.rect.x + dx, p.rect.y + dy, p.rect.w, p.rect.h);
+        }
+    }
     out
 }
 
@@ -766,7 +788,10 @@ mod tests {
                 p.control,
                 p.rect.h
             );
-            assert!((p.rect.y - 7.0).abs() < 0.001, "off the baseline");
+            assert!(
+                (p.rect.y - laid[0].rect.y).abs() < 0.001,
+                "off the baseline the rest of the row sits on"
+            );
         }
         for pair in laid.windows(2) {
             assert!(
@@ -804,6 +829,71 @@ mod tests {
                 "a slider {mm:.1} mm wide cannot be set to anything but its ends"
             );
         }
+    }
+
+    /// **A row of controls sits in the middle of its strip, not pinned to the top.**
+    ///
+    /// A menu bar with its items hugging the top edge and a band of nothing beneath reads as a
+    /// mistake, and it is what this looked like. Across the direction they run only: along it they
+    /// start at the beginning, because a list you read must start where reading starts.
+    #[test]
+    fn a_row_is_centred_in_the_room_it_is_given() {
+        let m = metrics();
+        let controls = sliders();
+        let content = Rect::new(0.0, 0.0, 4000.0, 200.0);
+        let laid = place(&controls, content, &m, Direction::Row, text);
+        // **The room above equals the room below.** Measuring the block and dividing would be
+        // circular: `extent` reports where the controls ended up, offset included, so it would
+        // agree with any offset at all.
+        let top = laid[0].rect.y - content.y;
+        let bottom = (content.y + content.h)
+            - laid
+                .iter()
+                .map(|p| p.rect.y + p.rect.h)
+                .fold(f32::MIN, f32::max);
+        assert!(
+            (top - bottom).abs() < 0.001,
+            "{top} above the row and {bottom} below it"
+        );
+        assert!(top > 0.0, "it is still pinned to the top");
+        // Along the row, it still begins at the beginning.
+        assert!((laid[0].rect.x - content.x).abs() < 0.001);
+
+        // A column is not pushed down: a list starts at the top and grows.
+        let down = place(&controls, content, &m, Direction::Column, text);
+        assert!((down[0].rect.y - content.y).abs() < 0.001);
+    }
+
+    /// A wrapped grid runs both ways, so it is centred both ways.
+    #[test]
+    fn a_wrapped_grid_is_centred_in_its_rail() {
+        let m = metrics();
+        let tools: Vec<Control> = (0..4)
+            .map(|i| Control::Choice {
+                id: i,
+                text: "Tool".to_owned(),
+                selected: false,
+                icon: None,
+            })
+            .collect();
+        let one = tools[0].width(&m, text(&tools[0]));
+        // A rail with room for two across and plenty to spare either side.
+        let content = Rect::new(0.0, 0.0, one * 2.0 + m.gap + 40.0, 400.0);
+        let laid = place(&tools, content, &m, Direction::Wrap, text);
+        let far = |f: fn(&Placed<'_>) -> f32| laid.iter().map(f).fold(f32::MIN, f32::max);
+        let left = laid.iter().map(|p| p.rect.x).fold(f32::MAX, f32::min) - content.x;
+        let right = (content.x + content.w) - far(|p| p.rect.x + p.rect.w);
+        assert!(
+            (left - right).abs() < 0.001,
+            "{left} to the left of the grid and {right} to the right"
+        );
+        let top = laid.iter().map(|p| p.rect.y).fold(f32::MAX, f32::min) - content.y;
+        let bottom = (content.y + content.h) - far(|p| p.rect.y + p.rect.h);
+        assert!(
+            (top - bottom).abs() < 0.001,
+            "{top} above the grid and {bottom} below it"
+        );
+        assert!(left > 0.0 && top > 0.0, "it is still in a corner");
     }
 
     /// Both directions stay hittable: a control's rectangle is its target either way.

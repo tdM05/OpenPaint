@@ -104,12 +104,14 @@ pub fn panel(
         (placed.rect.h - metrics.gutter).max(0.0),
     );
 
-    // **A compact header goes down the short side of the panel.**
+    // **A compact header goes down the short side of the panel, on the far edge.**
     //
     // A tool rail laid out across the bottom is a strip a couple of rows tall; a header band on
-    // top of it costs more height than the tools do, and the grab surface ends up nowhere near
-    // where the strip begins. On its side it costs a sliver of width instead, and the handle sits
-    // at the start of the strip where the eye already is.
+    // top of it costs more height than the tools do. On its side it costs a sliver of width
+    // instead. On the *right* rather than the left: a strip is read from the left like everything
+    // else, so its first control belongs at the start and its handle out of the way at the end --
+    // the same place a tall panel's handle sits, which is above its first control and not beside
+    // it.
     //
     // Only compact headers: a named header carries tabs, and tabs need width to be readable.
     // Deliberately decided from the panel's shape rather than from which panel it is -- a wide
@@ -162,13 +164,8 @@ pub fn panel(
     let bar_total = (bar * rows).min(if side { outer.w } else { outer.h });
     let (header, content) = if side {
         (
-            Rect::new(outer.x, outer.y, bar_total, outer.h),
-            Rect::new(
-                outer.x + bar_total,
-                outer.y,
-                (outer.w - bar_total).max(0.0),
-                outer.h,
-            ),
+            Rect::new(outer.x + outer.w - bar_total, outer.y, bar_total, outer.h),
+            Rect::new(outer.x, outer.y, (outer.w - bar_total).max(0.0), outer.h),
         )
     } else {
         (
@@ -592,6 +589,14 @@ mod tests {
             strip.header.w < strip.header.h,
             "on a wide panel the header should be a vertical bar, got {:?}",
             strip.header
+        );
+        assert!(
+            (strip.header.x + strip.header.w - (strip.outer.x + strip.outer.w)).abs() < 0.001,
+            "and it belongs at the far end, out of the way of the first control"
+        );
+        assert!(
+            (strip.content.x - strip.outer.x).abs() < 0.001,
+            "so the content starts where reading starts"
         );
         assert!(
             (strip.header.h - strip.outer.h).abs() < 0.001,
