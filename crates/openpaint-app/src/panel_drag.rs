@@ -73,6 +73,11 @@ pub enum Target {
     /// A window needs somewhere to be picked up that is not one of its tabs, or dragging it would
     /// always threaten to pull a panel out of it.
     Frame,
+    /// The part of a header beside its tabs: the panel as a whole, rather than any one of them.
+    ///
+    /// What that means is the caller's: a floating window moves, and a docked panel does nothing
+    /// at all until there is something worth putting here.
+    Strip,
 }
 
 /// What the pointer is held on, so the caller can show the wait on the right thing.
@@ -267,6 +272,9 @@ impl PanelDrag {
                 })
             }
             Target::Frame => Some(Kind::Frame),
+            // The strip means nothing on its own: whoever hit-tested it decides whether this
+            // arrangement has anything for it to do, and turns it into a `Frame` if so.
+            Target::Strip => None,
             Target::Elsewhere => None,
         };
         self.grab = kind.map(|kind| Grab {

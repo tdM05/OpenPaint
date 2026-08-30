@@ -81,6 +81,15 @@ impl Controls {
     }
 }
 
+/// How much of a header is kept for the panel strip, whatever the tabs want.
+///
+/// Wide enough to press with a pen, since it is a target like any other: the 4 mm floor the rest
+/// of the chrome is held to. See `theme::every_grab_surface_is_big_enough_for_a_pen`.
+#[must_use]
+pub fn strip_width(metrics: &Metrics) -> f32 {
+    metrics.header
+}
+
 /// Which side of a panel its handle sits on.
 ///
 /// **It follows the direction the panel's controls run, not the shape of the panel.** A panel set
@@ -151,12 +160,16 @@ pub fn panel(
         //
         // Shrinking tabs instead was the alternative and is worse: a tab narrower than its label
         // is one you can neither read nor aim at. Height is the cheaper thing to spend.
+        // **Room the tabs may not have.** The strip beside them is the panel's own handle, and it
+        // has to exist however many tabs there are -- otherwise a panel with enough tabs to fill
+        // its bar could not be picked up at all.
+        let room = (outer.w - strip_width(metrics)).max(1.0);
         let widths: Vec<f32> = (0..placed.tabs.len())
-            .map(|i| (measure(i) + metrics.tab_padding * 2.0).min(outer.w.max(1.0)))
+            .map(|i| (measure(i) + metrics.tab_padding * 2.0).min(room))
             .collect();
         let (mut x, mut y) = (outer.x, outer.y);
         for (index, w) in widths.iter().copied().enumerate() {
-            if x > outer.x && x + w > outer.x + outer.w {
+            if x > outer.x && x + w > outer.x + room {
                 x = outer.x;
                 y += bar;
                 rows += 1.0;
@@ -271,14 +284,15 @@ fn header_target(p: &Placed, chrome: &PanelChrome, x: f32, y: f32) -> Target {
             tab: tab.index,
         };
     }
-    // **Between tabs means nothing, once there is more than one.** Each tab is its own button, and
-    // a press on the bar beside them picking whichever happened to be on show is the behaviour
-    // that made a strip of tabs look like a single control.
+    // **The strip beside the tabs is not a tab.** It is the panel's own handle, and giving it to
+    // whichever tab happened to be on show is what made a header look like one control and what
+    // made pressing the empty part of it move a panel nobody had pointed at.
     //
-    // With one tab -- or none, which is what a compact header is -- the whole bar is that panel's
-    // handle. That is what makes the tool rail movable, and there is nothing else it could mean.
-    if chrome.tabs.len() > 1 {
-        return Target::Elsewhere;
+    // A header with *no* tabs is entirely strip, and that strip is the handle for the one panel it
+    // holds. That is what makes the tool rail and the menu movable, and there is nothing else it
+    // could mean.
+    if !chrome.tabs.is_empty() {
+        return Target::Strip;
     }
     Target::Tab {
         path: p.path.clone(),
@@ -844,13 +858,13 @@ mod tests {
         );
     }
 
-    /// **Between tabs means nothing, once there is more than one.**
+    /// **The bar beside the tabs belongs to the panel, not to any tab.**
     ///
-    /// Each tab is its own button. A press on the bar beside them picking whichever happened to be
-    /// on show is what made a strip of tabs look like a single control -- press one and the whole
-    /// bar answered.
+    /// Each tab is its own button. A press on the bar picking whichever happened to be on show is
+    /// what made a strip of tabs look like one control -- press one and the whole bar answered --
+    /// and it moved a panel nobody had pointed at.
     #[test]
-    fn the_bar_beside_several_tabs_grabs_nothing() {
+    fn the_bar_beside_several_tabs_is_the_panel_strip() {
         let mut l = Layout::single(CANVAS);
         l.insert(&[], Zone::Center, LAYERS);
         let placed = l.resolve(area());
@@ -868,8 +882,8 @@ mod tests {
                 past.x + past.w + 15.0,
                 past.y + 5.0
             ),
-            Target::Elsewhere,
-            "the bar beside two tabs belongs to neither"
+            Target::Strip,
+            "the bar beside the tabs belongs to the panel, not to a tab"
         );
         // And each tab still answers for itself.
         for tab in &c.tabs {
@@ -891,13 +905,41 @@ mod tests {
         }
     }
 
-    /// With one panel the whole bar is its handle, and with none -- a compact header -- likewise.
+    /// **A header with no tabs is entirely strip, and that strip is its panel's handle.**
     ///
-    /// There is nothing else the bar could mean, and it is what makes the tool rail movable.
+    /// There is nothing else it could mean, and it is what makes the tool rail and the menu
+    /// movable. A header that *has* tabs keeps its strip for the panel as a whole instead --
+    /// pressing it used to move whichever panel happened to be on show, which is a panel nobody
+    /// pointed at.
     #[test]
-    fn the_whole_bar_grabs_a_lone_panel() {
+    fn a_header_with_no_tabs_is_the_panels_handle() {
         let l = Layout::single(CANVAS);
         let placed = l.resolve(area());
+        let c = panel(
+            &placed[0],
+            &metrics(),
+            HeaderStyle::Compact,
+            Along::Down,
+            |_| 40.0,
+        );
+        assert!(c.tabs.is_empty(), "a compact header carries no tabs");
+        assert_eq!(
+            target_at(
+                &placed,
+                &[],
+                &metrics(),
+                |_| (HeaderStyle::Compact, Along::Down),
+                |_, _| 40.0,
+                c.header.x + c.header.w / 2.0,
+                c.header.y + c.header.h / 2.0
+            ),
+            Target::Tab {
+                path: vec![],
+                tab: 0
+            },
+        );
+
+        // One tab is still a tab: the bar beside it belongs to the panel, not to it.
         let c = panel(
             &placed[0],
             &metrics(),
@@ -916,11 +958,63 @@ mod tests {
                 past.x + past.w + 40.0,
                 past.y + 5.0
             ),
-            Target::Tab {
-                path: vec![],
-                tab: 0
-            },
+            Target::Strip,
         );
+    }
+
+    /// **The strip is always there**, however many tabs a panel has.
+    ///
+    /// A panel with enough tabs to fill its bar would otherwise have nowhere left to be picked up.
+    #[test]
+    fn the_strip_survives_any_number_of_tabs() {
+        let m = metrics();
+        // **Widths chosen so a tab would land in the reserve if nothing stopped it.** The first
+        // version of this used numbers where the tabs happened to wrap before the strip anyway, so
+        // removing the reservation changed nothing and the test agreed with the bug.
+        for width in [150.0_f32, 180.0, 200.0, 260.0, 300.0, 420.0] {
+            for label in [30.0_f32, 45.0, 66.0, 90.0] {
+                for count in [1_u32, 2, 3, 8] {
+                    let leaf = Placed {
+                        path: vec![],
+                        rect: Rect::new(0.0, 0.0, width, 400.0),
+                        tabs: (0..count).map(PanelId).collect(),
+                        active: 0,
+                    };
+                    let c = panel(&leaf, &m, HeaderStyle::Named, Along::Down, |_| label);
+                    for tab in &c.tabs {
+                        assert!(
+                            tab.rect.x + tab.rect.w
+                                <= c.outer.x + c.outer.w - strip_width(&m) + 0.001,
+                            "at {width} wide with {count} tabs of {label}, tab {} ate the strip",
+                            tab.index
+                        );
+                    }
+                    // And the strip answers as the strip, wherever the tabs ended up.
+                    let past = c.tabs.last().map_or(c.header.x, |t| t.rect.x + t.rect.w);
+                    let at = (
+                        past + strip_width(&m) / 2.0,
+                        c.header.y + c.header.h - m.header / 2.0,
+                    );
+                    let placed = [leaf.clone()];
+                    assert_eq!(
+                        target_at(
+                            &placed,
+                            &[],
+                            &m,
+                            |_| (HeaderStyle::Named, Along::Down),
+                            |_, _| label,
+                            at.0,
+                            at.1
+                        ),
+                        Target::Strip,
+                        "at {width} wide with {count} tabs of {label} there was no strip to press"
+                    );
+                }
+            }
+        }
+        // And the strip is a target you could actually hit with a pen.
+        const PER_MM: f32 = 96.0 / 25.4;
+        assert!(strip_width(&m) / PER_MM >= 4.0);
     }
 
     /// The drawn regions agree with `Layout::zone_at` **everywhere**, not just at their centres.
