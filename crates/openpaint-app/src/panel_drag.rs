@@ -302,11 +302,14 @@ impl PanelDrag {
                     Axis::Vertical => area.h,
                 };
                 if extent > 0.0 {
+                    // In units, with the split's extent alongside. A divider next to a strip moves
+                    // the strip's *minimum*, which is measured in units and has no fraction to be
+                    // expressed as; one between two weighted panels moves weights, which do.
                     let delta = match axis {
                         Axis::Horizontal => dx,
                         Axis::Vertical => dy,
-                    } / extent;
-                    layout.drag_splitter(path, *index, delta);
+                    };
+                    layout.drag_splitter(path, *index, delta, extent);
                 }
                 Some(Preview::Resizing {
                     path: path.clone(),

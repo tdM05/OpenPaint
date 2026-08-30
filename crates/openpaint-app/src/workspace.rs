@@ -212,6 +212,8 @@ pub enum PopupKind {
     Panels,
     /// One panel's own settings.
     Settings(PanelId),
+    /// The workspace's own settings: the look, rather than any one panel's arrangement.
+    Workspace,
     /// A panel drawing something of its own: a menu's items, say.
     ///
     /// The workspace owns where it is, what closes it and what a press inside it means; the panel
@@ -388,6 +390,44 @@ fn load_theme() -> Option<Theme> {
     }
 }
 
+/// How much room a strip's *contents* need: one row and the padding around it.
+///
+/// A compact header sits on a wide strip's *side*, so it costs width rather than height and does
+/// not appear here. Derived rather than written down, so changing the metrics moves the bar rather
+/// than quietly clipping it.
+#[must_use]
+fn strip_content_min(m: &Metrics) -> f32 {
+    m.row + m.padding * 2.0
+}
+
+/// How tall the *slot* holding a strip has to be.
+///
+/// The gutter is taken out of the slot by `chrome` before the panel sees it, so a slot exactly one
+/// row tall delivers a panel two units short. Two numbers rather than one, because they are two
+/// different things and giving them one name is how a constant quietly goes missing (§11a.8).
+#[must_use]
+fn strip_min(m: &Metrics) -> f32 {
+    strip_content_min(m) + m.gutter
+}
+
+/// How wide the tool rail has to be: its widest button and the padding either side.
+///
+/// The header is on top for a tall panel, so it costs height rather than width. The button width
+/// is the one thing here that cannot be derived without a font, so it is a stated allowance --
+/// generous, because the cost of being wrong is a clipped label and the cost of being generous is
+/// a few units of rail.
+#[must_use]
+fn rail_content_min(m: &Metrics) -> f32 {
+    const WIDEST_TOOL_LABEL: f32 = 52.0;
+    WIDEST_TOOL_LABEL + m.padding * 4.0
+}
+
+/// How wide the *slot* holding the tool rail has to be, gutter included.
+#[must_use]
+fn rail_min(m: &Metrics) -> f32 {
+    rail_content_min(m) + m.gutter
+}
+
 /// The arrangement a first-time artist finds.
 ///
 /// **Only a file's worth of decisions**, which is what §1c bought: this is a default, not a
@@ -395,24 +435,31 @@ fn load_theme() -> Option<Theme> {
 /// panels people reach for most stacked on the right.
 #[must_use]
 pub fn default_layout() -> Layout {
+    let m = Theme::default().metrics;
     let mut l = Layout::single(CANVAS);
 
     // A menu strip across the top. The weights matter as much as the structure: an `insert` halves
     // whatever it lands on, so without these the menu bar would take half the window — which a
     // test caught and no amount of reading the code would have.
     l.insert(&[], Zone::Top, MENU);
-    // Sized so the strip actually holds one row of controls and its padding at an ordinary window
-    // height, rather than a fraction that looked about right: see the test below, which works the
-    // requirement out from the metrics instead of trusting these numbers.
-    l.set_weight(&[0], 0.05);
-    l.set_weight(&[1], 0.95);
+    // **A menu bar is a fixed height, not a fraction of a window.** Given a weight alone it grew
+    // with the window and, at 900x600, clipped its own contents in half. The minimum is taken out
+    // before the weights are applied, so the bar stays the size it needs and the rest of the
+    // window is shared out below it. Worked out from the metrics rather than guessed; the test
+    // below re-derives it and fails if either drifts.
+    l.set_weight(&[0], 0.0);
+    l.set_min(&[0], strip_min(&m));
+    l.set_weight(&[1], 1.0);
 
     // Tools down the left, canvas taking what is left, panels down the right.
     l.insert(&[1], Zone::Left, TOOLS);
     l.insert(&[1, 1], Zone::Right, LAYERS);
-    l.set_weight(&[1, 0], 0.07);
-    l.set_weight(&[1, 1], 0.75);
-    l.set_weight(&[1, 2], 0.18);
+    l.set_weight(&[1, 0], 0.0);
+    // The rail is a strip on its side: it needs the width of its widest button, not a share of
+    // the window that happens to be about right on one screen.
+    l.set_min(&[1, 0], rail_min(&m));
+    l.set_weight(&[1, 1], 0.80);
+    l.set_weight(&[1, 2], 0.20);
 
     // The right column: layers over brush over colour, with history sharing the layers' slot
     // because the two are rarely wanted at once.
@@ -1004,6 +1051,21 @@ impl Workspace {
             // A panel's own popup is drawn by the panel; this is never asked about one.
             PopupKind::Panel(_) => Vec::new(),
             PopupKind::Panels => panel_list_controls(self),
+            PopupKind::Workspace => {
+                let mut controls = vec![Control::Label {
+                    text: "Icons".to_owned(),
+                }];
+                controls.extend(crate::icons::SETS.iter().map(|set| Control::Choice {
+                    id: ICON_SET_BASE + set.id,
+                    text: set.name.to_owned(),
+                    selected: self.theme.icons == set.id,
+                    // Deliberately no icon on the buttons that choose the icons: every set would
+                    // draw its own, and a row of four different pictures of the same thing is a
+                    // puzzle rather than a choice.
+                    icon: None,
+                }));
+                controls
+            }
             PopupKind::Settings(panel) => {
                 let mut controls = vec![Control::Label {
                     text: format!("{} settings", name_of(panel)),
@@ -1013,6 +1075,7 @@ impl Workspace {
                     id: *id,
                     text: (*name).to_owned(),
                     selected: current == *d,
+                    icon: None,
                 }));
                 controls
             }
@@ -1026,6 +1089,9 @@ impl Workspace {
             // The list stays open on a toggle: showing three panels should be three taps, not
             // three right-clicks.
             (PopupKind::Panels, Change::Toggled(id, _)) => self.toggle(PanelId(id)),
+            (PopupKind::Workspace, Change::Chose(id)) if id >= ICON_SET_BASE => {
+                self.set_icons(id - ICON_SET_BASE);
+            }
             (PopupKind::Settings(panel), Change::Chose(id)) => {
                 if let Some((_, _, d)) = DIRECTIONS.iter().find(|(i, _, _)| *i == id) {
                     self.set_direction(panel, *d);
@@ -1045,6 +1111,36 @@ impl Workspace {
             .get(&panel.0)
             .and_then(|o| o.direction)
             .unwrap_or_else(|| default_direction(panel))
+    }
+
+    /// Choose the icon set, and write the look out.
+    ///
+    /// Part of the theme, so it lives in the same file and is hand-editable like every other part
+    /// of the look. An unknown id is refused rather than stored: a theme file naming a set this
+    /// build does not have would otherwise leave every button blank.
+    pub fn set_icons(&mut self, set: u32) {
+        if crate::icons::SETS.iter().any(|s| s.id == set) {
+            self.theme.icons = set;
+            // Written out the same way `cycle_theme` writes the palette: the look is one file, and
+            // a setting that survived until the next restart and no further would be worse than
+            // one that never claimed to be saved at all.
+            if let Some(path) = theme_path() {
+                if let Err(e) = self
+                    .theme
+                    .to_json()
+                    .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()))
+                {
+                    eprintln!("icons: the look could not be saved ({e})");
+                }
+            }
+        } else {
+            eprintln!("icons: no set numbered {set}; keeping the one in use");
+        }
+    }
+
+    /// Ask for the workspace's own settings.
+    pub fn open_settings(&mut self) {
+        self.popup_wanted = Some(PopupKind::Workspace);
     }
 
     /// Set which way a panel's controls run, and remember it.
@@ -1247,6 +1343,9 @@ const DIRECTIONS: &[(u32, &str, Direction)] = &[
     (2, "Whichever fits", Direction::Auto),
     (3, "Across, wrapping", Direction::Wrap),
 ];
+
+/// Where the icon-set choices start, out of the way of anything else a workspace popup offers.
+const ICON_SET_BASE: u32 = 1 << 16;
 
 /// Which panel's header is under a point, if any.
 ///
@@ -1623,6 +1722,46 @@ mod tests {
         }
     }
 
+    /// **Every icon set can be chosen, and an unknown one is refused rather than stored.**
+    ///
+    /// A theme file naming a set this build does not have would otherwise leave every button
+    /// blank, which reads as the UI having failed to load.
+    #[test]
+    fn the_icon_set_can_be_chosen_and_only_from_the_ones_that_exist() {
+        let mut ws = bare();
+        let popup = ws.popup_controls(PopupKind::Workspace);
+        for set in crate::icons::SETS {
+            assert!(
+                popup.iter().any(|c| c.id() == Some(ICON_SET_BASE + set.id)),
+                "the {} set cannot be chosen",
+                set.name
+            );
+        }
+        // Exactly one reads as chosen, whatever the current setting is.
+        let lit = popup
+            .iter()
+            .filter(|c| matches!(c, crate::panel_ui::Control::Choice { selected: true, .. }))
+            .count();
+        assert_eq!(lit, 1, "{lit} sets read as chosen");
+
+        let words = crate::icons::SETS
+            .iter()
+            .find(|s| s.name == "Words")
+            .expect("a Words set");
+        ws.apply_popup(
+            PopupKind::Workspace,
+            crate::panel_ui::Change::Chose(ICON_SET_BASE + words.id),
+        );
+        assert_eq!(ws.theme.icons, words.id);
+
+        let before = ws.theme.icons;
+        ws.set_icons(9999);
+        assert_eq!(
+            ws.theme.icons, before,
+            "a set this build does not have should be refused, not stored"
+        );
+    }
+
     /// **A setting overrides its panel's default, and only for that panel.**
     ///
     /// This is what makes direction a setting rather than a decision somebody else made: the panel
@@ -1784,42 +1923,89 @@ mod tests {
         use crate::panel_ui::Control;
         // A stand-in for the widest label a strip carries, in place of a font.
         const LABEL: f32 = 45.0;
-        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let m = crate::theme::Theme::default().metrics;
         let layout = default_layout();
-        let placed = layout.resolve(screen);
 
-        let content_of = |panel: PanelId| {
-            let slot = placed
-                .iter()
-                .find(|p| p.tabs.contains(&panel))
-                .unwrap_or_else(|| panic!("{} is not in the default layout", name_of(panel)));
-            crate::chrome::panel(slot, &m, style_of(slot), |_| LABEL).content
-        };
+        // **At every window size, not one.** The first version of this checked 1400x900 and
+        // passed while the same arrangement clipped its own menu bar in half at 900x600 -- which
+        // a screenshot found and this did not. A fixture that cannot express the bug proves
+        // nothing, however carefully the assertion is written.
+        for (w, h) in [
+            (1400.0, 900.0),
+            (1920.0, 1080.0),
+            (1280.0, 720.0),
+            (1024.0, 640.0),
+            (900.0, 600.0),
+            (800.0, 500.0),
+        ] {
+            let screen = Rect::new(0.0, 0.0, w, h);
+            let placed = layout.resolve(screen);
+            let content_of = |panel: PanelId| {
+                let slot = placed
+                    .iter()
+                    .find(|p| p.tabs.contains(&panel))
+                    .unwrap_or_else(|| panic!("{} is not in the default layout", name_of(panel)));
+                crate::chrome::panel(slot, &m, style_of(slot), |_| LABEL).content
+            };
 
-        // The menu is a strip across the top: it needs the height of one row plus its padding.
-        let menu = content_of(MENU);
-        let needed = m.row + m.padding * 2.0;
-        assert!(
-            menu.h >= needed,
-            "the menu strip is {} tall and needs {needed}",
-            menu.h
-        );
+            // The menu is a strip across the top: it needs the height of one row plus its padding.
+            let menu = content_of(MENU);
+            assert!(
+                menu.h >= strip_content_min(&m),
+                "at {w}x{h} the menu strip is {} tall and needs {}",
+                menu.h,
+                strip_content_min(&m)
+            );
 
-        // The tool rail is a column down the side: it needs the width of one button plus padding.
-        let tools = content_of(TOOLS);
-        let button = Control::Choice {
-            id: 0,
-            text: String::new(),
-            selected: false,
+            // The tool rail is a column down the side: one button's width plus its padding.
+            let tools = content_of(TOOLS);
+            let button = Control::Choice {
+                id: 0,
+                text: String::new(),
+                selected: false,
+                icon: None,
+            }
+            .width(&m, LABEL)
+                + m.padding * 2.0;
+            assert!(
+                tools.w >= button,
+                "at {w}x{h} the tool rail is {} wide and needs {button}",
+                tools.w
+            );
+
+            // And the canvas still gets the lion's share, or the strips have eaten the document.
+            let canvas = content_of(CANVAS);
+            assert!(
+                canvas.w * canvas.h > w * h * 0.3,
+                "at {w}x{h} the canvas is down to {}x{}",
+                canvas.w,
+                canvas.h
+            );
         }
-        .width(&m, LABEL)
-            + m.padding * 2.0;
+    }
+
+    /// **A strip keeps its size as the window changes.** That is the difference between a minimum
+    /// and a weight, and the whole reason minimums exist.
+    #[test]
+    fn a_strip_does_not_grow_with_the_window() {
+        let m = crate::theme::Theme::default().metrics;
+        let layout = default_layout();
+        let height_at = |h: f32| {
+            let placed = layout.resolve(Rect::new(0.0, 0.0, 1400.0, h));
+            placed
+                .iter()
+                .find(|p| p.tabs.contains(&MENU))
+                .expect("menu")
+                .rect
+                .h
+        };
+        let small = height_at(600.0);
+        let large = height_at(1600.0);
         assert!(
-            tools.w >= button,
-            "the tool rail is {} wide and needs {button}",
-            tools.w
+            (small - large).abs() < 0.001,
+            "the menu bar was {small} tall in a short window and {large} in a tall one"
         );
+        assert!(small >= strip_min(&m));
     }
 
     /// **Two panels in one leaf always show tabs**, however compact they would rather be.

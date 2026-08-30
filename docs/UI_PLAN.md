@@ -144,22 +144,32 @@ of the whole exercise: until then these are defaults, not choices.
 
 ## What is still fundamental
 
-1. **A text control.** Renaming a layer, naming a brush preset, typing a page size. There is no
-   way to type into a described panel at all, and several sections cannot be ported without one.
-   It brings focus and a caret with it, which is why it is its own piece of work.
-2. **A colour wheel**, which is the first thing that genuinely cannot be described --- and so
-   brings the `Custom` escape hatch with it.
+**Wiring, not invention.** The three pieces that were missing all exist now as tested modules; what
+is left is calling them.
 
-Everything else is porting: History, and the old side panel's sections --- transform, text, pages,
-export, crop, wand. egui leaves when the last one lands.
+1. **A colour wheel panel.** `colour_wheel.rs` has the geometry for all three shapes, hit-testing
+   and marker placement, with press and marker proved to agree. It needs drawing and a panel. It
+   also brings `Custom`, the escape hatch for anything that cannot be described as a list.
+2. **A text field.** `text_field.rs` has caret, selection, word motion and hit-testing, on UTF-8
+   boundaries and fuzzed. It needs a `Control::Text`, a caret to draw and keyboard events. Stepping
+   is by `char`, not by grapheme cluster: one dependency fixes that, and two tests are named to
+   fail when it lands rather than pass silently.
+3. **The remaining ports**: History, and the old side panel's sections --- transform, text, pages,
+   export, crop, wand. egui leaves when the last one lands.
 
-**Done since this list was written:** per-instance panel settings and the hold-a-header gesture
-that reaches them; menus that work, by drilling in rather than dropping down; a row that carries
-its own switch, so a layer's eye lives on the layer.
+## Looking at it
 
-Icons replace the tool rail's words whenever there are icons worth using; the words are a
-placeholder chosen over glyphs because glyphs needed a tooltip, and a tooltip is something only a
-hovering pointer can reach.
+`screenshot.rs` renders the workspace headlessly and writes PNGs:
+
+```
+cargo test -p openpaint-app --bin openpaint -- --ignored shot_
+```
+
+They land in `crates/openpaint-app/target/screenshots/`. Not assertions --- a golden image fails on
+every font and driver and teaches everyone to ignore it. These are for a person to open, and they
+have already found three things no test did: a menu bar clipped in half at 900x600, a slider fill
+too faint to read, and every filled icon drawn as a fan of overlapping wedges.
+
 
 ## 1. The descriptor engine — and this is what replaces egui
 

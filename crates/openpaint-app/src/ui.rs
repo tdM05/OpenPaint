@@ -744,6 +744,7 @@ fn menu_items(which: u32, active_layer: usize, layers: usize) -> Vec<(String, Pi
         _ => vec![
             named("Fit", Picked::Command(Command::ZoomFit)),
             named("Actual size", Picked::Command(Command::ZoomActual)),
+            named("Settings", Picked::Settings),
         ],
     }
 }
@@ -823,6 +824,7 @@ fn workspace_panel(
                             // Lit while its menu is down, so there is never any doubt which list
                             // you are looking at.
                             selected: *paint.menu == Some(u32::try_from(i).unwrap_or(u32::MAX)),
+                            icon: None,
                         });
                     }
                     controls.push(Control::Separator);
@@ -906,21 +908,29 @@ fn workspace_panel(
             // readable at all, and a tooltip is something only a pointer that hovers can reach --
             // which is the thing this UI is explicitly not built around (§1b). Icons replace the
             // words when there are icons worth using.
+            use crate::icons::Symbol;
             use crate::panel_ui::{Change, Control};
-            let items: [(&str, Picked); 6] = [
-                ("Brush", Picked::Paint(Tool::Brush)),
-                ("Eraser", Picked::Paint(Tool::Eraser)),
-                ("Lasso", Picked::Select(SelectTool::Lasso)),
-                ("Rect", Picked::Select(SelectTool::Rect)),
-                ("Wand", Picked::Select(SelectTool::Wand)),
-                ("Move", Picked::Select(SelectTool::Move)),
+            let items: [(&str, Symbol, Picked); 6] = [
+                ("Brush", Symbol::Brush, Picked::Paint(Tool::Brush)),
+                ("Eraser", Symbol::Eraser, Picked::Paint(Tool::Eraser)),
+                ("Lasso", Symbol::Lasso, Picked::Select(SelectTool::Lasso)),
+                ("Rect", Symbol::RectSelect, Picked::Select(SelectTool::Rect)),
+                ("Wand", Symbol::Wand, Picked::Select(SelectTool::Wand)),
+                (
+                    "Move",
+                    Symbol::MoveSelection,
+                    Picked::Select(SelectTool::Move),
+                ),
             ];
             let controls: Vec<Control> = items
                 .iter()
                 .enumerate()
-                .map(|(i, (name, what))| Control::Choice {
+                .map(|(i, (name, symbol, what))| Control::Choice {
                     id: u32::try_from(i).unwrap_or(u32::MAX),
                     text: (*name).to_owned(),
+                    // The word and the picture both, so the icon set decides which is shown and
+                    // the rail needs no second table when somebody chooses Words.
+                    icon: Some(*symbol),
                     selected: match what {
                         // A paint tool reads as chosen only when no selection tool is up, since a
                         // selection tool is what the pen is currently doing.
@@ -931,14 +941,15 @@ fn workspace_panel(
                         | Picked::Selection(_)
                         | Picked::Command(_)
                         | Picked::OpenMenu { .. }
-                        | Picked::CloseMenu => false,
+                        | Picked::CloseMenu
+                        | Picked::Settings => false,
                     },
                 })
                 .collect();
 
             for change in paint.show(ui, &controls) {
                 picked = match change {
-                    Change::Chose(i) => items.get(i as usize).map(|(_, what)| what.clone()),
+                    Change::Chose(i) => items.get(i as usize).map(|(_, _, what)| what.clone()),
                     other => {
                         eprintln!("tools panel: unexpected {other:?}");
                         None
@@ -1147,6 +1158,8 @@ enum Picked {
     },
     /// Put the open menu away.
     CloseMenu,
+    /// Open the workspace's own settings.
+    Settings,
     /// A layer command, from the described Layers panel.
     Layer(LayerAction),
     /// A selection command, from a menu.
@@ -1416,6 +1429,7 @@ impl Ui {
                 let mut show_panel_list = false;
                 let mut menu_request: Option<(crate::layout::Rect, (f32, f32), Anchor)> = None;
                 let mut close_menu = false;
+                let mut show_settings = false;
                 // Copied out because `ws` is borrowed for the whole of `show`, and the panel that
                 // wants the theme runs inside it.
                 let theme = ws.theme;
@@ -1457,6 +1471,7 @@ impl Ui {
                                 menu_request = Some((at, size, side));
                             }
                             Picked::CloseMenu => close_menu = true,
+                            Picked::Settings => show_settings = true,
                         }
                     }
                 });
@@ -1465,6 +1480,9 @@ impl Ui {
                 }
                 if close_menu {
                     ws.close_popup();
+                }
+                if show_settings {
+                    ws.open_settings();
                 }
                 if let Some((at, size, side)) = menu_request {
                     ws.open_popup_for(crate::workspace::MENU, at, size, side, area);

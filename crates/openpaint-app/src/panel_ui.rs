@@ -82,6 +82,12 @@ pub enum Control {
         id: ControlId,
         text: String,
         selected: bool,
+        /// What this choice *is*, so an icon set can draw it.
+        ///
+        /// A role, not a picture: the set decides what a brush looks like. `None` means there is
+        /// no icon for this and the label stands on its own, which is what a choice with no
+        /// established symbol -- a direction, a blend mode -- should do.
+        icon: Option<crate::icons::Symbol>,
     },
     /// A row in a list: layers, presets, pages.
     Row {
@@ -700,6 +706,7 @@ mod tests {
                 id: i,
                 text: "Tool".to_owned(),
                 selected: false,
+                icon: None,
             })
             .collect();
         let one = tools[0].width(&m, text(&tools[0]));
@@ -735,6 +742,7 @@ mod tests {
             id: 0,
             text: String::new(),
             selected: false,
+            icon: None,
         };
         assert!(c.width(&m, 0.0) >= m.row);
     }

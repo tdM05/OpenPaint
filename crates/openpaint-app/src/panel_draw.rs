@@ -76,7 +76,16 @@ pub fn show(
     let content = Rect::new(area.min.x, area.min.y, area.width().max(0.0), visible);
     // Laid out first and scrolled afterwards, so how tall the list is comes from where the
     // controls actually ended up rather than from a second calculation that could disagree.
-    let text_of = |c: &Control| text_width(ui.ctx(), m.body, c);
+    // A control drawing an icon has no label to make room for, so it measures as zero and asks
+    // for a square. One question answered in one place: the width a control asks for and the thing
+    // actually drawn in it cannot disagree.
+    let text_of = |c: &Control| {
+        if icon_for(c, theme).is_some() {
+            0.0
+        } else {
+            text_width(ui.ctx(), m.body, c)
+        }
+    };
     let laid = place(controls, content, m, direction, text_of);
     let (_, tall) = extent(&laid, content);
 
@@ -227,10 +236,16 @@ fn draw(
             let t = to_fraction(*value, *min, *max, *log);
             painter.rect_filled(to_egui(r), m.radius, color(pal.header));
             if t > 0.0 {
+                // **The accent, held back.** The fill was one neutral step above the track and was
+                // all but invisible on screen -- a slider you cannot read at a glance is a number
+                // you have to squint at, and no test was ever going to say so. Muted rather than
+                // solid, because a solid accent is what "chosen" means elsewhere and a slider is
+                // not a choice.
+                let [sr, sg, sb] = pal.state.0;
                 painter.rect_filled(
                     to_egui(Rect::new(r.x, r.y, r.w * t, r.h)),
                     m.radius,
-                    color(pal.edge),
+                    egui::Color32::from_rgba_unmultiplied(sr, sg, sb, 110),
                 );
             }
             painter.text(
@@ -290,13 +305,20 @@ fn draw(
                     pal.header
                 }),
             );
-            painter.text(
-                egui::pos2(r.x + r.w / 2.0, r.y + r.h / 2.0),
-                egui::Align2::CENTER_CENTER,
-                text,
-                body,
-                color(if *selected { pal.on_state } else { pal.text }),
-            );
+            let ink = color(if *selected { pal.on_state } else { pal.text });
+            // The icon if the chosen set draws one, the label otherwise. "Words" is a set that
+            // draws none, so it needs no special case anywhere: its absence *is* the choice.
+            if let Some(marks) = icon_for(p.control, theme) {
+                draw_icon(painter, marks, r, ink);
+            } else {
+                painter.text(
+                    egui::pos2(r.x + r.w / 2.0, r.y + r.h / 2.0),
+                    egui::Align2::CENTER_CENTER,
+                    text,
+                    body,
+                    ink,
+                );
+            }
         }
         Control::Row {
             text,
@@ -350,6 +372,23 @@ fn draw(
     }
 }
 
+/// The icon a control shows, if it names one and the chosen set draws it.
+///
+/// One answer, used to size the control and to draw it. Asked twice with two implementations, a
+/// button would reserve room for a label it never shows.
+fn icon_for(control: &Control, theme: &Theme) -> Option<&'static [crate::icons::Mark]> {
+    let Control::Choice {
+        icon: Some(symbol), ..
+    } = control
+    else {
+        return None;
+    };
+    crate::icons::SETS
+        .iter()
+        .find(|s| s.id == theme.icons)
+        .and_then(|s| s.glyph(*symbol))
+}
+
 /// The width of a control's label, measured by the thing that will draw it.
 ///
 /// A column never asks, so this costs nothing there.
@@ -372,6 +411,72 @@ pub fn text_width(ctx: &egui::Context, size: f32, control: &Control) -> f32 {
         .size()
         .x
     })
+}
+
+/// Draw an icon into a rectangle.
+///
+/// The marks are in a 0..1 unit square, so this is a multiply and an add. Square by construction:
+/// an icon stretched to a wide button reads as a different icon, so the largest square that fits
+/// is used and centred, and the rest of the button is left to the label or to nothing.
+///
+/// The stroke width is the theme's hairline. An icon drawn heavier than the rules and dividers
+/// around it stops looking like part of the same drawing.
+pub fn draw_icon(
+    painter: &egui::Painter,
+    marks: &[crate::icons::Mark],
+    within: Rect,
+    tint: egui::Color32,
+) {
+    use crate::icons::Mark;
+    let side = within.w.min(within.h);
+    if side <= 0.0 {
+        return;
+    }
+    let (ox, oy) = (
+        within.x + (within.w - side) / 2.0,
+        within.y + (within.h - side) / 2.0,
+    );
+    let at = |p: [f32; 2]| egui::pos2(side.mul_add(p[0], ox), side.mul_add(p[1], oy));
+    let stroke = egui::Stroke::new((side / 22.0).max(1.0), tint);
+    for mark in marks {
+        match mark {
+            Mark::Path(points) => {
+                let line: Vec<egui::Pos2> = points.iter().map(|p| at(*p)).collect();
+                painter.add(egui::Shape::line(line, stroke));
+            }
+            Mark::Poly(points) => {
+                // Cut into triangles first: most of these outlines are concave, and filling one as
+                // a convex polygon draws a mess of overlapping wedges. That is exactly what the
+                // Solid set looked like the first time it was rendered.
+                //
+                // One mesh for the whole outline, not one shape per triangle. Every filled shape
+                // egui is handed grows an antialiasing fringe of its own, so a shape per triangle
+                // spends several times the vertices *and* outlines each piece separately -- and on
+                // a sheet of every icon at once that was enough to overflow a mesh's indices and
+                // paint triangles spanning the entire image.
+                let mut mesh = egui::Mesh::default();
+                for p in points.iter() {
+                    mesh.colored_vertex(at(*p), tint);
+                }
+                for tri in crate::icons::triangles(points) {
+                    let idx = |i: usize| u32::try_from(i).unwrap_or(0);
+                    mesh.add_triangle(idx(tri[0]), idx(tri[1]), idx(tri[2]));
+                }
+                if !mesh.is_empty() {
+                    painter.add(egui::Shape::mesh(mesh));
+                }
+            }
+            Mark::Circle { at: c, r, filled } => {
+                let centre = at(*c);
+                let radius = r * side;
+                if *filled {
+                    painter.circle_filled(centre, radius, tint);
+                } else {
+                    painter.circle_stroke(centre, radius, stroke);
+                }
+            }
+        }
+    }
 }
 
 /// How many decimals a value deserves, from how much room its range gives each step.

@@ -205,6 +205,21 @@ pub struct Metrics {
 pub struct Theme {
     pub palette: Palette,
     pub metrics: Metrics,
+    /// Which icon set the UI draws with. See [`crate::icons::SETS`].
+    ///
+    /// Part of the look, so it rides in the same file and is edited the same way. Set 0 is Words,
+    /// which draws no icons at all and lets every button show its label -- not a fallback but a
+    /// choice, and the one this UI shipped with.
+    #[serde(default = "default_icons")]
+    pub icons: u32,
+}
+
+/// The icon set a theme uses unless it says otherwise.
+///
+/// Line rather than Words: an artist who has never opened the settings should still get icons,
+/// because a rail of words is wider than a rail of pictures and the room belongs to the canvas.
+fn default_icons() -> u32 {
+    1
 }
 
 impl Default for Theme {
@@ -240,6 +255,7 @@ impl Default for Theme {
                 row: 22.0,
                 gap: 3.0,
             },
+            icons: default_icons(),
         }
     }
 }
@@ -266,6 +282,7 @@ impl Theme {
                 canvas: Color::rgb(0xCF, 0xCA, 0xC0),
             },
             metrics: Theme::default().metrics,
+            icons: Theme::default().icons,
         }
     }
 
@@ -377,6 +394,8 @@ mod tests {
     fn the_themes_differ_only_in_their_palette() {
         assert_ne!(Theme::default().palette, Theme::paper().palette);
         assert_eq!(Theme::default().metrics, Theme::paper().metrics);
+        // Icons too: they are a separate choice, not something a change of colour drags along.
+        assert_eq!(Theme::default().icons, Theme::paper().icons);
     }
 
     /// Every grab surface is big enough to press with a pen, in millimetres rather than in pixels.

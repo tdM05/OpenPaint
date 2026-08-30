@@ -18,3 +18,6 @@ openpaint-document.openpaint*
 
 # Scratch checkouts for background agents; never part of the project.
 .claude/worktrees/
+
+# Cargo puts a target directory beside whichever manifest it was run from.
+target/

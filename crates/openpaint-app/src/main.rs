@@ -36,10 +36,12 @@
 mod autosave;
 mod canvas_renderer;
 mod chrome;
+mod colour_wheel;
 mod crop;
 mod editor;
 mod export;
 mod history;
+mod icons;
 mod input;
 mod input_mouse;
 #[cfg(target_os = "windows")]
@@ -57,6 +59,7 @@ mod stroke_exec;
 mod stroke_layer;
 #[cfg(test)]
 mod test_gpu;
+mod text_field;
 mod theme;
 mod tile_pool;
 mod tile_store;

@@ -162,7 +162,6 @@ pub fn shoot(name: &str, screen: Rect, pokes: &[Poke], ws: &mut Workspace) {
         });
     });
 
-    let (w, h) = (screen.w as u32, screen.h as u32);
     let mut renderer = egui_wgpu::Renderer::new(&device, crate::test_gpu::SURFACE, None, 1, true);
     // Every pass's textures, in order: the font atlas arrives with the first one and never again.
     for pass in &passes {
@@ -171,6 +170,23 @@ pub fn shoot(name: &str, screen: Rect, pokes: &[Poke], ws: &mut Workspace) {
         }
     }
     let output = passes.pop().expect("at least one pass");
+    render_to_png(name, screen, &device, &queue, &mut renderer, &ctx, output);
+}
+
+/// Rasterise a finished egui frame and write it out.
+///
+/// Split from `shoot` so anything that draws its own frame -- a sheet of every icon, say -- can
+/// reuse it rather than growing a second copy that drifts.
+fn render_to_png(
+    name: &str,
+    screen: Rect,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut egui_wgpu::Renderer,
+    ctx: &egui::Context,
+    output: egui::FullOutput,
+) {
+    let (w, h) = (screen.w as u32, screen.h as u32);
     let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
     let desc = egui_wgpu::ScreenDescriptor {
         size_in_pixels: [w, h],
@@ -194,12 +210,12 @@ pub fn shoot(name: &str, screen: Rect, pokes: &[Poke], ws: &mut Workspace) {
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
     let mut encoder = device.create_command_encoder(&Default::default());
-    renderer.update_buffers(&device, &queue, &mut encoder, &primitives, &desc);
+    renderer.update_buffers(device, queue, &mut encoder, &primitives, &desc);
     {
         // Cleared rather than loaded, unlike the real path: on screen egui draws over a canvas the
         // GPU has already put there, and here there is nothing underneath. The clear colour is the
         // canvas colour so a missing panel reads as a hole rather than as black.
-        let ground = ws.theme.palette.canvas.0;
+        let ground = Theme::default().palette.canvas.0;
         let mut pass = encoder
             .begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("screenshot"),
@@ -317,11 +333,25 @@ fn filler(panel: crate::layout::PanelId, ui: &mut egui::Ui, direction: Direction
             id: 1,
             text: "Brush".to_owned(),
             selected: true,
+            icon: Some(crate::icons::Symbol::Brush),
         },
         Control::Choice {
             id: 2,
             text: "Eraser".to_owned(),
             selected: false,
+            icon: Some(crate::icons::Symbol::Eraser),
+        },
+        Control::Choice {
+            id: 3,
+            text: "Lasso".to_owned(),
+            selected: false,
+            icon: Some(crate::icons::Symbol::Lasso),
+        },
+        Control::Choice {
+            id: 4,
+            text: "Wand".to_owned(),
+            selected: false,
+            icon: Some(crate::icons::Symbol::Wand),
         },
     ];
     let mut input = crate::panel_draw::PanelInput::default();
@@ -374,6 +404,114 @@ mod tests {
             Rect::new(0.0, 0.0, 420.0, 900.0),
             &[],
             &mut ws,
+        );
+    }
+
+    /// Every icon in every set, side by side, at the size they will actually be drawn.
+    ///
+    /// The only way to know whether a glyph reads at six millimetres is to look at it at six
+    /// millimetres. Drawn twice on each row: once at tool-rail size, once magnified, so a shape
+    /// that is merely *wrong* can be told apart from one that is merely small.
+    #[test]
+    #[ignore = "writes a PNG to look at rather than asserting anything"]
+    fn shot_icons() {
+        use crate::icons::{Symbol, SETS};
+        let theme = Theme::default();
+        let m = theme.metrics;
+        let drawn: Vec<&crate::icons::IconSet> = SETS
+            .iter()
+            .filter(|s| s.glyph(Symbol::Brush).is_some())
+            .collect();
+        let big = 64.0;
+        let col = big + m.row + m.padding * 4.0;
+        let w = 200.0 + col * drawn.len() as f32;
+        let h = m.padding * 2.0 + Symbol::ALL.len() as f32 * (big + m.gap);
+
+        let Some((device, queue)) = crate::test_gpu::try_device() else {
+            eprintln!("screenshot icons: no GPU adapter, skipped");
+            return;
+        };
+        let screen = Rect::new(0.0, 0.0, w, h);
+        let ctx = egui::Context::default();
+        let mut passes = run_frames(&ctx, screen, &[], |c| {
+            let painter = c.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("icons"),
+            ));
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h)),
+                0.0,
+                egui::Color32::from_rgb(
+                    theme.palette.panel.0[0],
+                    theme.palette.panel.0[1],
+                    theme.palette.panel.0[2],
+                ),
+            );
+            let text = egui::Color32::from_rgb(
+                theme.palette.text.0[0],
+                theme.palette.text.0[1],
+                theme.palette.text.0[2],
+            );
+            for (row, symbol) in Symbol::ALL.iter().enumerate() {
+                let y = m.padding + row as f32 * (big + m.gap);
+                painter.text(
+                    egui::pos2(m.padding, y + big / 2.0),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{symbol:?}"),
+                    egui::FontId::proportional(m.body),
+                    egui::Color32::from_rgb(
+                        theme.palette.dim.0[0],
+                        theme.palette.dim.0[1],
+                        theme.palette.dim.0[2],
+                    ),
+                );
+                for (i, set) in drawn.iter().enumerate() {
+                    let Some(marks) = set.glyph(*symbol) else {
+                        continue;
+                    };
+                    let x = 200.0 + i as f32 * col;
+                    // At the size a tool button actually gives it.
+                    crate::panel_draw::draw_icon(
+                        &painter,
+                        marks,
+                        Rect::new(x, y + (big - m.row) / 2.0, m.row, m.row),
+                        text,
+                    );
+                    // And magnified, to tell a bad shape from a small one.
+                    crate::panel_draw::draw_icon(
+                        &painter,
+                        marks,
+                        Rect::new(x + m.row + m.padding, y, big, big),
+                        text,
+                    );
+                }
+            }
+            for (i, set) in drawn.iter().enumerate() {
+                painter.text(
+                    egui::pos2(200.0 + i as f32 * col, 2.0),
+                    egui::Align2::LEFT_TOP,
+                    set.name,
+                    egui::FontId::proportional(m.label),
+                    text,
+                );
+            }
+        });
+        let mut renderer =
+            egui_wgpu::Renderer::new(&device, crate::test_gpu::SURFACE, None, 1, true);
+        for pass in &passes {
+            for (id, delta) in &pass.textures_delta.set {
+                renderer.update_texture(&device, &queue, *id, delta);
+            }
+        }
+        let output = passes.pop().expect("a pass");
+        render_to_png(
+            "icons",
+            screen,
+            &device,
+            &queue,
+            &mut renderer,
+            &ctx,
+            output,
         );
     }
 

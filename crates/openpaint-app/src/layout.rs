@@ -151,6 +151,17 @@ pub struct Splitter {
 #[derive(Clone, Debug, PartialEq)]
 struct Child {
     weight: f32,
+    /// The size below which this child stops shrinking, in logical units along the split's axis.
+    ///
+    /// **A menu bar is not a fraction of a window.** Weights alone made every panel scale with the
+    /// window, so the same arrangement that looked right at 1400x900 clipped its own menu bar in
+    /// half at 900x600 -- found by looking at a screenshot, after a test that was meant to prevent
+    /// exactly that checked one size and happened to pick a big one.
+    ///
+    /// A number rather than something derived from the contents, because the layout must never
+    /// branch on which panel it holds (§1c). Whoever builds the arrangement knows what a strip
+    /// needs and says so.
+    min: f32,
     node: Node,
 }
 
@@ -348,6 +359,9 @@ impl Layout {
                         at,
                         Child {
                             weight: taken,
+                            // A panel arriving by drag has said nothing about a minimum, and
+                            // inventing one would freeze it at a size nobody chose.
+                            min: 0.0,
                             node: Node::leaf(vec![panel]),
                         },
                     );
@@ -366,10 +380,14 @@ impl Layout {
         let existing = std::mem::replace(node, Node::leaf(Vec::new()));
         let arriving = Child {
             weight: 0.5,
+            min: 0.0,
             node: Node::leaf(vec![panel]),
         };
         let displaced = Child {
             weight: 0.5,
+            // The displaced node keeps nothing: it is being wrapped, not resized, and whatever
+            // minimum it had belonged to its old parent's axis, which may not be this one.
+            min: 0.0,
             node: existing,
         };
         *node = Node::Split {
@@ -455,6 +473,26 @@ impl Layout {
     /// every child of a split together and need not make them sum to anything in particular.
     ///
     /// Floored above zero for the same reason a splitter drag is: a child at exactly nothing has
+    /// Say how small a child may get, in logical units along its parent's axis.
+    ///
+    /// **This is what makes a strip a strip.** A menu bar expressed only as a weight grows with
+    /// the window and, in a small one, shrinks below its own contents: at 900x600 the default
+    /// arrangement clipped its menu bar in half. A minimum is taken out first and the weights
+    /// share what is left, so a bar stays the height it needs and the canvas takes the rest.
+    pub fn set_min(&mut self, path: &[usize], min: f32) -> bool {
+        let Some(index) = path.last().copied() else {
+            return false;
+        };
+        let Some(Node::Split { children, .. }) = self.node_mut(&path[..path.len() - 1]) else {
+            return false;
+        };
+        let Some(child) = children.get_mut(index) else {
+            return false;
+        };
+        child.min = min.max(0.0);
+        true
+    }
+
     /// no header left to grab, and a layout you cannot grab is a layout you cannot fix.
     pub fn set_weight(&mut self, path: &[usize], weight: f32) -> bool {
         let Some((index, parent)) = path.split_last() else {
@@ -467,7 +505,10 @@ impl Layout {
         let Some(child) = children.get_mut(*index) else {
             return false;
         };
-        child.weight = weight.max(MIN_WEIGHT_FRACTION);
+        // Stored as given. The recoverability floor is applied when the split is *resolved*, not
+        // written into the data: doing it here made the answer depend on whether the weight or the
+        // minimum was set first, which is the kind of trap that is discovered months later.
+        child.weight = weight.max(0.0);
         true
     }
 
@@ -520,7 +561,7 @@ impl Layout {
     ///
     /// Only the two children either side move. Dragging one divider must not shuffle the whole
     /// row, which is what makes a layout feel adjusted rather than disturbed.
-    pub fn drag_splitter(&mut self, path: &[usize], index: usize, delta: f32) -> bool {
+    pub fn drag_splitter(&mut self, path: &[usize], index: usize, delta: f32, extent: f32) -> bool {
         let Some(Node::Split { children, .. }) = self.node_mut(path) else {
             return false;
         };
@@ -531,11 +572,31 @@ impl Layout {
         if total <= 0.0 {
             return false;
         }
+        // **Worked in weights, but only where weights still mean size.** Once a child has a
+        // minimum, its share is taken out before the weights are applied, so moving a weight by a
+        // fraction no longer moves the divider by that fraction. Rather than pretend otherwise,
+        // a pair where either side has a minimum is resized in *units*: the minimum stays put and
+        // the delta lands on the weighted side.
+        let (a, b) = (children[index].min, children[index + 1].min);
+        if a > 0.0 || b > 0.0 {
+            // A strip is dragged by changing what it will not shrink below -- which is exactly
+            // what the artist means by dragging its edge. Never below zero, and never so far that
+            // the other side is pushed out of existence.
+            if a > 0.0 {
+                children[index].min = (a + delta).max(0.0);
+            } else {
+                children[index + 1].min = (b - delta).max(0.0);
+            }
+            return true;
+        }
         let floor = total * MIN_WEIGHT_FRACTION;
         let pair = children[index].weight + children[index + 1].weight;
         // Clamped against the *pair*, so neither side can be pushed past the other or below the
         // floor that keeps its header grabbable.
-        let want = (children[index].weight + delta * total).clamp(floor, pair - floor);
+        // Back into weights, where they still mean size: a divider moved this far across a split
+        // this wide is that fraction of it.
+        let fraction = if extent > 0.0 { delta / extent } else { 0.0 };
+        let want = (children[index].weight + fraction * total).clamp(floor, pair - floor);
         children[index].weight = want;
         children[index + 1].weight = pair - want;
         true
@@ -563,7 +624,6 @@ impl Layout {
 /// have been — the drift is a ten-thousandth of a logical unit, which no pointer can land in and
 /// no eye can see. It stays because exactness here is free, not because anything depends on it.
 fn shares(axis: Axis, area: Rect, children: &[Child]) -> Vec<Rect> {
-    let total: f32 = children.iter().map(|c| c.weight).sum();
     let mut out = Vec::with_capacity(children.len());
     if children.is_empty() {
         return out;
@@ -572,14 +632,14 @@ fn shares(axis: Axis, area: Rect, children: &[Child]) -> Vec<Rect> {
         Axis::Horizontal => area.w,
         Axis::Vertical => area.h,
     };
+    let sizes = split_extent(extent, children);
     let mut offset = 0.0_f32;
-    for (i, child) in children.iter().enumerate() {
+    for (i, size) in sizes.into_iter().enumerate() {
+        // The last child takes whatever is left, so the pieces sum to the whole exactly.
         let size = if i + 1 == children.len() {
             extent - offset
-        } else if total > 0.0 {
-            extent * (child.weight / total)
         } else {
-            extent / children.len() as f32
+            size
         };
         out.push(match axis {
             Axis::Horizontal => Rect::new(area.x + offset, area.y, size, area.h),
@@ -588,6 +648,58 @@ fn shares(axis: Axis, area: Rect, children: &[Child]) -> Vec<Rect> {
         offset += size;
     }
     out
+}
+
+/// How much of `extent` each child gets, honouring what each has said it cannot shrink below.
+///
+/// **Minimums first, then weights on what is left.** A menu bar wants a fixed height and a canvas
+/// wants whatever remains; expressing that as weights alone means the bar grows with the window
+/// and, worse, shrinks below its own contents in a small one.
+///
+/// When the minimums cannot all be met the space is shared out in proportion to them, so a window
+/// too small for everything degrades evenly instead of starving whichever child happens to be
+/// last.
+#[must_use]
+fn split_extent(extent: f32, children: &[Child]) -> Vec<f32> {
+    // Taken as stored, not clamped again here. Every way a minimum can be set clamps it -- and a
+    // second guard over the same rule would mean a sabotage that removed either one changed
+    // nothing, which is how a guard stops being tested (`panel_ui::change_at` says the same).
+    let mins: Vec<f32> = children.iter().map(|c| c.min).collect();
+    let needed: f32 = mins.iter().sum();
+    if needed > extent && needed > 0.0 {
+        return mins.iter().map(|m| extent * (m / needed)).collect();
+    }
+    let spare = extent - needed;
+
+    // The recoverability floor, applied here rather than stored: a child dragged to nothing has no
+    // header left to grab, so the layout could not be undone by hand. A child with a *minimum*
+    // cannot reach nothing in the first place, and giving it a floor as well would make it grow
+    // with the window -- which is precisely what a strip must not do.
+    let stated: f32 = children.iter().map(|c| c.weight.max(0.0)).sum();
+    let floor = stated.max(1.0) * MIN_WEIGHT_FRACTION;
+    let weights: Vec<f32> = children
+        .iter()
+        .map(|c| {
+            if c.min > 0.0 {
+                c.weight.max(0.0)
+            } else {
+                c.weight.max(floor)
+            }
+        })
+        .collect();
+    let total: f32 = weights.iter().sum();
+
+    mins.iter()
+        .zip(&weights)
+        .map(|(min, weight)| {
+            let share = if total > 0.0 {
+                spare * (weight / total)
+            } else {
+                spare / children.len() as f32
+            };
+            min + share
+        })
+        .collect()
 }
 
 /// A layout as it goes to disk: the same tree, with panels named rather than numbered.
@@ -619,6 +731,9 @@ enum SavedNode {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct SavedChild {
     weight: f32,
+    /// Absent in files written before minimums existed, which is what the default is for.
+    #[serde(default)]
+    min: f32,
     node: SavedNode,
 }
 
@@ -677,6 +792,7 @@ fn save_node(node: &Node, name_of: impl Fn(PanelId) -> Option<String> + Copy) ->
                 .iter()
                 .map(|c| SavedChild {
                     weight: c.weight,
+                    min: c.min,
                     node: save_node(&c.node, name_of),
                 })
                 .collect(),
@@ -702,6 +818,9 @@ fn load_node(node: &SavedNode, id_of: impl Fn(&str) -> Option<PanelId> + Copy) -
                 .iter()
                 .map(|c| Child {
                     weight: c.weight,
+                    // Clamped on the way in: a hand-edited file is the one route a negative
+                    // minimum could arrive by, and `shares` trusts what it is given.
+                    min: c.min.max(0.0),
                     node: load_node(&c.node, id_of),
                 })
                 .collect(),
@@ -959,7 +1078,7 @@ mod tests {
         let mut l = three_across();
         // Push the split far from summing to one, in both directions.
         for _ in 0..6 {
-            l.drag_splitter(&[], 0, 0.05);
+            l.drag_splitter(&[], 0, 0.05, 1.0);
         }
         let placed = l.resolve(area());
         let covered: f32 = placed.iter().map(|p| p.rect.w).sum();
@@ -1050,7 +1169,7 @@ mod tests {
     fn dragging_a_splitter_disturbs_only_its_neighbours() {
         let mut l = three_across();
         let before = rects(&l);
-        assert!(l.drag_splitter(&[], 0, 0.1));
+        assert!(l.drag_splitter(&[], 0, 0.1, 1.0));
         let after = rects(&l);
 
         assert!(after[0].1.w > before[0].1.w, "the left child grew");
@@ -1067,7 +1186,7 @@ mod tests {
     fn a_splitter_cannot_close_a_panel_completely() {
         let mut l = three_across();
         for _ in 0..20 {
-            l.drag_splitter(&[], 0, -1.0);
+            l.drag_splitter(&[], 0, -1.0, 1.0);
         }
         let placed = l.resolve(area());
         assert!(
@@ -1076,6 +1195,139 @@ mod tests {
             placed[0].rect.w
         );
         assert!(placed[0].rect.w < area().w * 0.05, "but really a sliver");
+    }
+
+    /// **A minimum survives being saved.** Otherwise a workspace reopens with its menu bar as a
+    /// fraction again, and the bug this whole mechanism exists to fix comes back on restart.
+    #[test]
+    fn a_minimum_survives_the_saved_form() {
+        let mut original = three_across();
+        original.set_min(&[0], 38.0);
+        original.set_min(&[1], 0.0);
+        original.set_weight(&[2], 0.6);
+
+        let saved = original.to_saved(|p| Some(format!("p{}", p.0)));
+        let text = serde_json::to_string(&saved).expect("serialise");
+        let back: SavedLayout = serde_json::from_str(&text).expect("parse");
+        let restored = Layout::from_saved(&back, |n| {
+            n.strip_prefix('p')
+                .and_then(|d| d.parse().ok())
+                .map(PanelId)
+        });
+        assert_eq!(restored, original, "the minimum did not come back");
+
+        // And the arrangement it produces is the same one, which is what actually matters.
+        let area = Rect::new(0.0, 0.0, 1000.0, 400.0);
+        assert_eq!(restored.resolve(area), original.resolve(area));
+    }
+
+    /// **A window too small for every minimum shares what there is, evenly.**
+    ///
+    /// The alternative is handing each child its full minimum in turn until the space runs out,
+    /// which starves whichever happens to be last -- and "last" is an accident of how the tree was
+    /// built, not something anyone chose.
+    #[test]
+    fn a_window_too_small_for_its_minimums_shares_what_there_is() {
+        let mut l = three_across();
+        l.set_min(&[0], 300.0);
+        l.set_min(&[1], 300.0);
+        l.set_min(&[2], 300.0);
+
+        // Half the room the minimums ask for.
+        let area = Rect::new(0.0, 0.0, 450.0, 200.0);
+        let placed = l.resolve(area);
+        assert_eq!(placed.len(), 3);
+        for p in &placed {
+            assert!(
+                (p.rect.w - 150.0).abs() < 0.01,
+                "one child got {} of the 450 available",
+                p.rect.w
+            );
+        }
+        // Nothing was lost or invented on the way.
+        let total: f32 = placed.iter().map(|p| p.rect.w).sum();
+        assert!((total - area.w).abs() < 0.01);
+    }
+
+    /// **A panel cannot be dragged away to nothing**, because a panel with no header left has no
+    /// way back. The floor is about recoverability, not about size (§1c).
+    #[test]
+    fn a_panel_dragged_hard_keeps_something_to_grab() {
+        let area = Rect::new(0.0, 0.0, 1000.0, 400.0);
+        let mut l = three_across();
+        // Shove the first divider as far left as it will go, several times over.
+        for _ in 0..20 {
+            l.drag_splitter(&[], 0, -1000.0, area.w);
+        }
+        let first = l.resolve(area)[0].rect.w;
+        assert!(
+            first > 1.0,
+            "the first panel was squeezed to {first}, with no header left to grab"
+        );
+
+        // And the same in the other direction, for its neighbour.
+        for _ in 0..20 {
+            l.drag_splitter(&[], 0, 1000.0, area.w);
+        }
+        let second = l.resolve(area)[1].rect.w;
+        assert!(second > 1.0, "its neighbour was squeezed to {second}");
+    }
+
+    /// A weight of nothing still leaves something to grab.
+    ///
+    /// Dragging clamps on its own way in, so that path never reaches zero; setting a weight
+    /// directly does, and a child at exactly zero has no header left to take hold of. This is the
+    /// floor's real job, and the only route that tests it.
+    #[test]
+    fn a_weight_of_nothing_still_leaves_a_header_to_grab() {
+        let area = Rect::new(0.0, 0.0, 1000.0, 400.0);
+        let mut l = three_across();
+        l.set_weight(&[0], 0.0);
+        let first = l.resolve(area)[0].rect.w;
+        assert!(
+            first > 1.0,
+            "a panel weighted to nothing came out {first} wide, with no way to get it back"
+        );
+
+        // A child with a *minimum* is exempt, because it can never reach nothing anyway -- and a
+        // floor would make it grow with the window, which is the one thing a strip must not do.
+        let mut strip = three_across();
+        strip.set_min(&[0], 40.0);
+        strip.set_weight(&[0], 0.0);
+        let narrow = strip.resolve(Rect::new(0.0, 0.0, 1000.0, 400.0))[0].rect.w;
+        let wide = strip.resolve(Rect::new(0.0, 0.0, 4000.0, 400.0))[0].rect.w;
+        assert!(
+            (narrow - wide).abs() < 0.01,
+            "the strip grew from {narrow} to {wide} with the window"
+        );
+    }
+
+    /// A strip's edge can be dragged, and it cannot be dragged inside out.
+    ///
+    /// A strip is resized by moving what it will not shrink below -- which is what the artist
+    /// means by dragging its edge -- so that is the number that has to stay sane.
+    #[test]
+    fn a_strip_can_be_resized_but_not_turned_inside_out() {
+        let area = Rect::new(0.0, 0.0, 1000.0, 600.0);
+        let mut l = Layout::single(PanelId(1));
+        l.insert(&[], Zone::Top, PanelId(0));
+        l.set_min(&[0], 40.0);
+        l.set_weight(&[0], 0.0);
+        l.set_weight(&[1], 1.0);
+        assert!((l.resolve(area)[0].rect.h - 40.0).abs() < 0.01);
+
+        l.drag_splitter(&[], 0, 25.0, area.h);
+        assert!(
+            (l.resolve(area)[0].rect.h - 65.0).abs() < 0.01,
+            "dragging the strip's edge should have made it taller"
+        );
+
+        // Dragged far past its own top, it stops at nothing rather than going negative.
+        for _ in 0..10 {
+            l.drag_splitter(&[], 0, -500.0, area.h);
+        }
+        let h = l.resolve(area)[0].rect.h;
+        assert!(h >= 0.0, "the strip was dragged inside out to {h}");
     }
 
     /// A layout survives a round trip through its saved form, weights and tabs included.
@@ -1094,7 +1346,7 @@ mod tests {
         let mut original = three_across();
         original.insert(&[2], Zone::Center, HISTORY);
         original.insert(&[1], Zone::Bottom, COLOUR);
-        original.drag_splitter(&[], 0, 0.07);
+        original.drag_splitter(&[], 0, 0.07, 1.0);
         assert!(
             original.split_axis(&[1]) == Some(Axis::Vertical)
                 && original.split_axis(&[]) == Some(Axis::Horizontal),
