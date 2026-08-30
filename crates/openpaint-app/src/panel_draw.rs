@@ -21,7 +21,7 @@ use crate::theme::Theme;
 ///
 /// Not application state: nothing here is worth saving or undoing. But it cannot live inside a
 /// frame either, because both fields are answers to "what is still going on".
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PanelInput {
     /// Which control the pointer went down on and has not yet let go of.
     ///
@@ -32,6 +32,17 @@ pub struct PanelInput {
     pub latch: Option<ControlId>,
     /// How far down a list taller than its panel has been scrolled.
     pub scroll: f32,
+    /// Where each [`Control::Custom`] ended up, and where the pointer is inside the panel.
+    ///
+    /// Handed back rather than worked out again by the panel: the engine decides where a control
+    /// goes, and a panel that recomputed it would be a second answer to drift from the first.
+    pub custom: Vec<(ControlId, Rect)>,
+    /// Where the pointer is, if it is over this panel at all, and whether it is pressed.
+    ///
+    /// A custom drawing does its own hit-testing -- that is what makes it custom -- so it needs the
+    /// pointer rather than a change.
+    pub pointer: Option<(f32, f32)>,
+    pub pressed: bool,
     /// Where the control that was last pressed sits.
     ///
     /// For anchoring something to the control that opened it -- a menu belongs under its own
@@ -146,6 +157,15 @@ pub fn show(
             }
         }
     }
+
+    input.custom.clear();
+    for p in &placed {
+        if let Control::Custom { id, .. } = p.control {
+            input.custom.push((*id, p.rect));
+        }
+    }
+    input.pointer = resp.hover_pos().or(pointer).map(|q| (q.x, q.y));
+    input.pressed = down;
 
     let hover = resp
         .hover_pos()
@@ -320,6 +340,8 @@ fn draw(
                 );
             }
         }
+        // Drawn by whoever asked for it, from the rectangle reported back in `PanelInput`.
+        Control::Custom { .. } => {}
         Control::Row {
             text,
             selected,
@@ -400,7 +422,7 @@ pub fn text_width(ctx: &egui::Context, size: f32, control: &Control) -> f32 {
         | Control::Toggle { text, .. }
         | Control::Choice { text, .. }
         | Control::Row { text, .. } => text.as_str(),
-        Control::Separator => return 0.0,
+        Control::Separator | Control::Custom { .. } => return 0.0,
     };
     ctx.fonts(|f| {
         f.layout_no_wrap(
@@ -477,6 +499,166 @@ pub fn draw_icon(
             }
         }
     }
+}
+
+/// Where a colour wheel goes and what it is currently showing.
+///
+/// A struct because the argument list grew past the lint, and that is a signal rather than a lint
+/// to silence: these three are one thing -- the wheel as it stands this frame.
+#[derive(Clone, Copy, Debug)]
+pub struct WheelAt {
+    pub within: Rect,
+    pub shape: crate::colour_wheel::Shape,
+    pub colour: crate::colour_wheel::Hsv,
+}
+
+/// Draw a colour wheel into a rectangle, and report a colour if the pointer is setting one.
+///
+/// **The geometry is `colour_wheel`'s and stays there.** Where the ring is, which region a point
+/// is in, what colour a point means and where the current colour's marker goes are all decided by
+/// something with no screen attached and proved against itself; this turns those answers into
+/// triangles.
+///
+/// `holding` is which region the pointer took hold of, kept by the caller between frames: a drag
+/// that wanders out of the ring must keep setting the hue rather than jumping to whatever is under
+/// it, the same reason a slider latches.
+pub fn draw_wheel(
+    painter: &egui::Painter,
+    theme: &Theme,
+    at: WheelAt,
+    input: &PanelInput,
+    holding: &mut Option<crate::colour_wheel::Region>,
+) -> Option<crate::colour_wheel::Hsv> {
+    let WheelAt {
+        within,
+        shape,
+        colour,
+    } = at;
+    let (pointer, pressed) = (input.pointer, input.pressed);
+    use crate::colour_wheel::{Hsv, Region, Wheel};
+    let wheel = Wheel::new(shape, within, colour);
+    if wheel.is_empty() {
+        return None;
+    }
+    let pal = &theme.palette;
+
+    // The hue ring, as a fan of wedges. Twelve degrees is a chord that sags a third of a unit at
+    // this size -- under the hairline everything else is drawn with, so a finer fan would cost
+    // triangles and change no pixels.
+    if let Some(ring) = wheel.hue_ring() {
+        let mut mesh = egui::Mesh::default();
+        let steps = 30;
+        for i in 0..=steps {
+            let t = i as f32 / steps as f32;
+            let a = t * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+            let [r, g, b] = Hsv::new(t * 360.0, 1.0, 1.0).to_srgb8();
+            let tint = egui::Color32::from_rgb(r, g, b);
+            for radius in [ring.inner, ring.outer] {
+                mesh.colored_vertex(
+                    egui::pos2(
+                        radius.mul_add(a.cos(), ring.centre.0),
+                        radius.mul_add(a.sin(), ring.centre.1),
+                    ),
+                    tint,
+                );
+            }
+        }
+        for i in 0..steps {
+            let q = i * 2;
+            mesh.add_triangle(q, q + 1, q + 2);
+            mesh.add_triangle(q + 1, q + 3, q + 2);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    }
+
+    // The saturation/value area. A square is four corners; a triangle is three, and its colours
+    // are read from the wheel itself so the drawing cannot disagree with the press.
+    if let Some(area) = wheel.sv_square() {
+        let mut mesh = egui::Mesh::default();
+        for corner in [
+            (area.x, area.y),
+            (area.x + area.w, area.y),
+            (area.x, area.y + area.h),
+            (area.x + area.w, area.y + area.h),
+        ] {
+            let [r, g, b] = wheel
+                .colour_in(Region::Interior, corner.0, corner.1)
+                .to_srgb8();
+            mesh.colored_vertex(
+                egui::pos2(corner.0, corner.1),
+                egui::Color32::from_rgb(r, g, b),
+            );
+        }
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(1, 3, 2);
+        painter.add(egui::Shape::mesh(mesh));
+    }
+    if let Some(corners) = wheel.sv_triangle() {
+        let mut mesh = egui::Mesh::default();
+        for (x, y) in corners {
+            let [r, g, b] = wheel.colour_in(Region::Interior, x, y).to_srgb8();
+            mesh.colored_vertex(egui::pos2(x, y), egui::Color32::from_rgb(r, g, b));
+        }
+        mesh.add_triangle(0, 1, 2);
+        painter.add(egui::Shape::mesh(mesh));
+    }
+    if let Some(strip) = wheel.hue_strip() {
+        let mut mesh = egui::Mesh::default();
+        let steps = 24;
+        for i in 0..=steps {
+            let t = i as f32 / steps as f32;
+            let [r, g, b] = Hsv::new(t * 360.0, 1.0, 1.0).to_srgb8();
+            let tint = egui::Color32::from_rgb(r, g, b);
+            let x = strip.w.mul_add(t, strip.x);
+            mesh.colored_vertex(egui::pos2(x, strip.y), tint);
+            mesh.colored_vertex(egui::pos2(x, strip.y + strip.h), tint);
+        }
+        for i in 0..steps {
+            let q = i * 2;
+            mesh.add_triangle(q, q + 1, q + 2);
+            mesh.add_triangle(q + 1, q + 3, q + 2);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    }
+
+    // The markers, drawn where `marker` says -- which is the inverse of where a press reads, and
+    // proved against it. A ring rather than a dot, so the colour underneath is not hidden by the
+    // thing pointing at it.
+    for region in [Region::Hue, Region::Interior] {
+        if let Some((x, y)) = wheel.marker(region) {
+            painter.circle_stroke(
+                egui::pos2(x, y),
+                5.0,
+                egui::Stroke::new(
+                    2.0_f32,
+                    egui::Color32::from_rgb(pal.bright.0[0], pal.bright.0[1], pal.bright.0[2]),
+                ),
+            );
+            painter.circle_stroke(
+                egui::pos2(x, y),
+                6.5,
+                egui::Stroke::new(
+                    1.0_f32,
+                    egui::Color32::from_rgb(pal.canvas.0[0], pal.canvas.0[1], pal.canvas.0[2]),
+                ),
+            );
+        }
+    }
+
+    // A press takes hold of whichever region it landed in, and keeps it until let go: a drag that
+    // wanders off the ring must keep setting the hue rather than jumping to whatever is under it.
+    let Some((px, py)) = pointer else {
+        *holding = None;
+        return None;
+    };
+    if !pressed {
+        *holding = None;
+        return None;
+    }
+    if holding.is_none() {
+        *holding = wheel.region_at(px, py);
+    }
+    holding.map(|region| wheel.colour_in(region, px, py))
 }
 
 /// How many decimals a value deserves, from how much room its range gives each step.

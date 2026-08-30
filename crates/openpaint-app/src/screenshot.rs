@@ -518,6 +518,92 @@ mod tests {
         );
     }
 
+    /// All three colour wheels, at the size a docked Colour panel gives them.
+    ///
+    /// The geometry is proved without a screen; what a screenshot answers is whether the drawing
+    /// agrees with it -- a marker in the wrong place, a ring drawn as a disc, a triangle that does
+    /// not turn with its hue.
+    #[test]
+    #[ignore = "writes a PNG to look at rather than asserting anything"]
+    fn shot_colour_wheels() {
+        use crate::colour_wheel::{Hsv, Shape};
+        let theme = Theme::default();
+        let side = 190.0;
+        let gap = 24.0;
+        let shapes = [Shape::Ring, Shape::Triangle, Shape::Square];
+        let colours = [
+            Hsv::new(20.0, 0.9, 0.95),
+            Hsv::new(150.0, 0.6, 0.7),
+            Hsv::new(260.0, 0.35, 0.5),
+        ];
+        let screen = Rect::new(
+            0.0,
+            0.0,
+            gap + (side + gap) * shapes.len() as f32,
+            gap + (side + gap) * colours.len() as f32,
+        );
+
+        let Some((device, queue)) = crate::test_gpu::try_device() else {
+            eprintln!("screenshot colour-wheels: no GPU adapter, skipped");
+            return;
+        };
+        let ctx = egui::Context::default();
+        let mut passes = run_frames(&ctx, screen, &[], |c| {
+            let painter = c.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("wheels"),
+            ));
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(screen.w, screen.h)),
+                0.0,
+                egui::Color32::from_rgb(
+                    theme.palette.panel.0[0],
+                    theme.palette.panel.0[1],
+                    theme.palette.panel.0[2],
+                ),
+            );
+            for (row, colour) in colours.iter().enumerate() {
+                for (col, shape) in shapes.iter().enumerate() {
+                    let at = Rect::new(
+                        gap + (side + gap) * col as f32,
+                        gap + (side + gap) * row as f32,
+                        side,
+                        side,
+                    );
+                    let mut holding = None;
+                    crate::panel_draw::draw_wheel(
+                        &painter,
+                        &theme,
+                        crate::panel_draw::WheelAt {
+                            within: at,
+                            shape: *shape,
+                            colour: *colour,
+                        },
+                        &crate::panel_draw::PanelInput::default(),
+                        &mut holding,
+                    );
+                }
+            }
+        });
+        let mut renderer =
+            egui_wgpu::Renderer::new(&device, crate::test_gpu::SURFACE, None, 1, true);
+        for pass in &passes {
+            for (id, delta) in &pass.textures_delta.set {
+                renderer.update_texture(&device, &queue, *id, delta);
+            }
+        }
+        let output = passes.pop().expect("a pass");
+        render_to_png(
+            "colour-wheels",
+            screen,
+            &device,
+            &queue,
+            &mut renderer,
+            &ctx,
+            output,
+        );
+    }
+
     /// A panel lifted out of the arrangement, floating above it.
     #[test]
     #[ignore = "writes a PNG to look at rather than asserting anything"]
@@ -526,6 +612,174 @@ mod tests {
         ws.float(crate::workspace::BRUSH);
         ws.float(crate::workspace::COLOUR);
         shoot("floating", Rect::new(0.0, 0.0, 1400.0, 900.0), &[], &mut ws);
+    }
+
+    /// **A drag that wanders off the hue ring keeps setting the hue.**
+    ///
+    /// The same latch a slider has, and for the same reason: a hand sweeping round a ring does not
+    /// stay inside a twenty-unit band, and a picker that let go the moment it strayed would be
+    /// unusable. Without it the colour would jump to whatever happened to be under the pointer,
+    /// which for a point outside the wheel is nothing at all.
+    #[test]
+    fn a_drag_off_the_hue_ring_keeps_setting_the_hue() {
+        use crate::colour_wheel::{Hsv, Region, Shape};
+        use crate::panel_draw::{draw_wheel, PanelInput, WheelAt};
+        let theme = Theme::default();
+        let within = Rect::new(0.0, 0.0, 200.0, 200.0);
+        let start = Hsv::new(0.0, 1.0, 1.0);
+
+        // The top of the ring, which is where red lives.
+        let on_ring = (within.x + within.w / 2.0, within.y + 6.0);
+        let mut holding = None;
+        let picked = frame_with(Rect::new(0.0, 0.0, 400.0, 400.0), &[], |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("wheel-test"),
+            ));
+            let mut input = PanelInput {
+                pointer: Some(on_ring),
+                pressed: true,
+                ..PanelInput::default()
+            };
+            input.pointer = Some(on_ring);
+            draw_wheel(
+                &painter,
+                &theme,
+                WheelAt {
+                    within,
+                    shape: Shape::Ring,
+                    colour: start,
+                },
+                &input,
+                &mut holding,
+            )
+        });
+        assert!(picked.is_some(), "a press on the ring should set a colour");
+        assert_eq!(holding, Some(Region::Hue), "and it should have taken hold");
+
+        // Now well outside the wheel, still pressed.
+        let strayed = frame_with(Rect::new(0.0, 0.0, 400.0, 400.0), &[], |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("wheel-test-2"),
+            ));
+            let input = PanelInput {
+                pointer: Some((350.0, 350.0)),
+                pressed: true,
+                ..PanelInput::default()
+            };
+            draw_wheel(
+                &painter,
+                &theme,
+                WheelAt {
+                    within,
+                    shape: Shape::Ring,
+                    colour: start,
+                },
+                &input,
+                &mut holding,
+            )
+        });
+        assert!(
+            strayed.is_some(),
+            "a drag off the ring should keep setting the hue, not stop"
+        );
+        assert_eq!(holding, Some(Region::Hue), "and keep hold of the ring");
+
+        // Letting go releases it, so the next press can land somewhere else.
+        frame_with(Rect::new(0.0, 0.0, 400.0, 400.0), &[], |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("wheel-test-3"),
+            ));
+            let input = PanelInput {
+                pointer: Some(on_ring),
+                pressed: false,
+                ..PanelInput::default()
+            };
+            draw_wheel(
+                &painter,
+                &theme,
+                WheelAt {
+                    within,
+                    shape: Shape::Ring,
+                    colour: start,
+                },
+                &input,
+                &mut holding,
+            )
+        });
+        assert_eq!(holding, None, "letting go should release the ring");
+    }
+
+    /// A wheel with no pointer over it sets nothing, and lets go of whatever it held.
+    #[test]
+    fn a_wheel_with_no_pointer_sets_nothing() {
+        use crate::colour_wheel::{Hsv, Region, Shape};
+        use crate::panel_draw::{draw_wheel, PanelInput, WheelAt};
+        let theme = Theme::default();
+        let mut holding = Some(Region::Hue);
+        let picked = frame_with(Rect::new(0.0, 0.0, 400.0, 400.0), &[], |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("wheel-none"),
+            ));
+            draw_wheel(
+                &painter,
+                &theme,
+                WheelAt {
+                    within: Rect::new(0.0, 0.0, 200.0, 200.0),
+                    shape: Shape::Ring,
+                    colour: Hsv::new(0.0, 1.0, 1.0),
+                },
+                &PanelInput {
+                    pointer: None,
+                    pressed: true,
+                    ..PanelInput::default()
+                },
+                &mut holding,
+            )
+        });
+        assert_eq!(picked, None, "a pointer that is not there set a colour");
+        assert_eq!(holding, None, "and it should have let go");
+    }
+
+    /// **A custom control is handed the rectangle it was given**, or nothing can draw into it.
+    ///
+    /// The engine decides where it goes; a panel that worked the position out again would be a
+    /// second answer to drift from the first, and the symptom is a colour wheel drawn somewhere
+    /// other than where pressing it reads.
+    #[test]
+    fn a_custom_control_is_told_where_it_landed() {
+        let controls = vec![
+            Control::Label {
+                text: "Colour".to_owned(),
+            },
+            Control::Custom {
+                id: 9,
+                height: 120.0,
+            },
+        ];
+        let area = Rect::new(20.0, 20.0, 220.0, 300.0);
+        let (_, input) = press_controls(&controls, area, Direction::Column, (0.0, 0.0));
+        let (id, at) = *input
+            .custom
+            .first()
+            .expect("the custom control's rectangle was never reported");
+        assert_eq!(id, 9);
+        assert!(
+            (at.h - 120.0).abs() < 0.001,
+            "it asked for 120 and was given {}",
+            at.h
+        );
+        // And it is where `place` put it, not at the corner of the panel.
+        let m = Theme::default().metrics;
+        let expected = area.y + controls[0].height(&m) + m.gap;
+        assert!(
+            (at.y - expected).abs() < 0.001,
+            "it landed at {} rather than {expected}",
+            at.y
+        );
     }
 
     /// **A press on a control produces its change, all the way through egui.**

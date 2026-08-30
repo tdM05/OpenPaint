@@ -89,6 +89,15 @@ pub enum Control {
         /// established symbol -- a direction, a blend mode -- should do.
         icon: Option<crate::icons::Symbol>,
     },
+    /// Drawn by code, because it cannot be described.
+    ///
+    /// A colour wheel, a curve editor, a graph. The engine still owns *where* it goes and how tall
+    /// it is, so it stacks and scrolls with everything else and the panel is handed a rectangle
+    /// rather than left to work one out.
+    ///
+    /// **If half a panel ends up custom, this layer has bought nothing** -- that is the signal to
+    /// stop and rethink, not to reach for a second escape hatch.
+    Custom { id: ControlId, height: f32 },
     /// A row in a list: layers, presets, pages.
     Row {
         id: ControlId,
@@ -117,6 +126,7 @@ impl Control {
             | Self::Slider { id, .. }
             | Self::Toggle { id, .. }
             | Self::Choice { id, .. }
+            | Self::Custom { id, .. }
             | Self::Row { id, .. } => Some(*id),
         }
     }
@@ -131,6 +141,7 @@ impl Control {
         match self {
             Self::Separator => metrics.padding,
             Self::Label { .. } => metrics.body + metrics.padding * 0.5,
+            Self::Custom { height, .. } => *height,
             // Everything interactive is one row tall, so a column of them is a predictable rhythm
             // and every target is the same size.
             _ => metrics.row,
@@ -152,6 +163,9 @@ impl Control {
             Self::Toggle { .. } => text + metrics.row * 1.6 + metrics.padding * 2.0,
             // Square at least, so a single glyph is still a target rather than a sliver.
             Self::Choice { .. } => (text + metrics.padding * 2.0).max(metrics.row),
+            // Square, because a custom drawing has no label to be measured and nothing to say
+            // about how wide it wants to be along a row.
+            Self::Custom { height, .. } => *height,
             Self::Button { .. } | Self::Row { .. } => text + metrics.padding * 2.0,
         }
     }
@@ -394,7 +408,9 @@ pub fn change_at(
             };
             Some(Change::Set(*id, from_fraction(t, *min, *max, *log)))
         }
-        Control::Label { .. } | Control::Separator => None,
+        // A custom drawing decides for itself what a press on it means, so nothing is reported
+        // here -- only the rectangle it was given, which the panel needs in order to ask.
+        Control::Label { .. } | Control::Separator | Control::Custom { .. } => None,
     }
 }
 

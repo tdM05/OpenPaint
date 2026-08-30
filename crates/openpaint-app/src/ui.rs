@@ -765,6 +765,11 @@ struct Painting<'a> {
     menu: &'a mut Option<u32>,
     /// For measuring text, which only something holding the fonts can do.
     ctx: &'a egui::Context,
+    /// Which colour wheel the artist has chosen. A setting, kept where the other half-finished UI
+    /// state is kept.
+    wheel_shape: &'a mut crate::colour_wheel::Shape,
+    /// Which part of the wheel a drag took hold of, if one has.
+    wheel_hold: &'a mut Option<crate::colour_wheel::Region>,
 }
 
 impl Painting<'_> {
@@ -1120,13 +1125,83 @@ fn workspace_panel(
             }
         }
         ws::COLOUR => {
-            ui.horizontal(|ui| {
-                ui.color_edit_button_srgb(color_srgb);
-                ui.label(format!(
+            // **The first thing that genuinely cannot be described**, and so the first `Custom`.
+            // A hue ring is not a list of controls, and pretending otherwise would have meant a
+            // control kind that existed for one panel.
+            //
+            // What is described is everything around it: the wheel's shape, and the hex value.
+            // The engine still decides where the wheel goes and how tall it is, so it stacks and
+            // scrolls like anything else.
+            use crate::colour_wheel::{Hsv, Shape};
+            use crate::panel_ui::{Change, Control};
+            const WHEEL: u32 = 0;
+            const FIRST_SHAPE: u32 = 1;
+            const SHAPES: [(&str, Shape); 3] = [
+                ("Ring", Shape::Ring),
+                ("Triangle", Shape::Triangle),
+                ("Square", Shape::Square),
+            ];
+
+            let colour = Hsv::from_srgb8(*color_srgb);
+            let mut controls = vec![Control::Custom {
+                id: WHEEL,
+                // Square, and generous: a wheel small enough to fit anywhere is one you cannot
+                // pick a colour with.
+                height: 190.0,
+            }];
+            controls.push(Control::Label {
+                text: format!(
                     "#{:02X}{:02X}{:02X}",
                     color_srgb[0], color_srgb[1], color_srgb[2]
-                ));
+                ),
             });
+            controls.push(Control::Separator);
+            controls.extend(
+                SHAPES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, shape))| Control::Choice {
+                        id: FIRST_SHAPE + u32::try_from(i).unwrap_or(0),
+                        text: (*name).to_owned(),
+                        selected: *paint.wheel_shape == *shape,
+                        icon: None,
+                    }),
+            );
+
+            for change in paint.show(ui, &controls) {
+                match change {
+                    Change::Chose(id) if id >= FIRST_SHAPE => {
+                        if let Some((_, shape)) = SHAPES.get((id - FIRST_SHAPE) as usize) {
+                            *paint.wheel_shape = *shape;
+                        }
+                    }
+                    other => eprintln!("colour panel: unexpected {other:?}"),
+                }
+            }
+
+            // Drawn after the controls, into the rectangle the engine gave it.
+            if let Some((_, at)) = paint
+                .input
+                .custom
+                .iter()
+                .find(|(id, _)| *id == WHEEL)
+                .copied()
+            {
+                let where_it_is = crate::panel_draw::WheelAt {
+                    within: at,
+                    shape: *paint.wheel_shape,
+                    colour,
+                };
+                if let Some(picked) = crate::panel_draw::draw_wheel(
+                    ui.painter(),
+                    paint.theme,
+                    where_it_is,
+                    paint.input,
+                    paint.wheel_hold,
+                ) {
+                    *color_srgb = picked.to_srgb8();
+                }
+            }
         }
         ws::HISTORY => {
             // A described placeholder rather than a drawn one, so the day this panel gets its
@@ -1288,6 +1363,10 @@ pub struct Ui {
     panel_input: std::collections::HashMap<u32, crate::panel_draw::PanelInput>,
     /// Which menu the menu strip is drilled into, if any.
     menu_open: Option<u32>,
+    /// Which colour wheel the artist chose.
+    wheel_shape: crate::colour_wheel::Shape,
+    /// Which part of the wheel a drag has hold of.
+    wheel_hold: Option<crate::colour_wheel::Region>,
 }
 
 impl Ui {
@@ -1319,6 +1398,8 @@ impl Ui {
             preset_name: String::new(),
             panel_input: std::collections::HashMap::new(),
             menu_open: None,
+            wheel_shape: crate::colour_wheel::Shape::default(),
+            wheel_hold: None,
         }
     }
 
@@ -1408,6 +1489,8 @@ impl Ui {
         // back the moment it does not.
         let mut panel_input = std::mem::take(&mut self.panel_input);
         let mut menu_open = self.menu_open;
+        let mut wheel_shape = self.wheel_shape;
+        let mut wheel_hold = self.wheel_hold;
         let output = self.ctx.run(input, |ctx| {
             // The panel workspace, when it is switched on. Drawn *instead of* the side panel
             // rather than beside it: they are two answers to the same question, and showing both
@@ -1442,6 +1525,8 @@ impl Ui {
                                 input: panel_input.entry(panel.0).or_default(),
                                 menu: &mut menu_open,
                                 ctx,
+                                wheel_shape: &mut wheel_shape,
+                                wheel_hold: &mut wheel_hold,
                             },
                             place,
                         )
@@ -2681,6 +2766,8 @@ impl Ui {
         // of the left edge the panel covers", and only the panel can answer that.
         self.panel_input = panel_input;
         self.menu_open = menu_open;
+        self.wheel_shape = wheel_shape;
+        self.wheel_hold = wheel_hold;
         let scale = self.ctx.pixels_per_point();
         let used = panel_rect;
         self.occupied = egui::Rect::from_min_max(

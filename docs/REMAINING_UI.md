@@ -30,7 +30,8 @@ Nine things. Most of the application, by weight.
 5. **Brush, the other two thirds** — flow, angle, roundness, stabilisation, brush tips (load a
    bitmap tip, back to round), presets (save, load, delete), reset to defaults.
 6. **Layers, the rest** — blend mode, layer opacity, move up/down.
-7. **Colour** — the new panel is still a bare egui colour button. No wheel, no document palette.
+7. **Colour** — *the wheel is in*, in all three shapes, with the shape choosable in the panel.
+   What is left is the **document palette**: the swatches, saved with the document.
 8. **Select settings** — wand tolerance, expand, fill-on-click, fill with the brush colour. The
    *commands* (all / none / invert / clear) are already in the menu.
 9. **History** — still a placeholder label.
@@ -48,11 +49,14 @@ Two things, and both have to be done first or every worker invents its own versi
 |---|---|
 | **Pick** — a dropdown | blend mode, resampling kernel |
 | **Text** — a typed field | preset names, layer rename, page size, transform values |
-| **Custom** — drawn by code | colour wheel, curve editor, the layer list's drag-to-reorder |
+| ~~**Custom** — drawn by code~~ | **done**, and the colour wheel is drawn with it |
 
 `text_field.rs` already holds the editing logic (caret, selection, word motion, UTF-8 safe,
-fuzzed); it needs a `Control::Text`, a caret to draw and keyboard events. `colour_wheel.rs`
-already holds the geometry for all three wheel shapes; it needs `Custom` and a panel.
+fuzzed); it needs a `Control::Text`, a caret to draw and keyboard events.
+
+`Control::Custom` is done: the engine still decides where it goes and how tall it is, and hands
+the panel the rectangle back through `PanelInput`. The colour wheel is the worked example --- one
+custom control, everything around it described as usual.
 
 ### `ui.rs` is one function with an arm per panel
 
