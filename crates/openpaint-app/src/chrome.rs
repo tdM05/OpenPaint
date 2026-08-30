@@ -292,7 +292,12 @@ fn header_target(p: &Placed, chrome: &PanelChrome, x: f32, y: f32) -> Target {
     // holds. That is what makes the tool rail and the menu movable, and there is nothing else it
     // could mean.
     if !chrome.tabs.is_empty() {
-        return Target::Strip;
+        // Carrying the leaf it belongs to: a floating window can hold several after a five-zone
+        // drop, each with its own strip and its own shown panel, and "the shown panel's settings"
+        // has to mean the one whose strip was held.
+        return Target::Strip {
+            path: p.path.clone(),
+        };
     }
     Target::Tab {
         path: p.path.clone(),
@@ -882,7 +887,7 @@ mod tests {
                 past.x + past.w + 15.0,
                 past.y + 5.0
             ),
-            Target::Strip,
+            Target::Strip { path: vec![] },
             "the bar beside the tabs belongs to the panel, not to a tab"
         );
         // And each tab still answers for itself.
@@ -958,7 +963,7 @@ mod tests {
                 past.x + past.w + 40.0,
                 past.y + 5.0
             ),
-            Target::Strip,
+            Target::Strip { path: vec![] },
         );
     }
 
@@ -1006,7 +1011,7 @@ mod tests {
                             at.0,
                             at.1
                         ),
-                        Target::Strip,
+                        Target::Strip { path: vec![] },
                         "at {width} wide with {count} tabs of {label} there was no strip to press"
                     );
                 }

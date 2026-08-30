@@ -862,13 +862,26 @@ fn load_node(node: &SavedNode, id_of: impl Fn(&str) -> Option<PanelId> + Copy) -
 /// a layout with one drag and offer no way back but rebuilding it. It is also what makes §1c's
 /// movable menu bar a feature rather than a footgun: the answer to "I deleted my File menu" is
 /// Ctrl+Z, not a rule forbidding it.
-#[derive(Debug, Default)]
-pub struct LayoutHistory {
-    undo: Vec<Layout>,
-    redo: Vec<Layout>,
+/// Generic over what it remembers, because remembering only the *docked* arrangement was a bug:
+/// undoing a float put the panel back into the layout and left it floating as well, so it was in
+/// two places at once. Whatever counts as "the arrangement" has to be one value, or history keeps
+/// half of it.
+#[derive(Debug)]
+pub struct History<T> {
+    undo: Vec<T>,
+    redo: Vec<T>,
 }
 
-impl LayoutHistory {
+impl<T> Default for History<T> {
+    fn default() -> Self {
+        Self {
+            undo: Vec::new(),
+            redo: Vec::new(),
+        }
+    }
+}
+
+impl<T: Clone> History<T> {
     /// How many layout changes are kept.
     ///
     /// Deep enough to walk back out of a bad rearranging session, shallow enough that the whole
@@ -879,7 +892,7 @@ impl LayoutHistory {
     ///
     /// Before rather than after, so undo restores the state the artist was looking at when they
     /// started the drag. Recording afterwards is the off-by-one that makes undo feel like it skips.
-    pub fn record(&mut self, before: Layout) {
+    pub fn record(&mut self, before: T) {
         self.undo.push(before);
         if self.undo.len() > Self::DEPTH {
             self.undo.remove(0);
@@ -889,14 +902,14 @@ impl LayoutHistory {
     }
 
     /// Step back, given the layout as it stands. Returns what to replace it with.
-    pub fn undo(&mut self, current: &Layout) -> Option<Layout> {
+    pub fn undo(&mut self, current: &T) -> Option<T> {
         let previous = self.undo.pop()?;
         self.redo.push(current.clone());
         Some(previous)
     }
 
     /// Step forward again.
-    pub fn redo(&mut self, current: &Layout) -> Option<Layout> {
+    pub fn redo(&mut self, current: &T) -> Option<T> {
         let next = self.redo.pop()?;
         self.undo.push(current.clone());
         Some(next)
@@ -1463,7 +1476,7 @@ mod tests {
     /// Undo restores the layout exactly, and redo puts it back.
     #[test]
     fn layout_undo_restores_what_was_there() {
-        let mut history = LayoutHistory::default();
+        let mut history: History<Layout> = History::default();
         let mut l = three_across();
         let original = l.clone();
 
@@ -1481,7 +1494,7 @@ mod tests {
     /// A fresh change makes redo unreachable, exactly as it does for the canvas.
     #[test]
     fn a_new_change_clears_the_redo_stack() {
-        let mut history = LayoutHistory::default();
+        let mut history: History<Layout> = History::default();
         let mut l = three_across();
         history.record(l.clone());
         l.remove(TOOLS);

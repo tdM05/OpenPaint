@@ -28,7 +28,7 @@
 //! widgets later changes what the callback does and nothing here.
 
 use crate::chrome::{self, Along, HeaderStyle};
-use crate::layout::{Layout, LayoutHistory, PanelId, Rect, Zone};
+use crate::layout::{Layout, PanelId, Rect, Zone};
 use crate::panel_drag::{Held, Outcome, PanelDrag, Preview};
 use crate::panel_ui::Direction;
 use crate::theme::{Color, Metrics, Theme};
@@ -216,7 +216,7 @@ fn load_layout() -> Option<Loaded> {
 /// The workspace: a layout, its history, the gesture in progress, and the look.
 pub struct Workspace {
     pub layout: Layout,
-    pub history: LayoutHistory,
+    pub history: crate::layout::History<Arrangement>,
     pub theme: Theme,
     drag: PanelDrag,
     /// Where the canvas panel ended up last frame, so the renderer can put the canvas there.
@@ -262,12 +262,30 @@ pub struct Workspace {
     /// Where inside a floating window the pointer took hold of it, so a dragged window does not
     /// jump its own corner up to the pointer.
     grip: (f32, f32),
+    /// The arrangement as it stood when the gesture in flight began.
+    ///
+    /// Taken at the *press*, not the release: a divider moves live, so by the time it is let go
+    /// the change has already happened and a snapshot then records the state after it. That is the
+    /// same off-by-one that once made a resize impossible to undo.
+    pending: Option<Arrangement>,
     /// The window as it was last drawn.
     ///
     /// Kept because floating a panel has to put it *somewhere*, and the request can arrive from a
     /// menu that has no idea how big the window is. Written every frame; the default is only ever
     /// seen before the first one.
     screen: Rect,
+}
+
+/// The whole arrangement: what is docked, and every window floating above it.
+///
+/// **One value, because history that remembers half of it puts a panel in two places.** It used to
+/// remember only the docked tree, so undoing a float put the panel back into the layout and left
+/// it floating as well -- and merges and tear-offs were not recorded at all, because there was
+/// nowhere to record them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Arrangement {
+    docked: Layout,
+    floating: Vec<Floating>,
 }
 
 /// A window floating above the arrangement, holding an arrangement of its own.
@@ -422,7 +440,7 @@ impl Default for Workspace {
             load_layout().unwrap_or_else(|| (default_layout(), <_>::default(), Vec::new()));
         Self {
             layout,
-            history: LayoutHistory::default(),
+            history: crate::layout::History::default(),
             theme: load_theme().unwrap_or_default(),
             drag: PanelDrag::default(),
             canvas_rect: None,
@@ -434,6 +452,7 @@ impl Default for Workspace {
             grab_surface: Surface::Docked,
             next_float: 0,
             grip: (0.0, 0.0),
+            pending: None,
             screen: Rect::new(0.0, 0.0, 1280.0, 800.0),
         }
     }
@@ -735,7 +754,7 @@ impl Workspace {
     /// an artist can reach and come back from rather than a theoretical one. Undoable like any
     /// other layout change.
     pub fn toggle(&mut self, panel: PanelId) {
-        self.history.record(self.layout.clone());
+        self.remember_for_undo();
         if self.layout.find(panel).is_some() {
             self.layout.remove(panel);
         } else {
@@ -753,9 +772,10 @@ impl Workspace {
 
     /// Undo the last layout change. Returns whether there was one.
     pub fn undo(&mut self) -> bool {
-        match self.history.undo(&self.layout) {
+        let now = self.snapshot();
+        match self.history.undo(&now) {
             Some(previous) => {
-                self.layout = previous;
+                self.restore(previous);
                 self.remember();
                 true
             }
@@ -765,9 +785,10 @@ impl Workspace {
 
     /// Redo it.
     pub fn redo(&mut self) -> bool {
-        match self.history.redo(&self.layout) {
+        let now = self.snapshot();
+        match self.history.redo(&now) {
             Some(next) => {
-                self.layout = next;
+                self.restore(next);
                 self.remember();
                 true
             }
@@ -781,7 +802,7 @@ impl Workspace {
     /// have done to the workspace, including closing the menu itself, this is the way back. Goes
     /// on the undo stack like any other change, so it is not itself a one-way door.
     pub fn reset(&mut self) {
-        self.history.record(self.layout.clone());
+        self.remember_for_undo();
         self.layout = default_layout();
         self.remember();
     }
@@ -792,7 +813,7 @@ impl Workspace {
             self.layout.set_active(&path, tab);
             return;
         }
-        self.history.record(self.layout.clone());
+        self.remember_for_undo();
         // Into whichever leaf is showing, as a tab. Somewhere visible beats somewhere clever.
         let path = self
             .layout
@@ -863,8 +884,15 @@ impl Workspace {
         // One rule, and the answer depends on what you pressed.
         if ctx.input(|i| i.pointer.secondary_pressed()) {
             if let Some(pos) = pointer {
-                let kind = header_under(&placed, &m, pos.x, pos.y)
-                    .map_or(PopupKind::Panels, PopupKind::Settings);
+                let kind = header_under(
+                    &placed,
+                    &m,
+                    |pl| self.direction_of(showing_of(pl)),
+                    |pl, i| measure(ctx, m.label, pl.tabs.get(i).copied()),
+                    pos.x,
+                    pos.y,
+                )
+                .map_or(PopupKind::Panels, PopupKind::Settings);
                 self.open_popup_at(ctx, kind, pos.x, pos.y, screen);
             }
         }
@@ -1427,6 +1455,34 @@ impl Workspace {
         self.popup_wanted = None;
     }
 
+    /// The arrangement as it stands.
+    #[must_use]
+    fn snapshot(&self) -> Arrangement {
+        Arrangement {
+            docked: self.layout.clone(),
+            floating: self.floating.clone(),
+        }
+    }
+
+    /// Put an arrangement back, whole.
+    fn restore(&mut self, was: Arrangement) {
+        self.layout = was.docked;
+        self.floating = was.floating;
+        // Whatever the gesture was working in may not exist any more.
+        self.grab_surface = Surface::Docked;
+        self.drag.let_go();
+    }
+
+    /// Record the arrangement as it was, before changing it.
+    ///
+    /// **The one place anything becomes undoable.** Scattered `history.record` calls are how a
+    /// change gets forgotten: floating a panel was recorded, merging two windows was not, and
+    /// tearing a tab out of one was not either.
+    fn remember_for_undo(&mut self) {
+        let was = self.snapshot();
+        self.history.record(was);
+    }
+
     /// Whether a panel is in a floating window.
     #[must_use]
     pub fn is_floating(&self, panel: PanelId) -> bool {
@@ -1447,7 +1503,7 @@ impl Workspace {
         if self.is_floating(panel) || !self.is_docked(panel) {
             return;
         }
-        self.history.record(self.layout.clone());
+        self.remember_for_undo();
         self.layout.remove(panel);
         let at = first_float(self.screen, self.floating.len(), &self.theme.metrics);
         let id = self.take_float_id();
@@ -1473,7 +1529,7 @@ impl Workspace {
             eprintln!("dock: {} is not in the arrangement", name_of(into));
             return;
         };
-        self.history.record(self.layout.clone());
+        self.remember_for_undo();
         self.take_from_floating(panel);
         self.layout.insert(&path, Zone::Center, panel);
         self.popup = None;
@@ -1493,6 +1549,7 @@ impl Workspace {
             return None;
         }
         let size = source.rect;
+        self.remember_for_undo();
         let id = self.take_float_id();
         if let Some(held) = self.floating.iter_mut().find(|f| f.id == from) {
             held.layout.remove(panel);
@@ -1620,8 +1677,14 @@ impl Workspace {
                 },
             )
         };
-        if let Some(Preview::MovingWindow { dx, dy }) = preview {
-            self.push_window(working, dx, dy);
+        // **Moved by the pointer and the grip, never by accumulated deltas.** Applying a distance
+        // each frame let the window slip: every clamp against a screen edge changed the offset
+        // between pointer and window for good, so a drag out to the edge and back left it
+        // somewhere else entirely. This is the same path a dragged tab takes, for the same reason.
+        if matches!(preview, Some(Preview::MovingWindow)) {
+            if let Some(at) = input.at {
+                self.drag_window_to(working, at);
+            }
         }
         // **Dragging anything in a floating window moves the window.** A floating panel is a
         // window, and a window that could not be moved by the thing you naturally take hold of --
@@ -1643,43 +1706,33 @@ impl Workspace {
                 self.drag_window_to(working, at);
             }
         }
-        if matches!(preview, Some(Preview::AskingFrame)) {
-            self.frame_asked(working);
+        if let Some(Preview::AskingFrame { path }) = &preview {
+            self.frame_asked(working, path);
         }
         preview
-    }
-
-    /// Push a floating window about by however far the pointer went.
-    ///
-    /// Where a window may go is the workspace's business: `panel_drag` reports the movement and
-    /// this decides whether the window may have it.
-    fn push_window(&mut self, which: Surface, dx: f32, dy: f32) {
-        let Surface::Floating(id) = which else {
-            return;
-        };
-        let (screen, m) = (self.screen, self.theme.metrics);
-        if let Some(held) = self.floating.iter_mut().find(|f| f.id == id) {
-            held.rect = hold_on_screen(
-                Rect::new(held.rect.x + dx, held.rect.y + dy, held.rect.w, held.rect.h),
-                screen,
-                &m,
-            );
-        }
     }
 
     /// A window's frame was held still: ask about the panel it is showing.
     ///
     /// A frame belongs to no one panel, so it stands for the one on show -- which is the panel
     /// whose settings carry "put it back", the reason to ask a window anything at all.
-    fn frame_asked(&mut self, which: Surface) {
+    fn frame_asked(&mut self, which: Surface, path: &[usize]) {
         let Some(area) = self.area_of(which) else {
             return;
         };
-        if let Some(slot) = self
-            .layout_of(which)
-            .and_then(|l| l.resolve(area).into_iter().next())
-        {
-            self.popup_wanted = Some(PopupKind::Settings(showing_of(&slot)));
+        let Some(layout) = self.layout_of(which) else {
+            return;
+        };
+        // The leaf whose strip was held, not simply the first: a window can hold several after a
+        // five-zone drop, each showing a different panel, and asking about the first one means
+        // holding a strip opens somebody else's settings.
+        let placed = layout.resolve(area);
+        let slot = placed
+            .iter()
+            .find(|s| s.path == path)
+            .or_else(|| placed.first());
+        if let Some(slot) = slot {
+            self.popup_wanted = Some(PopupKind::Settings(showing_of(slot)));
         }
     }
 
@@ -1693,6 +1746,7 @@ impl Workspace {
         let Some(area) = self.area_of(Surface::Floating(to)) else {
             return;
         };
+        self.remember_for_undo();
         let Some(landing) = self
             .layout_of(Surface::Floating(to))
             .and_then(|l| l.leaf_at(area, x, y))
@@ -1773,9 +1827,14 @@ impl Workspace {
     /// a real bug and an asymmetric one: dragging the lower of two windows onto the upper worked,
     /// because the upper won the test; dragging the upper onto the lower found only itself and
     /// silently did nothing.
+    ///
+    /// **Only once it has moved.** Excluding it from the moment it was *pressed* was worse than
+    /// the bug it fixed: a tap on a tab then reported the pointer as being over nothing at all, so
+    /// the tap was read as a release in a different arrangement and thrown away -- and tapping a
+    /// tab in a window holding two stopped switching between them.
     #[must_use]
     fn window_at(&self, x: f32, y: f32) -> Option<FloatId> {
-        let carried = match (self.drag.armed(), self.grab_surface) {
+        let carried = match (self.drag.moved(), self.grab_surface) {
             (true, Surface::Floating(id)) => Some(id),
             _ => None,
         };
@@ -2004,6 +2063,9 @@ impl Workspace {
             Pulse::Press => {
                 let target = target_at(x, y);
                 let layout = self.layout_of(self.grab_surface)?.clone();
+                // Taken at the press, because a divider moves live: by the time it is let go the
+                // change has already happened, and a snapshot then records the state *after* it.
+                self.pending = Some(self.snapshot());
                 self.take_grip(self.grab_surface, (x, y));
                 self.drag.press(&layout, &target, x, y, now_ms);
                 None
@@ -2038,15 +2100,20 @@ impl Workspace {
                     }
                     return None;
                 }
-                let mut history = std::mem::take(&mut self.history);
+                // The arrangement as it stood at the *press*, kept only if the gesture changed
+                // something. Snapshotting here instead would be too late for a divider, which
+                // moves live: by now the change has already happened.
+                let was = self.pending.take();
                 let mut drag = std::mem::take(&mut self.drag);
                 let outcome = match self.layout_of_mut(self.grab_surface) {
-                    Some(layout) => drag.release(layout, &mut history, area, x, y),
+                    Some(layout) => drag.release(layout, area, x, y),
                     None => Outcome::Nothing,
                 };
                 self.drag = drag;
-                self.history = history;
                 if saves(&outcome) {
+                    if let Some(was) = was {
+                        self.history.record(was);
+                    }
                     self.remember();
                 }
                 match outcome {
@@ -2280,9 +2347,26 @@ fn hold_on_screen(rect: Rect, screen: Rect, m: &Metrics) -> Rect {
 /// A header is a panel's handle: it is what you hold to move it, and what you press to ask what it
 /// offers. Anything else belongs to the workspace rather than to a panel.
 #[must_use]
-fn header_under(placed: &[crate::layout::Placed], m: &Metrics, x: f32, y: f32) -> Option<PanelId> {
+fn header_under(
+    placed: &[crate::layout::Placed],
+    m: &Metrics,
+    direction_for: impl Fn(&crate::layout::Placed) -> Direction,
+    mut measure: impl FnMut(&crate::layout::Placed, usize) -> f32,
+    x: f32,
+    y: f32,
+) -> Option<PanelId> {
     placed.iter().find_map(|slot| {
-        let c = chrome::panel(slot, m, style_of(slot), Along::Down, |_| 0.0);
+        // **The same chrome the primary button is tested against.** This used to build its own
+        // with the handle always on top and every label measured as nothing, so on the tool rail --
+        // whose handle is a bar down the side -- a right-click on the visible handle found no
+        // header at all and opened the workspace list instead of the panel's settings.
+        let c = chrome::panel(
+            slot,
+            m,
+            style_of(slot),
+            along_of(slot, direction_for(slot)),
+            |i| measure(slot, i),
+        );
         c.header
             .contains(x, y)
             .then(|| slot.tabs.get(slot.active).copied())
@@ -2404,11 +2488,14 @@ fn window_target(target: crate::panel_drag::Target, in_window: bool) -> crate::p
     use crate::panel_drag::Target;
     match target {
         // A window's own body, or the strip beside its tabs: both are the window itself.
-        Target::Elsewhere | Target::Strip if in_window => Target::Frame,
+        // A window's own body has no leaf to name, so it stands for the first one -- which is the
+        // only leaf a window with one has.
+        Target::Elsewhere if in_window => Target::Frame { path: Vec::new() },
+        Target::Strip { path } if in_window => Target::Frame { path },
         // In the arrangement the strip does nothing yet. It is the natural home for "float
         // everything in this panel", or for moving a whole tab group, and it is left free rather
         // than given a second meaning.
-        Target::Strip => Target::Elsewhere,
+        Target::Strip { .. } => Target::Elsewhere,
         other => other,
     }
 }
@@ -2515,7 +2602,7 @@ mod tests {
     fn bare() -> Workspace {
         Workspace {
             layout: default_layout(),
-            history: LayoutHistory::default(),
+            history: crate::layout::History::default(),
             theme: crate::theme::Theme::default(),
             drag: crate::panel_drag::PanelDrag::default(),
             canvas_rect: None,
@@ -2527,6 +2614,7 @@ mod tests {
             grab_surface: Surface::Docked,
             next_float: 0,
             grip: (0.0, 0.0),
+            pending: None,
             screen: Rect::new(0.0, 0.0, 1280.0, 800.0),
         }
     }
@@ -2824,9 +2912,22 @@ mod tests {
     #[test]
     fn a_press_on_a_windows_own_body_moves_the_window() {
         use crate::panel_drag::Target;
-        assert_eq!(window_target(Target::Elsewhere, true), Target::Frame);
-        // In the arrangement there is no window to move, so it still means nothing.
+        assert_eq!(
+            window_target(Target::Elsewhere, true),
+            Target::Frame { path: vec![] }
+        );
+        // And the strip carries the leaf it belongs to, so a window holding several can say which
+        // one a hold is asking about.
+        assert_eq!(
+            window_target(Target::Strip { path: vec![1, 0] }, true),
+            Target::Frame { path: vec![1, 0] }
+        );
+        // In the arrangement there is no window to move, so both still mean nothing.
         assert_eq!(window_target(Target::Elsewhere, false), Target::Elsewhere);
+        assert_eq!(
+            window_target(Target::Strip { path: vec![1] }, false),
+            Target::Elsewhere
+        );
         // And it never steals a press that belonged to something.
         let tab = Target::Tab {
             path: vec![1],
@@ -2842,32 +2943,88 @@ mod tests {
 
     /// A window pushed about goes where it was pushed, and stays reachable.
     #[test]
-    fn a_window_moves_by_what_it_was_pushed() {
+    fn a_window_is_carried_by_the_place_it_was_held() {
         let mut ws = bare();
         ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.float(BRUSH);
         let id = ws.floating[0].id;
         let before = ws.floating[0].rect;
 
-        ws.push_window(Surface::Floating(id), 40.0, 25.0);
+        // Taken hold of at its corner, then carried.
+        ws.take_grip(Surface::Floating(id), (before.x, before.y));
+        ws.drag_window_to(Surface::Floating(id), (before.x + 40.0, before.y + 25.0));
         let after = ws.floating[0].rect;
         assert!(
             (after.x - before.x - 40.0).abs() < 0.001 && (after.y - before.y - 25.0).abs() < 0.001,
-            "pushed 40,25 and moved {},{}",
+            "carried 40,25 and moved {},{}",
             after.x - before.x,
             after.y - before.y
         );
 
+        // **Out to a corner and back leaves it where the hand is, not where a clamp left it.**
+        // Moving it by accumulated deltas did not: every clamp against an edge changed the offset
+        // between pointer and window for good.
+        ws.drag_window_to(Surface::Floating(id), (-9000.0, -9000.0));
+        ws.drag_window_to(Surface::Floating(id), (before.x + 40.0, before.y + 25.0));
+        assert_eq!(
+            ws.floating[0].rect, after,
+            "the window slipped out from under the pointer"
+        );
+
         // Thrown at the far corner, it still keeps a handle on screen.
-        ws.push_window(Surface::Floating(id), 9000.0, 9000.0);
+        ws.drag_window_to(Surface::Floating(id), (9000.0, 9000.0));
         let far = ws.floating[0].rect;
         assert!(far.x < ws.screen.x + ws.screen.w, "it went off the right");
         assert!(far.y < ws.screen.y + ws.screen.h, "it went off the bottom");
 
-        // The docked arrangement is not a window and cannot be pushed.
+        // The docked arrangement is not a window and cannot be carried.
         let docked = ws.layout.clone();
-        ws.push_window(Surface::Docked, 100.0, 100.0);
+        ws.drag_window_to(Surface::Docked, (100.0, 100.0));
         assert_eq!(ws.layout, docked);
+    }
+
+    /// **A secondary press finds a header where the header actually is.**
+    ///
+    /// `header_under` used to build chrome of its own, with the handle always on top and every
+    /// label measured as nothing. On a panel laid out across -- whose handle is a bar down its
+    /// left side -- a right-click on the visible handle found no header at all and offered the
+    /// workspace list instead of that panel's settings. Nothing could see it, because nothing
+    /// tested the secondary press against a panel whose handle is anywhere but the top.
+    #[test]
+    fn a_secondary_press_on_a_side_handle_finds_the_panel() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.screen = screen;
+        ws.set_direction(TOOLS, Direction::Row);
+
+        let m = ws.theme.metrics;
+        let placed = ws.layout.resolve(screen);
+        let rail = placed
+            .iter()
+            .find(|p| p.tabs.contains(&TOOLS))
+            .expect("the tool rail");
+        let c = crate::chrome::panel(rail, &m, style_of(rail), Along::Across, |_| 46.0);
+        assert!(
+            c.header.h > m.header * 2.0,
+            "laid out across, the handle should be a bar down the side"
+        );
+        // Well down that bar: inside the handle as drawn, and far below anything a strip across
+        // the top could reach.
+        let at = (c.header.x + c.header.w / 2.0, c.header.y + c.header.h - 4.0);
+
+        let found = header_under(
+            &placed,
+            &m,
+            |pl| ws.direction_of(showing_of(pl)),
+            |_, _| 46.0,
+            at.0,
+            at.1,
+        );
+        assert_eq!(
+            found,
+            Some(TOOLS),
+            "a secondary press on the visible handle found no header"
+        );
     }
 
     /// Holding a window's frame asks about the panel it is showing.
@@ -2878,7 +3035,7 @@ mod tests {
         ws.float(BRUSH);
         let id = ws.floating[0].id;
 
-        ws.frame_asked(Surface::Floating(id));
+        ws.frame_asked(Surface::Floating(id), &[]);
         assert_eq!(
             ws.popup_wanted,
             Some(PopupKind::Settings(BRUSH)),
@@ -3074,6 +3231,428 @@ mod tests {
             Some(under),
             "pressing a window should have brought it to the front"
         );
+    }
+
+    /// Float two panels and drop the first onto the second's centre, leaving one window.
+    fn two_in_one_window(ws: &mut Workspace, screen: Rect) -> FloatId {
+        ws.screen = screen;
+        if !ws.is_floating(COLOUR) {
+            ws.float(COLOUR);
+        }
+        if !ws.is_floating(HISTORY) {
+            ws.float(HISTORY);
+        }
+        // Set apart before anything is grabbed. Windows land offset by a header each, so two of
+        // them overlap heavily -- and a fixture that grabs a tab hidden under another window is
+        // testing the hit test rather than the merge.
+        ws.floating[0].rect = Rect::new(60.0, 60.0, 300.0, 300.0);
+        ws.floating[1].rect = Rect::new(700.0, 60.0, 300.0, 300.0);
+        let (a, b) = (ws.floating[0].id, ws.floating[1].id);
+        let mut hand = Hand::new(ws, screen);
+        let grab = hand.tab_of(b);
+        let onto = hand.rect_of(a);
+        hand.drag(grab, (onto.x + onto.w / 2.0, onto.y + onto.h / 2.0));
+        assert_eq!(ws.floating.len(), 1, "they should be one window now");
+        assert_eq!(ws.floating[0].layout.panels().len(), 2);
+        ws.floating[0].id
+    }
+
+    /// **Tapping a tab in a merged window shows that panel.**
+    ///
+    /// Reported: "I drag history into colour center, but then clicking colour tab does not change
+    /// to it."
+    #[test]
+    fn tapping_a_tab_in_a_merged_window_shows_it() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let id = two_in_one_window(&mut ws, screen);
+
+        let m = ws.theme.metrics;
+        let area = ws.area_of(Surface::Floating(id)).expect("the window");
+        let slot = ws
+            .layout_of(Surface::Floating(id))
+            .expect("its arrangement")
+            .resolve(area)
+            .into_iter()
+            .next()
+            .expect("a leaf");
+        let c = crate::chrome::panel(&slot, &m, style_of(&slot), Along::Down, |_| 46.0);
+        assert_eq!(c.tabs.len(), 2, "both panels should have a tab");
+
+        for tab in &c.tabs {
+            let want = slot.tabs[tab.index];
+            let at = (tab.rect.x + tab.rect.w / 2.0, tab.rect.y + tab.rect.h / 2.0);
+            let mut hand = Hand::new(&mut ws, screen);
+            hand.press(at);
+            hand.release(at);
+
+            let now = ws
+                .layout_of(Surface::Floating(id))
+                .expect("its arrangement")
+                .resolve(area)
+                .into_iter()
+                .next()
+                .expect("a leaf");
+            assert_eq!(
+                showing_of(&now),
+                want,
+                "tapping the {want:?} tab did not show it"
+            );
+        }
+    }
+
+    /// **Either tab can be dragged out of a merged window, and the right one comes out.**
+    ///
+    /// Reported: "dragging history out works, but dragging color out drags history out instead
+    /// and breaks everything."
+    #[test]
+    fn either_tab_can_be_dragged_out_of_a_merged_window() {
+        for wanted in [COLOUR, HISTORY] {
+            let mut ws = bare();
+            let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+            let id = two_in_one_window(&mut ws, screen);
+
+            let m = ws.theme.metrics;
+            let area = ws.area_of(Surface::Floating(id)).expect("the window");
+            let slot = ws
+                .layout_of(Surface::Floating(id))
+                .expect("its arrangement")
+                .resolve(area)
+                .into_iter()
+                .next()
+                .expect("a leaf");
+            let c = crate::chrome::panel(&slot, &m, style_of(&slot), Along::Down, |_| 46.0);
+            let index = slot
+                .tabs
+                .iter()
+                .position(|p| *p == wanted)
+                .expect("the panel is in this window");
+            let tab = c.tabs[index].rect;
+
+            let mut hand = Hand::new(&mut ws, screen);
+            hand.drag((tab.x + tab.w / 2.0, tab.y + tab.h / 2.0), (1050.0, 700.0));
+
+            assert_eq!(
+                ws.floating.len(),
+                2,
+                "dragging {wanted:?} out should leave two windows"
+            );
+            // The window under the pointer is the one that came out, and it holds what was pressed.
+            let torn = ws
+                .floating
+                .iter()
+                .find(|f| f.id != id)
+                .expect("a new window");
+            assert_eq!(
+                torn.layout.panels(),
+                vec![wanted],
+                "dragging the {wanted:?} tab pulled out the wrong panel"
+            );
+            let left = ws
+                .floating
+                .iter()
+                .find(|f| f.id == id)
+                .expect("the old one");
+            assert_eq!(left.layout.panels().len(), 1, "and one stayed behind");
+            assert_ne!(left.layout.panels(), vec![wanted]);
+        }
+    }
+
+    /// **Floating, merging and tearing out are all undoable**, and undo puts the panel in exactly
+    /// one place.
+    ///
+    /// Reported: "f3 does not seem able to undo these". History only ever held the docked
+    /// arrangement, so undoing a float put the panel back into the layout while leaving it
+    /// floating as well -- in two places at once -- and merges and tear-offs were not recorded at
+    /// all.
+    #[test]
+    fn every_floating_change_can_be_taken_back() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.screen = screen;
+
+        let docked = ws.layout.clone();
+        ws.float(COLOUR);
+        assert!(ws.undo(), "floating should be undoable");
+        assert_eq!(
+            ws.layout, docked,
+            "the panel should be back in the arrangement"
+        );
+        assert!(
+            ws.floating.is_empty(),
+            "and gone from the floating windows -- it cannot be in both"
+        );
+        assert!(!ws.is_floating(COLOUR));
+        assert!(ws.is_docked(COLOUR));
+
+        // Merging.
+        let id = two_in_one_window(&mut ws, screen);
+        let _ = id;
+        assert!(ws.undo(), "merging should be undoable");
+        assert_eq!(ws.floating.len(), 2, "the two windows should be back");
+
+        // Tearing out.
+        let id = two_in_one_window(&mut ws, screen);
+        let m = ws.theme.metrics;
+        let area = ws.area_of(Surface::Floating(id)).expect("the window");
+        let slot = ws
+            .layout_of(Surface::Floating(id))
+            .expect("arrangement")
+            .resolve(area)
+            .into_iter()
+            .next()
+            .expect("a leaf");
+        let c = crate::chrome::panel(&slot, &m, style_of(&slot), Along::Down, |_| 46.0);
+        let tab = c.tabs[0].rect;
+        let mut hand = Hand::new(&mut ws, screen);
+        hand.drag((tab.x + tab.w / 2.0, tab.y + tab.h / 2.0), (1050.0, 700.0));
+        assert_eq!(ws.floating.len(), 2);
+        assert!(ws.undo(), "tearing a tab out should be undoable");
+        assert_eq!(
+            ws.floating.len(),
+            1,
+            "it should be back in the window it left"
+        );
+        assert_eq!(ws.floating[0].layout.panels().len(), 2);
+    }
+
+    /// **Neither direction crosses the boundary by dragging** --- including docked into floating,
+    /// which nothing tested at all.
+    ///
+    /// A sabotage that let a docked panel drop into a floating window left the whole suite green,
+    /// while a docked panel dropped on a window really did move itself into whatever docked leaf
+    /// happened to lie underneath it.
+    #[test]
+    fn a_docked_panel_dragged_onto_a_window_stays_docked() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.screen = screen;
+        ws.float(COLOUR);
+        ws.floating[0].rect = Rect::new(600.0, 300.0, 320.0, 320.0);
+        let window = ws.floating[0].rect;
+        let before_float = ws.floating.clone();
+        let before_docked = ws.layout.clone();
+
+        // The Layers tab, which is docked.
+        let m = ws.theme.metrics;
+        let slot = ws
+            .layout
+            .resolve(screen)
+            .into_iter()
+            .find(|p| p.tabs.contains(&LAYERS))
+            .expect("layers is docked");
+        let c = crate::chrome::panel(&slot, &m, style_of(&slot), Along::Down, |_| 46.0);
+        let index = slot
+            .tabs
+            .iter()
+            .position(|p| *p == LAYERS)
+            .expect("its tab");
+        let tab = c.tabs[index].rect;
+
+        let mut hand = Hand::new(&mut ws, screen);
+        hand.drag(
+            (tab.x + tab.w / 2.0, tab.y + tab.h / 2.0),
+            (window.x + window.w / 2.0, window.y + window.h / 2.0),
+        );
+
+        assert!(ws.is_docked(LAYERS), "a docked panel must stay docked");
+        assert!(
+            !ws.is_floating(LAYERS),
+            "and must not have joined the window"
+        );
+        assert_eq!(
+            ws.floating, before_float,
+            "the floating window should be untouched"
+        );
+        // **And it must not have moved within the arrangement either.** Asserting only that it
+        // stayed docked was too weak: the panel was still being dropped into whatever docked leaf
+        // lay *behind* the window, which is not where anybody pointed. A sabotage doing exactly
+        // that left this test green.
+        assert_eq!(
+            ws.layout, before_docked,
+            "the panel was dropped into whatever lay behind the window"
+        );
+    }
+
+    /// **A press on a floating window's strip moves the window, not a panel out of it.**
+    ///
+    /// Tested on a window holding *two*, because with one panel "move the window" and "drag the
+    /// shown tab" are the same movement --- so the one-panel fixture could not tell them apart, and
+    /// removing the strip rule entirely left it green.
+    #[test]
+    fn the_strip_of_a_shared_window_moves_it_rather_than_emptying_it() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let id = two_in_one_window(&mut ws, screen);
+        let before = ws.floating[0].rect;
+
+        let mut hand = Hand::new(&mut ws, screen);
+        let at = hand.strip_of(id);
+        hand.drag(at, (at.0 + 250.0, at.1 + 150.0));
+
+        assert_eq!(
+            ws.floating.len(),
+            1,
+            "the strip tore a panel out of the window"
+        );
+        assert_eq!(
+            ws.floating[0].layout.panels().len(),
+            2,
+            "both panels should still be in it"
+        );
+        let after = ws.floating[0].rect;
+        assert!(
+            (after.x - before.x - 250.0).abs() < 1.0 && (after.y - before.y - 150.0).abs() < 1.0,
+            "the window did not move: {before:?} -> {after:?}"
+        );
+    }
+
+    /// **A window dropped on another's edge splits it**, rather than always landing as a tab.
+    ///
+    /// Only centre drops were tested, so a merge that ignored the zone entirely passed.
+    #[test]
+    fn a_window_dropped_on_an_edge_splits_the_one_it_lands_on() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.screen = screen;
+        ws.float(COLOUR);
+        ws.float(HISTORY);
+        ws.floating[0].rect = Rect::new(60.0, 60.0, 300.0, 300.0);
+        ws.floating[1].rect = Rect::new(700.0, 60.0, 300.0, 300.0);
+        let (a, b) = (ws.floating[0].id, ws.floating[1].id);
+
+        let mut hand = Hand::new(&mut ws, screen);
+        let grab = hand.tab_of(b);
+        let onto = hand.rect_of(a);
+        // Well into the left band, which is a split rather than a tab.
+        hand.drag(grab, (onto.x + 8.0, onto.y + onto.h / 2.0));
+
+        assert_eq!(ws.floating.len(), 1);
+        let left = &ws.floating[0];
+        let area = Rect::new(0.0, 0.0, 300.0, 300.0);
+        assert_eq!(
+            left.layout.resolve(area).len(),
+            2,
+            "an edge drop should have split the window, not stacked the panels as tabs"
+        );
+    }
+
+    /// The window a tab was pulled out of stays exactly where it was.
+    ///
+    /// Nothing checked it: a tear-off that also shifted the source window left the suite green.
+    #[test]
+    fn tearing_a_tab_out_leaves_the_source_window_alone() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let id = two_in_one_window(&mut ws, screen);
+        let before = ws.floating[0].rect;
+
+        let mut hand = Hand::new(&mut ws, screen);
+        let grab = hand.tab_of(id);
+        hand.drag(grab, (1050.0, 700.0));
+
+        let source = ws
+            .floating
+            .iter()
+            .find(|f| f.id == id)
+            .expect("the window it came from");
+        assert_eq!(source.rect, before, "the source window moved");
+    }
+
+    /// **A compact panel can actually be moved**, end to end, by the bar that is its whole handle.
+    ///
+    /// This was checked only at the target level -- that a press there *means* the panel -- and not
+    /// that the arrangement then changes.
+    #[test]
+    fn a_compact_panel_can_be_dragged_by_its_bar() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.screen = screen;
+        let before = ws.layout.clone();
+
+        let m = ws.theme.metrics;
+        let placed = ws.layout.resolve(screen);
+        let rail = placed
+            .iter()
+            .find(|p| p.tabs.contains(&TOOLS))
+            .expect("the tool rail");
+        let c = crate::chrome::panel(
+            rail,
+            &m,
+            style_of(rail),
+            along_of(rail, ws.direction_of(TOOLS)),
+            |_| 0.0,
+        );
+        assert!(c.tabs.is_empty(), "a compact header carries no tabs");
+        let at = (c.header.x + c.header.w / 2.0, c.header.y + c.header.h / 2.0);
+
+        // Onto the far side of the canvas, which is a different leaf.
+        let canvas = placed
+            .iter()
+            .find(|p| p.tabs.contains(&CANVAS))
+            .expect("the canvas");
+        let drop = (
+            canvas.rect.x + canvas.rect.w / 2.0,
+            canvas.rect.y + canvas.rect.h - 10.0,
+        );
+        let mut hand = Hand::new(&mut ws, screen);
+        hand.drag(at, drop);
+
+        assert_ne!(ws.layout, before, "the tool rail could not be moved at all");
+        assert!(ws.is_docked(TOOLS), "and it should still be docked");
+    }
+
+    /// **Holding a strip asks about the leaf whose strip it is**, not the first in the window.
+    ///
+    /// A window can hold several leaves after an edge drop, each showing a different panel. Asking
+    /// about the first meant holding one panel's strip opened another panel's settings -- and no
+    /// test could see it, because every fixture used a window with a single leaf, where the first
+    /// leaf *is* the one you held.
+    #[test]
+    fn holding_a_strip_asks_about_the_leaf_it_belongs_to() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.screen = screen;
+        ws.float(COLOUR);
+        ws.float(HISTORY);
+        ws.floating[0].rect = Rect::new(60.0, 60.0, 400.0, 400.0);
+        ws.floating[1].rect = Rect::new(700.0, 60.0, 400.0, 400.0);
+        let (a, b) = (ws.floating[0].id, ws.floating[1].id);
+
+        // An edge drop, so the window ends up with two leaves side by side.
+        {
+            let mut hand = Hand::new(&mut ws, screen);
+            let grab = hand.tab_of(b);
+            let onto = hand.rect_of(a);
+            hand.drag(grab, (onto.x + 8.0, onto.y + onto.h / 2.0));
+        }
+        assert_eq!(ws.floating.len(), 1);
+        let id = ws.floating[0].id;
+        let area = ws.area_of(Surface::Floating(id)).expect("the window");
+        let leaves = ws
+            .layout_of(Surface::Floating(id))
+            .expect("its arrangement")
+            .resolve(area);
+        assert_eq!(leaves.len(), 2, "the edge drop should have split it");
+
+        let m = ws.theme.metrics;
+        for slot in &leaves {
+            let want = showing_of(slot);
+            let c = crate::chrome::panel(slot, &m, style_of(slot), Along::Down, |_| 46.0);
+            let past = c.tabs.last().map_or(c.header.x, |t| t.rect.x + t.rect.w);
+            let at = (
+                past + crate::chrome::strip_width(&m) / 2.0,
+                c.header.y + c.header.h / 2.0,
+            );
+            ws.popup_wanted = None;
+            let mut hand = Hand::new(&mut ws, screen);
+            hand.hold(at);
+            assert_eq!(
+                ws.popup_wanted,
+                Some(PopupKind::Settings(want)),
+                "holding {want:?}'s strip asked about something else"
+            );
+        }
     }
 
     /// **One window at a time.** After moving one, moving another must move *that* one.
@@ -4680,7 +5259,6 @@ mod tests {
         );
 
         let mut drag = PanelDrag::default();
-        let mut history = LayoutHistory::default();
         drag.press(&layout, &target, px, py, 0.0);
         // Held still past the hold, which is what arms it.
         drag.drag(&mut layout, screen, px, py, 1.0);
@@ -4697,7 +5275,7 @@ mod tests {
             canvas.rect.y + canvas.rect.h - 8.0,
         );
         drag.drag(&mut layout, screen, dx, dy, 2.0);
-        let outcome = drag.release(&mut layout, &mut history, screen, dx, dy);
+        let outcome = drag.release(&mut layout, screen, dx, dy);
 
         assert_eq!(outcome, Outcome::Moved, "the drop did nothing");
         assert!(

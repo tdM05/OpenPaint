@@ -43,7 +43,7 @@
 //! is the one ordering hazard in this module and it is exactly §11a's shape: the operation is
 //! correct, and doing it in the wrong order is silently wrong rather than loud.
 
-use crate::layout::{Axis, Layout, LayoutHistory, PanelId, Path, Placed, Rect, Zone};
+use crate::layout::{Axis, Layout, PanelId, Path, Placed, Rect, Zone};
 
 /// How far the pointer may wander during the hold before the gesture is abandoned.
 ///
@@ -71,13 +71,14 @@ pub enum Target {
     /// The frame of a floating window: dragging it moves the window rather than anything in it.
     ///
     /// A window needs somewhere to be picked up that is not one of its tabs, or dragging it would
-    /// always threaten to pull a panel out of it.
-    Frame,
+    /// always threaten to pull a panel out of it. Carries the leaf it belongs to, so a window
+    /// holding several can say which one a hold is asking about.
+    Frame { path: Path },
     /// The part of a header beside its tabs: the panel as a whole, rather than any one of them.
     ///
     /// What that means is the caller's: a floating window moves, and a docked panel does nothing
     /// at all until there is something worth putting here.
-    Strip,
+    Strip { path: Path },
 }
 
 /// What the pointer is held on, so the caller can show the wait on the right thing.
@@ -120,10 +121,17 @@ pub enum Preview {
     /// Reported rather than performed: what a panel offers is the panel's business and the
     /// workspace's to place, and this module knows about neither.
     Asking(PanelId),
-    /// A floating window is being pushed about; the caller moves it by this much.
-    MovingWindow { dx: f32, dy: f32 },
-    /// A floating window's frame was held still: the caller decides what that asks about.
-    AskingFrame,
+    /// A floating window is being pushed about.
+    ///
+    /// **No distance.** It used to report one, and applying deltas frame by frame let the window
+    /// slip out from under the pointer: every clamp against the screen edge changed the offset
+    /// permanently, so a drag out to the edge and back left the window somewhere else entirely.
+    /// The caller knows where the pointer is and where it took hold; that is enough, and it cannot
+    /// drift.
+    MovingWindow,
+    /// A floating window's frame was held still: the caller decides what that asks about. The
+    /// leaf whose strip was held, so a window holding several says which one.
+    AskingFrame { path: Path },
 }
 
 /// The drop a release would perform, and the rectangle to light up for it.
@@ -165,8 +173,9 @@ enum Kind {
         index: usize,
         axis: Axis,
     },
-    /// A floating window's frame, which moves the window.
-    Frame,
+    /// A floating window's frame, which moves the window. The leaf whose strip was held, so a
+    /// window holding several can say which one asked.
+    Frame { path: Path },
 }
 
 /// One press, and everything that has happened to it since.
@@ -238,6 +247,16 @@ impl PanelDrag {
         self.grab = None;
     }
 
+    /// Whether the gesture in flight has actually moved anything yet.
+    ///
+    /// A press that has gone nowhere is still a tap or a hold. The distinction matters to whoever
+    /// is hit-testing: a *dragged* floating window follows the pointer and must be left out of the
+    /// test, but a merely pressed one is exactly where it looks and must not be.
+    #[must_use]
+    pub fn moved(&self) -> bool {
+        self.grab.as_ref().is_some_and(|g| g.moved)
+    }
+
     /// How long until the hold completes, if one is waiting.
     ///
     /// **Painting is demand-driven**, so a hold that nobody asks to draw simply never fires: with
@@ -271,10 +290,10 @@ impl PanelDrag {
                     axis,
                 })
             }
-            Target::Frame => Some(Kind::Frame),
+            Target::Frame { path } => Some(Kind::Frame { path: path.clone() }),
             // The strip means nothing on its own: whoever hit-tested it decides whether this
             // arrangement has anything for it to do, and turns it into a `Frame` if so.
-            Target::Strip => None,
+            Target::Strip { .. } => None,
             Target::Elsewhere => None,
         };
         self.grab = kind.map(|kind| Grab {
@@ -331,7 +350,7 @@ impl PanelDrag {
                         },
                         // A window's frame is drawn by whoever owns the window; there is no node
                         // in this layout to mark.
-                        Kind::Frame => Held::Frame,
+                        Kind::Frame { .. } => Held::Frame,
                     },
                 });
             }
@@ -342,7 +361,7 @@ impl PanelDrag {
                 Kind::Tab { panel, .. } => Some(*panel),
                 // A frame belongs to a window rather than a panel, so the caller decides what its
                 // hold asks about -- it knows which window, and this does not.
-                Kind::Frame => None,
+                Kind::Frame { .. } => None,
                 // A divider belongs to no one panel, so there is nothing to ask. It keeps waiting,
                 // which costs nothing: the drag is still live and still resizes on the next move.
                 Kind::Splitter { .. } => None,
@@ -351,9 +370,10 @@ impl PanelDrag {
                 self.grab = None;
                 return Some(Preview::Asking(panel));
             }
-            if matches!(grab.kind, Kind::Frame) {
+            if let Kind::Frame { path } = &grab.kind {
+                let path = path.clone();
                 self.grab = None;
-                return Some(Preview::AskingFrame);
+                return Some(Preview::AskingFrame { path });
             }
             return None;
         }
@@ -361,10 +381,9 @@ impl PanelDrag {
         match &grab.kind {
             // The window moves by however far the pointer has, and the caller applies it: where a
             // window may go is the workspace's business, not this module's.
-            Kind::Frame => {
-                let (dx, dy) = (x - grab.last.0, y - grab.last.1);
+            Kind::Frame { .. } => {
                 grab.last = (x, y);
-                Some(Preview::MovingWindow { dx, dy })
+                Some(Preview::MovingWindow)
             }
             Kind::Splitter { path, index, axis } => {
                 let (dx, dy) = (x - grab.last.0, y - grab.last.1);
@@ -403,18 +422,11 @@ impl PanelDrag {
     ///
     /// Records the layout *before* changing it, and only when it actually changes — so a tap, or a
     /// drop back where it started, leaves the undo stack alone.
-    pub fn release(
-        &mut self,
-        layout: &mut Layout,
-        history: &mut LayoutHistory,
-        area: Rect,
-        x: f32,
-        y: f32,
-    ) -> Outcome {
+    pub fn release(&mut self, layout: &mut Layout, area: Rect, x: f32, y: f32) -> Outcome {
         let Some(grab) = self.grab.take() else {
             return Outcome::Nothing;
         };
-        if matches!(grab.kind, Kind::Frame) {
+        if matches!(grab.kind, Kind::Frame { .. }) {
             // A window that was pushed about has changed the arrangement; one merely touched has
             // not. Where it ended up is the caller's to remember, since it was the caller moving
             // it.
@@ -434,20 +446,19 @@ impl PanelDrag {
                     layout.set_active(&path, tab);
                     Outcome::Switched
                 }
-                Kind::Splitter { .. } | Kind::Frame => Outcome::Nothing,
+                Kind::Splitter { .. } | Kind::Frame { .. } => Outcome::Nothing,
             };
         }
 
         match grab.kind {
             // Already answered above; a frame never reaches here.
-            Kind::Frame => Outcome::Nothing,
+            Kind::Frame { .. } => Outcome::Nothing,
             Kind::Splitter { .. } => {
                 // The divider has already moved; what is recorded is where it started. A drag that
                 // ended where it began is not a change and does not deserve an undo step.
                 if *layout == grab.before {
                     return Outcome::Nothing;
                 }
-                history.record(grab.before);
                 Outcome::Resized
             }
             Kind::Tab { panel, .. } => {
@@ -468,16 +479,14 @@ impl PanelDrag {
                     return Outcome::Nothing;
                 };
 
-                let before = grab.before;
                 layout.remove(panel);
                 let Some((fresh, _)) = layout.find(anchor) else {
-                    // The anchor vanished, which should be impossible — it was a different panel
+                    // The anchor vanished, which should be impossible -- it was a different panel
                     // in a leaf that still had it. Put the layout back rather than guess.
-                    *layout = before;
+                    *layout = grab.before;
                     return Outcome::Nothing;
                 };
                 layout.insert(&fresh, zone, panel);
-                history.record(before);
                 Outcome::Moved
             }
         }
@@ -609,19 +618,16 @@ mod tests {
     #[test]
     fn a_tap_switches_the_tab_and_records_nothing() {
         let mut l = workspace();
-        let mut h = LayoutHistory::default();
         let mut d = PanelDrag::default();
 
         assert_eq!(l.resolve(area())[1].active, 1, "History is showing");
         assert!(d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0));
         d.drag(&mut l, area(), 702.0, 11.0, 40.0);
-        assert_eq!(
-            d.release(&mut l, &mut h, area(), 702.0, 11.0),
-            Outcome::Switched
-        );
+        assert_eq!(d.release(&mut l, area(), 702.0, 11.0), Outcome::Switched);
 
         assert_eq!(l.resolve(area())[1].active, 0, "Layers is showing now");
-        assert_eq!(h.depth(), (0, 0), "a tap is not an undoable edit");
+        // Whether a tap is undoable is the caller's question now: this module reports what
+        // happened and records nothing.
     }
 
     /// **Moving lifts the panel at once**, which is the rule this module is now built on.
@@ -679,7 +685,6 @@ mod tests {
     #[test]
     fn an_armed_divider_follows_the_pointer() {
         let mut l = workspace();
-        let mut h = LayoutHistory::default();
         let before = l.resolve(area())[0].rect.w;
         let mut d = PanelDrag::default();
         let s = l.splitters(area(), 26.0)[0].clone();
@@ -710,7 +715,7 @@ mod tests {
             "the panel should have followed the divider 120 units, went {before} to {after}"
         );
         assert_eq!(
-            d.release(&mut l, &mut h, area(), s.rect.x + 120.0, 400.0),
+            d.release(&mut l, area(), s.rect.x + 120.0, 400.0),
             Outcome::Resized
         );
     }
@@ -791,7 +796,6 @@ mod tests {
         let mut l = Layout::single(CANVAS);
         l.insert(&[], Zone::Right, LAYERS);
         l.insert(&[1], Zone::Right, HISTORY);
-        let mut h = LayoutHistory::default();
         let mut d = PanelDrag::default();
 
         let placed = l.resolve(area());
@@ -802,10 +806,7 @@ mod tests {
         d.drag(&mut l, area(), 10.0, 10.0, 1.0);
         let drop = (target.x + target.w / 2.0, target.y + target.h / 2.0);
         d.drag(&mut l, area(), drop.0, drop.1, HOLD_MS + 40.0);
-        assert_eq!(
-            d.release(&mut l, &mut h, area(), drop.0, drop.1),
-            Outcome::Moved
-        );
+        assert_eq!(d.release(&mut l, area(), drop.0, drop.1), Outcome::Moved);
 
         let (path, _) = l.find(CANVAS).expect("the canvas is still in the layout");
         let placed = l.resolve(area());
@@ -822,7 +823,6 @@ mod tests {
     #[test]
     fn an_edge_drop_splits_the_target() {
         let mut l = workspace();
-        let mut h = LayoutHistory::default();
         let mut d = PanelDrag::default();
 
         let canvas_rect = l.resolve(area())[0].rect;
@@ -833,14 +833,10 @@ mod tests {
             canvas_rect.y + canvas_rect.h * 0.95,
         );
         d.drag(&mut l, area(), drop.0, drop.1, HOLD_MS + 40.0);
-        assert_eq!(
-            d.release(&mut l, &mut h, area(), drop.0, drop.1),
-            Outcome::Moved
-        );
+        assert_eq!(d.release(&mut l, area(), drop.0, drop.1), Outcome::Moved);
 
         let (path, _) = l.find(LAYERS).expect("layers moved, not vanished");
         assert_ne!(path, l.find(CANVAS).expect("canvas is there").0);
-        assert_eq!(h.depth().0, 1, "and the move is undoable");
     }
 
     /// Dropping a panel back where it came from changes nothing and records nothing.
@@ -848,34 +844,25 @@ mod tests {
     fn dropping_a_panel_back_home_is_not_an_edit() {
         let mut l = workspace();
         let before = l.clone();
-        let mut h = LayoutHistory::default();
         let mut d = PanelDrag::default();
 
         let home = l.resolve(area())[1].rect;
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
         let drop = (home.x + home.w / 2.0, home.y + home.h / 2.0);
         carry(&mut d, &mut l, drop);
-        assert_eq!(
-            d.release(&mut l, &mut h, area(), drop.0, drop.1),
-            Outcome::Nothing
-        );
+        assert_eq!(d.release(&mut l, area(), drop.0, drop.1), Outcome::Nothing);
         assert_eq!(l, before);
-        assert_eq!(h.depth(), (0, 0));
     }
 
     /// A lone panel dropped on its own leaf's edge would be split away from itself.
     #[test]
     fn a_lone_panel_cannot_split_its_own_leaf() {
         let mut l = Layout::single(CANVAS);
-        let mut h = LayoutHistory::default();
         let mut d = PanelDrag::default();
 
         d.press(&l, &tab(&[], 0), 10.0, 10.0, 0.0);
         carry(&mut d, &mut l, (990.0, 400.0));
-        assert_eq!(
-            d.release(&mut l, &mut h, area(), 990.0, 400.0),
-            Outcome::Nothing
-        );
+        assert_eq!(d.release(&mut l, area(), 990.0, 400.0), Outcome::Nothing);
         assert_eq!(l, Layout::single(CANVAS));
     }
 
@@ -883,16 +870,14 @@ mod tests {
     #[test]
     fn letting_go_outside_asks_to_float() {
         let mut l = workspace();
-        let mut h = LayoutHistory::default();
         let mut d = PanelDrag::default();
 
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
         carry(&mut d, &mut l, (-50.0, 400.0));
         assert_eq!(
-            d.release(&mut l, &mut h, area(), -50.0, 400.0),
+            d.release(&mut l, area(), -50.0, 400.0),
             Outcome::Floated(LAYERS)
         );
-        assert_eq!(h.depth(), (0, 0), "nothing has happened to the layout yet");
     }
 
     /// Once a hold has fired, it stops asking for frames.
@@ -926,32 +911,31 @@ mod tests {
         );
     }
 
-    /// **A window's frame reports how far it went, and nothing else.**
+    /// **A window's frame says it is moving and nothing more.**
     ///
-    /// Where a window may go belongs to whoever owns the window; this only says how far the
-    /// pointer moved since it was last asked.
+    /// It used to report a distance, and applying one each frame let the window slip out from
+    /// under the pointer: every clamp against a screen edge changed the offset for good, so a drag
+    /// out to the edge and back left the window somewhere else entirely. Where a window may go
+    /// belongs to whoever owns it, and it knows where the pointer is.
     #[test]
-    fn a_frame_reports_the_distance_and_lets_the_caller_place_it() {
+    fn a_frame_says_it_is_moving_and_leaves_the_placing_to_the_caller() {
         let mut l = workspace();
-        let mut h = LayoutHistory::default();
         let mut d = PanelDrag::default();
         let before = l.clone();
 
-        d.press(&l, &Target::Frame, 100.0, 100.0, 0.0);
+        d.press(&l, &Target::Frame { path: vec![] }, 100.0, 100.0, 0.0);
         assert_eq!(
             d.drag(&mut l, area(), 140.0, 130.0, 1.0),
-            Some(Preview::MovingWindow { dx: 40.0, dy: 30.0 })
+            Some(Preview::MovingWindow)
         );
-        // The next step is measured from where it got to, not from the press: adding them up again
-        // would move a window twice as far as the hand did.
         assert_eq!(
             d.drag(&mut l, area(), 150.0, 130.0, 2.0),
-            Some(Preview::MovingWindow { dx: 10.0, dy: 0.0 })
+            Some(Preview::MovingWindow)
         );
         assert_eq!(l, before, "a frame must not rearrange anything");
 
         assert_eq!(
-            d.release(&mut l, &mut h, area(), 150.0, 130.0),
+            d.release(&mut l, area(), 150.0, 130.0),
             Outcome::Moved,
             "a window that was pushed about has changed the arrangement"
         );
@@ -961,13 +945,9 @@ mod tests {
     #[test]
     fn a_frame_merely_touched_is_not_a_change() {
         let mut l = workspace();
-        let mut h = LayoutHistory::default();
         let mut d = PanelDrag::default();
-        d.press(&l, &Target::Frame, 100.0, 100.0, 0.0);
-        assert_eq!(
-            d.release(&mut l, &mut h, area(), 100.0, 100.0),
-            Outcome::Nothing
-        );
+        d.press(&l, &Target::Frame { path: vec![] }, 100.0, 100.0, 0.0);
+        assert_eq!(d.release(&mut l, area(), 100.0, 100.0), Outcome::Nothing);
     }
 
     /// **A hold that drifted a little is still a hold.**
@@ -1067,7 +1047,6 @@ mod tests {
     fn cancelling_abandons_the_gesture() {
         let mut l = workspace();
         let before = l.clone();
-        let mut h = LayoutHistory::default();
         let mut d = PanelDrag::default();
 
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
@@ -1075,11 +1054,7 @@ mod tests {
         d.cancel(&mut l);
 
         assert!(!d.active());
-        assert_eq!(
-            d.release(&mut l, &mut h, area(), 400.0, 400.0),
-            Outcome::Nothing
-        );
+        assert_eq!(d.release(&mut l, area(), 400.0, 400.0), Outcome::Nothing);
         assert_eq!(l, before);
-        assert_eq!(h.depth(), (0, 0));
     }
 }
