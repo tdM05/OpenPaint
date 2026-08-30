@@ -30,7 +30,7 @@
 use crate::chrome::{self, HeaderStyle};
 use crate::layout::{Layout, LayoutHistory, PanelId, Rect, Zone};
 use crate::panel_drag::{Held, Outcome, PanelDrag, Preview};
-use crate::panel_ui::Flow;
+use crate::panel_ui::Direction;
 use crate::theme::{Color, Theme};
 
 /// A panel the app can show.
@@ -46,7 +46,7 @@ pub struct PanelKind {
     /// **A default, not a rule.** It lives beside the name because it is the panel's own business
     /// which way it reads: a menu is a strip and a layer list is a list, and neither is a fact
     /// about the layout. When per-panel settings arrive this is what they start from.
-    pub flow: Flow,
+    pub direction: Direction,
 }
 
 /// Every panel, in the order they appear in a menu.
@@ -58,43 +58,43 @@ pub const PANELS: &[PanelKind] = &[
         id: PanelId(0),
         name: "Menu",
         header: HeaderStyle::Compact,
-        flow: Flow::Auto,
+        direction: Direction::Auto,
     },
     PanelKind {
         id: PanelId(1),
         name: "Tools",
         header: HeaderStyle::Compact,
-        flow: Flow::Wrap,
+        direction: Direction::Wrap,
     },
     PanelKind {
         id: PanelId(2),
         name: "Canvas",
         header: HeaderStyle::Named,
-        flow: Flow::Column,
+        direction: Direction::Column,
     },
     PanelKind {
         id: PanelId(3),
         name: "Brush",
         header: HeaderStyle::Named,
-        flow: Flow::Column,
+        direction: Direction::Column,
     },
     PanelKind {
         id: PanelId(4),
         name: "Layers",
         header: HeaderStyle::Named,
-        flow: Flow::Column,
+        direction: Direction::Column,
     },
     PanelKind {
         id: PanelId(5),
         name: "Colour",
         header: HeaderStyle::Named,
-        flow: Flow::Column,
+        direction: Direction::Column,
     },
     PanelKind {
         id: PanelId(6),
         name: "History",
         header: HeaderStyle::Named,
-        flow: Flow::Column,
+        direction: Direction::Column,
     },
 ];
 
@@ -810,7 +810,7 @@ impl Workspace {
                 &mut ui,
                 &controls,
                 &theme,
-                Flow::Column,
+                Direction::Column,
                 &mut self.list_input,
             );
             for change in changes {
@@ -862,7 +862,7 @@ impl Workspace {
             &controls,
             Rect::new(0.0, 0.0, w, screen.h),
             &m,
-            Flow::Column,
+            Direction::Column,
             |_| 0.0,
         );
         let h = (crate::panel_ui::extent(&laid, Rect::new(0.0, 0.0, w, screen.h)).1
@@ -965,8 +965,8 @@ fn list_press(list: Option<Rect>, pressed: bool, at: Option<(f32, f32)>) -> List
 /// From the panel table, so nothing branches on which panel it is holding: the answer is a column
 /// in the table, and a panel added tomorrow brings its own.
 #[must_use]
-pub fn flow_of(panel: PanelId) -> Flow {
-    kind(panel).map_or(Flow::Column, |k| k.flow)
+pub fn direction_of(panel: PanelId) -> Direction {
+    kind(panel).map_or(Direction::Column, |k| k.direction)
 }
 
 /// The panel list: one switch per panel this build knows about.
@@ -1261,12 +1261,17 @@ mod tests {
     #[test]
     fn each_panel_brings_its_own_direction() {
         for kind in PANELS {
-            assert_eq!(flow_of(kind.id), kind.flow, "{} lost its flow", kind.name);
+            assert_eq!(
+                direction_of(kind.id),
+                kind.direction,
+                "{} lost its direction",
+                kind.name
+            );
         }
         // And the table actually says more than one thing, or the check above proves nothing.
-        let first = PANELS[0].flow;
+        let first = PANELS[0].direction;
         assert!(
-            PANELS.iter().any(|k| k.flow != first),
+            PANELS.iter().any(|k| k.direction != first),
             "every panel has the same direction, so this test is vacuous"
         );
     }

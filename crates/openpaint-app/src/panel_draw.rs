@@ -12,8 +12,8 @@
 
 use crate::layout::Rect;
 use crate::panel_ui::{
-    change_at, clamp_scroll, extent, hit, place, to_fraction, Change, Control, ControlId, Flow,
-    Placed,
+    change_at, clamp_scroll, extent, hit, place, to_fraction, Change, Control, ControlId,
+    Direction, Placed,
 };
 use crate::theme::Theme;
 
@@ -54,7 +54,7 @@ pub fn show(
     ui: &mut egui::Ui,
     controls: &[Control],
     theme: &Theme,
-    flow: Flow,
+    direction: Direction,
     input: &mut PanelInput,
 ) -> Vec<Change> {
     let m = &theme.metrics;
@@ -71,7 +71,7 @@ pub fn show(
     // Laid out first and scrolled afterwards, so how tall the list is comes from where the
     // controls actually ended up rather than from a second calculation that could disagree.
     let text_of = |c: &Control| text_width(ui.ctx(), m.body, c);
-    let laid = place(controls, content, m, flow, text_of);
+    let laid = place(controls, content, m, direction, text_of);
     let (_, tall) = extent(&laid, content);
 
     // Only the panel under the pointer takes the wheel. The delta egui reports is the window's,
@@ -84,7 +84,7 @@ pub fn show(
     };
     input.scroll = clamp_scroll(input.scroll - wheel, tall, visible);
     let scrolled = Rect::new(content.x, content.y - input.scroll, content.w, content.h);
-    let placed = place(controls, scrolled, m, flow, text_of);
+    let placed = place(controls, scrolled, m, direction, text_of);
     let latch = &mut input.latch;
 
     let mut changes = Vec::new();
@@ -130,7 +130,7 @@ pub fn show(
         .and_then(|p| hit(&placed, p.x, p.y).and_then(|(c, _)| c.id()));
     let painter = ui.painter_at(area);
     for p in &placed {
-        draw(&painter, p, theme, flow, hover, *latch);
+        draw(&painter, p, theme, direction, hover, *latch);
     }
     changes
 }
@@ -139,7 +139,7 @@ fn draw(
     painter: &egui::Painter,
     p: &Placed<'_>,
     theme: &Theme,
-    flow: Flow,
+    direction: Direction,
     hover: Latch,
     latch: Latch,
 ) {
@@ -181,7 +181,7 @@ fn draw(
                 let y = (r.y + r.h / 2.0).round() + 0.5;
                 (egui::pos2(r.x, y), egui::pos2(r.x + r.w, y))
             };
-            let _ = flow;
+            let _ = direction;
             painter.line_segment([a, b], egui::Stroke::new(1.0_f32, color(pal.edge)));
         }
         Control::Button { text, .. } => {

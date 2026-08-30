@@ -4,7 +4,7 @@
 //! later, reversible decision, and nothing in `openpaint-core` knows this exists.
 //!
 //! It is not decoration: a soft round brush **cannot** be tuned to match
-//! Photoshop's (docs Q7a) without live sliders. Flow and opacity in particular
+//! Photoshop's (docs Q7a) without live sliders. Direction and opacity in particular
 //! have correct semantics but were unreachable until now, so their behavior could
 //! only be verified by unit test, never felt.
 //!
@@ -665,7 +665,7 @@ fn workspace_panel(
             // **A row or a column, never a half-broken row.** The menu is a panel like any other
             // and can be dragged somewhere narrow; wrapping it onto a second line leaves a ragged
             // edge and a last line with one item on it, which no arrangement makes look
-            // deliberate. Turning the whole strip on its side does. That is `Flow::Auto`, and it
+            // deliberate. Turning the whole strip on its side does. That is `Direction::Auto`, and it
             // is a setting on the panel rather than a rule about menus.
             use crate::panel_ui::{Change, Control};
             const PANELS_LIST: u32 = 1 << 20;
@@ -691,7 +691,7 @@ fn workspace_panel(
                 ui,
                 &controls,
                 theme,
-                crate::workspace::flow_of(panel),
+                crate::workspace::direction_of(panel),
                 input,
             ) {
                 picked = match change {
@@ -707,7 +707,7 @@ fn workspace_panel(
         }
         ws::TOOLS => {
             // A wrapped grid, so the rail works whether it is a column down the side or a strip
-            // along the bottom. Nothing here knows which it currently is: `Flow::Wrap` is the
+            // along the bottom. Nothing here knows which it currently is: `Direction::Wrap` is the
             // panel's default in the table, and wrapping is honest here because every button is
             // the same width.
             //
@@ -748,7 +748,7 @@ fn workspace_panel(
                 ui,
                 &controls,
                 theme,
-                crate::workspace::flow_of(panel),
+                crate::workspace::direction_of(panel),
                 input,
             ) {
                 picked = match change {
@@ -818,7 +818,7 @@ fn workspace_panel(
                 ui,
                 &controls,
                 theme,
-                crate::workspace::flow_of(panel),
+                crate::workspace::direction_of(panel),
                 input,
             ) {
                 match change {
@@ -894,7 +894,7 @@ fn workspace_panel(
                 ui,
                 &controls,
                 theme,
-                crate::workspace::flow_of(panel),
+                crate::workspace::direction_of(panel),
                 input,
             ) {
                 picked = match change {
@@ -955,7 +955,7 @@ fn workspace_panel(
                 ui,
                 &controls,
                 theme,
-                crate::workspace::flow_of(panel),
+                crate::workspace::direction_of(panel),
                 input,
             ) {
                 eprintln!("history panel: unexpected {change:?}");
@@ -1602,8 +1602,8 @@ impl Ui {
                             ui.add(egui::Slider::new(&mut brush.opacity, 0.0..=1.0).text("Opacity"));
                             ui.label(
                                 egui::RichText::new(
-                                    "Flow = paint per dab. Opacity = ceiling for the whole \
-                                     stroke. Set flow low and opacity mid to see build-up \
+                                    "Direction = paint per dab. Opacity = ceiling for the whole \
+                                     stroke. Set direction low and opacity mid to see build-up \
                                      stop at the ceiling; lift and stroke again to go darker.",
                                 )
                                 .small()

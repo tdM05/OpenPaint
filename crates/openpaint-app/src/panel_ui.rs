@@ -145,6 +145,11 @@ impl Control {
 
 /// Which way a panel's controls run.
 ///
+/// **Not `Flow`**, which this was called first and should never have been: in a paint application
+/// flow is how much paint a brush lays down, and `Brush` already had a field by that name. The
+/// compiler found the collision the moment the rename went through, which is later than a reader
+/// would have.
+///
 /// **A strip is a row or a column and never a half-broken row.** Wrapping a row of buttons onto a
 /// second line leaves a ragged edge and a last line with one item on it, and no arrangement of a
 /// panel makes that look deliberate. Turning the whole thing on its side does.
@@ -153,7 +158,7 @@ impl Control {
 /// panel gets it without anything being written twice.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Flow {
+pub enum Direction {
     /// Down the panel. What a properties panel wants.
     Column,
     /// Across it. What a menu bar or a tool strip wants.
@@ -192,15 +197,15 @@ pub fn place<'a>(
     controls: &'a [Control],
     content: Rect,
     metrics: &Metrics,
-    flow: Flow,
+    direction: Direction,
     text_of: impl Fn(&Control) -> f32,
 ) -> Vec<Placed<'a>> {
-    let across = match flow {
-        Flow::Row | Flow::Wrap => true,
-        Flow::Column => false,
+    let across = match direction {
+        Direction::Row | Direction::Wrap => true,
+        Direction::Column => false,
         // The whole point of Auto: it decides once, for the whole list. A per-control decision is
         // what produces a wrapped row, which is the thing being avoided.
-        Flow::Auto => row_width(controls, metrics, &text_of) <= content.w,
+        Direction::Auto => row_width(controls, metrics, &text_of) <= content.w,
     };
     let mut out = Vec::with_capacity(controls.len());
     let (mut x, mut y) = (content.x, content.y);
@@ -209,7 +214,7 @@ pub fn place<'a>(
             // Everything in a row is one row tall, including the labels and the rules, or the
             // strip has no baseline to read along.
             let w = control.width(metrics, text_of(control));
-            if flow == Flow::Wrap && x > content.x && x + w > content.x + content.w {
+            if direction == Direction::Wrap && x > content.x && x + w > content.x + content.w {
                 x = content.x;
                 y += metrics.row + metrics.gap;
             }
@@ -368,7 +373,7 @@ mod tests {
     }
 
     fn column<'a>(controls: &'a [Control]) -> Vec<Placed<'a>> {
-        place(controls, content(), &metrics(), Flow::Column, text)
+        place(controls, content(), &metrics(), Direction::Column, text)
     }
 
     fn sliders() -> Vec<Control> {
@@ -579,7 +584,7 @@ mod tests {
         let wide = Rect::new(0.0, 0.0, 4000.0, 300.0);
         let narrow = Rect::new(0.0, 0.0, 120.0, 300.0);
 
-        let across = place(&controls, wide, &m, Flow::Auto, text);
+        let across = place(&controls, wide, &m, Direction::Auto, text);
         let rows: std::collections::BTreeSet<i32> =
             across.iter().map(|p| p.rect.y as i32).collect();
         assert_eq!(rows.len(), 1, "with room to spare it should be one row");
@@ -593,7 +598,7 @@ mod tests {
             "the row it chose runs off the panel"
         );
 
-        let down = place(&controls, narrow, &m, Flow::Auto, text);
+        let down = place(&controls, narrow, &m, Direction::Auto, text);
         let columns: std::collections::BTreeSet<i32> =
             down.iter().map(|p| p.rect.x as i32).collect();
         assert_eq!(columns.len(), 1, "too narrow, so it should be one column");
@@ -605,7 +610,7 @@ mod tests {
             &controls,
             Rect::new(0.0, 0.0, bare, 300.0),
             &m,
-            Flow::Auto,
+            Direction::Auto,
             text,
         );
         let cols: std::collections::BTreeSet<i32> = snug.iter().map(|p| p.rect.x as i32).collect();
@@ -648,7 +653,7 @@ mod tests {
         let one = tools[0].width(&m, text(&tools[0]));
         // Room for three across, so six should land on two lines.
         let content = Rect::new(0.0, 0.0, one * 3.0 + m.gap * 2.0, 300.0);
-        let laid = place(&tools, content, &m, Flow::Wrap, text);
+        let laid = place(&tools, content, &m, Direction::Wrap, text);
 
         let lines: std::collections::BTreeSet<i32> = laid.iter().map(|p| p.rect.y as i32).collect();
         assert_eq!(lines.len(), 2, "six buttons, three to a line");
@@ -691,7 +696,7 @@ mod tests {
             &controls,
             Rect::new(5.0, 7.0, 4000.0, 300.0),
             &m,
-            Flow::Row,
+            Direction::Row,
             text,
         );
         for p in &laid {
@@ -726,7 +731,7 @@ mod tests {
             &controls,
             Rect::new(0.0, 0.0, 4000.0, 300.0),
             &m,
-            Flow::Row,
+            Direction::Row,
             text,
         );
         for p in &laid {
@@ -746,12 +751,12 @@ mod tests {
     fn a_control_can_be_pressed_in_either_direction() {
         let controls = sliders();
         let m = metrics();
-        for flow in [Flow::Row, Flow::Column] {
+        for direction in [Direction::Row, Direction::Column] {
             let laid = place(
                 &controls,
                 Rect::new(0.0, 0.0, 4000.0, 300.0),
                 &m,
-                flow,
+                direction,
                 text,
             );
             let slider = laid
@@ -762,7 +767,7 @@ mod tests {
             let found = hit(&laid, r.x + r.w / 2.0, r.y + r.h / 2.0);
             assert!(
                 matches!(found, Some((Control::Slider { id: 1, .. }, _))),
-                "{flow:?}: the slider is not where it was drawn"
+                "{direction:?}: the slider is not where it was drawn"
             );
         }
     }
