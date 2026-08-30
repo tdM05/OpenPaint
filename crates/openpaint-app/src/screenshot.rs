@@ -630,6 +630,103 @@ mod tests {
         shoot("placing", screen, &[Poke::Move(420.0, 500.0)], &mut ws);
     }
 
+    /// **Nothing in a panel answers the press that puts a panel down.**
+    ///
+    /// A pick is answered by pressing wherever the panel should go, and that is as often as not on
+    /// top of a control -- so without this the artist puts a panel down and changes the brush size
+    /// at the same time.
+    ///
+    /// **The case chosen is the one that is not saved by ordering.** A press that lands somewhere
+    /// rearranges the leaf it lands in, so the control under it has usually moved by the time egui
+    /// looks -- which is luck, not a rule, and it does not hold when the press lands *nowhere*: the
+    /// pick is put back, the arrangement is exactly as it was, and the control is still sitting
+    /// under the pointer. Here that is a floating window offered a panel that may not float.
+    ///
+    /// Driven through a real egui frame rather than by reading a flag, because what is being
+    /// checked is whether egui hands the press to a widget, which no amount of asserting about
+    /// `Workspace` can see -- and through `ws.show`, so it is the application's own draw path.
+    ///
+    /// Three things stop that press between them and this cannot tell them apart: the panels are
+    /// disabled, the landing rearranges the leaf, and the overlay's layer occludes what is beneath
+    /// it. That is fine here -- the promise is that no control answers, not which of the three
+    /// keeps it -- but it does mean removing any one of them on its own leaves this green.
+    #[test]
+    fn a_panel_answers_nothing_while_a_pick_is_waiting() {
+        for waiting in [false, true] {
+            let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+            let mut ws = plain_workspace();
+            ws.set_screen(screen);
+            ws.float(crate::workspace::BRUSH);
+            if waiting {
+                // The canvas may not float, so the window below is no destination for it: the
+                // press will put the pick back and change nothing.
+                ws.start_placing(crate::workspace::CANVAS);
+            }
+
+            let at = control_point(&ws, crate::workspace::BRUSH, screen);
+            let mut changed = Vec::new();
+            let ctx = egui::Context::default();
+            let _ = run_frames(
+                &ctx,
+                screen,
+                &[
+                    Poke::Move(at.0, at.1),
+                    Poke::Press(at.0, at.1),
+                    Poke::Release(at.0, at.1),
+                ],
+                |c| {
+                    changed.clear();
+                    ws.show(c, screen, |panel, ui, direction, place| {
+                        if panel == crate::workspace::BRUSH {
+                            let theme = Theme::default();
+                            let mut input = crate::panel_draw::PanelInput::default();
+                            changed = crate::panel_draw::show(
+                                ui,
+                                &[Control::Slider {
+                                    id: 0,
+                                    text: "Size".to_owned(),
+                                    value: 14.0,
+                                    min: 0.5,
+                                    max: 400.0,
+                                    unit: "px",
+                                    log: true,
+                                }],
+                                &theme,
+                                direction,
+                                &mut input,
+                            );
+                        } else {
+                            filler(panel, ui, direction, place);
+                        }
+                    });
+                },
+            );
+
+            if waiting {
+                assert!(
+                    changed.is_empty(),
+                    "a control answered the press that was answering a pick: {changed:?}"
+                );
+            } else {
+                // The other half: without a pick the very same press *does* reach the control.
+                // Otherwise this would pass just as well on a panel nobody can press at all.
+                assert!(
+                    !changed.is_empty(),
+                    "the press never reached the control, so the other half proves nothing"
+                );
+            }
+        }
+    }
+
+    /// The middle of a panel's first row of controls, in screen units.
+    fn control_point(ws: &Workspace, panel: crate::layout::PanelId, screen: Rect) -> (f32, f32) {
+        let area = ws
+            .content_of(panel, screen)
+            .expect("the panel is somewhere");
+        let m = Theme::default().metrics;
+        (area.x + area.w / 2.0, area.y + m.row / 2.0)
+    }
+
     /// **A drag that wanders off the hue ring keeps setting the hue.**
     ///
     /// The same latch a slider has, and for the same reason: a hand sweeping round a ring does not

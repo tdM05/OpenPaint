@@ -927,7 +927,24 @@ impl OpenPaint {
     }
 
     fn ui_blocks_point(&self, x: f64, y: f64) -> bool {
-        self.ui.as_ref().is_some_and(|ui| ui.blocks_point(x, y))
+        let Some(ui) = self.ui.as_ref() else {
+            return false;
+        };
+        if self.workspace_mode {
+            // **Asked of the workspace, not of a copy kept beside it.** Where the canvas is and
+            // what is drawn over it are one answer, and a cached copy is a second place for it to
+            // be wrong -- which is what it was: it carried the rectangle and not the floating
+            // windows above it, so the wheel zoomed the drawing behind whatever panel was being
+            // scrolled. There is nothing left here to fall out of step.
+            let scale = ui.pixels_per_point();
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "window coordinates, which are far inside f32"
+            )]
+            let (x, y) = (x as f32 / scale, y as f32 / scale);
+            return self.workspace.takes_point(x, y);
+        }
+        ui.blocks_point(x, y)
     }
 
     /// Remember where the pointer is. Returns whether it moved far enough to be worth a frame.

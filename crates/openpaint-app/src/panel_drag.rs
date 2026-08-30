@@ -252,19 +252,16 @@ pub struct PanelDrag {
 }
 
 impl PanelDrag {
-    /// Whether a gesture is in progress, armed or still waiting.
+    /// Whether a gesture is in progress: pressed, whatever it has done since.
+    ///
+    /// **One function.** There used to be two, `active` and `armed`, with comments explaining that
+    /// a press merely waiting out the hold had taken nothing and should not count as busy -- and
+    /// identical bodies. The comments were describing a design that had been superseded: a tab and
+    /// a divider are grabbed the instant they are touched, so there is no waiting state left in
+    /// which nothing has been taken. Two names for one answer is two things to keep in step
+    /// (recurring hazard 11a.8), and the pair had already drifted from what they said.
     #[must_use]
     pub fn active(&self) -> bool {
-        self.grab.is_some()
-    }
-
-    /// Whether something is actually moving, so the caller knows the pointer is spoken for.
-    ///
-    /// Distinct from [`PanelDrag::active`] on purpose: a press that is merely *waiting* has taken
-    /// nothing, and treating it as busy would make the first fifth of a second of every press feel
-    /// dead.
-    #[must_use]
-    pub fn armed(&self) -> bool {
         self.grab.is_some()
     }
 
@@ -560,7 +557,12 @@ impl PanelDrag {
         match &grab.kind {
             Kind::Frame { .. } => Some(WindowMove::Whole),
             Kind::Edge { pull } => Some(WindowMove::Edges(*pull)),
-            Kind::Tab { .. } | Kind::Splitter { .. } => None,
+            // A tab in a floating window carries the window, so it wants the release position
+            // as much as a frame does. In the arrangement `drag_window_to` has no window to move
+            // and does nothing, which is the right answer there.
+            Kind::Tab { .. } => Some(WindowMove::Whole),
+            // A divider moves nothing but the layout it was given, which the release already has.
+            Kind::Splitter { .. } => None,
         }
     }
 

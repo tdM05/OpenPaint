@@ -136,6 +136,20 @@ pub const LAYERS: PanelId = PanelId(4);
 pub const COLOUR: PanelId = PanelId(5);
 pub const HISTORY: PanelId = PanelId(6);
 
+/// Whether a panel may live in a floating window.
+///
+/// Read off the same table that decides whether its settings offer *Float*, so the button and the
+/// pick cannot disagree -- and so a panel added later is covered by the row somebody writes for it
+/// rather than by a list here that they will not think to update (recurring hazard 11a.8).
+///
+/// The canvas is the one that says no today, and the reason is not a rule about canvases: it is
+/// drawn by the GPU *underneath* egui, so a window's own background would be painted straight over
+/// the artwork. A floating canvas is a window with nothing in it and a workspace with no drawing.
+#[must_use]
+fn may_float(id: PanelId) -> bool {
+    kind(id).is_some_and(|k| k.settings.contains(&Setting::Floating))
+}
+
 #[must_use]
 fn kind(id: PanelId) -> Option<&'static PanelKind> {
     PANELS.iter().find(|k| k.id == id)
@@ -691,6 +705,24 @@ impl Workspace {
         self.canvas_rect
     }
 
+    /// Whether the workspace's own chrome claims this point rather than the canvas.
+    ///
+    /// **The one answer, asked of the workspace itself.** It used to be two values -- the canvas
+    /// rectangle and the chrome drawn over it -- cached beside the shell, and a caller could take
+    /// the first and forget the second. One did: floating windows and popups are painted *on top*
+    /// of the canvas, so by the rectangle alone the pen and the wheel were told they were over the
+    /// artwork while they were plainly on a panel. The reported symptom was scrolling a floating
+    /// panel zooming the drawing behind it.
+    ///
+    /// **No canvas panel means no canvas anywhere.** The artist can close it like any other, and
+    /// the workspace then fills the window with ground -- the artwork is not on screen at all, so
+    /// nothing may be painted on it.
+    #[must_use]
+    pub fn takes_point(&self, x: f32, y: f32) -> bool {
+        self.canvas_rect.is_none_or(|c| !c.contains(x, y))
+            || self.over_canvas().iter().any(|r| r.contains(x, y))
+    }
+
     /// The workspace's own chrome that is drawn **over** the canvas rather than beside it.
     ///
     /// Everything else in the workspace is a leaf of the arrangement, and the canvas is another
@@ -701,7 +733,7 @@ impl Workspace {
     ///
     /// Front to back, because that is the order they are drawn and the order a press picks them.
     #[must_use]
-    pub fn over_canvas(&self) -> Vec<Rect> {
+    fn over_canvas(&self) -> Vec<Rect> {
         // Grown by the resize border's outer half, because that half is the window's to answer for
         // -- a press there sizes the window, and without this the wheel in the same place zoomed
         // the drawing behind it. Two answers to "where is this window" is one too many.
@@ -724,7 +756,7 @@ impl Workspace {
         // and a press meant for it must not also start a stroke.
         // A pick counts too: the whole point of it is that the next press lands a panel, so that
         // press must not also start a stroke.
-        self.drag.armed() || self.popup.is_some() || self.placing.is_some()
+        self.drag.active() || self.popup.is_some() || self.placing.is_some()
     }
 
     /// Abandon a panel drag without applying it.
@@ -850,6 +882,11 @@ impl Workspace {
 
     /// Undo the last layout change. Returns whether there was one.
     pub fn undo(&mut self) -> bool {
+        // **Before the snapshot, not after.** `restore` ends the pick too, but by then `now` has
+        // been sampled -- and during a pick `now` is the arrangement with the picked panel taken
+        // out, a state the artist never committed. Pushing that onto the redo stack meant redoing
+        // straight back into it, with the panel in neither tree and no pick to put it anywhere.
+        self.cancel_placing();
         let now = self.snapshot();
         match self.history.undo(&now) {
             Some(previous) => {
@@ -863,6 +900,8 @@ impl Workspace {
 
     /// Redo it.
     pub fn redo(&mut self) -> bool {
+        // See `undo`: the same trap, with the stacks the other way round.
+        self.cancel_placing();
         let now = self.snapshot();
         match self.history.redo(&now) {
             Some(next) => {
@@ -886,6 +925,12 @@ impl Workspace {
     }
 
     /// Show a panel, bringing it forward if it is already open.
+    ///
+    /// **Not the way a panel is switched on** -- that starts a pick, and the artist says where it
+    /// goes. This is the last resort behind two recovery paths: a merge whose destination window
+    /// vanished, and a drop outside everything. Both are mid-gesture, with nobody to ask and a
+    /// panel already in the air, and there somewhere visible beats a question. Losing it silently
+    /// would be the worst possible answer (DECISIONS 6b).
     pub fn open(&mut self, panel: PanelId) {
         if let Some((path, tab)) = self.layout.find(panel) {
             self.layout.set_active(&path, tab);
@@ -919,7 +964,7 @@ impl Workspace {
         ));
         let m = self.theme.metrics;
         let p = self.theme.palette;
-        self.screen = screen;
+        self.set_screen(screen);
 
         let placed = self.layout.resolve(screen);
 
@@ -989,6 +1034,10 @@ impl Workspace {
             self.popup = None;
         }
 
+        // **Read before the press is acted on.** `input_frame` answers a waiting pick, so by the
+        // time the panels below are drawn `self.placing` is already `None` -- and the one frame on
+        // which the panels must not answer the pointer is exactly that one.
+        let was_picking = self.placing.is_some();
         // Everything a press means, in one place: `show` draws, and this decides. Tests drive
         // the *same* entry point rather than a hand-made idea of what the pointer is over -- which
         // is exactly the disagreement that let a real bug pass a green suite.
@@ -1118,10 +1167,17 @@ impl Workspace {
             // Contents are clipped to their own panel, so a list too long for its slot cannot
             // draw over the panel beside it.
             ui.set_clip_rect(content);
-            // **Nothing in a panel answers while a pick is waiting.** The press that lands the
-            // panel goes wherever it is pointed, and a button under that point would be pressed as
-            // well -- so the artist would put a panel down and set the brush size at the same time.
-            if self.placing.is_some() {
+            // **Nothing in a panel answers while a pick is waiting**, and it visibly says so: the
+            // press that lands the panel goes wherever it is pointed, and a control under that
+            // point would otherwise be worked at the same time.
+            //
+            // Two other things happen to stop that press as well -- the landing rearranges the leaf
+            // the control was in, and the drop overlay's layer occludes what is under it -- so no
+            // test can tell this line apart from those. It stays because it is the *stated* rule
+            // and the only one of the three that is; the other two are accidents of ordering and of
+            // how egui picks a layer. It also greys the workspace, which is how the artist can see
+            // that a question is being asked.
+            if was_picking {
                 ui.disable();
             }
             // The direction is worked out here and handed over, because the panel that wants it
@@ -1241,7 +1297,7 @@ impl Workspace {
         // second set of rules about what the five zones mean.
         let picking = self.placing().map(|panel| {
             let landing = pointer
-                .and_then(|q| self.landing_at(q.x, q.y))
+                .and_then(|q| self.landing_at(panel, q.x, q.y))
                 .map(|(_, _, rect, zone)| crate::panel_drag::Landing { rect, zone });
             (panel, landing)
         });
@@ -1364,6 +1420,11 @@ impl Workspace {
                     egui::UiBuilder::new().max_rect(to_egui(c.controls.rect())),
                 );
                 ui.set_clip_rect(to_egui(c.controls.rect()));
+                // The same rule as the arrangement's panels, and for the same reason: a pick can
+                // land *in* a floating window.
+                if was_picking {
+                    ui.disable();
+                }
                 contents(showing, &mut ui, self.direction_of(showing), Place::Panel);
             }
         }
@@ -1609,7 +1670,7 @@ impl Workspace {
     /// Undoable like any other change to the arrangement, because it *is* one: the panel has left
     /// the tree, and getting it back should not need remembering where it was.
     pub fn float(&mut self, panel: PanelId) {
-        if self.is_floating(panel) || !self.is_docked(panel) {
+        if self.is_floating(panel) || !self.is_docked(panel) || !may_float(panel) {
             return;
         }
         self.remember_for_undo();
@@ -1623,6 +1684,40 @@ impl Workspace {
         });
         self.popup = None;
         self.remember();
+    }
+
+    /// Where a panel's controls are drawn, wherever the panel is.
+    ///
+    /// For tests that need to press something inside a panel and must not care whether it is in
+    /// the arrangement or in a window -- which is exactly the difference they are checking does
+    /// not matter.
+    #[cfg(test)]
+    #[must_use]
+    pub fn content_of(&self, panel: PanelId, screen: Rect) -> Option<Rect> {
+        let m = self.theme.metrics;
+        let places = std::iter::once((&self.layout, screen)).chain(
+            self.floating
+                .iter()
+                .map(|f| (&f.layout, inset(f.rect, m.gutter))),
+        );
+        for (layout, area) in places {
+            for slot in layout.resolve(area) {
+                if showing_of(&slot) == panel {
+                    return Some(
+                        chrome::panel(
+                            &slot,
+                            &m,
+                            style_of(&slot),
+                            along_of(&slot, self.direction_of(panel)),
+                            |_| 46.0,
+                        )
+                        .controls
+                        .rect(),
+                    );
+                }
+            }
+        }
+        None
     }
 
     /// The panel waiting to be put somewhere, if there is one.
@@ -1660,7 +1755,7 @@ impl Workspace {
         let Some(waiting) = self.placing.take() else {
             return false;
         };
-        let Some((over, path, _, zone)) = self.landing_at(x, y) else {
+        let Some((over, path, _, zone)) = self.landing_at(waiting.panel, x, y) else {
             self.restore(waiting.was);
             return false;
         };
@@ -1688,10 +1783,22 @@ impl Workspace {
     ///
     /// Floating windows first, because they are above.
     #[must_use]
-    fn landing_at(&self, x: f32, y: f32) -> Option<(Surface, crate::layout::Path, Rect, Zone)> {
-        let over = self
-            .window_at(x, y)
-            .map_or(Surface::Docked, Surface::Floating);
+    fn landing_at(
+        &self,
+        panel: PanelId,
+        x: f32,
+        y: f32,
+    ) -> Option<(Surface, crate::layout::Path, Rect, Zone)> {
+        // A window is no destination for a panel that may not float -- and nor is whatever lies
+        // *behind* the window, which is not where anybody pointed. So the answer is no destination
+        // at all, and the press puts the panel back. Answered here rather than at the drop, so the
+        // overlay does not light up a zone the press will refuse: an overlay you cannot believe is
+        // worse than none.
+        let over = match self.window_at(x, y) {
+            Some(id) if may_float(panel) => Surface::Floating(id),
+            Some(_) => return None,
+            None => Surface::Docked,
+        };
         let area = self.area_of(over)?;
         let leaf = self.layout_of(over)?.leaf_at(area, x, y)?;
         Some((
@@ -1744,6 +1851,34 @@ impl Workspace {
         });
         self.remember();
         Some(id)
+    }
+
+    /// Learn how big the window is, and bring the floating ones back within reach of it.
+    ///
+    /// Called from both places that are told the size -- `show`, which draws, and `input_frame`,
+    /// which decides -- because it must not matter which of them hears first. One function rather
+    /// than the same two lines in each, so they cannot drift.
+    pub fn set_screen(&mut self, screen: Rect) {
+        if self.screen == screen {
+            return;
+        }
+        self.screen = screen;
+        self.hold_windows_on_screen();
+    }
+
+    /// Bring every floating window back within reach of the screen it is now on.
+    ///
+    /// **The third way a window is stranded.** Moving one is clamped, and now so is sizing one --
+    /// but the screen can move instead of the window: park a window near the right edge of a wide
+    /// display and open the file on a narrow one, and it is outside every hit test with no handle
+    /// showing. Only a change of size does this, so it costs nothing on an ordinary frame.
+    ///
+    /// The same clamp a drag uses, so there is one idea of "within reach" rather than two.
+    fn hold_windows_on_screen(&mut self) {
+        let (screen, m) = (self.screen, self.theme.metrics);
+        for held in &mut self.floating {
+            held.rect = hold_on_screen(held.rect, screen, &m);
+        }
     }
 
     /// Take note of where inside a window the pointer landed, so a drag can keep it there.
@@ -1811,6 +1946,7 @@ impl Workspace {
         mut measure: impl FnMut(Option<PanelId>) -> f32,
     ) -> Option<Preview> {
         let m = self.theme.metrics;
+        self.set_screen(screen);
         // **A pick owns the press, and owns it first.** Everything below is about rearranging what
         // is already placed; while a panel is in the air the only question on the table is where it
         // goes, and letting a header or a divider answer first would rearrange the workspace with
@@ -1841,13 +1977,35 @@ impl Workspace {
         // **Which arrangement is under the pointer**, floating windows first because they are
         // above. A press picks one; everything after it stays with whatever the press picked, or a
         // drag that wandered over another window would start rearranging that one instead.
-        // With the resize border's reach, because that border straddles the window's edge and its
-        // outer half is still the window's to answer for.
+        // **Which arrangement is under the pointer**, with the resize border's reach: that border
+        // straddles the window's edge, and its outer half is the window's to answer for.
+        //
+        // Except where the arrangement has something *visible* there. The outer half lies over
+        // whatever is behind the window, and a header or a divider you can see must not lose a
+        // press to a border you cannot -- the same rule that puts window rectangles ahead of window
+        // borders, one layer further down. Inside a window's rectangle it does not arise: the
+        // window is drawn on top, so it is what you can see.
+        let docked = self.layout.resolve(screen);
+        let seams = self.layout.splitters(screen, m.splitter_grab);
         let over = input
             .at
-            .and_then(|(x, y)| self.window_within(m.splitter_grab / 2.0, x, y))
+            .and_then(|(x, y)| {
+                self.window_hit(0.0, x, y).or_else(|| {
+                    self.window_hit(m.splitter_grab / 2.0, x, y).filter(|_| {
+                        chrome::target_at(
+                            &docked,
+                            &seams,
+                            &m,
+                            |pl| (style_of(pl), along_of(pl, direction_for(pl))),
+                            |pl, i| measure(pl.tabs.get(i).copied()),
+                            x,
+                            y,
+                        ) == crate::panel_drag::Target::Elsewhere
+                    })
+                })
+            })
             .map_or(Surface::Docked, Surface::Floating);
-        self.grab_surface = working_surface(self.drag.armed(), over, self.grab_surface);
+        self.grab_surface = working_surface(self.drag.active(), over, self.grab_surface);
         if input.pressed {
             if let Surface::Floating(id) = self.grab_surface {
                 self.raise(id);
@@ -2367,6 +2525,8 @@ impl Workspace {
                 None
             }
             Pulse::Release => {
+                // Asked before the release takes the grab apart.
+                let carried = self.drag.carries_window();
                 // **The release carries a position of its own, and it is the last one.** A tab's
                 // drop already used it; a window's move and a window's resize were applied only on
                 // the frames in between, so the final movement of every window drag was thrown
@@ -2393,9 +2553,17 @@ impl Workspace {
                 // itself the answer, since the pointer cannot get there without moving. A guard
                 // that cannot change the outcome only looks load-bearing, and a sabotage removing
                 // this one changed nothing at all.
+                // **Only a window that was being carried.** The comment that used to stand here
+                // argued that no "has it moved" guard was needed, because the pointer could not
+                // reach another arrangement without moving -- which was true when carrying was the
+                // only gesture that could get here. Resizing a window and dragging a divider
+                // inside one are not carries: the window stays put while the pointer travels, so
+                // it can leave and end up over a neighbour. Without this, sizing a window down and
+                // releasing over the window beside it merged the two and destroyed the one being
+                // sized.
                 if let (Surface::Floating(from), Surface::Floating(to)) = (self.grab_surface, over)
                 {
-                    if from != to {
+                    if from != to && carried {
                         self.drag.let_go();
                         // **One gesture, one step, snapshotted at the press.** The window has been
                         // following the pointer since then, so this covers the carry as well as
@@ -2409,7 +2577,7 @@ impl Workspace {
                         return None;
                     }
                 }
-                if over != self.grab_surface {
+                if over != self.grab_surface && carried {
                     // Different modes: the window has already been carried to where it was let go,
                     // and that is all that was asked for -- but it is still a change, and it goes
                     // on the undo stack like every other. Without this, resizing a window could be
@@ -3466,7 +3634,9 @@ mod tests {
 
     impl Hand<'_> {
         fn new(ws: &mut Workspace, screen: Rect) -> Hand<'_> {
-            ws.screen = screen;
+            // Through the same door the shell uses, so a test cannot hand the workspace a size in
+            // a way the application never would.
+            ws.set_screen(screen);
             Hand {
                 ws,
                 screen,
@@ -3509,6 +3679,17 @@ mod tests {
         fn drag(&mut self, from: (f32, f32), to: (f32, f32)) {
             self.press(from);
             self.move_to(to);
+            self.release(to);
+        }
+
+        /// The same, but let go somewhere the last move frame did not reach.
+        ///
+        /// A real release carries a position of its own, and it is the last one there is. `drag`
+        /// releases where it last moved to, so no test built on it could ever see a gesture that
+        /// throws the release position away -- and two of them did.
+        fn drag_letting_go_at(&mut self, from: (f32, f32), via: (f32, f32), to: (f32, f32)) {
+            self.press(from);
+            self.move_to(via);
             self.release(to);
         }
 
@@ -4121,9 +4302,23 @@ mod tests {
             let mut hand = Hand::new(&mut ws, screen);
             hand.drag(at, (at.0 + dx, at.1 + dy));
 
+            // **Worked out here, not asked of the function under test.** Using `pull_edges` as
+            // the oracle could only ever catch a routing mistake, never an arithmetic one.
             let got = ws.floating[0].rect;
-            let want =
-                crate::chrome::pull_edges(start, pull, dx, dy, least_window(&ws.theme.metrics));
+            let want = Rect::new(
+                if pull.x == -1 { start.x + dx } else { start.x },
+                if pull.y == -1 { start.y + dy } else { start.y },
+                match pull.x {
+                    -1 => start.w - dx,
+                    1 => start.w + dx,
+                    _ => start.w,
+                },
+                match pull.y {
+                    -1 => start.h - dy,
+                    1 => start.h + dy,
+                    _ => start.h,
+                },
+            );
             assert_eq!(got, want, "pulling {pull:?} did not resize the window");
             // And it really is a resize, not a move: the opposite edges have not budged.
             if pull.x == 1 {
@@ -4500,14 +4695,24 @@ mod tests {
     /// Every panel offers a way out of the workspace, whatever else its settings hold.
     #[test]
     fn every_panel_can_be_removed_from_its_own_settings() {
-        let ws = bare();
         for k in PANELS {
+            let mut ws = bare();
+            ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
             let controls = ws.popup_controls(PopupKind::Settings(k.id));
             assert!(
                 controls.iter().any(|c| c.id() == Some(REMOVE_ID)),
                 "{} cannot be removed from its own settings",
                 k.name
             );
+            // **And pressing it removes the panel.** Offering the button and wiring it to nothing
+            // would have passed the half of this that only looked at the list.
+            ws.apply_popup(
+                PopupKind::Settings(k.id),
+                crate::panel_ui::Change::Pressed(REMOVE_ID),
+            );
+            assert!(!ws.is_open(k.id), "{}'s remove button did nothing", k.name);
+            assert!(ws.undo(), "{}: removing should be undoable", k.name);
+            assert!(ws.is_open(k.id), "{}: undo did not bring it back", k.name);
         }
     }
 
@@ -4534,47 +4739,57 @@ mod tests {
         assert_eq!(ws.placing(), None, "nor started a pick for a second copy");
     }
 
-    /// **A floating window covers the canvas**, so a scroll over it is not the canvas's.
+    /// **What is drawn over the canvas is not the canvas.**
     ///
-    /// The canvas is drawn underneath everything, so "inside the canvas rectangle" was not the
-    /// same question as "the canvas gets this" -- and the wheel zoomed the drawing behind whatever
-    /// floating panel was being scrolled.
+    /// The workspace lays the canvas out as a panel among panels, so "not inside the canvas
+    /// rectangle" answers for everything beside it. Floating windows and popups are the exception:
+    /// they are painted on top, and by the rectangle alone the pen and the wheel were told they
+    /// were over the artwork while they were plainly on a panel. Reported as scrolling a floating
+    /// panel zooming the drawing behind it.
     #[test]
-    fn a_floating_window_is_over_the_canvas() {
+    fn what_is_drawn_over_the_canvas_takes_the_pointer() {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
-        ws.screen = screen;
-        assert!(ws.over_canvas().is_empty(), "nothing covers it yet");
+        ws.set_screen(screen);
+        // The canvas is worked out while drawing, so say where it is directly.
+        let canvas = Rect::new(200.0, 100.0, 800.0, 600.0);
+        ws.canvas_rect = Some(canvas);
 
+        // Beside the canvas: the workspace's. On it: the canvas's.
+        assert!(ws.takes_point(50.0, 50.0));
+        assert!(!ws.takes_point(600.0, 400.0));
+
+        // Under a floating window: the window's, border and all.
         ws.float(COLOUR);
+        ws.floating[0].rect = Rect::new(300.0, 200.0, 240.0, 180.0);
         let window = ws.floating[0].rect;
-        let over = ws.over_canvas();
-        assert_eq!(
-            over.len(),
-            1,
-            "the floating window should be over the canvas"
+        assert!(
+            ws.takes_point(window.x + 60.0, window.y + 60.0),
+            "a floating window over the canvas did not take the pointer"
         );
-        // Its resize border too: a press four units outside the edge sizes the window, so the
-        // wheel four units outside the edge must not reach the drawing behind it.
         let reach = ws.theme.metrics.splitter_grab / 2.0;
         assert!(
-            over[0].contains(window.x - reach / 2.0, window.y + window.h / 2.0),
-            "the border outside the window was left to the canvas: {over:?}"
+            ws.takes_point(window.x - reach / 2.0, window.y + 60.0),
+            "its resize border, which a press there resizes, did not take the pointer"
         );
         assert!(
-            !over[0].contains(window.x - reach * 2.0, window.y + window.h / 2.0),
+            !ws.takes_point(window.x - reach * 3.0, window.y + 60.0),
             "and it should not reach further than the border does"
         );
 
+        // Under the popup: the popup's.
         ws.popup = Some(Popup {
             kind: PopupKind::Panels,
-            rect: Rect::new(10.0, 10.0, 200.0, 300.0),
+            rect: Rect::new(700.0, 500.0, 120.0, 90.0),
         });
-        assert_eq!(
-            ws.over_canvas().len(),
-            2,
-            "the popup covers it too, and is drawn above the window"
-        );
+        assert!(ws.takes_point(750.0, 540.0), "the popup did not take it");
+
+        // **And with the canvas panel closed there is no canvas anywhere.** The workspace fills
+        // the window with ground, so the artwork is not on screen at all -- answering "the whole
+        // surface is canvas, then" let the pen paint on a drawing nobody could see.
+        ws.canvas_rect = None;
+        assert!(ws.takes_point(600.0, 400.0));
+        assert!(ws.takes_point(0.0, 0.0));
     }
 
     /// **A window you can see never loses a press to one you cannot.**
@@ -4877,6 +5092,270 @@ mod tests {
         assert!(!ws.undo(), "and there should be nothing else behind it");
     }
 
+    /// **Sizing a window and letting go over another one does not merge them.**
+    ///
+    /// A carry ends wherever the pointer is, because the window went with it. A *resize* does not:
+    /// the window stays where it is -- or shrinks away -- while the pointer travels, so the pointer
+    /// can leave it and end up over a neighbour. The release then re-parented every panel of the
+    /// window being sized into that neighbour and took the window down.
+    ///
+    /// Two shapes, because they leave the pointer behind for different reasons: an edge dragged
+    /// *inwards*, which shrinks the window away from the pointer, and a divider inside a window,
+    /// which does not move the window at all.
+    #[test]
+    fn sizing_a_window_over_another_does_not_merge_them() {
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        for divider in [false, true] {
+            let mut ws = bare();
+            ws.set_screen(screen);
+            ws.float(BRUSH);
+            ws.float(COLOUR);
+            ws.floating[0].rect = Rect::new(700.0, 200.0, 400.0, 400.0);
+            ws.floating[1].rect = Rect::new(60.0, 200.0, 400.0, 400.0);
+            let (right, left) = (ws.floating[0].id, ws.floating[1].id);
+
+            if divider {
+                // Split the right window, so it has a divider of its own. Its third panel comes
+                // from the arrangement, floated for the purpose.
+                ws.float(HISTORY);
+                ws.floating[2].rect = Rect::new(700.0, 700.0, 200.0, 150.0);
+                let spare = ws.floating[2].id;
+                let mut hand = Hand::new(&mut ws, screen);
+                let grab = hand.tab_of(spare);
+                let onto = hand.rect_of(right);
+                hand.drag(grab, (onto.x + 8.0, onto.y + onto.h / 2.0));
+                assert_eq!(
+                    ws.floating.len(),
+                    2,
+                    "the edge drop should have merged them"
+                );
+            }
+
+            let onto = ws
+                .rect_of(Surface::Floating(left))
+                .expect("the other window");
+            let mid = (onto.x + onto.w / 2.0, onto.y + onto.h / 2.0);
+            let before = ws.rect_of(Surface::Floating(right)).expect("it");
+
+            let at = if divider {
+                let area = ws.area_of(Surface::Floating(right)).expect("the window");
+                let seam = ws
+                    .layout_of(Surface::Floating(right))
+                    .expect("its arrangement")
+                    .splitters(area, ws.theme.metrics.splitter_grab)
+                    .first()
+                    .cloned()
+                    .expect("a divider inside it");
+                (
+                    seam.rect.x + seam.rect.w / 2.0,
+                    seam.rect.y + seam.rect.h / 2.0,
+                )
+            } else {
+                // Its *right* edge, dragged left: the window shrinks away from the pointer rather
+                // than following it, so the pointer ends up somewhere the window is not.
+                (before.x + before.w, before.y + before.h / 2.0)
+            };
+
+            let mut hand = Hand::new(&mut ws, screen);
+            hand.drag(at, mid);
+
+            assert_eq!(
+                ws.floating.len(),
+                2,
+                "sizing a window over another merged them (divider: {divider})"
+            );
+            assert!(
+                ws.floating.iter().any(|f| f.id == right),
+                "the window being sized was destroyed (divider: {divider})"
+            );
+            assert!(ws.floating.iter().any(|f| f.id == left));
+            if divider {
+                assert_eq!(
+                    ws.rect_of(Surface::Floating(right)),
+                    Some(before),
+                    "dragging its divider resized the window"
+                );
+            }
+        }
+    }
+
+    /// **Undo then redo during a pick does not leave the panel nowhere.**
+    ///
+    /// `undo` used to sample the present *before* the pick gave way -- and during a pick the
+    /// present is the arrangement with the picked panel taken out, a state the artist never
+    /// committed. Redoing went straight back into it, with the panel in neither tree and no pick to
+    /// put it anywhere.
+    #[test]
+    fn undo_and_redo_during_a_pick_lose_nothing() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.screen = screen;
+        let whole = ws.snapshot();
+
+        ws.hide(LAYERS);
+        let without = ws.snapshot();
+        ws.start_placing(BRUSH);
+
+        assert!(ws.undo(), "there is a change to take back");
+        assert_eq!(ws.placing(), None, "the pick should have given way");
+        assert_eq!(ws.snapshot(), whole, "undo did not go back to where it was");
+
+        assert!(ws.redo(), "and forward again");
+        assert_eq!(
+            ws.snapshot(),
+            without,
+            "redo landed in a state that was never committed"
+        );
+        assert!(ws.is_open(BRUSH), "the panel was left in neither tree");
+    }
+
+    /// **A panel that cannot float cannot be picked into a floating window.**
+    ///
+    /// Not a rule about canvases: the canvas is drawn by the GPU *underneath* egui, so a window's
+    /// own background is painted straight over the artwork. A floating canvas is a window with
+    /// nothing in it and a workspace with no drawing -- and, with no *Float* in its settings, no
+    /// "Put back into..." either, so no way out.
+    #[test]
+    fn a_panel_that_cannot_float_is_not_offered_a_window() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.screen = screen;
+        ws.float(COLOUR);
+        ws.floating[0].rect = Rect::new(600.0, 300.0, 320.0, 320.0);
+        let window = ws.floating[0].rect;
+        let mid = (window.x + window.w / 2.0, window.y + window.h / 2.0);
+
+        ws.start_placing(CANVAS);
+        assert!(
+            !ws.place_at(mid.0, mid.1),
+            "the window took a panel that cannot float"
+        );
+        assert!(
+            ws.is_docked(CANVAS),
+            "and the pick put it back where it was"
+        );
+        assert!(!ws.is_floating(CANVAS));
+
+        // Nor by asking directly.
+        ws.float(CANVAS);
+        assert!(!ws.is_floating(CANVAS), "floating it was not refused");
+
+        // And a panel that *can* float still lands there, so this is not simply refusing windows.
+        ws.start_placing(LAYERS);
+        assert!(ws.place_at(mid.0, mid.1));
+        assert!(ws.is_floating(LAYERS));
+    }
+
+    /// **Visible chrome beats a window's invisible outer border.**
+    ///
+    /// The border straddles the window's edge, so its outer half lies over whatever is behind. Over
+    /// the canvas that is right -- the window is on top there. Over a docked panel's *tab* it is
+    /// not: the tab is what you can see, and it was becoming unpressable within thirteen units of
+    /// a window nobody was aiming at.
+    #[test]
+    fn a_docked_tab_beats_a_windows_outer_border() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.screen = screen;
+
+        // A docked tab, and where its middle is.
+        let m = ws.theme.metrics;
+        let slot = ws
+            .layout
+            .resolve(screen)
+            .into_iter()
+            .find(|p| p.tabs.contains(&LAYERS))
+            .expect("layers is docked");
+        let c = crate::chrome::panel(&slot, &m, style_of(&slot), Along::Down, |_| 46.0);
+        let index = slot
+            .tabs
+            .iter()
+            .position(|p| *p == LAYERS)
+            .expect("its tab");
+        let tab = c.tabs[index].rect;
+        let at = (tab.x + tab.w / 2.0, tab.y + tab.h / 2.0);
+
+        // A window whose top edge sits just below that tab, so its border reaches up over it.
+        ws.float(BRUSH);
+        let window = Rect::new(tab.x - 40.0, at.1 + 8.0, 300.0, 300.0);
+        ws.floating[0].rect = window;
+        assert!(
+            !window.contains(at.0, at.1),
+            "the tab should be outside the window"
+        );
+        let before = ws.floating[0].rect;
+
+        let mut hand = Hand::new(&mut ws, screen);
+        hand.press(at);
+        hand.release(at);
+
+        assert_eq!(
+            ws.floating[0].rect, before,
+            "pressing a docked tab resized the window whose border reached over it"
+        );
+        assert_eq!(
+            showing_of(
+                &ws.layout
+                    .resolve(screen)
+                    .into_iter()
+                    .find(|p| p.tabs.contains(&LAYERS))
+                    .expect("layers")
+            ),
+            LAYERS,
+            "and the tap should have shown that tab"
+        );
+    }
+
+    /// A window carried by its tab keeps the position it was let go at.
+    ///
+    /// The release carries a position of its own and it is the last one there is. The frame and the
+    /// edge were given it; a tab, which carries the window just as surely, was not.
+    #[test]
+    fn a_window_carried_by_its_tab_lands_where_it_was_let_go() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.screen = screen;
+        ws.float(BRUSH);
+        ws.floating[0].rect = Rect::new(200.0, 200.0, 300.0, 300.0);
+        let id = ws.floating[0].id;
+
+        let mut hand = Hand::new(&mut ws, screen);
+        let grab = hand.tab_of(id);
+        hand.drag_letting_go_at(grab, (700.0, 600.0), (900.0, 300.0));
+
+        let got = ws.floating[0].rect;
+        // The grip is kept, so the point that took hold of it is still under the pointer.
+        let held = (grab.0 - 200.0, grab.1 - 200.0);
+        assert!(
+            (got.x + held.0 - 900.0).abs() < 1.0 && (got.y + held.1 - 300.0).abs() < 1.0,
+            "the window stopped where the last move frame was, not where it was let go: {got:?}"
+        );
+    }
+
+    /// **A window is brought back within reach when the screen shrinks under it.**
+    ///
+    /// Moving one is clamped and sizing one is clamped, but the screen can move instead of the
+    /// window: park one near the right edge of a wide display and open the file on a narrow one.
+    #[test]
+    fn a_window_is_brought_back_when_the_screen_shrinks() {
+        let mut ws = bare();
+        let wide = Rect::new(0.0, 0.0, 2560.0, 1440.0);
+        ws.screen = wide;
+        ws.float(BRUSH);
+        ws.floating[0].rect = Rect::new(2300.0, 1200.0, 300.0, 200.0);
+
+        let narrow = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let mut hand = Hand::new(&mut ws, narrow);
+        hand.frame((10.0, 10.0), false, false, false);
+
+        let keep = least_window(&ws.theme.metrics);
+        let got = ws.floating[0].rect;
+        assert!(
+            got.x <= narrow.w - keep && got.y <= narrow.h - keep && got.y >= narrow.y,
+            "the window was stranded off the smaller screen: {got:?}"
+        );
+    }
+
     /// **One window at a time.** After moving one, moving another must move *that* one.
     ///
     /// Reported as "sometimes after moving a tab, then trying to move another tab moves the first
@@ -4898,6 +5377,7 @@ mod tests {
         let a_after = hand.rect_of(a);
 
         // Now the second.
+        let before_b = hand.rect_of(b);
         let grab = hand.tab_of(b);
         hand.drag(grab, (300.0, 700.0));
 
@@ -4906,9 +5386,12 @@ mod tests {
             a_after,
             "moving the second window moved the first"
         );
+        // Where the grip says it should be, not merely nearby: a loose tolerance here would let
+        // a grip regression of a header and a half through.
         let moved = hand.rect_of(b);
         assert!(
-            (moved.y - 700.0).abs() < 60.0,
+            (moved.y + (grab.1 - before_b.y) - 700.0).abs() < 1.0
+                && (moved.x + (grab.0 - before_b.x) - 300.0).abs() < 1.0,
             "the second window did not go where it was put: {moved:?}"
         );
     }
@@ -6114,7 +6597,7 @@ mod tests {
             |_, _| unreachable!("only a press asks what is under the pointer"),
         );
         assert!(
-            ws.drag.armed(),
+            ws.drag.active(),
             "the press should have taken hold of the panel at once"
         );
         // Frame 3: carried over the canvas.
@@ -6578,7 +7061,7 @@ mod tests {
         drag.press(&layout, &target, px, py, 0.0);
         // Held still past the hold, which is what arms it.
         drag.drag(&mut layout, screen, px, py, 1.0);
-        assert!(drag.armed(), "the hold should have armed the move");
+        assert!(drag.active(), "the hold should have armed the move");
 
         // Onto the far side of the canvas, which is a different leaf.
         let canvas = layout

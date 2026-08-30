@@ -173,6 +173,13 @@ While a pick is waiting:
   somewhere arbitrary. Cancelling a *Put back into* leaves the window floating exactly where it
   was; cancelling an enable leaves the panel off.
 
+**Not everything can go everywhere.** A panel may only be put into a floating window if its own
+settings offer *Float* — the same table decides both, so the button and the pick cannot disagree.
+The canvas is the one that says no, and the reason is not a rule about canvases: it is drawn by the
+GPU *underneath* egui, so a window's own background would be painted straight over the artwork.
+Pointing at a window with such a panel in the air is pointing at nothing, and the press puts it
+back.
+
 One pick is waiting at a time. Starting another replaces it, and **any change to the arrangement
 underneath ends it** — undo, reset, floating something else. The way back is a snapshot of the
 arrangement the panel came out of, and a snapshot of an arrangement that has since changed is not
@@ -202,3 +209,27 @@ worse than either rule applied consistently.
 
 Escape and a lost pointer put back the **whole** arrangement, floating windows and their sizes
 included — not just the tree the drag was told about.
+
+## Carrying and sizing are not the same gesture
+
+A window that is **carried** goes where the pointer goes, so where the pointer ends is where the
+window ends, and letting go over another window merges the two. A window that is **sized** does
+not: it stays where it is, or shrinks away, while the pointer travels — so the pointer can leave it
+entirely. Only a carry can merge. Getting this wrong meant sizing a window down and letting go over
+its neighbour destroyed the one being sized.
+
+The same is true of a divider *inside* a window, which moves neither the window nor the pointer's
+relationship to it.
+
+## Reach, and what beats it
+
+Three targets are deliberately wider than they look, and where two of them overlap the rule is
+always the same: **the one you can see wins.**
+
+- A tab beats a divider where they meet.
+- A header beats a window's resize border where they meet.
+- A window's rectangle beats another window's border.
+- Visible chrome in the arrangement beats a window's border reaching out over it.
+
+A window's border reaching over the *canvas* is the one case with nothing to lose to, and there it
+keeps its full reach — which is why the wheel and the pen treat that ring as the window's too.
