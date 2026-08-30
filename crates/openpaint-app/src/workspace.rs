@@ -31,7 +31,8 @@ use crate::chrome::{self, HeaderStyle};
 use crate::layout::{Layout, LayoutHistory, PanelId, Rect, Zone};
 use crate::panel_drag::{Held, Outcome, PanelDrag, Preview};
 use crate::panel_ui::Direction;
-use crate::theme::{Color, Theme};
+use crate::theme::{Color, Metrics, Theme};
+use serde::{Deserialize, Serialize};
 
 /// A panel the app can show.
 ///
@@ -137,12 +138,13 @@ fn layout_path() -> Option<std::path::PathBuf> {
 /// A missing file is the ordinary case. A broken one is reported and the default used, rather
 /// than opening into some half-parsed workspace — the same tolerance the brush library and the
 /// theme take with theirs.
-fn load_layout() -> Option<Layout> {
+fn load_layout() -> Option<(Layout, std::collections::HashMap<u32, PanelOptions>)> {
     let path = layout_path()?;
     let text = std::fs::read_to_string(&path).ok()?;
-    match serde_json::from_str::<crate::layout::SavedLayout>(&text) {
+    match serde_json::from_str::<SavedWorkspace>(&text) {
         Ok(saved) => {
-            let layout = Layout::from_saved(&saved, id_for);
+            let layout = Layout::from_saved(&saved.layout, id_for);
+            let options = options_from_saved(&saved.panels);
             // A file that resolved to nothing at all -- every panel in it renamed away, say --
             // would open into an empty window with no way back but a shortcut. The default is the
             // better answer, and it is not silent.
@@ -155,7 +157,7 @@ fn load_layout() -> Option<Layout> {
                 );
                 return None;
             }
-            Some(layout)
+            Some((layout, options))
         }
         Err(e) => {
             eprintln!(
@@ -185,26 +187,110 @@ pub struct Workspace {
     /// Reached with a secondary press anywhere, so it needs no panel to exist and no particular
     /// panel to be open. The Menu still offers it too, because a right-click is not discoverable
     /// on its own.
-    panel_list: Option<Rect>,
-    /// The list's own half-finished gesture, exactly like any other described panel's.
-    list_input: crate::panel_draw::PanelInput,
-    /// The list has been asked for from somewhere with no pointer position; open it next frame.
-    list_wanted: bool,
+    popup: Option<Popup>,
+    /// The popup's own half-finished gesture, exactly like any other described panel's.
+    popup_input: crate::panel_draw::PanelInput,
+    /// A popup has been asked for from somewhere with no pointer position; open it next frame.
+    popup_wanted: Option<PopupKind>,
+    /// What each panel has been set to, over and above the defaults in `PANELS`.
+    ///
+    /// Keyed by panel, which is per *instance* because a panel appears in the layout at most once
+    /// -- moving one that is already open moves it rather than making a second. Saved with the
+    /// arrangement, under the panel's name for the same reason the layout is (§ persistence).
+    options: std::collections::HashMap<u32, PanelOptions>,
+}
+
+/// What a floating list is showing.
+///
+/// **One mechanism, not one per thing that floats.** The panel list came first; panel settings
+/// want exactly the same object -- a described list, opened at a point, above everything, taking
+/// the pointer while it is up -- and building a second one would have meant two sets of rules
+/// about what closes it and what a press inside it means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopupKind {
+    /// Every panel this build has, with a switch each.
+    Panels,
+    /// One panel's own settings.
+    Settings(PanelId),
+}
+
+/// An open popup and where it is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Popup {
+    kind: PopupKind,
+    rect: Rect,
+}
+
+/// What a panel has been set to, over and above its defaults.
+///
+/// Every field is an override, so `None` means "whatever the panel table says" rather than a
+/// second copy of the default that would quietly stop tracking it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanelOptions {
+    /// Which way this panel's controls run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<Direction>,
 }
 
 impl Default for Workspace {
     fn default() -> Self {
+        // The arrangement and the settings come out of the same file together, because a setting
+        // belongs to a panel and the panels are the arrangement: loading one without the other
+        // would open a workspace half of which was somebody's and half of which was the default's.
+        let (layout, options) = load_layout().unwrap_or_else(|| (default_layout(), <_>::default()));
         Self {
-            layout: load_layout().unwrap_or_else(default_layout),
+            layout,
             history: LayoutHistory::default(),
             theme: load_theme().unwrap_or_default(),
             drag: PanelDrag::default(),
             canvas_rect: None,
-            panel_list: None,
-            list_input: crate::panel_draw::PanelInput::default(),
-            list_wanted: false,
+            popup: None,
+            popup_input: crate::panel_draw::PanelInput::default(),
+            popup_wanted: None,
+            options,
         }
     }
+}
+
+/// Panel settings on their way to disk: keyed by name, and only where something was actually set.
+///
+/// Its own function because a test can see it and cannot see a file being written --- the same
+/// split that made `saves` testable. A default is not written at all: a file full of "whatever the
+/// panel table says" would freeze today's defaults into every saved workspace.
+#[must_use]
+fn options_to_saved(
+    options: &std::collections::HashMap<u32, PanelOptions>,
+) -> std::collections::BTreeMap<String, PanelOptions> {
+    options
+        .iter()
+        .filter(|(_, o)| **o != PanelOptions::default())
+        .filter_map(|(id, o)| name_for(PanelId(*id)).map(|n| (n, *o)))
+        .collect()
+}
+
+/// Panel settings on their way back, dropping any name this build does not know.
+#[must_use]
+fn options_from_saved(
+    saved: &std::collections::BTreeMap<String, PanelOptions>,
+) -> std::collections::HashMap<u32, PanelOptions> {
+    saved
+        .iter()
+        .filter_map(|(name, o)| id_for(name).map(|id| (id.0, *o)))
+        .collect()
+}
+
+/// A workspace as it goes to disk: the arrangement, and what each panel has been set to.
+///
+/// Settings are keyed by panel **name** for the same reason the arrangement is: an id is whatever
+/// row a panel happens to occupy in the table, so a file full of them would silently hand one
+/// panel's settings to another the day a panel is added. A name this build does not know is
+/// dropped, because a workspace missing one setting beats a file that cannot be opened.
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedWorkspace {
+    #[serde(flatten)]
+    layout: crate::layout::SavedLayout,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    panels: std::collections::BTreeMap<String, PanelOptions>,
 }
 
 /// Where a hand-edited theme lives, beside the brush library.
@@ -287,7 +373,7 @@ impl Workspace {
     pub fn busy(&self) -> bool {
         // The open panel list counts: it floats over whatever is beneath, including the canvas,
         // and a press meant for it must not also start a stroke.
-        self.drag.armed() || self.panel_list.is_some()
+        self.drag.armed() || self.popup.is_some()
     }
 
     /// Abandon a panel drag without applying it.
@@ -295,9 +381,9 @@ impl Workspace {
     /// Escape, and the same promise a transform makes (§5e): a gesture you have thought better of
     /// costs nothing, because nothing has happened to the layout until you let go.
     pub fn cancel_drag(&mut self) -> bool {
-        let was = self.drag.active() || self.panel_list.is_some();
+        let was = self.drag.active() || self.popup.is_some();
         self.drag.cancel(&mut self.layout);
-        self.panel_list = None;
+        self.popup = None;
         was
     }
 
@@ -344,7 +430,10 @@ impl Workspace {
         let Some(path) = layout_path() else {
             return;
         };
-        let saved = self.layout.to_saved(name_for);
+        let saved = SavedWorkspace {
+            layout: self.layout.to_saved(name_for),
+            panels: options_to_saved(&self.options),
+        };
         match serde_json::to_string_pretty(&saved)
             .map_err(|e| e.to_string())
             .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()))
@@ -443,7 +532,7 @@ impl Workspace {
         &mut self,
         ctx: &egui::Context,
         screen: Rect,
-        mut contents: impl FnMut(PanelId, &mut egui::Ui),
+        mut contents: impl FnMut(PanelId, &mut egui::Ui, Direction),
     ) {
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Background,
@@ -481,28 +570,37 @@ impl Workspace {
         // The panel list: opened by a secondary press anywhere, closed by a primary press outside
         // it. Anywhere, because it must not depend on any panel being open -- least of all the one
         // it used to live in.
-        if std::mem::take(&mut self.list_wanted) {
+        if let Some(kind) = self.popup_wanted.take() {
             // Centred, because a request with no pointer behind it has nowhere better to go.
-            let mid = self.list_rect(
+            let mid = self.popup_rect(ctx, kind, screen.x, screen.y, screen);
+            self.open_popup_at(
                 ctx,
-                screen.x + screen.w / 2.0,
-                screen.y + screen.h / 2.0,
+                kind,
+                (screen.w - mid.w) / 2.0,
+                (screen.h - mid.h) / 2.0,
                 screen,
             );
-            self.panel_list =
-                Some(self.list_rect(ctx, mid.x - mid.w / 2.0, mid.y - mid.h / 2.0, screen));
         }
+        // A secondary press asks whatever is under the pointer what it offers: a panel's header
+        // offers that panel's settings, anything else offers the workspace's own list of panels.
+        // One rule, and the answer depends on what you pressed.
         if ctx.input(|i| i.pointer.secondary_pressed()) {
             if let Some(pos) = pointer {
-                self.panel_list = Some(self.list_rect(ctx, pos.x, pos.y, screen));
+                let kind = header_under(&placed, &m, pos.x, pos.y)
+                    .map_or(PopupKind::Panels, PopupKind::Settings);
+                self.open_popup_at(ctx, kind, pos.x, pos.y, screen);
             }
         }
-        let on_list = list_press(self.panel_list, pressed, pointer.map(|q| (q.x, q.y)));
-        if on_list == ListPress::Close {
-            self.panel_list = None;
+        let on_popup = popup_press(
+            self.popup.map(|p| p.rect),
+            pressed,
+            pointer.map(|q| (q.x, q.y)),
+        );
+        if on_popup == PopupPress::Close {
+            self.popup = None;
         }
 
-        let preview = if on_list == ListPress::Consume {
+        let preview = if on_popup == PopupPress::Consume {
             // The list owns this press. A drag already in flight still gets its release, which is
             // why only the press is withheld and not the whole frame.
             None
@@ -649,7 +747,9 @@ impl Workspace {
             // Contents are clipped to their own panel, so a list too long for its slot cannot
             // draw over the panel beside it.
             ui.set_clip_rect(content);
-            contents(showing, &mut ui);
+            // The direction is worked out here and handed over, because the panel that wants it
+            // runs inside a borrow of the workspace that holds the setting.
+            contents(showing, &mut ui, self.direction_of(showing));
         }
 
         // --- the wait, drawn on the thing being held ---
@@ -786,23 +886,23 @@ impl Workspace {
             }
         }
 
-        // --- the panel list, above everything, drawn by the same descriptor layer as any panel ---
-        if let Some(rect) = self.panel_list {
-            let controls = panel_list_controls(self);
+        // --- the popup, above everything, drawn by the same descriptor layer as any panel ---
+        if let Some(popup) = self.popup {
+            let controls = self.popup_controls(popup.kind);
             let theme = self.theme;
             let mut ui = egui::Ui::new(
                 ctx.clone(),
-                egui::LayerId::new(egui::Order::Foreground, egui::Id::new("panel-list")),
-                egui::Id::new("panel-list-ui"),
-                // The list draws its own frame, so it owns its own padding: `chrome` is not
+                egui::LayerId::new(egui::Order::Foreground, egui::Id::new("workspace-popup")),
+                egui::Id::new("workspace-popup-ui"),
+                // A popup draws its own frame, so it owns its own padding: `chrome` is not
                 // involved, and the renderer does not add any.
-                egui::UiBuilder::new().max_rect(to_egui(inset(rect, m.padding))),
+                egui::UiBuilder::new().max_rect(to_egui(inset(popup.rect, m.padding))),
             );
-            ui.set_clip_rect(to_egui(rect));
+            ui.set_clip_rect(to_egui(popup.rect));
             let frame = ui.painter();
-            frame.rect_filled(to_egui(rect), m.radius, rgb(p.panel));
+            frame.rect_filled(to_egui(popup.rect), m.radius, rgb(p.panel));
             frame.rect_stroke(
-                to_egui(rect),
+                to_egui(popup.rect),
                 m.radius,
                 egui::Stroke::new(1.0_f32, rgb(p.edge)),
             );
@@ -811,17 +911,67 @@ impl Workspace {
                 &controls,
                 &theme,
                 Direction::Column,
-                &mut self.list_input,
+                &mut self.popup_input,
             );
             for change in changes {
-                match change {
-                    // The list stays open on a toggle: showing three panels should be three taps,
-                    // not three right-clicks.
-                    crate::panel_ui::Change::Toggled(id, _) => self.toggle(PanelId(id)),
-                    other => eprintln!("panel list: unexpected {other:?}"),
-                }
+                self.apply_popup(popup.kind, change);
             }
         }
+    }
+
+    /// The controls a popup is showing.
+    #[must_use]
+    fn popup_controls(&self, kind: PopupKind) -> Vec<crate::panel_ui::Control> {
+        use crate::panel_ui::Control;
+        match kind {
+            PopupKind::Panels => panel_list_controls(self),
+            PopupKind::Settings(panel) => {
+                let mut controls = vec![Control::Label {
+                    text: format!("{} settings", name_of(panel)),
+                }];
+                let current = self.direction_of(panel);
+                controls.extend(DIRECTIONS.iter().map(|(id, name, d)| Control::Choice {
+                    id: *id,
+                    text: (*name).to_owned(),
+                    selected: current == *d,
+                }));
+                controls
+            }
+        }
+    }
+
+    /// Act on something the artist changed in a popup.
+    fn apply_popup(&mut self, kind: PopupKind, change: crate::panel_ui::Change) {
+        use crate::panel_ui::Change;
+        match (kind, change) {
+            // The list stays open on a toggle: showing three panels should be three taps, not
+            // three right-clicks.
+            (PopupKind::Panels, Change::Toggled(id, _)) => self.toggle(PanelId(id)),
+            (PopupKind::Settings(panel), Change::Chose(id)) => {
+                if let Some((_, _, d)) = DIRECTIONS.iter().find(|(i, _, _)| *i == id) {
+                    self.set_direction(panel, *d);
+                }
+            }
+            (_, other) => eprintln!("popup {kind:?}: unexpected {other:?}"),
+        }
+    }
+
+    /// Which way a panel's controls run: what it has been set to, or what its kind defaults to.
+    ///
+    /// **The override is per panel, and a panel appears in the layout at most once**, so this is
+    /// per instance without needing instance identity invented for it.
+    #[must_use]
+    pub fn direction_of(&self, panel: PanelId) -> Direction {
+        self.options
+            .get(&panel.0)
+            .and_then(|o| o.direction)
+            .unwrap_or_else(|| default_direction(panel))
+    }
+
+    /// Set which way a panel's controls run, and remember it.
+    pub fn set_direction(&mut self, panel: PanelId, direction: Direction) {
+        self.options.entry(panel.0).or_default().direction = Some(direction);
+        self.remember();
     }
 
     /// Ask for the panel list without saying where.
@@ -830,44 +980,49 @@ impl Workspace {
     /// open it at, and no window to measure against until the next frame begins. So it is a
     /// request, honoured at the top of `show`.
     pub fn open_panel_list(&mut self) {
-        self.list_wanted = true;
+        self.popup_wanted = Some(PopupKind::Panels);
     }
 
-    /// Where the panel list goes when it is opened at a point.
+    /// Open a popup at a point, sized to its own contents and kept inside the window.
     ///
-    /// Sized to its own contents and kept inside the window, so opening it near an edge does not
-    /// put half of it out of reach.
-    fn list_rect(&self, ctx: &egui::Context, x: f32, y: f32, screen: Rect) -> Rect {
+    /// Opening one near an edge must not put half of it out of reach, and a popup that had to be
+    /// dragged back into view would be a worse problem than the one it solves.
+    fn open_popup_at(
+        &mut self,
+        ctx: &egui::Context,
+        kind: PopupKind,
+        x: f32,
+        y: f32,
+        screen: Rect,
+    ) {
+        self.popup = Some(Popup {
+            kind,
+            rect: self.popup_rect(ctx, kind, x, y, screen),
+        });
+        // A fresh popup starts unscrolled and holding nothing, or it would open part-way down a
+        // list it has never shown before.
+        self.popup_input = crate::panel_draw::PanelInput::default();
+    }
+
+    fn popup_rect(
+        &self,
+        ctx: &egui::Context,
+        kind: PopupKind,
+        x: f32,
+        y: f32,
+        screen: Rect,
+    ) -> Rect {
         let m = self.theme.metrics;
-        let controls = panel_list_controls(self);
-        let widest = PANELS
-            .iter()
-            .map(|k| {
-                ctx.fonts(|f| {
-                    f.layout_no_wrap(
-                        k.name.to_owned(),
-                        egui::FontId::proportional(m.body),
-                        egui::Color32::WHITE,
-                    )
-                    .size()
-                    .x
-                })
-            })
-            .fold(0.0_f32, f32::max);
-        // Room for the name, the switch beside it, and the padding either side.
+        let controls = self.popup_controls(kind);
+        let text_of = |c: &crate::panel_ui::Control| crate::panel_draw::text_width(ctx, m.body, c);
+        let widest = controls.iter().map(&text_of).fold(0.0_f32, f32::max);
+        // Room for the widest label, whatever sits beside it, and the padding either side.
         let w = (widest + m.row * 1.6 + m.padding * 4.0).min(screen.w);
-        // Measured from where the switches actually land, not from a second sum of the same
+        // Measured from where the controls actually land, not from a second sum of the same
         // heights that could drift out of step with the first.
-        let laid = crate::panel_ui::place(
-            &controls,
-            Rect::new(0.0, 0.0, w, screen.h),
-            &m,
-            Direction::Column,
-            |_| 0.0,
-        );
-        let h = (crate::panel_ui::extent(&laid, Rect::new(0.0, 0.0, w, screen.h)).1
-            + m.padding * 2.0)
-            .min(screen.h);
+        let origin = Rect::new(0.0, 0.0, w - m.padding * 2.0, screen.h);
+        let laid = crate::panel_ui::place(&controls, origin, &m, Direction::Column, text_of);
+        let h = (crate::panel_ui::extent(&laid, origin).1 + m.padding * 2.0).min(screen.h);
         Rect::new(
             x.min(screen.x + screen.w - w).max(screen.x),
             y.min(screen.y + screen.h - h).max(screen.y),
@@ -919,6 +1074,9 @@ impl Workspace {
                         // (DECISIONS 6b).
                         self.open(panel);
                     }
+                    Outcome::Settings(panel) => {
+                        self.popup_wanted = Some(PopupKind::Settings(panel))
+                    }
                     Outcome::Moved | Outcome::Resized | Outcome::Nothing | Outcome::Switched => {}
                 }
                 None
@@ -932,14 +1090,14 @@ impl Workspace {
     }
 }
 
-/// What a primary press does to the panel list.
+/// What a primary press does to an open popup.
 ///
 /// Its own answer because it is three rules that have to agree, and burying them in a frame is
 /// how the release bug happened: a press *inside* the list must reach the list and must not also
 /// close it or start a panel drag; a press outside must close it; and with no list open there is
 /// nothing to decide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ListPress {
+enum PopupPress {
     /// Nothing to do with the list.
     Ignore,
     /// Put the list away.
@@ -949,24 +1107,51 @@ enum ListPress {
 }
 
 #[must_use]
-fn list_press(list: Option<Rect>, pressed: bool, at: Option<(f32, f32)>) -> ListPress {
+fn popup_press(popup: Option<Rect>, pressed: bool, at: Option<(f32, f32)>) -> PopupPress {
     if !pressed {
-        return ListPress::Ignore;
+        return PopupPress::Ignore;
     }
-    match (list, at) {
-        (Some(r), Some((x, y))) if r.contains(x, y) => ListPress::Consume,
-        (Some(_), _) => ListPress::Close,
-        (None, _) => ListPress::Ignore,
+    match (popup, at) {
+        (Some(r), Some((x, y))) if r.contains(x, y) => PopupPress::Consume,
+        (Some(_), _) => PopupPress::Close,
+        (None, _) => PopupPress::Ignore,
     }
 }
 
-/// Which way a panel's controls run.
+/// Which way a panel's controls run *unless the artist has said otherwise*.
 ///
 /// From the panel table, so nothing branches on which panel it is holding: the answer is a column
-/// in the table, and a panel added tomorrow brings its own.
+/// in the table, and a panel added tomorrow brings its own. See [`Workspace::direction_of`] for
+/// the answer that takes the setting into account.
 #[must_use]
-pub fn direction_of(panel: PanelId) -> Direction {
+fn default_direction(panel: PanelId) -> Direction {
     kind(panel).map_or(Direction::Column, |k| k.direction)
+}
+
+/// The directions a panel can be set to, with the ids its settings popup uses.
+///
+/// One table, so the switches offered and the setting applied cannot come apart (§11a.8), and so
+/// a direction added later appears in every panel's settings without anyone remembering to.
+const DIRECTIONS: &[(u32, &str, Direction)] = &[
+    (0, "Across", Direction::Row),
+    (1, "Down", Direction::Column),
+    (2, "Whichever fits", Direction::Auto),
+    (3, "Across, wrapping", Direction::Wrap),
+];
+
+/// Which panel's header is under a point, if any.
+///
+/// A header is a panel's handle: it is what you hold to move it, and what you press to ask what it
+/// offers. Anything else belongs to the workspace rather than to a panel.
+#[must_use]
+fn header_under(placed: &[crate::layout::Placed], m: &Metrics, x: f32, y: f32) -> Option<PanelId> {
+    placed.iter().find_map(|slot| {
+        let c = chrome::panel(slot, m, style_of(slot), |_| 0.0);
+        c.header
+            .contains(x, y)
+            .then(|| slot.tabs.get(slot.active).copied())
+            .flatten()
+    })
 }
 
 /// The panel list: one switch per panel this build knows about.
@@ -998,7 +1183,8 @@ fn panel_list_controls(ws: &Workspace) -> Vec<crate::panel_ui::Control> {
 fn saves(outcome: &Outcome) -> bool {
     match outcome {
         Outcome::Moved | Outcome::Resized | Outcome::Floated(_) => true,
-        Outcome::Nothing | Outcome::Switched => false,
+        // Asking a panel what it offers has not changed anything yet.
+        Outcome::Nothing | Outcome::Switched | Outcome::Settings(_) => false,
     }
 }
 
@@ -1092,9 +1278,10 @@ mod tests {
             theme: crate::theme::Theme::default(),
             drag: crate::panel_drag::PanelDrag::default(),
             canvas_rect: None,
-            panel_list: None,
-            list_input: crate::panel_draw::PanelInput::default(),
-            list_wanted: false,
+            popup: None,
+            popup_input: crate::panel_draw::PanelInput::default(),
+            popup_wanted: None,
+            options: std::collections::HashMap::new(),
         }
     }
 
@@ -1107,24 +1294,24 @@ mod tests {
     fn a_press_inside_the_panel_list_is_the_lists_own() {
         let r = Rect::new(100.0, 100.0, 200.0, 300.0);
         assert_eq!(
-            list_press(Some(r), true, Some((150.0, 150.0))),
-            ListPress::Consume
+            popup_press(Some(r), true, Some((150.0, 150.0))),
+            PopupPress::Consume
         );
         // Outside puts it away.
         assert_eq!(
-            list_press(Some(r), true, Some((50.0, 50.0))),
-            ListPress::Close
+            popup_press(Some(r), true, Some((50.0, 50.0))),
+            PopupPress::Close
         );
         // A press with the pointer nowhere is still a press somewhere else.
-        assert_eq!(list_press(Some(r), true, None), ListPress::Close);
+        assert_eq!(popup_press(Some(r), true, None), PopupPress::Close);
         // Hovering over it decides nothing.
         assert_eq!(
-            list_press(Some(r), false, Some((150.0, 150.0))),
-            ListPress::Ignore
+            popup_press(Some(r), false, Some((150.0, 150.0))),
+            PopupPress::Ignore
         );
         assert_eq!(
-            list_press(None, true, Some((150.0, 150.0))),
-            ListPress::Ignore
+            popup_press(None, true, Some((150.0, 150.0))),
+            PopupPress::Ignore
         );
     }
 
@@ -1134,13 +1321,239 @@ mod tests {
     fn an_open_panel_list_holds_the_pointer() {
         let mut ws = bare();
         assert!(!ws.busy(), "nothing is happening yet");
-        ws.panel_list = Some(Rect::new(10.0, 10.0, 200.0, 300.0));
+        ws.popup = Some(Popup {
+            kind: PopupKind::Panels,
+            rect: Rect::new(10.0, 10.0, 200.0, 300.0),
+        });
         assert!(
             ws.busy(),
             "a press meant for the list must not reach the canvas"
         );
         ws.cancel_drag();
         assert!(!ws.busy(), "and Escape puts it away");
+    }
+
+    /// Every direction a panel can be in is offered by its settings.
+    ///
+    /// Named here rather than read out of `DIRECTIONS`, because a test that takes its expectations
+    /// from the table it is checking passes whatever the table says --- including a table with a
+    /// direction quietly missing from it. The match is exhaustive, so adding a direction without
+    /// offering it stops compiling rather than shipping.
+    #[test]
+    fn every_direction_a_panel_can_be_in_is_offered() {
+        for d in [
+            Direction::Row,
+            Direction::Column,
+            Direction::Auto,
+            Direction::Wrap,
+        ] {
+            // Exhaustive on purpose: a new variant must be added here, which is the prompt to add
+            // it to `DIRECTIONS` too.
+            let known = match d {
+                Direction::Row | Direction::Column | Direction::Auto | Direction::Wrap => true,
+            };
+            assert!(known);
+            assert!(
+                DIRECTIONS.iter().any(|(_, _, offered)| *offered == d),
+                "{d:?} cannot be chosen from a panel's settings"
+            );
+        }
+        // And no direction is offered twice, which would put two switches on the same answer.
+        for (i, (id, _, d)) in DIRECTIONS.iter().enumerate() {
+            for (other_id, _, other) in DIRECTIONS.iter().skip(i + 1) {
+                assert_ne!(d, other, "offered twice");
+                assert_ne!(id, other_id, "two directions share an id");
+            }
+        }
+    }
+
+    /// Settings go to disk under panel *names*, and come back only for names this build knows.
+    ///
+    /// The same reason the arrangement does: an id is whatever row a panel occupies in the table,
+    /// so a file full of them would hand one panel's settings to another the day a panel is added.
+    #[test]
+    fn settings_are_written_by_name_and_read_back_by_name() {
+        let mut options = std::collections::HashMap::new();
+        options.insert(
+            LAYERS.0,
+            PanelOptions {
+                direction: Some(Direction::Row),
+            },
+        );
+        // A panel left at its defaults is not written at all, or the file would freeze today's
+        // defaults into every saved workspace.
+        options.insert(BRUSH.0, PanelOptions::default());
+
+        let saved = options_to_saved(&options);
+        assert_eq!(saved.keys().collect::<Vec<_>>(), vec!["Layers"]);
+        assert_eq!(
+            options_from_saved(&saved).get(&LAYERS.0).copied(),
+            options.get(&LAYERS.0).copied()
+        );
+
+        // A name this build does not know is dropped rather than becoming some other panel's.
+        let mut strange = std::collections::BTreeMap::new();
+        strange.insert(
+            "Sparkles".to_owned(),
+            PanelOptions {
+                direction: Some(Direction::Wrap),
+            },
+        );
+        assert!(options_from_saved(&strange).is_empty());
+    }
+
+    /// Settings survive a trip through the saved form, and are written under panel *names*.
+    ///
+    /// The same reason the arrangement is: an id is whatever row a panel occupies in the table, so
+    /// a file full of them would hand one panel's settings to another the day a panel is added.
+    #[test]
+    fn settings_round_trip_by_name() {
+        let saved = SavedWorkspace {
+            layout: default_layout().to_saved(name_for),
+            panels: [(
+                "Layers".to_owned(),
+                PanelOptions {
+                    direction: Some(Direction::Row),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let text = serde_json::to_string(&saved).expect("serialise");
+        assert!(
+            text.contains("Layers"),
+            "settings must be written by name, not by number: {text}"
+        );
+
+        let back: SavedWorkspace = serde_json::from_str(&text).expect("parse");
+        assert_eq!(back.panels, saved.panels);
+        assert_eq!(
+            back.layout, saved.layout,
+            "and the arrangement came with it"
+        );
+
+        // A name this build does not know is dropped rather than refusing the whole file.
+        let text = text.replace("Layers", "Sparkles");
+        let back: SavedWorkspace = serde_json::from_str(&text).expect("parse");
+        let options: std::collections::HashMap<u32, PanelOptions> = back
+            .panels
+            .iter()
+            .filter_map(|(n, o)| id_for(n).map(|id| (id.0, *o)))
+            .collect();
+        assert!(options.is_empty());
+    }
+
+    /// **A setting overrides its panel's default, and only for that panel.**
+    ///
+    /// This is what makes direction a setting rather than a decision somebody else made: the panel
+    /// table supplies a starting point, and what the artist chooses wins over it.
+    #[test]
+    fn a_panel_keeps_its_own_direction() {
+        let mut ws = bare();
+        assert_eq!(ws.direction_of(LAYERS), default_direction(LAYERS));
+
+        ws.set_direction(LAYERS, Direction::Row);
+        assert_eq!(ws.direction_of(LAYERS), Direction::Row);
+        // And nobody else moved.
+        for kind in PANELS {
+            if kind.id != LAYERS {
+                assert_eq!(
+                    ws.direction_of(kind.id),
+                    kind.direction,
+                    "{} was dragged along with it",
+                    kind.name
+                );
+            }
+        }
+    }
+
+    /// Holding a panel's header and letting go without moving asks it what it offers.
+    ///
+    /// The one gesture left over once "hold then move" means move, so it costs no pixels and every
+    /// panel has a header to press.
+    #[test]
+    fn holding_a_header_still_asks_the_panel_for_its_settings() {
+        use crate::panel_drag::{pulse, Target, HOLD_MS};
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let mut ws = bare();
+        let (path, _) = ws.layout.find(BRUSH).expect("brush");
+        let target = Target::Tab { path, tab: 0 };
+
+        ws.gesture(
+            screen,
+            pulse(true, false, true),
+            Some((10.0, 10.0)),
+            0.0,
+            |_, _| target.clone(),
+        );
+        for t in [1.0, 2.0] {
+            ws.gesture(
+                screen,
+                pulse(false, false, true),
+                Some((10.0, 10.0)),
+                HOLD_MS + t,
+                |_, _| unreachable!(),
+            );
+        }
+        ws.gesture(
+            screen,
+            pulse(false, true, false),
+            Some((10.0, 10.0)),
+            HOLD_MS + 3.0,
+            |_, _| unreachable!(),
+        );
+        assert_eq!(
+            ws.popup_wanted,
+            Some(PopupKind::Settings(BRUSH)),
+            "holding a header and letting go should ask the panel what it offers"
+        );
+    }
+
+    /// A settings popup offers every direction, and marks the one in force.
+    #[test]
+    fn the_settings_popup_offers_every_direction() {
+        let mut ws = bare();
+        ws.set_direction(LAYERS, Direction::Wrap);
+        let controls = ws.popup_controls(PopupKind::Settings(LAYERS));
+        for (id, name, _) in DIRECTIONS {
+            assert!(
+                controls.iter().any(|c| c.id() == Some(*id)),
+                "{name} is not offered"
+            );
+        }
+        let chosen: Vec<&str> = controls
+            .iter()
+            .filter_map(|c| match c {
+                crate::panel_ui::Control::Choice {
+                    text,
+                    selected: true,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            chosen,
+            vec!["Across, wrapping"],
+            "exactly one direction should read as chosen"
+        );
+    }
+
+    /// Choosing in the settings popup changes the panel it belongs to.
+    #[test]
+    fn choosing_in_the_settings_popup_sets_that_panel() {
+        let mut ws = bare();
+        let (id, _, direction) = DIRECTIONS[0];
+        ws.apply_popup(
+            PopupKind::Settings(HISTORY),
+            crate::panel_ui::Change::Chose(id),
+        );
+        assert_eq!(ws.direction_of(HISTORY), direction);
+        assert_eq!(
+            ws.direction_of(LAYERS),
+            default_direction(LAYERS),
+            "and only that panel"
+        );
     }
 
     /// **There is always a way back, from any state the artist can reach.**
@@ -1262,7 +1675,7 @@ mod tests {
     fn each_panel_brings_its_own_direction() {
         for kind in PANELS {
             assert_eq!(
-                direction_of(kind.id),
+                default_direction(kind.id),
                 kind.direction,
                 "{} lost its direction",
                 kind.name
@@ -1742,6 +2155,8 @@ mod tests {
         // Which tab you are looking at is not part of the arrangement, the same reason it is not
         // recorded for undo.
         assert!(!saves(&Outcome::Switched));
+        // Nor is asking a panel what it offers: nothing has changed until something is chosen.
+        assert!(!saves(&Outcome::Settings(BRUSH)));
     }
 
     /// Press where a pointer would land, wait out the hold, move to another panel, let go.

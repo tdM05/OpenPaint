@@ -90,6 +90,14 @@ pub enum Control {
         selected: bool,
         /// A colour chip at the start of the row, for a swatch or a layer thumbnail.
         swatch: Option<[u8; 3]>,
+        /// A switch at the end of the row, with its own id and its own answer.
+        ///
+        /// **A row can be worth more than one thing.** A layer wants to be chosen *and* shown or
+        /// hidden, and every paint application puts the eye on the row itself; a switch below the
+        /// list acting on "the current layer" makes hiding one a two-step job. Its own id, so a
+        /// press on the switch is a different answer from a press on the row -- which is the
+        /// whole point.
+        mark: Option<RowMark>,
     },
 }
 
@@ -141,6 +149,13 @@ impl Control {
             Self::Button { .. } | Self::Row { .. } => text + metrics.padding * 2.0,
         }
     }
+}
+
+/// A switch that lives at the end of a list row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowMark {
+    pub id: ControlId,
+    pub on: bool,
 }
 
 /// Which way a panel's controls run.
@@ -293,13 +308,46 @@ pub fn hit<'a>(placed: &[Placed<'a>], x: f32, y: f32) -> Option<(&'a Control, Re
         .map(|p| (p.control, p.rect))
 }
 
+/// Where a row's switch sits inside it, if it has one.
+///
+/// **One definition, used to draw it and to decide what a press means.** Drawn in one place and
+/// hit-tested in another, the two drift, and the symptom is a switch that does nothing along one
+/// edge -- which is indistinguishable from a control that is simply broken.
+#[must_use]
+pub fn mark_rect(row: Rect, metrics: &Metrics) -> Rect {
+    let w = metrics.row * 1.6;
+    let h = metrics.row * 0.6;
+    Rect::new(
+        row.x + row.w - w - metrics.padding * 0.5,
+        row.y + (row.h - h) / 2.0,
+        w,
+        h,
+    )
+}
+
 /// The change a press or drag at `x` produces on `control`.
 ///
 /// A slider maps the whole row's width, so its value follows the pointer wherever in the row it
 /// is — dragging from anywhere on the row works, which matters when the track itself is three
 /// units tall.
 #[must_use]
-pub fn change_at(control: &Control, rect: Rect, x: f32) -> Option<Change> {
+pub fn change_at(
+    control: &Control,
+    rect: Rect,
+    metrics: &Metrics,
+    x: f32,
+    y: f32,
+) -> Option<Change> {
+    // A row's switch is inside the row, so it is asked first: otherwise the row swallows every
+    // press and the switch is decoration.
+    if let Control::Row {
+        mark: Some(mark), ..
+    } = control
+    {
+        if mark_rect(rect, metrics).contains(x, y) {
+            return Some(Change::Toggled(mark.id, !mark.on));
+        }
+    }
     match control {
         Control::Button { id, .. } => Some(Change::Pressed(*id)),
         Control::Toggle { id, on, .. } => Some(Change::Toggled(*id, !on)),
@@ -485,7 +533,11 @@ mod tests {
     fn a_press_produces_the_obvious_change() {
         let controls = sliders();
         let placed = column(&controls);
-        let at = |i: usize, x: f32| change_at(placed[i].control, placed[i].rect, x);
+        let m = metrics();
+        let at = |i: usize, x: f32| {
+            let r = placed[i].rect;
+            change_at(placed[i].control, r, &m, x, r.y + r.h / 2.0)
+        };
 
         assert_eq!(at(4, 20.0), Some(Change::Toggled(3, true)));
         assert_eq!(at(5, 20.0), Some(Change::Pressed(4)));
@@ -770,6 +822,75 @@ mod tests {
                 "{direction:?}: the slider is not where it was drawn"
             );
         }
+    }
+
+    /// **A row's switch is its own answer.** A press on the switch shows or hides; a press
+    /// anywhere else on the row chooses it.
+    ///
+    /// Without the switch having its own target, hiding a layer meant selecting it first and then
+    /// finding a control below the list, which is two steps for something every paint application
+    /// does in one.
+    #[test]
+    fn a_rows_switch_answers_before_the_row_does() {
+        let m = metrics();
+        let rows = vec![Control::Row {
+            id: 7,
+            text: "Ink".to_owned(),
+            selected: false,
+            swatch: None,
+            mark: Some(RowMark { id: 107, on: true }),
+        }];
+        let laid = column(&rows);
+        let r = laid[0].rect;
+        let pill = mark_rect(r, &m);
+
+        assert_eq!(
+            change_at(
+                laid[0].control,
+                r,
+                &m,
+                pill.x + pill.w / 2.0,
+                pill.y + pill.h / 2.0
+            ),
+            Some(Change::Toggled(107, false)),
+            "a press on the switch flips it"
+        );
+        assert_eq!(
+            change_at(laid[0].control, r, &m, r.x + 4.0, r.y + r.h / 2.0),
+            Some(Change::Chose(7)),
+            "a press elsewhere on the row chooses the row"
+        );
+        // The switch is inside the row, so the row must not swallow it.
+        assert!(
+            pill.x >= r.x && pill.x + pill.w <= r.x + r.w,
+            "the switch should sit inside its row"
+        );
+    }
+
+    /// A row without a switch is just a row.
+    #[test]
+    fn a_row_with_no_switch_answers_everywhere() {
+        let m = metrics();
+        let rows = vec![Control::Row {
+            id: 7,
+            text: "Ink".to_owned(),
+            selected: false,
+            swatch: None,
+            mark: None,
+        }];
+        let laid = column(&rows);
+        let r = laid[0].rect;
+        let pill = mark_rect(r, &m);
+        assert_eq!(
+            change_at(
+                laid[0].control,
+                r,
+                &m,
+                pill.x + pill.w / 2.0,
+                pill.y + pill.h / 2.0
+            ),
+            Some(Change::Chose(7))
+        );
     }
 
     /// A list cannot be scrolled past its own end, and one that fits does not scroll at all.

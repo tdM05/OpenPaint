@@ -123,6 +123,8 @@ pub enum Outcome {
     /// Reported rather than performed: floating is a second [`Layout`] in a second window, and
     /// whose window that is belongs to the shell.
     Floated(PanelId),
+    /// A panel was held still and let go: it is being asked what it offers.
+    Settings(PanelId),
 }
 
 /// What a grab is for.
@@ -154,6 +156,11 @@ struct Grab {
     armed: bool,
     /// Set if the pointer wandered before arming, which abandons the gesture for good.
     strayed: bool,
+    /// Set if the pointer wandered *after* arming, which is what makes a hold into a drag.
+    ///
+    /// The difference matters because holding still and letting go is its own gesture: it is how a
+    /// panel is asked what it offers, with no button spending pixels on the question.
+    moved: bool,
     /// Where the pointer was last, for the incremental divider drag.
     last: (f32, f32),
     /// The arrangement as it stood when the gesture began.
@@ -230,6 +237,7 @@ impl PanelDrag {
             press_ms: now_ms,
             armed: false,
             strayed: false,
+            moved: false,
             last: (x, y),
             before: layout.clone(),
         });
@@ -279,7 +287,11 @@ impl PanelDrag {
             // Movement counts from *here*, not from the press: the pointer drifts a few units
             // during the hold, and counting that would make everything jump the instant it arms.
             grab.last = (x, y);
+            grab.press = (x, y);
         }
+        // Whether this hold has become a drag. Latched, because a panel carried out and brought
+        // back is still a drag and must not be mistaken for a question.
+        grab.moved = grab.moved || (x - grab.press.0).hypot(y - grab.press.1) >= SLOP;
 
         match &grab.kind {
             Kind::Splitter { path, index, axis } => {
@@ -350,6 +362,15 @@ impl PanelDrag {
                 }
                 history.record(grab.before);
                 Outcome::Resized
+            }
+            Kind::Tab { panel, .. } if !grab.moved => {
+                // **Held, and let go without moving.** The hold has already armed, so this is a
+                // deliberate press-and-wait rather than a tap -- and it is the one gesture left
+                // over once "hold then move" means move. So it asks the panel what it offers.
+                //
+                // Every panel has a header, always, so there is no panel this cannot reach: which
+                // is the mistake that once put the panel list inside a closable menu.
+                Outcome::Settings(panel)
             }
             Kind::Tab { panel, .. } => {
                 let Some(placed) = layout.leaf_at(area, x, y) else {
@@ -497,6 +518,17 @@ mod tests {
     /// Hold still until it arms, which every gesture now has to do.
     fn arm(d: &mut PanelDrag, l: &mut Layout, x: f32, y: f32) {
         d.drag(l, area(), x, y, HOLD_MS + 1.0);
+    }
+
+    /// Arm a gesture and carry it to a point, which is what the app always does: a release is
+    /// preceded by the frames that got the pointer there.
+    ///
+    /// Tests that armed and released without the frames in between were letting go without ever
+    /// having moved, which is now its own gesture -- so they were quietly asking a panel for its
+    /// settings while claiming to test a drop.
+    fn carry(d: &mut PanelDrag, l: &mut Layout, from: (f32, f32), to: (f32, f32)) {
+        arm(d, l, from.0, from.1);
+        d.drag(l, area(), to.0, to.1, HOLD_MS + 2.0);
     }
 
     /// A quick press and release on a tab shows it — and records nothing, because Ctrl+Z must walk
@@ -738,8 +770,8 @@ mod tests {
 
         let home = l.resolve(area())[1].rect;
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
-        arm(&mut d, &mut l, 700.0, 10.0);
         let drop = (home.x + home.w / 2.0, home.y + home.h / 2.0);
+        carry(&mut d, &mut l, (700.0, 10.0), drop);
         assert_eq!(
             d.release(&mut l, &mut h, area(), drop.0, drop.1),
             Outcome::Nothing
@@ -756,7 +788,7 @@ mod tests {
         let mut d = PanelDrag::default();
 
         d.press(&l, &tab(&[], 0), 10.0, 10.0, 0.0);
-        arm(&mut d, &mut l, 10.0, 10.0);
+        carry(&mut d, &mut l, (10.0, 10.0), (990.0, 400.0));
         assert_eq!(
             d.release(&mut l, &mut h, area(), 990.0, 400.0),
             Outcome::Nothing
@@ -772,12 +804,48 @@ mod tests {
         let mut d = PanelDrag::default();
 
         d.press(&l, &tab(&[1], 0), 700.0, 10.0, 0.0);
-        arm(&mut d, &mut l, 700.0, 10.0);
+        carry(&mut d, &mut l, (700.0, 10.0), (-50.0, 400.0));
         assert_eq!(
             d.release(&mut l, &mut h, area(), -50.0, 400.0),
             Outcome::Floated(LAYERS)
         );
         assert_eq!(h.depth(), (0, 0), "nothing has happened to the layout yet");
+    }
+
+    /// **A hold that drifted a little is still a hold.**
+    ///
+    /// The pointer never sits perfectly still through a third of a second, especially a pen on
+    /// glass. Counting movement from the original press would mean a hold that drifted almost to
+    /// the slop threshold turned into a drag on the first stray unit afterwards --- so the gesture
+    /// would work or not depending on how steady the hand was.
+    #[test]
+    fn a_hold_that_drifted_before_arming_is_still_a_hold() {
+        let mut l = workspace();
+        let mut h = LayoutHistory::default();
+        let mut d = PanelDrag::default();
+
+        let start = (700.0, 10.0);
+        d.press(&l, &tab(&[1], 0), start.0, start.1, 0.0);
+        // Drifts almost the whole way to the slop threshold while waiting.
+        let drifted = (start.0 + SLOP * 0.9, start.1);
+        d.drag(&mut l, area(), drifted.0, drifted.1, HOLD_MS + 1.0);
+        assert!(d.armed(), "it should still have armed");
+
+        // Wobbles on a little further after arming. Measured from the original press that is now
+        // past the threshold; measured from where it armed, which is what a hold means, it is
+        // nowhere near.
+        let wobbled = (drifted.0 + SLOP * 0.2, drifted.1);
+        d.drag(&mut l, area(), wobbled.0, wobbled.1, HOLD_MS + 2.0);
+        assert!(
+            (wobbled.0 - start.0).hypot(wobbled.1 - start.1) > SLOP,
+            "the fixture must pass the threshold as measured from the press, or it proves nothing"
+        );
+
+        assert_eq!(
+            d.release(&mut l, &mut h, area(), wobbled.0, wobbled.1),
+            Outcome::Settings(LAYERS),
+            "a hand that wobbled should still be asking, not dragging"
+        );
     }
 
     /// A press on a panel's content is declined, so the panel itself sees it.

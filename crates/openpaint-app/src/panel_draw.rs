@@ -12,8 +12,8 @@
 
 use crate::layout::Rect;
 use crate::panel_ui::{
-    change_at, clamp_scroll, extent, hit, place, to_fraction, Change, Control, ControlId,
-    Direction, Placed,
+    change_at, clamp_scroll, extent, hit, mark_rect, place, to_fraction, Change, Control,
+    ControlId, Direction, Placed,
 };
 use crate::theme::Theme;
 
@@ -99,7 +99,7 @@ pub fn show(
         if let Some((control, rect)) = hit(&placed, p.x, p.y) {
             if matches!(control, Control::Slider { .. }) {
                 *latch = control.id();
-                changes.extend(change_at(control, rect, p.x));
+                changes.extend(change_at(control, rect, m, p.x, p.y));
             }
         }
     }
@@ -108,7 +108,13 @@ pub fn show(
     // running off the end of the window pins the value rather than losing it.
     if let (Some(id), Some(p), true) = (*latch, pointer, down) {
         if let Some(found) = placed.iter().find(|q| q.control.id() == Some(id)) {
-            changes.extend(change_at(found.control, found.rect, p.x));
+            changes.extend(change_at(
+                found.control,
+                found.rect,
+                m,
+                p.x,
+                found.rect.y + found.rect.h / 2.0,
+            ));
         }
     }
     if !down {
@@ -119,7 +125,7 @@ pub fn show(
         if let Some(p) = pointer {
             if let Some((control, rect)) = hit(&placed, p.x, p.y) {
                 if !matches!(control, Control::Slider { .. }) {
-                    changes.extend(change_at(control, rect, p.x));
+                    changes.extend(change_at(control, rect, m, p.x, p.y));
                 }
             }
         }
@@ -289,6 +295,7 @@ fn draw(
             text,
             selected,
             swatch,
+            mark,
             ..
         } => {
             if *selected {
@@ -311,6 +318,27 @@ fn draw(
                 // colour fails contrast against.
                 color(if *selected { pal.on_state } else { pal.text }),
             );
+            if let Some(mark) = mark {
+                // Drawn where `mark_rect` says, because that is also where the press is read: one
+                // definition, so the switch cannot be a few units away from its own target.
+                let pill = mark_rect(r, m);
+                painter.rect_filled(
+                    to_egui(pill),
+                    pill.h / 2.0,
+                    color(if mark.on { pal.state } else { pal.edge }),
+                );
+                let d = pill.h - 4.0;
+                let cx = if mark.on {
+                    pill.x + pill.w - 2.0 - d / 2.0
+                } else {
+                    pill.x + 2.0 + d / 2.0
+                };
+                painter.circle_filled(
+                    egui::pos2(cx, pill.y + pill.h / 2.0),
+                    d / 2.0,
+                    color(if mark.on { pal.on_state } else { pal.dim }),
+                );
+            }
         }
     }
 }
@@ -318,7 +346,7 @@ fn draw(
 /// The width of a control's label, measured by the thing that will draw it.
 ///
 /// A column never asks, so this costs nothing there.
-fn text_width(ctx: &egui::Context, size: f32, control: &Control) -> f32 {
+pub fn text_width(ctx: &egui::Context, size: f32, control: &Control) -> f32 {
     let text = match control {
         Control::Label { text }
         | Control::Button { text, .. }

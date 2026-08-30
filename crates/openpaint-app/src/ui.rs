@@ -641,14 +641,35 @@ struct PanelState<'a> {
     select_tool: Option<SelectTool>,
 }
 
+/// Everything a described panel needs in order to be drawn.
+///
+/// A struct for the same reason `PanelState` is one: the argument list grew past the lint, and
+/// that is a signal rather than a lint to silence. These three always travel together --- the look,
+/// which way the controls run, and the gesture the panel is part-way through.
+struct Painting<'a> {
+    theme: &'a crate::theme::Theme,
+    direction: crate::panel_ui::Direction,
+    input: &'a mut crate::panel_draw::PanelInput,
+}
+
+impl Painting<'_> {
+    /// Draw a list of controls and report what changed.
+    fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        controls: &[crate::panel_ui::Control],
+    ) -> Vec<crate::panel_ui::Change> {
+        crate::panel_draw::show(ui, controls, self.theme, self.direction, self.input)
+    }
+}
+
 fn workspace_panel(
     panel: crate::layout::PanelId,
     ui: &mut egui::Ui,
     brush: &mut Brush,
     color_srgb: &mut [u8; 3],
     state: &PanelState<'_>,
-    theme: &crate::theme::Theme,
-    input: &mut crate::panel_draw::PanelInput,
+    paint: &mut Painting<'_>,
 ) -> Option<Picked> {
     let PanelState {
         layers,
@@ -687,13 +708,7 @@ fn workspace_panel(
                 text: "Panels".to_owned(),
             });
 
-            for change in crate::panel_draw::show(
-                ui,
-                &controls,
-                theme,
-                crate::workspace::direction_of(panel),
-                input,
-            ) {
+            for change in paint.show(ui, &controls) {
                 picked = match change {
                     // The list itself belongs to the workspace, not here: this is a second way to
                     // reach it, because a right-click is not discoverable on its own.
@@ -744,13 +759,7 @@ fn workspace_panel(
                 })
                 .collect();
 
-            for change in crate::panel_draw::show(
-                ui,
-                &controls,
-                theme,
-                crate::workspace::direction_of(panel),
-                input,
-            ) {
+            for change in paint.show(ui, &controls) {
                 picked = match change {
                     Change::Chose(i) => items.get(i as usize).map(|(_, what)| what.clone()),
                     other => {
@@ -814,13 +823,7 @@ fn workspace_panel(
                     log: false,
                 },
             ];
-            for change in crate::panel_draw::show(
-                ui,
-                &controls,
-                theme,
-                crate::workspace::direction_of(panel),
-                input,
-            ) {
+            for change in paint.show(ui, &controls) {
                 match change {
                     Change::Set(SIZE, v) => brush.radius = v,
                     Change::Set(OPACITY, v) => brush.opacity = v,
@@ -839,8 +842,8 @@ fn workspace_panel(
             use crate::panel_ui::{Change, Control};
             // Rows are numbered by layer index, so the ids above them start where no document
             // could reach. A row and a button sharing an id would be a silent mis-hit.
+            const FIRST_VISIBILITY: u32 = 1 << 19;
             const FIRST_COMMAND: u32 = 1 << 20;
-            const VISIBLE: u32 = FIRST_COMMAND;
             const LOCK_ALPHA: u32 = FIRST_COMMAND + 1;
             const ADD: u32 = FIRST_COMMAND + 2;
             const DUPLICATE: u32 = FIRST_COMMAND + 3;
@@ -851,27 +854,23 @@ fn workspace_panel(
             // Top of the list is the top of the stack, which is how every layers panel reads and
             // the opposite of how the document stores it.
             for (index, layer) in layers.iter().enumerate().rev() {
+                let row = u32::try_from(index).unwrap_or(u32::MAX);
                 controls.push(Control::Row {
-                    id: u32::try_from(index).unwrap_or(u32::MAX),
+                    id: row,
                     text: layer.name.clone(),
                     selected: index == active_layer,
-                    // A hidden layer's chip goes dark rather than the row changing colour:
-                    // visibility is a property of the layer, not of whether it is chosen, and
-                    // conflating the two is how a panel starts lying about its state.
-                    swatch: Some(if layer.visible {
-                        [0xC6, 0xCC, 0xD3]
-                    } else {
-                        [0x3A, 0x3F, 0x46]
+                    // The eye, on the row it belongs to. Hiding a layer used to mean selecting it
+                    // first and then finding a switch below the list, which is two steps for
+                    // something every paint application does in one.
+                    mark: Some(crate::panel_ui::RowMark {
+                        id: FIRST_VISIBILITY + row,
+                        on: layer.visible,
                     }),
+                    swatch: None,
                 });
             }
             let active = layers.get(active_layer);
             controls.push(Control::Separator);
-            controls.push(Control::Toggle {
-                id: VISIBLE,
-                text: "Visible".to_owned(),
-                on: active.is_some_and(|l| l.visible),
-            });
             controls.push(Control::Toggle {
                 id: LOCK_ALPHA,
                 text: "Lock alpha".to_owned(),
@@ -890,20 +889,16 @@ fn workspace_panel(
                 });
             }
 
-            for change in crate::panel_draw::show(
-                ui,
-                &controls,
-                theme,
-                crate::workspace::direction_of(panel),
-                input,
-            ) {
+            for change in paint.show(ui, &controls) {
                 picked = match change {
                     Change::Chose(index) => {
                         Some(Picked::Layer(LayerAction::Select(index as usize)))
                     }
-                    Change::Toggled(VISIBLE, visible) => {
+                    Change::Toggled(id, visible)
+                        if (FIRST_VISIBILITY..FIRST_COMMAND).contains(&id) =>
+                    {
                         Some(Picked::Layer(LayerAction::SetVisible {
-                            index: active_layer,
+                            index: (id - FIRST_VISIBILITY) as usize,
                             visible,
                         }))
                     }
@@ -951,13 +946,7 @@ fn workspace_panel(
             let controls = [crate::panel_ui::Control::Label {
                 text: "Undo history moves here once the old panel is ported.".to_owned(),
             }];
-            for change in crate::panel_draw::show(
-                ui,
-                &controls,
-                theme,
-                crate::workspace::direction_of(panel),
-                input,
-            ) {
+            for change in paint.show(ui, &controls) {
                 eprintln!("history panel: unexpected {change:?}");
             }
         }
@@ -1232,9 +1221,15 @@ impl Ui {
                 // Copied out because `ws` is borrowed for the whole of `show`, and the panel that
                 // wants the theme runs inside it.
                 let theme = ws.theme;
-                ws.show(ctx, area, |panel, ui| {
+                ws.show(ctx, area, |panel, ui, direction| {
                     if let Some(picked) =
-                        workspace_panel(panel, ui, brush, &mut color_srgb, &state, &theme, panel_input.entry(panel.0).or_default())
+                        workspace_panel(panel, ui, brush, &mut color_srgb, &state,
+                            &mut Painting {
+                                theme: &theme,
+                                direction,
+                                input: panel_input.entry(panel.0).or_default(),
+                            },
+                        )
                     {
                         match picked {
                             // Both: choosing a paint tool must also put any selection tool down,
