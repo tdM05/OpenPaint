@@ -247,14 +247,17 @@ pub fn default_layout() -> Layout {
     // whatever it lands on, so without these the menu bar would take half the window — which a
     // test caught and no amount of reading the code would have.
     l.insert(&[], Zone::Top, MENU);
-    l.set_weight(&[0], 0.04);
-    l.set_weight(&[1], 0.96);
+    // Sized so the strip actually holds one row of controls and its padding at an ordinary window
+    // height, rather than a fraction that looked about right: see the test below, which works the
+    // requirement out from the metrics instead of trusting these numbers.
+    l.set_weight(&[0], 0.05);
+    l.set_weight(&[1], 0.95);
 
     // Tools down the left, canvas taking what is left, panels down the right.
     l.insert(&[1], Zone::Left, TOOLS);
     l.insert(&[1, 1], Zone::Right, LAYERS);
-    l.set_weight(&[1, 0], 0.045);
-    l.set_weight(&[1, 1], 0.775);
+    l.set_weight(&[1, 0], 0.07);
+    l.set_weight(&[1, 1], 0.75);
     l.set_weight(&[1, 2], 0.18);
 
     // The right column: layers over brush over colour, with history sharing the layers' slot
@@ -632,7 +635,11 @@ impl Workspace {
                 continue;
             }
 
-            let content = to_egui(inset(c.content, m.padding));
+            // The rectangle `chrome` says controls go in, already padded. Padding was once
+            // applied here as well as in the renderer, and a menu strip ended up mostly made of
+            // nothing; no amount of adjusting the padding would have fixed it, because the padding
+            // was not the problem (recurring hazard 11a.8).
+            let content = to_egui(c.controls.rect());
             let mut ui = egui::Ui::new(
                 ctx.clone(),
                 egui::LayerId::new(egui::Order::Middle, egui::Id::new(("panel", showing.0))),
@@ -787,7 +794,9 @@ impl Workspace {
                 ctx.clone(),
                 egui::LayerId::new(egui::Order::Foreground, egui::Id::new("panel-list")),
                 egui::Id::new("panel-list-ui"),
-                egui::UiBuilder::new().max_rect(to_egui(rect)),
+                // The list draws its own frame, so it owns its own padding: `chrome` is not
+                // involved, and the renderer does not add any.
+                egui::UiBuilder::new().max_rect(to_egui(inset(rect, m.padding))),
             );
             ui.set_clip_rect(to_egui(rect));
             let frame = ui.painter();
@@ -1168,6 +1177,56 @@ mod tests {
             ws.toggle(kind.id);
             assert!(ws.is_open(kind.id), "{} did not come back", kind.name);
         }
+    }
+
+    /// **The default arrangement gives every strip room for its own contents.**
+    ///
+    /// The weights are fractions of a window, so it is entirely possible to pick one that leaves
+    /// a menu bar too short to draw its own row of controls in --- and the symptom is not "the
+    /// weight is wrong", it is text mysteriously clipped at the bottom. So the requirement is
+    /// worked out from the metrics rather than trusted: whatever the fractions say, a strip must
+    /// hold one row and its padding.
+    #[test]
+    fn the_default_arrangement_fits_what_it_holds() {
+        use crate::panel_ui::Control;
+        // A stand-in for the widest label a strip carries, in place of a font.
+        const LABEL: f32 = 45.0;
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let m = crate::theme::Theme::default().metrics;
+        let layout = default_layout();
+        let placed = layout.resolve(screen);
+
+        let content_of = |panel: PanelId| {
+            let slot = placed
+                .iter()
+                .find(|p| p.tabs.contains(&panel))
+                .unwrap_or_else(|| panic!("{} is not in the default layout", name_of(panel)));
+            crate::chrome::panel(slot, &m, style_of(slot), |_| LABEL).content
+        };
+
+        // The menu is a strip across the top: it needs the height of one row plus its padding.
+        let menu = content_of(MENU);
+        let needed = m.row + m.padding * 2.0;
+        assert!(
+            menu.h >= needed,
+            "the menu strip is {} tall and needs {needed}",
+            menu.h
+        );
+
+        // The tool rail is a column down the side: it needs the width of one button plus padding.
+        let tools = content_of(TOOLS);
+        let button = Control::Choice {
+            id: 0,
+            text: String::new(),
+            selected: false,
+        }
+        .width(&m, LABEL)
+            + m.padding * 2.0;
+        assert!(
+            tools.w >= button,
+            "the tool rail is {} wide and needs {button}",
+            tools.w
+        );
     }
 
     /// **Two panels in one leaf always show tabs**, however compact they would rather be.

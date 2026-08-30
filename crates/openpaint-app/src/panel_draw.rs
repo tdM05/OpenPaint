@@ -60,17 +60,14 @@ pub fn show(
     let m = &theme.metrics;
     let area = ui.available_rect_before_wrap();
     let resp = ui.allocate_rect(area, egui::Sense::click_and_drag());
-    let visible = (area.height() - m.padding * 2.0).max(0.0);
+    // `area` is already the panel's controls rectangle, padded once by `chrome`. Padding again
+    // here is what spent it twice.
+    let visible = area.height().max(0.0);
     // Scrolling is a subtraction from where the list starts and nothing more, which is why `place`
     // has never heard of it. Clamped every frame rather than only when the wheel turns: the list
     // itself changes length when a layer is deleted, and an offset left pointing past the new end
     // would strand the panel showing nothing at all.
-    let content = Rect::new(
-        area.min.x + m.padding,
-        area.min.y + m.padding,
-        (area.width() - m.padding * 2.0).max(0.0),
-        visible,
-    );
+    let content = Rect::new(area.min.x, area.min.y, area.width().max(0.0), visible);
     // Laid out first and scrolled afterwards, so how tall the list is comes from where the
     // controls actually ended up rather than from a second calculation that could disagree.
     let text_of = |c: &Control| text_width(ui.ctx(), m.body, c);

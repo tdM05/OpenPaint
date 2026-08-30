@@ -142,6 +142,31 @@ part that makes it a setting rather than a decision --- storing it **per panel i
 with the workspace, and the hold gesture to reach it. That is the next batch, and it is the point
 of the whole exercise: until then these are defaults, not choices.
 
+## What is still fundamental
+
+Everything below unlocks ports rather than being one. Until these exist, "finish the UI" is
+blocked on them, not on effort.
+
+1. **Per-instance panel settings, and the gesture to reach them.** `Flow` exists but is a default
+   per panel *kind*; two Layers panels cannot yet disagree. Storing the override per instance,
+   saving it with the workspace, and reaching it by holding a header is what turns a decision into
+   a setting.
+2. **A text control.** Renaming a layer, naming a brush preset, typing a page size. There is no
+   way to type into a described panel at all, and several sections cannot be ported without one.
+3. **A menu control** --- a button that opens a list. File, Edit, Layer, Select and View are inert
+   labels precisely because this does not exist. The panel list is already one of these by hand;
+   generalising it is the work.
+4. **A row that holds more than one target.** A layer wants to be chosen *and* hidden from its own
+   row. Today visibility is a switch below the list.
+
+After those, the remaining ports are ordinary: Colour (which brings the first `Custom`, a real
+colour wheel), History, and the old side panel's sections --- transform, text, pages, export,
+crop, wand. egui leaves when the last one lands.
+
+Icons replace the tool rail's words whenever there are icons worth using; the words are a
+placeholder chosen over glyphs because glyphs needed a tooltip, and a tooltip is something only a
+hovering pointer can reach.
+
 ## 1. The descriptor engine — and this is what replaces egui
 
 **A panel is a list of controls, described as data.** Rendering that list is one

@@ -46,10 +46,39 @@ pub struct PanelChrome {
     /// The header strip.
     pub header: Rect,
     /// What is left for the panel to draw in.
+    ///
+    /// Not where controls go: the canvas fills this exactly, and padding it would leave a border
+    /// of ground around the artwork.
     pub content: Rect,
+    /// Where a panel's *controls* go: the content, inset by the padding.
+    ///
+    /// **The one place the padding is applied**, because it was previously applied twice --- once
+    /// where the panel's egui area was built and once inside the renderer --- and the result was a
+    /// menu strip with sixteen units of nothing above its own text. Naming the padded rectangle
+    /// separately means the renderer takes a rectangle rather than a rectangle-and-a-convention,
+    /// and there is nowhere left for a second helping to hide.
+    pub controls: Controls,
     /// Empty when the header is compact.
     pub tabs: Vec<Tab>,
     pub style: HeaderStyle,
+}
+
+/// A panel's controls rectangle, which only [`panel`] can make.
+///
+/// A newtype for one reason: the padding used to be applied here *and* again where the panel's
+/// drawing area was built, and the result was a menu strip mostly made of empty space. A plain
+/// `Rect` invites a second helping and looks perfectly reasonable doing it; this does not
+/// type-check unless somebody deliberately takes the rectangle out first, which is the difference
+/// between a mistake and a decision.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Controls(Rect);
+
+impl Controls {
+    /// The rectangle itself, for whoever is actually going to draw in it.
+    #[must_use]
+    pub fn rect(self) -> Rect {
+        self.0
+    }
 }
 
 /// Lay out one panel slot.
@@ -156,6 +185,12 @@ pub fn panel(
     PanelChrome {
         outer,
         header,
+        controls: Controls(Rect::new(
+            content.x + metrics.padding,
+            content.y + metrics.padding,
+            (content.w - metrics.padding * 2.0).max(0.0),
+            (content.h - metrics.padding * 2.0).max(0.0),
+        )),
         content,
         tabs,
         style,
@@ -495,6 +530,35 @@ mod tests {
         );
         assert!(c.content.h >= 0.0);
         assert!((c.header.h + c.content.h - c.outer.h).abs() < 0.001);
+    }
+
+    /// Controls are inset from the content by the padding, once, and never off the panel.
+    ///
+    /// This is where the padding is decided, so this is where it is checked. Applying it a second
+    /// time at the call site is what produced a menu strip mostly made of nothing.
+    #[test]
+    fn controls_sit_one_padding_inside_the_content() {
+        let m = metrics();
+        for slot in [wide(), tall()] {
+            for style in [HeaderStyle::Named, HeaderStyle::Compact] {
+                let c = panel(&slot, &m, style, |_| 40.0);
+                let controls = c.controls.rect();
+                assert!((controls.x - c.content.x - m.padding).abs() < 0.001);
+                assert!((controls.y - c.content.y - m.padding).abs() < 0.001);
+                assert!((controls.w - (c.content.w - m.padding * 2.0)).abs() < 0.001);
+                assert!((controls.h - (c.content.h - m.padding * 2.0)).abs() < 0.001);
+            }
+        }
+
+        // A panel too small to hold its own padding gets an empty rectangle, not a negative one.
+        let sliver = Placed {
+            path: vec![],
+            rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+            tabs: vec![CANVAS],
+            active: 0,
+        };
+        let c = panel(&sliver, &m, HeaderStyle::Named, |_| 40.0);
+        assert!(c.controls.rect().w >= 0.0 && c.controls.rect().h >= 0.0);
     }
 
     /// A compact header has no tabs and takes less room, but is still a header.
