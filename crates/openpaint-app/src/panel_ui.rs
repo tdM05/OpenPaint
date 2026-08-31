@@ -112,12 +112,6 @@ pub enum Control {
     /// [`crate::text_field`], which is where the caret, the selection, the word motion and the
     /// UTF-8 arithmetic already are and are already fuzzed -- this is only the part that says
     /// there is a field here and what is in it.
-    // Used by the tests already, and by the panels being ported; `expect` rather than `allow` so
-    // it stops compiling the moment a panel does, and cannot be left behind.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the panels that use it are being ported")
-    )]
     Text {
         id: ControlId,
         text: String,
