@@ -236,13 +236,19 @@ as "sometimes in front" — which is exactly how it was reported.
 
 ## A divider has two appearances, not three
 
-Available while the pointer is near it, taken from the instant it is pressed. Nothing in between,
-because there is nothing to wait for: a divider and a window's edge are both grabbed the moment
-they are touched, and the hold does nothing for either.
+Available while the pointer is near it, and taken **from the instant it is pressed until the
+instant it is let go**. Nothing in between and nothing after: there is nothing to wait for, because
+a divider and a window's edge are both grabbed the moment they are touched, and the hold does
+nothing for either.
 
-It used to have a third — nothing at all — because the press put it into the hold animation, which
-begins at no alpha. So it went blue on hover, blank for the first frames of the press, and blue
-again once it moved.
+It used to have a third — nothing at all — twice over. The press put it into the hold animation,
+which begins at no alpha, so it went blue on hover, blank for the first frames of the press, and
+blue again once it moved. And once the hold *finished*, it went blank again, because a divider
+being held perfectly still has nothing to report and the mark was being read off what the frame
+reported. Holding still is the one thing that should change nothing.
+
+So the mark is read off **what the pointer has hold of**, which is true every frame until it lets
+go, rather than off what this frame had to say.
 
 ## Reach, and what beats it
 

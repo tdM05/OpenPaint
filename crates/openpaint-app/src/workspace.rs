@@ -711,31 +711,31 @@ enum Seam {
 /// Which seam the marks are for this frame, and whether it has been taken.
 ///
 /// **Two states and no third.** It is *available* while the pointer is near it and *taken* from the
-/// instant it is pressed -- and nothing in between, because there is nothing to wait for: a divider
-/// and a window's edge are both grabbed the moment they are touched.
+/// instant it is pressed until the instant it is let go -- and nothing in between, because there is
+/// nothing to wait for: a divider and a window's edge are both grabbed the moment they are touched.
 ///
 /// The version that answered these four cases separately gave one control three appearances. The
 /// press put it into the hold animation, which starts at no alpha at all, so it went blue on hover,
 /// **blank** for the first frames of the press, and blue again once it moved. Reported exactly that
 /// way: *"if I hold, it shows blue, for a flick, then nothing. then if drag, back to blue."*
 ///
+/// **`held`, not the frame's preview.** A preview says what to draw because something changed, and
+/// a divider held perfectly still changes nothing -- so once its hold has run it reports nothing,
+/// and the mark went out again. Holding still for a third of a second is the one thing that should
+/// not change anything. What the pointer *has hold of* is true every frame until it lets go.
+///
 /// A window's edge is included for the same reason its resize is: it is a divider with the screen
 /// on its far side, and it should light up under a hovering pen like one.
 #[must_use]
 fn seam_in_use(
-    preview: Option<&Preview>,
+    held: Option<&Held>,
     seams: &[crate::layout::Splitter],
     border: Option<Rect>,
     at: Option<(f32, f32)>,
     m: &Metrics,
 ) -> Option<(Seam, bool)> {
-    // Taken: whatever the gesture says, whether it has moved yet or not.
-    match preview {
-        Some(Preview::Waiting {
-            on: Held::Divider { path, index },
-            ..
-        })
-        | Some(Preview::Resizing { path, index }) => {
+    match held {
+        Some(Held::Divider { path, index }) => {
             return Some((
                 Seam::Divider {
                     path: path.clone(),
@@ -744,14 +744,8 @@ fn seam_in_use(
                 true,
             ));
         }
-        Some(Preview::Waiting {
-            on: Held::Edge { pull },
-            ..
-        })
-        | Some(Preview::ResizingWindow { pull }) => {
-            return Some((Seam::Edge(*pull), true));
-        }
-        // Any other gesture owns the pointer, and a hint about something it is not doing would be
+        Some(Held::Edge { pull }) => return Some((Seam::Edge(*pull), true)),
+        // Some other gesture owns the pointer, and a hint about something it is not doing would be
         // a second thing to read.
         Some(_) => return None,
         None => {}
@@ -1358,13 +1352,7 @@ impl Workspace {
         // Drawn last of the chrome so it sits over the panels either side. Two appearances and no
         // third: `p.edge` while it is merely available, `p.state` from the instant it is taken.
         // See `seam_in_use` for the third one this used to have.
-        if let Some((seam, taken)) = seam_in_use(
-            preview.as_ref(),
-            &seams,
-            self.rect_of(working),
-            pointer.map(|q| (q.x, q.y)),
-            &m,
-        ) {
+        if let Some((seam, taken)) = self.seam_mark(&seams, pointer.map(|q| (q.x, q.y))) {
             // At the *drawn* thickness rather than the grab width: the point is to show where it
             // is, not how big the target is.
             let t = m.splitter_hover;
@@ -1819,6 +1807,27 @@ impl Workspace {
     #[cfg(test)]
     pub fn put_window_for_test(&mut self, which: usize, rect: Rect) {
         self.floating[which].rect = rect;
+    }
+
+    /// The divider or window edge this frame's marks are for, and whether it has been taken.
+    ///
+    /// A method rather than three arguments assembled at the point of drawing: everything it needs
+    /// beyond the seams and the pointer, it already knows. What is left in `show` is one call, with
+    /// nothing there left to pass wrongly -- which is where the last version of this hid a
+    /// sabotage that no test could reach.
+    #[must_use]
+    fn seam_mark(
+        &self,
+        seams: &[crate::layout::Splitter],
+        at: Option<(f32, f32)>,
+    ) -> Option<(Seam, bool)> {
+        seam_in_use(
+            self.drag.held().as_ref(),
+            seams,
+            self.rect_of(self.grab_surface),
+            at,
+            &self.theme.metrics,
+        )
     }
 
     /// The panel waiting to be put somewhere, if there is one.
@@ -3724,6 +3733,8 @@ mod tests {
         ws: &'a mut Workspace,
         screen: Rect,
         clock: f64,
+        /// Where the pointer was left, so time can pass without it moving.
+        last: (f32, f32),
     }
 
     impl Hand<'_> {
@@ -3735,11 +3746,13 @@ mod tests {
                 ws,
                 screen,
                 clock: 0.0,
+                last: (0.0, 0.0),
             }
         }
 
         /// One frame. `measure` is a fixed label width, since there are no fonts here.
         fn frame(&mut self, at: (f32, f32), pressed: bool, released: bool, down: bool) {
+            self.last = at;
             self.clock += 1.0;
             let screen = self.screen;
             let clock = self.clock;
@@ -3804,6 +3817,13 @@ mod tests {
                 PopupPress::Ignore,
                 |_| 46.0,
             );
+        }
+
+        /// Let time pass with the pointer where it is and the button still down.
+        fn wait(&mut self, ms: f64) {
+            self.clock += ms;
+            let at = self.last;
+            self.frame(at, false, false, true);
         }
 
         /// Hold still long enough for the hold to fire.
@@ -5464,106 +5484,147 @@ mod tests {
         }
     }
 
-    /// **A divider is blue from the moment it is touched until it is let go.**
+    /// **A divider is marked from the moment it is touched until the moment it is let go.**
     ///
-    /// It had three appearances where it has two: the press put it into the hold animation, which
-    /// starts at no alpha at all, so it went blue on hover, blank for the first frames of the
-    /// press, and blue again once it moved. Reported as *"if I hold, it shows blue, for a flick,
-    /// then nothing. then if drag, back to blue."*
+    /// It had three appearances where it has two. The press put it into the hold animation, which
+    /// starts at no alpha, so it went blue on hover, blank for the first frames of the press, blue
+    /// again once it moved -- and then, once the hold had run, blank again, because a divider being
+    /// held perfectly still reports nothing to draw. Holding still for a third of a second is the
+    /// one thing that should not change anything.
     ///
-    /// Asserted as "there is always a mark, and it is the same one" rather than as three separate
-    /// cases, because the gap between them is the bug.
+    /// Driven through `input_frame`, over a hold far longer than any timer in the code, because
+    /// "it goes out after a while" is a thing only a clock can show.
     #[test]
-    fn a_seam_is_marked_from_hover_through_to_the_drag() {
-        let m = crate::theme::Theme::default().metrics;
+    fn a_divider_stays_marked_however_long_it_is_held() {
+        let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
-        let layout = default_layout();
-        let seams = layout.splitters(screen, m.splitter_grab);
-        let seam = seams.first().cloned().expect("a divider");
-        let at = Some((
+        ws.set_screen(screen);
+        let m = ws.theme.metrics;
+        let seam = ws
+            .layout
+            .splitters(screen, m.splitter_grab)
+            .first()
+            .cloned()
+            .expect("a divider");
+        let at = (
             seam.rect.x + seam.rect.w / 2.0,
             seam.rect.y + seam.rect.h / 2.0,
-        ));
+        );
         let want = Seam::Divider {
             path: seam.path.clone(),
             index: seam.index,
         };
+        let look =
+            |ws: &Workspace, seams: &[crate::layout::Splitter]| ws.seam_mark(seams, Some(at));
+        let seams = ws.layout.splitters(screen, m.splitter_grab);
 
         // Hovering it: available.
+        {
+            let mut hand = Hand::new(&mut ws, screen);
+            hand.move_to(at);
+        }
         assert_eq!(
-            seam_in_use(None, &seams, None, at, &m),
+            look(&ws, &seams),
             Some((want.clone(), false)),
             "hovering a divider showed nothing"
         );
-        // Every instant of the press, including the very first: taken, not fading in.
-        for progress in [0.0_f32, 0.001, 0.5, 1.0] {
-            let waiting = Preview::Waiting {
-                progress,
-                on: Held::Divider {
-                    path: seam.path.clone(),
-                    index: seam.index,
-                },
-            };
+
+        // Pressed, and then held still for far longer than the hold: taken, throughout.
+        let mut hand = Hand::new(&mut ws, screen);
+        hand.press(at);
+        assert_eq!(
+            look(hand.ws, &seams),
+            Some((want.clone(), true)),
+            "the mark did not come on when it was pressed"
+        );
+        for _ in 0..4 {
+            hand.wait(crate::panel_drag::HOLD_MS);
             assert_eq!(
-                seam_in_use(Some(&waiting), &seams, None, at, &m),
+                look(hand.ws, &seams),
                 Some((want.clone(), true)),
-                "the mark went out {progress} of the way through the press"
+                "the mark went out while it was still being held"
             );
         }
-        // And moving it: still taken, still the same seam.
-        let resizing = Preview::Resizing {
-            path: seam.path.clone(),
-            index: seam.index,
-        };
-        assert_eq!(
-            seam_in_use(Some(&resizing), &seams, None, at, &m),
-            Some((want, true))
+        // And moving it, still taken.
+        hand.move_to((at.0 + 40.0, at.1));
+        assert_eq!(look(hand.ws, &seams), Some((want.clone(), true)));
+
+        // Let go: no longer taken. Whether it is still *available* depends only on where the
+        // pointer now is, which is what it should depend on.
+        hand.release((at.0 + 40.0, at.1));
+        let after = ws.layout.splitters(screen, m.splitter_grab);
+        assert!(
+            !matches!(look(&ws, &after), Some((_, true))),
+            "it stayed taken after it was let go"
         );
     }
 
     /// The same promise for a window's edge, which is a divider with the screen on its far side.
     #[test]
-    fn a_window_edge_is_marked_from_hover_through_to_the_drag() {
-        let m = crate::theme::Theme::default().metrics;
+    fn a_window_edge_stays_marked_however_long_it_is_held() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.set_screen(screen);
+        ws.float(BRUSH);
         let window = Rect::new(400.0, 300.0, 320.0, 260.0);
-        let at = Some((window.x + window.w, window.y + window.h / 2.0));
+        ws.floating[0].rect = window;
+        let at = (window.x + window.w, window.y + window.h / 2.0);
         let pull = crate::chrome::Pull { x: 1, y: 0 };
+        let look = |ws: &Workspace| ws.seam_mark(&[], Some(at));
 
+        // Hovering the edge, before anything is pressed. A frame first, because which window the
+        // pointer is over is worked out by the same entry point everything else goes through.
+        {
+            let mut hand = Hand::new(&mut ws, screen);
+            hand.move_to(at);
+        }
         assert_eq!(
-            seam_in_use(None, &[], Some(window), at, &m),
+            look(&ws),
             Some((Seam::Edge(pull), false)),
             "hovering a window's edge showed nothing"
         );
-        for progress in [0.0_f32, 0.001, 1.0] {
-            let waiting = Preview::Waiting {
-                progress,
-                on: Held::Edge { pull },
-            };
+
+        let mut hand = Hand::new(&mut ws, screen);
+        hand.press(at);
+        assert_eq!(
+            look(hand.ws),
+            Some((Seam::Edge(pull), true)),
+            "the mark did not come on when the edge was pressed"
+        );
+        for _ in 0..4 {
+            hand.wait(crate::panel_drag::HOLD_MS);
             assert_eq!(
-                seam_in_use(Some(&waiting), &[], Some(window), at, &m),
+                look(hand.ws),
                 Some((Seam::Edge(pull), true)),
-                "the mark went out {progress} of the way through the press"
+                "the mark went out while the edge was still being held"
             );
         }
-        assert_eq!(
-            seam_in_use(
-                Some(&Preview::ResizingWindow { pull }),
-                &[],
-                Some(window),
-                at,
-                &m
-            ),
-            Some((Seam::Edge(pull), true))
-        );
+        hand.release(at);
+        assert!(!matches!(look(&ws), Some((_, true))), "it stayed taken");
+    }
 
-        // Away from every edge, and while some *other* gesture owns the pointer: nothing, because
-        // a hint about something that is not happening is a second thing to read.
+    /// Some other gesture owning the pointer means no hint about one it is not making.
+    #[test]
+    fn a_seam_shows_nothing_while_another_gesture_owns_the_pointer() {
+        let m = crate::theme::Theme::default().metrics;
+        let window = Rect::new(400.0, 300.0, 320.0, 260.0);
+        let at = Some((window.x + window.w, window.y + window.h / 2.0));
+        for held in [
+            Held::Frame,
+            Held::Panel {
+                path: vec![],
+                tab: 0,
+            },
+        ] {
+            assert_eq!(
+                seam_in_use(Some(&held), &[], Some(window), at, &m),
+                None,
+                "a hint appeared while {held:?} was being carried"
+            );
+        }
+        // And away from every edge, with nothing held at all.
         let middle = Some((window.x + window.w / 2.0, window.y + window.h / 2.0));
         assert_eq!(seam_in_use(None, &[], Some(window), middle, &m), None);
-        assert_eq!(
-            seam_in_use(Some(&Preview::MovingWindow), &[], Some(window), at, &m),
-            None
-        );
     }
 
     /// **One window at a time.** After moving one, moving another must move *that* one.

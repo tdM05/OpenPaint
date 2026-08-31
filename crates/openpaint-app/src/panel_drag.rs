@@ -204,6 +204,28 @@ enum Kind {
     Edge { pull: crate::chrome::Pull },
 }
 
+/// What a grab is on, said in the terms the caller draws in.
+///
+/// One place, so [`PanelDrag::held`] and the wait it reports cannot describe the same grab two
+/// different ways.
+#[must_use]
+fn held_of(kind: &Kind) -> Held {
+    match kind {
+        Kind::Tab { path, tab, .. } => Held::Panel {
+            path: path.clone(),
+            tab: *tab,
+        },
+        Kind::Splitter { path, index, .. } => Held::Divider {
+            path: path.clone(),
+            index: *index,
+        },
+        // A window's frame is drawn by whoever owns the window; there is no node in this layout to
+        // mark. Nor is its edge.
+        Kind::Frame { .. } => Held::Frame,
+        Kind::Edge { pull } => Held::Edge { pull: *pull },
+    }
+}
+
 /// One press, and everything that has happened to it since.
 ///
 /// A single shape for both kinds rather than one per kind, because the arming is now *identical*
@@ -263,6 +285,20 @@ impl PanelDrag {
     #[must_use]
     pub fn active(&self) -> bool {
         self.grab.is_some()
+    }
+
+    /// What the pointer has hold of, if it has hold of anything.
+    ///
+    /// **Asked of the grab, not of the frame's preview.** A preview says what to draw *because
+    /// something changed*, and a divider being held perfectly still changes nothing -- so once its
+    /// hold has run it reports nothing at all, and the mark on it went out. After a third of a
+    /// second of holding still, which is the one thing that should not change anything.
+    ///
+    /// This says what is *true*, every frame, until the gesture ends.
+    #[must_use]
+    pub fn held(&self) -> Option<Held> {
+        let grab = self.grab.as_ref()?;
+        Some(held_of(&grab.kind))
     }
 
     /// Abandon the gesture without touching anything, for a drop the caller has taken over.
@@ -365,20 +401,7 @@ impl PanelDrag {
                 let progress = ((now_ms - grab.press_ms) / HOLD_MS).clamp(0.0, 1.0) as f32;
                 return Some(Preview::Waiting {
                     progress,
-                    on: match &grab.kind {
-                        Kind::Tab { path, tab, .. } => Held::Panel {
-                            path: path.clone(),
-                            tab: *tab,
-                        },
-                        Kind::Splitter { path, index, .. } => Held::Divider {
-                            path: path.clone(),
-                            index: *index,
-                        },
-                        // A window's frame is drawn by whoever owns the window; there is no node
-                        // in this layout to mark. Nor is its edge.
-                        Kind::Frame { .. } => Held::Frame,
-                        Kind::Edge { pull } => Held::Edge { pull: *pull },
-                    },
+                    on: held_of(&grab.kind),
                 });
             }
             grab.asked = true;
