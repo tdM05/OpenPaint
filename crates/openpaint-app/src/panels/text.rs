@@ -1129,8 +1129,10 @@ mod wiring {
     /// arriving at `show` reaches the block and leaves again as something the shell can write.
     #[test]
     fn an_edit_folds_into_the_block_and_comes_back() {
-        let mut block = openpaint_core::TextBlock::default();
-        block.text = "Before".to_owned();
+        let block = openpaint_core::TextBlock {
+            text: "Before".to_owned(),
+            ..openpaint_core::TextBlock::default()
+        };
         let was = block.clone();
 
         // What `show` does with the frame's changes, in the same order.
