@@ -931,7 +931,7 @@ mod tests {
                     raw.events.push(as_event(*poke));
                 }
             }
-            ctx.run(raw, |c| {
+            let _ = ctx.run(raw, |c| {
                 let mut ui = egui::Ui::new(
                     c.clone(),
                     egui::LayerId::new(egui::Order::Middle, egui::Id::new("typed")),

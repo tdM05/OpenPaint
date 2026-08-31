@@ -100,6 +100,12 @@ pub enum Control {
     /// same way the menu opens its own items.
     ///
     /// [`Choice`]: Control::Choice
+    // Used by the tests already, and by the panels being ported; `expect` rather than `allow` so
+    // it stops compiling the moment a panel does, and cannot be left behind.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the panels that use it are being ported")
+    )]
     Pick {
         id: ControlId,
         text: String,
@@ -112,6 +118,12 @@ pub enum Control {
     /// [`crate::text_field`], which is where the caret, the selection, the word motion and the
     /// UTF-8 arithmetic already are and are already fuzzed -- this is only the part that says
     /// there is a field here and what is in it.
+    // Used by the tests already, and by the panels being ported; `expect` rather than `allow` so
+    // it stops compiling the moment a panel does, and cannot be left behind.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the panels that use it are being ported")
+    )]
     Text {
         id: ControlId,
         text: String,
@@ -384,6 +396,9 @@ pub enum Change {
     ///
     /// By position rather than by name, because the panel that offered the list is the one being
     /// told, and it has the list in front of it. A name would have to survive being spelled twice.
+    // Nothing produces it yet -- the dropdown's round trip is the next thing to be written.
+    // `expect` rather than `allow` so it stops compiling the moment something does.
+    #[expect(dead_code, reason = "the dropdown's round trip is being written")]
     Picked(ControlId, usize),
     /// A [`Control::Text`] took the caret. Nothing has changed yet.
     ///
