@@ -1063,6 +1063,160 @@ mod tests {
         );
     }
 
+    /// **A caption typed into the panel comes back out of it.**
+    ///
+    /// The one line that makes the whole caption editor work: `show` folding the frame's changes
+    /// into its copy of the block. Everything either side of it is proved -- the editor by its own
+    /// tests, the writing back by `written_back` -- and between them sat a transcription that
+    /// could be deleted with the suite still green.
+    ///
+    /// So this drives the real panel through a real frame: a text layer under it, a press on the
+    /// caption field, words typed, Enter. What comes out must be the words.
+    #[test]
+    fn a_caption_typed_into_the_panel_reaches_the_shell() {
+        use crate::ui::Picked;
+        let screen = Rect::new(0.0, 0.0, 400.0, 600.0);
+        let area = Rect::new(0.0, 0.0, 360.0, 560.0);
+        let layers = vec![openpaint_core::Layer::restored(
+            0,
+            "Caption",
+            1.0,
+            openpaint_core::Blend::Normal,
+            true,
+            false,
+            false,
+        )
+        .with_text(openpaint_core::TextBlock {
+            text: "Before".to_owned(),
+            ..openpaint_core::TextBlock::default()
+        })];
+
+        let theme = Theme::default();
+        let mut brush = openpaint_core::Brush::default();
+        let mut colour = brush.color_srgb8();
+        let mut input = crate::panel_draw::PanelInput::default();
+        let mut menu = None;
+        let mut pick = None;
+        let mut shape = crate::colour_wheel::Shape::default();
+        let mut hold = None;
+        let mut answers: Vec<Picked> = Vec::new();
+
+        // Where the caption field is: the first `Text` control the panel offers.
+        let ctx = egui::Context::default();
+        let mut at = (0.0, 0.0);
+        for pass in 0..3 {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(screen.x, screen.y),
+                    egui::vec2(screen.w, screen.h),
+                )),
+                ..Default::default()
+            };
+            // Pass 1 takes the caret, pass 2 types and finishes. One batch per frame, because a
+            // press and a release are one click and there is one click per frame.
+            if pass == 1 {
+                for poke in [
+                    Poke::Move(at.0, at.1),
+                    Poke::Press(at.0, at.1),
+                    Poke::Release(at.0, at.1),
+                ] {
+                    raw.events.push(as_event(poke));
+                }
+            } else if pass == 2 {
+                for poke in [Poke::Say("After"), Poke::Tap(egui::Key::Enter)] {
+                    raw.events.push(as_event(poke));
+                }
+            }
+            let _ = ctx.run(raw, |c| {
+                let status = crate::ui::Status {
+                    history: (0, 0, 0),
+                    message: None,
+                    page_size: (100, 100),
+                    crop: None,
+                    crop_rect: None,
+                    residency: (0, 0),
+                    spilled: 0,
+                    traffic: (0, 0),
+                    layers: &layers,
+                    active_layer: 0,
+                    pages: (1, 0),
+                    tool: crate::editor::Tool::Brush,
+                    confirm: None,
+                    brush_cursor: None,
+                    perf: crate::perf::PerfSnapshot::default(),
+                    recovery: None,
+                    palette: &[],
+                    presets: &[],
+                    preset_trouble: None,
+                    font_families: &[],
+                    font_substituted: None,
+                    transform: None,
+                    transform_box: None,
+                    kernel: openpaint_core::Kernel::default(),
+                    autosave: "",
+                    selection: &[],
+                    select_tool: None,
+                    has_selection: false,
+                    wand: crate::ui::WandSettings::default(),
+                };
+                let mut ui = egui::Ui::new(
+                    c.clone(),
+                    egui::LayerId::new(egui::Order::Middle, egui::Id::new("caption")),
+                    egui::Id::new("caption-ui"),
+                    egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                        egui::pos2(area.x, area.y),
+                        egui::vec2(area.w, area.h),
+                    )),
+                );
+                let mut paint = crate::ui::Painting {
+                    theme: &theme,
+                    direction: Direction::Column,
+                    input: &mut input,
+                    menu: &mut menu,
+                    pick: &mut pick,
+                    extend_by: 512,
+                    preset_name: "",
+                    ctx: c,
+                    wheel_shape: &mut shape,
+                    wheel_hold: &mut hold,
+                };
+                if let Some(what) = crate::panels::show(
+                    crate::workspace::TEXT,
+                    &mut ui,
+                    &mut brush,
+                    &mut colour,
+                    &status,
+                    &mut paint,
+                    crate::workspace::Place::Panel,
+                ) {
+                    answers.push(what);
+                }
+            });
+            // After the first pass the controls have been laid out, so the field can be found.
+            if pass == 0 {
+                let m = theme.metrics;
+                let mut y = area.y;
+                for control in crate::panels::text::controls_for_test(&layers[0]) {
+                    let tall = crate::panel_draw::wrapped_height(&ctx, m.body, &control, area.w);
+                    let h = control.height(&m, tall);
+                    if matches!(control, Control::Text { .. }) {
+                        at = (area.x + area.w * 0.75, y + h / 2.0);
+                        break;
+                    }
+                    y += h + m.gap;
+                }
+            }
+        }
+
+        assert!(
+            answers.iter().any(|a| matches!(
+                a,
+                Picked::TextSet(block) if block.text == "After"
+            )),
+            "the caption never reached the shell: {answers:?}"
+        );
+    }
+
     /// A pick answers by asking to be opened. It chooses nothing by itself.
     #[test]
     fn a_pick_asks_to_be_opened() {

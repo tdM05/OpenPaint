@@ -539,6 +539,49 @@ mod tests {
 
     /// A stand-in for a font: every label the same width, so a test says what it means about
     /// *layout* rather than about text measurement.
+    /// **A label is as tall as its sentence.**
+    ///
+    /// It used to be one row whatever it said, and the ported panels were clipping their
+    /// explanations at the panel's edge -- four of them had split one sentence into three labels
+    /// to work around it. Only a screenshot caught that; this is the assertion that keeps it
+    /// caught.
+    #[test]
+    fn a_label_grows_with_its_words() {
+        let m = metrics();
+        let label = Control::Label {
+            text: "However long this happens to be".to_owned(),
+        };
+        let one = label.height(&m, m.body);
+        let three = label.height(&m, m.body * 3.0);
+        assert!(
+            three > one + m.body,
+            "three lines of words asked for {three} and one asked for {one}"
+        );
+
+        // And never less than one line, whatever it was told: a label measured as nothing is
+        // still a label, and a zero-height row is a row nobody can read or press.
+        assert!(label.height(&m, 0.0) >= m.body);
+
+        // Everything else is one row, whatever the measurement says. A slider does not grow
+        // because its name is long; it is a target before it is a caption.
+        for control in [
+            Control::Button {
+                id: 0,
+                text: "x".to_owned(),
+            },
+            Control::Toggle {
+                id: 1,
+                text: "x".to_owned(),
+                on: true,
+            },
+        ] {
+            assert!(
+                (control.height(&m, m.body * 4.0) - m.row).abs() < 0.001,
+                "{control:?} grew with a measurement it should ignore"
+            );
+        }
+    }
+
     /// A label of one line, whatever it says: these tests are about arrangement, not fonts.
     fn one_line(control: &Control, _width: f32) -> f32 {
         match control {

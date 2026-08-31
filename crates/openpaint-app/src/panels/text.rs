@@ -166,10 +166,36 @@ pub(crate) fn show(
     }
     // One write for the frame, and only when the words actually differ: every edit here costs a
     // re-render and a step on the undo stack.
-    picked.or_else(|| match (edited, block) {
+    picked.or_else(|| written_back(edited, block))
+}
+
+/// What the frame's edits amount to: a caption to write, or nothing.
+///
+/// **One write per frame, and only when the words differ.** Several changes can arrive together --
+/// a slider moving while a field gives up the caret -- and each one that got its own write would
+/// be its own re-render and its own step on the undo stack. A change that ended where it started
+/// is not a change at all.
+///
+/// Its own function because it is the whole of what `show` decides, and `show` needs a window.
+#[must_use]
+fn written_back(
+    edited: Option<openpaint_core::TextBlock>,
+    was: Option<&openpaint_core::TextBlock>,
+) -> Option<Picked> {
+    match (edited, was) {
         (Some(now), Some(was)) if now != *was => Some(Picked::TextSet(now)),
         _ => None,
-    })
+    }
+}
+
+/// What this panel draws for a layer, so a test can find a control without guessing where it is.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn controls_for_test(layer: &openpaint_core::Layer) -> Vec<Control> {
+    layer
+        .text()
+        .map(|b| editor::controls_for(b, None))
+        .unwrap_or_default()
 }
 
 /// The caption editor: the controls for one [`TextBlock`], and what a change to one means.
@@ -1159,6 +1185,34 @@ mod wiring {
             editor::Applied::Nothing
         );
         assert_eq!(same, was);
+    }
+
+    /// **An edit reaches the shell, and one that changes nothing does not.**
+    ///
+    /// The half of the wiring `show` owns: folding the frame's changes into a copy and deciding
+    /// whether the copy is worth writing. Both halves have been wrong -- a version that never
+    /// answered at all, and one that answered on every frame the panel was drawn.
+    #[test]
+    fn a_caption_is_written_back_only_when_it_differs() {
+        let was = openpaint_core::TextBlock {
+            text: "Before".to_owned(),
+            ..openpaint_core::TextBlock::default()
+        };
+
+        // Changed: it goes back, and it goes back as what it now says.
+        let mut now = was.clone();
+        now.text = "After".to_owned();
+        assert_eq!(
+            written_back(Some(now.clone()), Some(&was)),
+            Some(Picked::TextSet(now))
+        );
+
+        // Unchanged: nothing. Every write is a re-render and a step on the undo stack.
+        assert_eq!(written_back(Some(was.clone()), Some(&was)), None);
+
+        // No text layer under the panel: nothing to write, whatever arrived.
+        assert_eq!(written_back(Some(was.clone()), None), None);
+        assert_eq!(written_back(None, Some(&was)), None);
     }
 
     /// The font list asks to be opened rather than choosing anything by itself.
