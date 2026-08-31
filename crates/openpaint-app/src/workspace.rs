@@ -2602,7 +2602,11 @@ impl Workspace {
         // Measured from where the controls actually land, not from a second sum of the same
         // heights that could drift out of step with the first.
         let origin = Rect::new(0.0, 0.0, w - m.padding * 2.0, screen.h);
-        let laid = crate::panel_ui::place(&controls, origin, &m, Direction::Column, text_of);
+        // Every control here is a button or a choice, so nothing has a sentence to wrap and
+        // the height of one is a question that never gets asked.
+        let tall_of = |_: &crate::panel_ui::Control, _: f32| 0.0;
+        let laid =
+            crate::panel_ui::place(&controls, origin, &m, Direction::Column, text_of, tall_of);
         let h = (crate::panel_ui::extent(&laid, origin).1 + m.padding * 2.0).min(screen.h);
         Rect::new(
             x.min(screen.x + screen.w - w).max(screen.x),

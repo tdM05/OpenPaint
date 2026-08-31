@@ -119,7 +119,10 @@ pub fn show(
             text_width(ui.ctx(), m.body, c)
         }
     };
-    let laid = place(controls, content, m, direction, text_of);
+    // How tall a label's sentence is at the width it will get. Measured by the thing that will
+    // draw it, so the room made and the room used are one answer.
+    let tall_of = |c: &Control, w: f32| wrapped_height(ui.ctx(), m.body, c, w);
+    let laid = place(controls, content, m, direction, text_of, &tall_of);
     let (_, tall) = extent(&laid, content);
 
     // Only the panel under the pointer takes the wheel. The delta egui reports is the window's,
@@ -132,7 +135,7 @@ pub fn show(
     };
     input.scroll = clamp_scroll(input.scroll - wheel, tall, visible);
     let scrolled = Rect::new(content.x, content.y - input.scroll, content.w, content.h);
-    let placed = place(controls, scrolled, m, direction, text_of);
+    let placed = place(controls, scrolled, m, direction, text_of, &tall_of);
 
     let mut changes = Vec::new();
     let pointer = resp.interact_pointer_pos();
@@ -297,11 +300,17 @@ fn draw(
 
     match p.control {
         Control::Label { text } => {
-            painter.text(
-                egui::pos2(left, r.y + r.h / 2.0),
-                egui::Align2::LEFT_CENTER,
-                text,
-                egui::FontId::proportional(m.label),
+            // Wrapped to the room it was given, which is the room `place` made for it after
+            // measuring the same way. A label is the one control whose height is its content.
+            let galley = painter.layout(
+                text.clone(),
+                egui::FontId::proportional(m.body),
+                color(pal.dim),
+                (r.x + r.w - left).max(1.0),
+            );
+            painter.galley(
+                egui::pos2(left, r.y + m.padding * 0.25),
+                galley,
                 color(pal.dim),
             );
         }
@@ -707,6 +716,28 @@ pub fn text_well(r: Rect, m: &crate::theme::Metrics, left: f32) -> Rect {
         (r.x + r.w - m.padding * 0.5 - left).max(m.row),
         (r.h - m.padding * 0.5).max(m.row * 0.6),
     )
+}
+
+/// How tall a label's words are once wrapped to `width`, or zero for anything that is not one.
+///
+/// The same `layout` the drawing uses, so the height made for it and the height it takes cannot
+/// disagree -- which is what a hand-rolled "characters per line" guess would eventually do, and it
+/// would do it as text clipped at the panel's edge.
+#[must_use]
+pub fn wrapped_height(ctx: &egui::Context, size: f32, control: &Control, width: f32) -> f32 {
+    let Control::Label { text } = control else {
+        return 0.0;
+    };
+    ctx.fonts(|f| {
+        f.layout(
+            text.clone(),
+            egui::FontId::proportional(size),
+            egui::Color32::WHITE,
+            width.max(1.0),
+        )
+        .size()
+        .y
+    })
 }
 
 /// The width of a control's label, measured by the thing that will draw it.

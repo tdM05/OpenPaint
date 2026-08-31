@@ -169,11 +169,20 @@ impl Control {
     /// Grab targets get the full row height rather than the height of their ink: a slider's track
     /// is three units tall and its target is the whole row, which is what makes it catchable with
     /// a pen (§1b, and the millimetre check in `theme`).
+    ///
+    /// `wrapped` is how tall the caller measured this control's *text* to be at the width it will
+    /// get, which only something holding the fonts can know. It matters for one kind: a label is
+    /// as tall as its sentence, and a sentence longer than the panel is wide runs onto another
+    /// line rather than off the end of the panel.
     #[must_use]
-    pub fn height(&self, metrics: &Metrics) -> f32 {
+    pub fn height(&self, metrics: &Metrics, wrapped: f32) -> f32 {
         match self {
             Self::Separator => metrics.padding,
-            Self::Label { .. } => metrics.body + metrics.padding * 0.5,
+            // **However many lines it takes.** A label that clipped at the panel's edge was the
+            // most visible thing wrong with the ported panels, and it had every panel working
+            // around it -- splitting one sentence into three `Label`s, which reads as three
+            // paragraphs and comes undone the moment the panel is a different width.
+            Self::Label { .. } => wrapped.max(metrics.body) + metrics.padding * 0.5,
             Self::Custom { height, .. } => *height,
             // Everything interactive is one row tall, so a column of them is a predictable rhythm
             // and every target is the same size.
@@ -274,6 +283,7 @@ pub fn place<'a>(
     metrics: &Metrics,
     direction: Direction,
     text_of: impl Fn(&Control) -> f32,
+    tall_of: impl Fn(&Control, f32) -> f32,
 ) -> Vec<Placed<'a>> {
     let across = match direction {
         Direction::Row | Direction::Wrap => true,
@@ -297,7 +307,7 @@ pub fn place<'a>(
             x += w + metrics.gap;
             r
         } else {
-            let h = control.height(metrics);
+            let h = control.height(metrics, tall_of(control, content.w));
             let r = Rect::new(x, y, content.w, h);
             y += h + metrics.gap;
             r
@@ -529,12 +539,27 @@ mod tests {
 
     /// A stand-in for a font: every label the same width, so a test says what it means about
     /// *layout* rather than about text measurement.
+    /// A label of one line, whatever it says: these tests are about arrangement, not fonts.
+    fn one_line(control: &Control, _width: f32) -> f32 {
+        match control {
+            Control::Label { .. } => metrics().body,
+            _ => 0.0,
+        }
+    }
+
     fn text(_: &Control) -> f32 {
         40.0
     }
 
     fn column<'a>(controls: &'a [Control]) -> Vec<Placed<'a>> {
-        place(controls, content(), &metrics(), Direction::Column, text)
+        place(
+            controls,
+            content(),
+            &metrics(),
+            Direction::Column,
+            text,
+            one_line,
+        )
     }
 
     fn sliders() -> Vec<Control> {
@@ -601,9 +626,9 @@ mod tests {
                 continue;
             }
             assert!(
-                (control.height(&m) - m.row).abs() < 0.001,
+                (control.height(&m, 0.0) - m.row).abs() < 0.001,
                 "{control:?} is {} tall, not one row",
-                control.height(&m)
+                control.height(&m, 0.0)
             );
         }
     }
@@ -749,7 +774,7 @@ mod tests {
         let wide = Rect::new(0.0, 0.0, 4000.0, 300.0);
         let narrow = Rect::new(0.0, 0.0, 120.0, 300.0);
 
-        let across = place(&controls, wide, &m, Direction::Auto, text);
+        let across = place(&controls, wide, &m, Direction::Auto, text, one_line);
         let rows: std::collections::BTreeSet<i32> =
             across.iter().map(|p| p.rect.y as i32).collect();
         assert_eq!(rows.len(), 1, "with room to spare it should be one row");
@@ -763,7 +788,7 @@ mod tests {
             "the row it chose runs off the panel"
         );
 
-        let down = place(&controls, narrow, &m, Direction::Auto, text);
+        let down = place(&controls, narrow, &m, Direction::Auto, text, one_line);
         let columns: std::collections::BTreeSet<i32> =
             down.iter().map(|p| p.rect.x as i32).collect();
         assert_eq!(columns.len(), 1, "too narrow, so it should be one column");
@@ -777,6 +802,7 @@ mod tests {
             &m,
             Direction::Auto,
             text,
+            one_line,
         );
         let cols: std::collections::BTreeSet<i32> = snug.iter().map(|p| p.rect.x as i32).collect();
         assert_eq!(
@@ -819,7 +845,7 @@ mod tests {
         let one = tools[0].width(&m, text(&tools[0]));
         // Room for three across, so six should land on two lines.
         let content = Rect::new(0.0, 0.0, one * 3.0 + m.gap * 2.0, 300.0);
-        let laid = place(&tools, content, &m, Direction::Wrap, text);
+        let laid = place(&tools, content, &m, Direction::Wrap, text, one_line);
 
         let lines: std::collections::BTreeSet<i32> = laid.iter().map(|p| p.rect.y as i32).collect();
         assert_eq!(lines.len(), 2, "six buttons, three to a line");
@@ -865,6 +891,7 @@ mod tests {
             &m,
             Direction::Row,
             text,
+            one_line,
         );
         for p in &laid {
             assert!(
@@ -903,6 +930,7 @@ mod tests {
             &m,
             Direction::Row,
             text,
+            one_line,
         );
         for p in &laid {
             if !matches!(p.control, Control::Slider { .. }) {
@@ -926,7 +954,7 @@ mod tests {
         let m = metrics();
         let controls = sliders();
         let content = Rect::new(0.0, 0.0, 4000.0, 200.0);
-        let laid = place(&controls, content, &m, Direction::Row, text);
+        let laid = place(&controls, content, &m, Direction::Row, text, one_line);
         // **The room above equals the room below.** Measuring the block and dividing would be
         // circular: `extent` reports where the controls ended up, offset included, so it would
         // agree with any offset at all.
@@ -945,7 +973,7 @@ mod tests {
         assert!((laid[0].rect.x - content.x).abs() < 0.001);
 
         // A column is not pushed down: a list starts at the top and grows.
-        let down = place(&controls, content, &m, Direction::Column, text);
+        let down = place(&controls, content, &m, Direction::Column, text, one_line);
         assert!((down[0].rect.y - content.y).abs() < 0.001);
     }
 
@@ -964,7 +992,7 @@ mod tests {
         let one = tools[0].width(&m, text(&tools[0]));
         // A rail with room for two across and plenty to spare either side.
         let content = Rect::new(0.0, 0.0, one * 2.0 + m.gap + 40.0, 400.0);
-        let laid = place(&tools, content, &m, Direction::Wrap, text);
+        let laid = place(&tools, content, &m, Direction::Wrap, text, one_line);
         let far = |f: fn(&Placed<'_>) -> f32| laid.iter().map(f).fold(f32::MIN, f32::max);
         let left = laid.iter().map(|p| p.rect.x).fold(f32::MAX, f32::min) - content.x;
         let right = (content.x + content.w) - far(|p| p.rect.x + p.rect.w);
@@ -993,6 +1021,7 @@ mod tests {
                 &m,
                 direction,
                 text,
+                one_line,
             );
             let slider = laid
                 .iter()

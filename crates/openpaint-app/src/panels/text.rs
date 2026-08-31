@@ -1066,7 +1066,14 @@ mod tests {
         let m = Theme::default().metrics;
         let content = Rect::new(0.0, 0.0, 260.0, 4000.0);
         // A stand-in for a font: this test is about ids, not about text measurement.
-        let laid = place(&controls, content, &m, Direction::Column, |_| 40.0);
+        let laid = place(
+            &controls,
+            content,
+            &m,
+            Direction::Column,
+            |_| 40.0,
+            |_, _| 0.0,
+        );
 
         let mut pressed = 0;
         for p in &laid {

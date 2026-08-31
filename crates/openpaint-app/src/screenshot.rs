@@ -151,6 +151,135 @@ pub fn press_controls(
     (changes, input)
 }
 
+/// A document to draw the panels against.
+///
+/// **Not `Default`, because there is no `Default`** -- and there should not be: every field of
+/// `Status` is the document saying something about itself, and a blanket default would be a
+/// second, quieter answer to all of it. Written out here, once, with enough in it that the panels
+/// have something to show: layers with names, a palette, a page, a font that was substituted.
+#[must_use]
+fn sample_document() -> (
+    Vec<openpaint_core::Layer>,
+    Vec<[u8; 3]>,
+    Vec<openpaint_core::BrushPreset>,
+    Vec<String>,
+) {
+    let layers: Vec<openpaint_core::Layer> = ["Paper", "Flats", "Ink"]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            openpaint_core::Layer::restored(
+                u32::try_from(i).expect("three of them"),
+                *name,
+                1.0,
+                openpaint_core::Blend::Normal,
+                true,
+                false,
+                false,
+            )
+        })
+        .collect();
+    let palette = vec![
+        [232, 196, 168],
+        [186, 132, 102],
+        [64, 48, 56],
+        [240, 240, 236],
+        [120, 160, 200],
+    ];
+    let presets = Vec::new();
+    let fonts = vec!["Inter".to_owned(), "Source Han Sans".to_owned()];
+    (layers, palette, presets, fonts)
+}
+
+/// Render one frame of a workspace with the **real** panels in it.
+///
+/// [`shoot`] draws `filler`, which is right for looking at chrome and wrong for looking at panels:
+/// a picture of stand-in controls under a panel's name says nothing about that panel and says it
+/// convincingly. This one calls `panels::show`, the same way the application does.
+pub fn shoot_panels(name: &str, screen: Rect, ws: &mut Workspace) {
+    let Some((device, queue)) = crate::test_gpu::try_device() else {
+        eprintln!("screenshot {name}: no GPU adapter, skipped");
+        return;
+    };
+    let (layers, palette, presets, fonts) = sample_document();
+    let theme = ws.theme;
+    let mut brush = openpaint_core::Brush::default();
+    let mut colour = brush.color_srgb8();
+    let mut panel_input: std::collections::HashMap<u32, crate::panel_draw::PanelInput> =
+        std::collections::HashMap::new();
+    let mut menu: Option<u32> = None;
+    let mut pick: Option<crate::panel_ui::ControlId> = None;
+    let mut wheel_shape = crate::colour_wheel::Shape::default();
+    let mut wheel_hold: Option<crate::colour_wheel::Region> = None;
+
+    let ctx = egui::Context::default();
+    let mut passes = run_frames(&ctx, screen, &[], |c| {
+        let status = crate::ui::Status {
+            history: (3, 1, 2 * 1024 * 1024),
+            message: None,
+            page_size: (1200, 1600),
+            crop: None,
+            crop_rect: None,
+            residency: (0, 0),
+            spilled: 0,
+            traffic: (0, 0),
+            layers: &layers,
+            active_layer: 2,
+            pages: (3, 0),
+            tool: crate::editor::Tool::Brush,
+            confirm: None,
+            brush_cursor: None,
+            perf: crate::perf::PerfSnapshot::default(),
+            recovery: None,
+            palette: &palette,
+            presets: &presets,
+            preset_trouble: None,
+            font_families: &fonts,
+            font_substituted: None,
+            transform: None,
+            transform_box: None,
+            kernel: openpaint_core::Kernel::default(),
+            autosave: "",
+            selection: &[],
+            select_tool: Some(crate::ui::SelectTool::Wand),
+            has_selection: true,
+            wand: crate::ui::WandSettings::default(),
+        };
+        ws.show(c, screen, |panel, ui, direction, place| {
+            let mut paint = crate::ui::Painting {
+                theme: &theme,
+                direction,
+                input: panel_input.entry(panel.0).or_default(),
+                menu: &mut menu,
+                pick: &mut pick,
+                extend_by: 512,
+                preset_name: "",
+                ctx: c,
+                wheel_shape: &mut wheel_shape,
+                wheel_hold: &mut wheel_hold,
+            };
+            crate::panels::show(
+                panel,
+                ui,
+                &mut brush,
+                &mut colour,
+                &status,
+                &mut paint,
+                place,
+            );
+        });
+    });
+
+    let mut renderer = egui_wgpu::Renderer::new(&device, crate::test_gpu::SURFACE, None, 1, true);
+    for pass in &passes {
+        for (id, delta) in &pass.textures_delta.set {
+            renderer.update_texture(&device, &queue, *id, delta);
+        }
+    }
+    let output = passes.pop().expect("at least one pass");
+    render_to_png(name, screen, &device, &queue, &mut renderer, &ctx, output);
+}
+
 /// A workspace with the built-in arrangement and the built-in look.
 ///
 /// **Not `Workspace::default()`**, which reads the saved layout and theme out of the real data
@@ -1020,6 +1149,67 @@ mod tests {
         (changes, input)
     }
 
+    /// Every ported panel at once, floated so each is visible at a usable size.
+    ///
+    /// Nine panels were written by nine people against one written specification. This is the only
+    /// thing that says whether they look like one application -- and three of them draw things no
+    /// assertion can see: a curve, a palette grid, a caption.
+    ///
+    /// **Drawn by the panels themselves**, not by `filler`. A picture of stand-in controls under
+    /// the ported panels' names would say nothing about the ported panels, and would say it
+    /// convincingly.
+    #[test]
+    #[ignore = "writes a PNG to look at rather than asserting anything"]
+    fn shot_ported_panels() {
+        use crate::workspace as w;
+        let screen = Rect::new(0.0, 0.0, 1800.0, 1000.0);
+        let mut ws = plain_workspace();
+        ws.set_screen(screen);
+        for (i, panel) in [w::TRANSFORM, w::PAGES, w::PAGE, w::SELECT, w::TEXT]
+            .into_iter()
+            .enumerate()
+        {
+            ws.float(panel);
+            let (col, row) = (i % 3, i / 3);
+            ws.put_window_for_test(
+                i,
+                Rect::new(
+                    40.0 + 340.0 * col as f32,
+                    40.0 + 470.0 * row as f32,
+                    320.0,
+                    450.0,
+                ),
+            );
+        }
+        shoot_panels("ported-panels", screen, &mut ws);
+    }
+
+    /// The brush panel, which is the one with the drawings in it.
+    #[test]
+    #[ignore = "writes a PNG to look at rather than asserting anything"]
+    fn shot_brush_panel() {
+        let screen = Rect::new(0.0, 0.0, 1400.0, 1000.0);
+        let mut ws = plain_workspace();
+        ws.set_screen(screen);
+        ws.float(crate::workspace::BRUSH);
+        ws.put_window_for_test(0, Rect::new(60.0, 40.0, 360.0, 920.0));
+        shoot_panels("brush-panel", screen, &mut ws);
+    }
+
+    /// The layers and colour panels, which have a list and a grid in them.
+    #[test]
+    #[ignore = "writes a PNG to look at rather than asserting anything"]
+    fn shot_layers_and_colour() {
+        let screen = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        let mut ws = plain_workspace();
+        ws.set_screen(screen);
+        ws.float(crate::workspace::LAYERS);
+        ws.put_window_for_test(0, Rect::new(50.0, 40.0, 330.0, 700.0));
+        ws.float(crate::workspace::COLOUR);
+        ws.put_window_for_test(1, Rect::new(420.0, 40.0, 330.0, 700.0));
+        shoot_panels("layers-and-colour", screen, &mut ws);
+    }
+
     /// **A drag that wanders off the hue ring keeps setting the hue.**
     ///
     /// The same latch a slider has, and for the same reason: a hand sweeping round a ring does not
@@ -1178,9 +1368,15 @@ mod tests {
             "it asked for 120 and was given {}",
             at.h
         );
-        // And it is where `place` put it, not at the corner of the panel.
+        // And it is where `place` put it, not at the corner of the panel: under the label, by
+        // however tall that label's words actually are. Measured the same way the layout measures
+        // it -- a label's height is its content now, so a second guess here would be a second
+        // answer to the same question.
         let m = Theme::default().metrics;
-        let expected = area.y + controls[0].height(&m) + m.gap;
+        let label_tall = frame_with(area, &[], |ctx| {
+            crate::panel_draw::wrapped_height(ctx, m.body, &controls[0], area.w)
+        });
+        let expected = area.y + controls[0].height(&m, label_tall) + m.gap;
         assert!(
             (at.y - expected).abs() < 0.001,
             "it landed at {} rather than {expected}",
@@ -1206,7 +1402,7 @@ mod tests {
         let area = Rect::new(20.0, 20.0, 220.0, 300.0);
         let m = Theme::default().metrics;
         // The button is the second control, so it sits one label plus one gap down.
-        let y = area.y + controls[0].height(&m) + m.gap + m.row / 2.0;
+        let y = area.y + controls[0].height(&m, 0.0) + m.gap + m.row / 2.0;
         let (changes, input) =
             press_controls(&controls, area, Direction::Column, (area.x + 60.0, y));
         assert!(
