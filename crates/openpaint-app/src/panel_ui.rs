@@ -89,6 +89,37 @@ pub enum Control {
         /// established symbol -- a direction, a blend mode -- should do.
         icon: Option<crate::icons::Symbol>,
     },
+    /// One of a longer list, shown as what is chosen now and opened to change it.
+    ///
+    /// **A [`Choice`] per option stops working past about five.** Blend modes are two dozen; a
+    /// resampling kernel is half that. Laid out as choices they fill a panel with things nobody is
+    /// looking at, and the one that matters -- what is set *now* -- has to be found among them.
+    ///
+    /// The options are not here. This is what the panel shows when nothing is open, and the list
+    /// belongs to whoever knows what the options are; opening it is an answer the panel gives, the
+    /// same way the menu opens its own items.
+    ///
+    /// [`Choice`]: Control::Choice
+    Pick {
+        id: ControlId,
+        text: String,
+        /// What is chosen now, in words: "Multiply", "Lanczos".
+        value: String,
+    },
+    /// Words the artist types.
+    ///
+    /// A preset's name, a layer's name, a page size, a transform's exact numbers. Editing lives in
+    /// [`crate::text_field`], which is where the caret, the selection, the word motion and the
+    /// UTF-8 arithmetic already are and are already fuzzed -- this is only the part that says
+    /// there is a field here and what is in it.
+    Text {
+        id: ControlId,
+        text: String,
+        /// What the field holds. What the artist has typed *while editing* lives with the pointer
+        /// state, not here: a control is a description of the panel, and a description that
+        /// changed under every keystroke would be rebuilt on every keystroke.
+        value: String,
+    },
     /// Drawn by code, because it cannot be described.
     ///
     /// A colour wheel, a curve editor, a graph. The engine still owns *where* it goes and how tall
@@ -126,6 +157,8 @@ impl Control {
             | Self::Slider { id, .. }
             | Self::Toggle { id, .. }
             | Self::Choice { id, .. }
+            | Self::Pick { id, .. }
+            | Self::Text { id, .. }
             | Self::Custom { id, .. }
             | Self::Row { id, .. } => Some(*id),
         }
@@ -163,6 +196,13 @@ impl Control {
             Self::Toggle { .. } => text + metrics.row * 1.6 + metrics.padding * 2.0,
             // Square at least, so a single glyph is still a target rather than a sliver.
             Self::Choice { .. } => (text + metrics.padding * 2.0).max(metrics.row),
+            // Both hold words that change, so both need room for words longer than the ones there
+            // now -- a field that resizes as you type is a field that moves out from under the
+            // caret. The same floor a slider gets, for the same reason: below it they are buttons
+            // that lie about what they do.
+            Self::Pick { .. } | Self::Text { .. } => {
+                (text + metrics.row * 4.0).max(metrics.row * 6.0)
+            }
             // Square, because a custom drawing has no label to be measured and nothing to say
             // about how wide it wants to be along a row.
             Self::Custom { height, .. } => *height,
@@ -328,7 +368,11 @@ pub fn clamp_scroll(offset: f32, total: f32, visible: f32) -> f32 {
 }
 
 /// What the artist did.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// **Not `Copy` any more**, because a finished field carries its words. Nothing here is passed
+/// anywhere hot enough for the clone to matter, and the alternative -- reporting only *that* it
+/// changed and making the receiver go and look -- is a second place for the answer to live.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Change {
     Pressed(ControlId),
     /// A slider moved. Already clamped to its range.
@@ -336,6 +380,21 @@ pub enum Change {
     Toggled(ControlId, bool),
     /// A row was chosen.
     Chose(ControlId),
+    /// Option `n` of a [`Control::Pick`] was chosen, counting from the list the panel offered.
+    ///
+    /// By position rather than by name, because the panel that offered the list is the one being
+    /// told, and it has the list in front of it. A name would have to survive being spelled twice.
+    Picked(ControlId, usize),
+    /// A [`Control::Text`] took the caret. Nothing has changed yet.
+    ///
+    /// Reported so the panel can tell that a field is being edited -- to stop a shortcut eating
+    /// the keystrokes, say -- and so the *engine* is not the only thing that knows.
+    Typing(ControlId),
+    /// A [`Control::Text`] was finished with, and this is what it says now.
+    ///
+    /// On Enter or on losing the caret, never per keystroke: a name applied letter by letter is a
+    /// name that renames a layer eight times and puts eight steps on the undo stack.
+    Typed(ControlId, String),
 }
 
 /// What a press at a point would do, without doing it.
@@ -394,6 +453,13 @@ pub fn change_at(
         Control::Button { id, .. } => Some(Change::Pressed(*id)),
         Control::Toggle { id, on, .. } => Some(Change::Toggled(*id, !on)),
         Control::Choice { id, .. } | Control::Row { id, .. } => Some(Change::Chose(*id)),
+        // **A press opens it; it does not choose anything by itself.** What the options are is
+        // known to whoever built the control, and it answers by opening a list of them -- the same
+        // way the menu opens its own items.
+        Control::Pick { id, .. } => Some(Change::Pressed(*id)),
+        // A press puts the caret in it. Where the caret goes is the field's own arithmetic and
+        // needs the glyph positions, so it is settled where the text is drawn.
+        Control::Text { id, .. } => Some(Change::Typing(*id)),
         Control::Slider {
             id, min, max, log, ..
         } => {

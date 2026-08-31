@@ -89,7 +89,7 @@ pub enum Motion {
 /// The selection runs between `anchor` and `caret` in either order, because that is what dragging
 /// produces — the anchor is where the gesture started and the caret is where it is now. Callers see
 /// it ordered, through [`TextField::selection`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TextField {
     text: String,
     /// Byte offset, always on a character boundary. Where the next character lands.

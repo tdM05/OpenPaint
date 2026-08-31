@@ -29,6 +29,10 @@ pub enum Poke {
     Move(f32, f32),
     Press(f32, f32),
     Release(f32, f32),
+    /// Words typed, as the window would deliver them.
+    Say(&'static str),
+    /// A key pressed and let go: Enter, Backspace, an arrow.
+    Tap(egui::Key),
 }
 
 /// Run egui frames with no window, and hand back what the last one drew.
@@ -64,20 +68,34 @@ fn run_frames(
         // back to where it started, which is the sort of thing that makes a harness lie.
         if pass == 1 {
             for poke in pokes {
-                input.events.push(match *poke {
-                    Poke::Move(x, y) => egui::Event::PointerMoved(egui::pos2(x, y)),
-                    Poke::Press(x, y) | Poke::Release(x, y) => egui::Event::PointerButton {
-                        pos: egui::pos2(x, y),
-                        button: egui::PointerButton::Primary,
-                        pressed: matches!(poke, Poke::Press(..)),
-                        modifiers: egui::Modifiers::default(),
-                    },
-                });
+                input.events.push(as_event(*poke));
             }
         }
         passes.push(ctx.run(input, &mut build));
     }
     passes
+}
+
+/// One poke, as the window would have delivered it.
+#[must_use]
+fn as_event(poke: Poke) -> egui::Event {
+    match poke {
+        Poke::Move(x, y) => egui::Event::PointerMoved(egui::pos2(x, y)),
+        Poke::Press(x, y) | Poke::Release(x, y) => egui::Event::PointerButton {
+            pos: egui::pos2(x, y),
+            button: egui::PointerButton::Primary,
+            pressed: matches!(poke, Poke::Press(..)),
+            modifiers: egui::Modifiers::default(),
+        },
+        Poke::Say(text) => egui::Event::Text(text.to_owned()),
+        Poke::Tap(key) => egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        },
+    }
 }
 
 /// Drive one settled egui frame and let the caller inspect whatever the closure produced.
@@ -738,6 +756,204 @@ mod tests {
         // Squarely over the panels down the right-hand side, which draw content of their own.
         ws.put_window_for_test(0, Rect::new(1000.0, 120.0, 320.0, 300.0));
         shoot("floating-in-front", screen, &[], &mut ws);
+    }
+
+    use crate::panel_ui::Change;
+
+    /// **A text field takes the caret, takes what is typed, and reports it once.**
+    ///
+    /// End to end through a real egui frame, because everything that could be wrong about a field
+    /// is in the wiring: whether the press gives it the caret, whether the keys reach it at all,
+    /// and whether what comes back out is what was typed.
+    #[test]
+    fn a_text_field_reports_what_was_typed_when_it_is_finished_with() {
+        let area = Rect::new(0.0, 0.0, 300.0, 120.0);
+        let field = || Control::Text {
+            id: 7,
+            text: "Name".to_owned(),
+            value: "Layer 1".to_owned(),
+        };
+        let m = Theme::default().metrics;
+        let at = (area.x + area.w * 0.75, area.y + m.row / 2.0);
+
+        // Pressing it takes the caret and says so, and nothing has changed yet.
+        let (changes, input) = type_into(&[field()], area, &[tap(at)]);
+        assert_eq!(
+            changes,
+            vec![Change::Typing(7)],
+            "the press did not take the caret"
+        );
+        assert!(input.editing.is_some(), "and nothing is being edited");
+
+        // Typing replaces what was there -- the field arrives selected, as every field does -- and
+        // Enter finishes it.
+        let (changes, input) = type_into(
+            &[field()],
+            area,
+            &[tap(at), vec![Poke::Say("Sky"), Poke::Tap(egui::Key::Enter)]],
+        );
+        assert!(
+            changes.contains(&Change::Typed(7, "Sky".to_owned())),
+            "the field did not report what was typed: {changes:?}"
+        );
+        assert!(
+            input.editing.is_none(),
+            "and it should have let go of the caret"
+        );
+    }
+
+    /// Backspace and the arrows reach the field, and nothing is reported until it is finished.
+    #[test]
+    fn a_text_field_edits_before_it_reports() {
+        let area = Rect::new(0.0, 0.0, 300.0, 120.0);
+        let m = Theme::default().metrics;
+        let at = (area.x + area.w * 0.75, area.y + m.row / 2.0);
+        let one = [Control::Text {
+            id: 3,
+            text: String::new(),
+            value: "ab".to_owned(),
+        }];
+
+        // Typed but not finished: the words are in the field and nobody has been told.
+        let (changes, input) = type_into(&one, area, &[tap(at), vec![Poke::Say("xy")]]);
+        assert!(
+            !changes.iter().any(|c| matches!(c, Change::Typed(..))),
+            "it reported before it was finished with: {changes:?}"
+        );
+        assert_eq!(input.editing.as_ref().map(|(_, f)| f.text()), Some("xy"));
+
+        // Backspace takes one off, and the caret keys move rather than type.
+        let (_, input) = type_into(
+            &one,
+            area,
+            &[
+                tap(at),
+                vec![
+                    Poke::Say("xyz"),
+                    Poke::Tap(egui::Key::Backspace),
+                    Poke::Tap(egui::Key::ArrowLeft),
+                    Poke::Say("-"),
+                ],
+            ],
+        );
+        assert_eq!(input.editing.as_ref().map(|(_, f)| f.text()), Some("x-y"));
+    }
+
+    /// **Pressing something else finishes the field**, rather than letting it eat the next thing.
+    #[test]
+    fn pressing_elsewhere_finishes_a_field() {
+        let area = Rect::new(0.0, 0.0, 300.0, 160.0);
+        let m = Theme::default().metrics;
+        let controls = [
+            Control::Text {
+                id: 3,
+                text: String::new(),
+                value: "old".to_owned(),
+            },
+            Control::Button {
+                id: 4,
+                text: "Apply".to_owned(),
+            },
+        ];
+        let on_field = (area.x + area.w * 0.75, area.y + m.row / 2.0);
+        let on_button = (area.x + area.w / 2.0, area.y + m.row * 1.5);
+
+        let (changes, input) = type_into(
+            &controls,
+            area,
+            &[tap(on_field), vec![Poke::Say("new")], tap(on_button)],
+        );
+        assert!(
+            changes.contains(&Change::Typed(3, "new".to_owned())),
+            "the field did not report when the pointer went elsewhere: {changes:?}"
+        );
+        assert!(input.editing.is_none());
+    }
+
+    /// A pick answers by asking to be opened. It chooses nothing by itself.
+    #[test]
+    fn a_pick_asks_to_be_opened() {
+        let area = Rect::new(0.0, 0.0, 300.0, 120.0);
+        let m = Theme::default().metrics;
+        let at = (area.x + area.w / 2.0, area.y + m.row / 2.0);
+        let (changes, _) = press_controls(
+            &[Control::Pick {
+                id: 9,
+                text: "Blend".to_owned(),
+                value: "Multiply".to_owned(),
+            }],
+            area,
+            Direction::Column,
+            at,
+        );
+        assert_eq!(changes, vec![Change::Pressed(9)]);
+    }
+
+    /// A pointer arriving, pressing and letting go, which is what a tap is made of.
+    fn tap(at: (f32, f32)) -> Vec<Poke> {
+        vec![
+            Poke::Move(at.0, at.1),
+            Poke::Press(at.0, at.1),
+            Poke::Release(at.0, at.1),
+        ]
+    }
+
+    /// Drive a list of controls through a run of real frames and hand back everything that
+    /// changed and the state the engine kept.
+    ///
+    /// **One batch of events per frame, because that is what a frame is.** Two taps delivered
+    /// together are one tap as far as egui is concerned -- a press and a release coalesce into a
+    /// click and there is one click per frame -- so "press the field, then press something else"
+    /// cannot be said at all in a single batch, and a test that tried it read as passing.
+    fn type_into(
+        controls: &[Control],
+        area: Rect,
+        frames: &[Vec<Poke>],
+    ) -> (Vec<crate::panel_ui::Change>, crate::panel_draw::PanelInput) {
+        let theme = Theme::default();
+        let mut input = crate::panel_draw::PanelInput::default();
+        let mut changes = Vec::new();
+        let screen = Rect::new(0.0, 0.0, area.x + area.w + 40.0, area.y + area.h + 40.0);
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(screen.x, screen.y),
+            egui::vec2(screen.w, screen.h),
+        );
+        let ctx = egui::Context::default();
+        // A warm-up pass first, then one per batch: egui measures text from an atlas it builds as
+        // it goes, so the first frame after a context is made can lay everything out at zero.
+        for pass in 0..=frames.len() {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            };
+            if pass > 0 {
+                for poke in &frames[pass - 1] {
+                    raw.events.push(as_event(*poke));
+                }
+            }
+            ctx.run(raw, |c| {
+                let mut ui = egui::Ui::new(
+                    c.clone(),
+                    egui::LayerId::new(egui::Order::Middle, egui::Id::new("typed")),
+                    egui::Id::new("typed-ui"),
+                    egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                        egui::pos2(area.x, area.y),
+                        egui::vec2(area.w, area.h),
+                    )),
+                );
+                let out = crate::panel_draw::show(
+                    &mut ui,
+                    controls,
+                    &theme,
+                    Direction::Column,
+                    &mut input,
+                );
+                if pass > 0 {
+                    changes.extend(out);
+                }
+            });
+        }
+        (changes, input)
     }
 
     /// **A drag that wanders off the hue ring keeps setting the hue.**

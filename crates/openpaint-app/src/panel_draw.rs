@@ -30,6 +30,17 @@ pub struct PanelInput {
     /// would be maddening. So the control is latched on press and released on release, exactly as
     /// the panel drag latches a tab.
     pub latch: Option<ControlId>,
+    /// The text field that has the caret, and what it says while it is being typed into.
+    ///
+    /// **Here rather than in the [`Control`].** A control is a description of the panel, rebuilt
+    /// whenever the panel is asked what it looks like; a description that changed under every
+    /// keystroke would be rebuilt under every keystroke, and the words would go back to what the
+    /// panel last committed the moment anything else moved.
+    ///
+    /// One at a time, because one caret is all there is.
+    ///
+    /// [`Control`]: crate::panel_ui::Control
+    pub editing: Option<(ControlId, crate::text_field::TextField)>,
     /// How far down a list taller than its panel has been scrolled.
     pub scroll: f32,
     /// Where each [`Control::Custom`] ended up, and where the pointer is inside the panel.
@@ -111,7 +122,6 @@ pub fn show(
     input.scroll = clamp_scroll(input.scroll - wheel, tall, visible);
     let scrolled = Rect::new(content.x, content.y - input.scroll, content.w, content.h);
     let placed = place(controls, scrolled, m, direction, text_of);
-    let latch = &mut input.latch;
 
     let mut changes = Vec::new();
     let pointer = resp.interact_pointer_pos();
@@ -124,7 +134,7 @@ pub fn show(
     if let (Some(p), true) = (pointer, pressed) {
         if let Some((control, rect)) = hit(&placed, p.x, p.y) {
             if matches!(control, Control::Slider { .. }) {
-                *latch = control.id();
+                input.latch = control.id();
                 changes.extend(change_at(control, rect, m, p.x, p.y));
             }
         }
@@ -132,7 +142,7 @@ pub fn show(
 
     // A latched slider keeps following, wherever the pointer has got to. `change_at` clamps, so
     // running off the end of the window pins the value rather than losing it.
-    if let (Some(id), Some(p), true) = (*latch, pointer, down) {
+    if let (Some(id), Some(p), true) = (input.latch, pointer, down) {
         if let Some(found) = placed.iter().find(|q| q.control.id() == Some(id)) {
             changes.extend(change_at(
                 found.control,
@@ -144,10 +154,10 @@ pub fn show(
         }
     }
     if !down {
-        *latch = None;
+        input.latch = None;
     }
 
-    if resp.clicked() && latch.is_none() {
+    if resp.clicked() && input.latch.is_none() {
         if let Some(p) = pointer {
             if let Some((control, rect)) = hit(&placed, p.x, p.y) {
                 if !matches!(control, Control::Slider { .. }) {
@@ -155,6 +165,66 @@ pub fn show(
                     changes.extend(change_at(control, rect, m, p.x, p.y));
                 }
             }
+        }
+    }
+
+    // **A press anywhere that is not this field finishes it.** A field that kept the caret until
+    // Enter would eat the next thing the artist did, and "I clicked the button and it typed into
+    // the box" is not a bug anyone should have to report.
+    if pressed {
+        let still = pointer
+            .and_then(|p| hit(&placed, p.x, p.y))
+            .and_then(|(c, _)| matches!(c, Control::Text { .. }).then(|| c.id()).flatten());
+        if input.editing.as_ref().map(|(id, _)| *id) != still {
+            changes.extend(finish_editing(input));
+        }
+    }
+    // A field the panel no longer offers cannot keep the caret either -- a layer renamed out from
+    // under the field, a preset deleted.
+    if input
+        .editing
+        .as_ref()
+        .is_some_and(|(id, _)| !controls.iter().any(|c| c.id() == Some(*id)))
+    {
+        input.editing = None;
+    }
+    // Take the caret, keeping whatever is in the field as its starting point.
+    for change in &changes {
+        if let Change::Typing(id) = change {
+            if input.editing.as_ref().map(|(held, _)| *held) != Some(*id) {
+                let value = controls.iter().find_map(|c| match c {
+                    Control::Text { id: q, value, .. } if q == id => Some(value.clone()),
+                    _ => None,
+                });
+                let mut field = crate::text_field::TextField::new(value.unwrap_or_default());
+                // Selected, so typing replaces rather than appends -- what every field does when
+                // you tab into it, and what an artist renaming a layer means every time.
+                field.select_all();
+                input.editing = Some((*id, field));
+            }
+        }
+    }
+    // The keys, once the caret is somewhere. Read here rather than by the panel, because the panel
+    // has no idea a field is being edited and should not have to.
+    if input.editing.is_some() {
+        let events = ui.input(|i| i.events.clone());
+        let mut done = false;
+        if let Some((_, field)) = input.editing.as_mut() {
+            for event in &events {
+                match event {
+                    egui::Event::Text(t) => field.insert_str(t),
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => done |= apply_key(field, *key, *modifiers),
+                    _ => {}
+                }
+            }
+        }
+        if done {
+            changes.extend(finish_editing(input));
         }
     }
 
@@ -172,7 +242,16 @@ pub fn show(
         .and_then(|p| hit(&placed, p.x, p.y).and_then(|(c, _)| c.id()));
     let painter = ui.painter_at(area);
     for p in &placed {
-        draw(&painter, p, theme, direction, hover, *latch);
+        draw(&painter, p, theme, direction, hover, input.latch);
+        // The field with the caret shows what is being typed, not what was last committed -- and
+        // the caret itself, or it is indistinguishable from a field that is merely highlighted.
+        if let (Control::Text { id, text, .. }, Some((held, field))) =
+            (p.control, input.editing.as_ref())
+        {
+            if id == held {
+                draw_editing(&painter, p.rect, text, field, theme, ui.ctx());
+            }
+        }
     }
     changes
 }
@@ -281,6 +360,72 @@ fn draw(
                 format_value(*value, *min, *max, unit),
                 body,
                 color(pal.dim),
+            );
+        }
+        // **What is chosen now, and a mark saying there is more.** Drawn as the slider is, with
+        // the label on the left and the value on the right, because from a distance a panel of
+        // settings should read as one column of "name: value" whatever kind of setting each is.
+        Control::Pick { text, value, .. } => {
+            painter.rect_filled(
+                to_egui(r),
+                m.radius,
+                color(if lit { pal.edge } else { pal.header }),
+            );
+            painter.text(
+                egui::pos2(left, r.y + r.h / 2.0),
+                egui::Align2::LEFT_CENTER,
+                text,
+                body.clone(),
+                color(pal.text),
+            );
+            // Room for the mark, so a long value does not run into it.
+            let room = m.padding.mul_add(0.5, m.row * 0.5);
+            painter.text(
+                egui::pos2(r.x + r.w - room, r.y + r.h / 2.0),
+                egui::Align2::RIGHT_CENTER,
+                value,
+                body,
+                color(pal.bright),
+            );
+            // A small triangle pointing down: the one mark that means "there is a list behind
+            // this" in every application anybody has used.
+            let cx = r.x + r.w - m.padding * 0.5 - m.row * 0.25;
+            let cy = r.y + r.h / 2.0;
+            let w = m.row * 0.22;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(cx - w, cy - w * 0.6),
+                    egui::pos2(cx + w, cy - w * 0.6),
+                    egui::pos2(cx, cy + w * 0.7),
+                ],
+                color(pal.dim),
+                egui::Stroke::NONE,
+            ));
+        }
+        // **A sunken well with words in it**, which is what a field looks like everywhere. The
+        // caret and any selection are drawn over the top, by whoever is holding the editing state
+        // -- see `draw_caret`.
+        Control::Text { text, value, .. } => {
+            painter.text(
+                egui::pos2(left, r.y + r.h / 2.0),
+                egui::Align2::LEFT_CENTER,
+                text,
+                body.clone(),
+                color(pal.text),
+            );
+            let well = text_well(r, m, ui_text_left(r, m, text, body.size));
+            painter.rect_filled(to_egui(well), m.radius, color(pal.ground));
+            painter.rect_stroke(
+                to_egui(well),
+                m.radius,
+                egui::Stroke::new(1.0_f32, color(if lit { pal.state } else { pal.edge })),
+            );
+            painter.text(
+                egui::pos2(well.x + m.padding * 0.5, well.y + well.h / 2.0),
+                egui::Align2::LEFT_CENTER,
+                value,
+                body,
+                color(pal.bright),
             );
         }
         Control::Toggle { text, on, .. } => {
@@ -411,6 +556,141 @@ fn icon_for(control: &Control, theme: &Theme) -> Option<&'static [crate::icons::
         .and_then(|s| s.glyph(*symbol))
 }
 
+/// The words being typed, the selection behind them, and the caret.
+///
+/// Drawn over the control rather than instead of it, so the well, the label and the lit border are
+/// the ordinary ones and there is one description of what a field looks like.
+fn draw_editing(
+    painter: &egui::Painter,
+    r: Rect,
+    label: &str,
+    field: &crate::text_field::TextField,
+    theme: &Theme,
+    ctx: &egui::Context,
+) {
+    let (m, pal) = (&theme.metrics, &theme.palette);
+    let font = egui::FontId::proportional(m.body);
+    let well = text_well(r, m, ui_text_left(r, m, label, m.body));
+    let left = well.x + m.padding * 0.5;
+    let mid = well.y + well.h / 2.0;
+    let upto = |bytes: usize| {
+        ctx.fonts(|f| {
+            f.layout_no_wrap(
+                field.text()[..bytes].to_owned(),
+                font.clone(),
+                egui::Color32::WHITE,
+            )
+            .size()
+            .x
+        })
+    };
+    // The selection first, so the words sit on it.
+    if let Some(range) = field.selection() {
+        let (a, b) = (upto(range.start), upto(range.end));
+        let [sr, sg, sb] = pal.state.0;
+        painter.rect_filled(
+            to_egui(Rect::new(left + a, well.y + 2.0, b - a, well.h - 4.0)),
+            0.0_f32,
+            egui::Color32::from_rgba_unmultiplied(sr, sg, sb, 120),
+        );
+    }
+    // Over the committed words, which are the same words unless the panel has fallen behind.
+    painter.rect_filled(to_egui(well), m.radius, color(pal.ground));
+    painter.text(
+        egui::pos2(left, mid),
+        egui::Align2::LEFT_CENTER,
+        field.text(),
+        font.clone(),
+        color(pal.bright),
+    );
+    let caret = (left + upto(field.caret())).round() + 0.5;
+    painter.line_segment(
+        [
+            egui::pos2(caret, well.y + 2.0),
+            egui::pos2(caret, well.y + well.h - 2.0),
+        ],
+        egui::Stroke::new(1.0_f32, color(pal.bright)),
+    );
+}
+
+/// Let go of the field that has the caret and report what it says.
+///
+/// **On the way out, once.** A name applied per keystroke renames a layer eight times and leaves
+/// eight steps on the undo stack; one that is never applied at all is a field that pretends.
+fn finish_editing(input: &mut PanelInput) -> Option<Change> {
+    let (id, field) = input.editing.take()?;
+    Some(Change::Typed(id, field.text().to_owned()))
+}
+
+/// One key, applied to the field with the caret. Returns whether the field is finished with.
+///
+/// The motions and the arithmetic are [`crate::text_field`]'s; this is only which key means which.
+fn apply_key(
+    field: &mut crate::text_field::TextField,
+    key: egui::Key,
+    mods: egui::Modifiers,
+) -> bool {
+    use crate::text_field::Motion;
+    let word = mods.ctrl || mods.command;
+    let motion = match key {
+        egui::Key::ArrowLeft if word => Some(Motion::WordLeft),
+        egui::Key::ArrowRight if word => Some(Motion::WordRight),
+        egui::Key::ArrowLeft => Some(Motion::Left),
+        egui::Key::ArrowRight => Some(Motion::Right),
+        egui::Key::Home => Some(Motion::Home),
+        egui::Key::End => Some(Motion::End),
+        _ => None,
+    };
+    if let Some(motion) = motion {
+        // Shift takes the selection with it, which is what shift means in every field there is.
+        if mods.shift {
+            field.extend_selection(motion);
+        } else {
+            field.move_caret(motion);
+        }
+        return false;
+    }
+    match key {
+        egui::Key::Backspace => field.backspace(),
+        egui::Key::Delete => field.delete(),
+        egui::Key::A if word => field.select_all(),
+        // **Both finish it**, and both keep what was typed. Escape putting the old words back is a
+        // second rule about what a field remembers, and the way back from a name you did not mean
+        // is the same undo as everything else.
+        egui::Key::Enter | egui::Key::Escape => return true,
+        _ => {}
+    }
+    false
+}
+
+/// Where the words in a text field start, which is after its label.
+///
+/// **One definition.** The well is drawn here and the caret is placed against it elsewhere; two
+/// answers would put the caret beside the letters rather than between them, which reads as the
+/// field being broken rather than as an arithmetic slip.
+#[must_use]
+pub fn ui_text_left(r: Rect, m: &crate::theme::Metrics, label: &str, size: f32) -> f32 {
+    // A label of nothing takes no room and no gap either, so a field with no name is all field.
+    if label.is_empty() {
+        return r.x + m.padding * 0.5;
+    }
+    // Measured by the caller in a column; here the label is on the left and the well takes what is
+    // left over, with a floor so a long name cannot squeeze the field out of existence.
+    let want = size.mul_add(0.6 * label.chars().count() as f32, m.padding * 1.5);
+    r.x + want.min(r.w * 0.5)
+}
+
+/// The well a text field's words sit in: from `left` to the end of the row.
+#[must_use]
+pub fn text_well(r: Rect, m: &crate::theme::Metrics, left: f32) -> Rect {
+    Rect::new(
+        left,
+        r.y + m.padding * 0.25,
+        (r.x + r.w - m.padding * 0.5 - left).max(m.row),
+        (r.h - m.padding * 0.5).max(m.row * 0.6),
+    )
+}
+
 /// The width of a control's label, measured by the thing that will draw it.
 ///
 /// A column never asks, so this costs nothing there.
@@ -421,6 +701,8 @@ pub fn text_width(ctx: &egui::Context, size: f32, control: &Control) -> f32 {
         | Control::Slider { text, .. }
         | Control::Toggle { text, .. }
         | Control::Choice { text, .. }
+        | Control::Pick { text, .. }
+        | Control::Text { text, .. }
         | Control::Row { text, .. } => text.as_str(),
         Control::Separator | Control::Custom { .. } => return 0.0,
     };
