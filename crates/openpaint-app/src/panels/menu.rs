@@ -154,7 +154,7 @@ fn menu_size(which: u32, active_layer: usize, layers: usize, paint: &Painting<'_
     // Every control here is a button or a choice, so nothing has a sentence to wrap and
     // the height of one is a question that never gets asked.
     let tall_of = |_: &crate::panel_ui::Control, _: f32| 0.0;
-    let laid = crate::panel_ui::place(&controls, origin, m, Direction::Column, text_of, tall_of);
+    let laid = crate::panel_ui::place(&controls, origin, m, Direction::Column, &text_of, &tall_of);
     let tall = crate::panel_ui::extent(&laid, origin).1;
     (widest + m.padding * 4.0, tall + m.padding * 2.0)
 }

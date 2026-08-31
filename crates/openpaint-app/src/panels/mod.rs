@@ -98,7 +98,7 @@ pub(crate) fn list_size(options: &[String], paint: &Painting<'_>) -> (f32, f32) 
     // Every control here is a button or a choice, so nothing has a sentence to wrap and
     // the height of one is a question that never gets asked.
     let tall_of = |_: &crate::panel_ui::Control, _: f32| 0.0;
-    let laid = place(&controls, origin, m, Direction::Column, text_of, tall_of);
+    let laid = place(&controls, origin, m, Direction::Column, &text_of, &tall_of);
     let tall = extent(&laid, origin).1;
     (
         widest + m.padding * 4.0,

@@ -282,15 +282,15 @@ pub fn place<'a>(
     content: Rect,
     metrics: &Metrics,
     direction: Direction,
-    text_of: impl Fn(&Control) -> f32,
-    tall_of: impl Fn(&Control, f32) -> f32,
+    text_of: &impl Fn(&Control) -> f32,
+    tall_of: &impl Fn(&Control, f32) -> f32,
 ) -> Vec<Placed<'a>> {
     let across = match direction {
         Direction::Row | Direction::Wrap => true,
         Direction::Column => false,
         // The whole point of Auto: it decides once, for the whole list. A per-control decision is
         // what produces a wrapped row, which is the thing being avoided.
-        Direction::Auto => row_width(controls, metrics, &text_of) <= content.w,
+        Direction::Auto => row_width(controls, metrics, text_of) <= content.w,
     };
     let mut out = Vec::with_capacity(controls.len());
     let (mut x, mut y) = (content.x, content.y);
@@ -557,8 +557,8 @@ mod tests {
             content(),
             &metrics(),
             Direction::Column,
-            text,
-            one_line,
+            &text,
+            &one_line,
         )
     }
 
@@ -774,7 +774,7 @@ mod tests {
         let wide = Rect::new(0.0, 0.0, 4000.0, 300.0);
         let narrow = Rect::new(0.0, 0.0, 120.0, 300.0);
 
-        let across = place(&controls, wide, &m, Direction::Auto, text, one_line);
+        let across = place(&controls, wide, &m, Direction::Auto, &text, &one_line);
         let rows: std::collections::BTreeSet<i32> =
             across.iter().map(|p| p.rect.y as i32).collect();
         assert_eq!(rows.len(), 1, "with room to spare it should be one row");
@@ -788,7 +788,7 @@ mod tests {
             "the row it chose runs off the panel"
         );
 
-        let down = place(&controls, narrow, &m, Direction::Auto, text, one_line);
+        let down = place(&controls, narrow, &m, Direction::Auto, &text, &one_line);
         let columns: std::collections::BTreeSet<i32> =
             down.iter().map(|p| p.rect.x as i32).collect();
         assert_eq!(columns.len(), 1, "too narrow, so it should be one column");
@@ -801,8 +801,8 @@ mod tests {
             Rect::new(0.0, 0.0, bare, 300.0),
             &m,
             Direction::Auto,
-            text,
-            one_line,
+            &text,
+            &one_line,
         );
         let cols: std::collections::BTreeSet<i32> = snug.iter().map(|p| p.rect.x as i32).collect();
         assert_eq!(
@@ -845,7 +845,7 @@ mod tests {
         let one = tools[0].width(&m, text(&tools[0]));
         // Room for three across, so six should land on two lines.
         let content = Rect::new(0.0, 0.0, one * 3.0 + m.gap * 2.0, 300.0);
-        let laid = place(&tools, content, &m, Direction::Wrap, text, one_line);
+        let laid = place(&tools, content, &m, Direction::Wrap, &text, &one_line);
 
         let lines: std::collections::BTreeSet<i32> = laid.iter().map(|p| p.rect.y as i32).collect();
         assert_eq!(lines.len(), 2, "six buttons, three to a line");
@@ -890,8 +890,8 @@ mod tests {
             Rect::new(5.0, 7.0, 4000.0, 300.0),
             &m,
             Direction::Row,
-            text,
-            one_line,
+            &text,
+            &one_line,
         );
         for p in &laid {
             assert!(
@@ -929,8 +929,8 @@ mod tests {
             Rect::new(0.0, 0.0, 4000.0, 300.0),
             &m,
             Direction::Row,
-            text,
-            one_line,
+            &text,
+            &one_line,
         );
         for p in &laid {
             if !matches!(p.control, Control::Slider { .. }) {
@@ -954,7 +954,7 @@ mod tests {
         let m = metrics();
         let controls = sliders();
         let content = Rect::new(0.0, 0.0, 4000.0, 200.0);
-        let laid = place(&controls, content, &m, Direction::Row, text, one_line);
+        let laid = place(&controls, content, &m, Direction::Row, &text, &one_line);
         // **The room above equals the room below.** Measuring the block and dividing would be
         // circular: `extent` reports where the controls ended up, offset included, so it would
         // agree with any offset at all.
@@ -973,7 +973,7 @@ mod tests {
         assert!((laid[0].rect.x - content.x).abs() < 0.001);
 
         // A column is not pushed down: a list starts at the top and grows.
-        let down = place(&controls, content, &m, Direction::Column, text, one_line);
+        let down = place(&controls, content, &m, Direction::Column, &text, &one_line);
         assert!((down[0].rect.y - content.y).abs() < 0.001);
     }
 
@@ -992,7 +992,7 @@ mod tests {
         let one = tools[0].width(&m, text(&tools[0]));
         // A rail with room for two across and plenty to spare either side.
         let content = Rect::new(0.0, 0.0, one * 2.0 + m.gap + 40.0, 400.0);
-        let laid = place(&tools, content, &m, Direction::Wrap, text, one_line);
+        let laid = place(&tools, content, &m, Direction::Wrap, &text, &one_line);
         let far = |f: fn(&Placed<'_>) -> f32| laid.iter().map(f).fold(f32::MIN, f32::max);
         let left = laid.iter().map(|p| p.rect.x).fold(f32::MAX, f32::min) - content.x;
         let right = (content.x + content.w) - far(|p| p.rect.x + p.rect.w);
@@ -1020,8 +1020,8 @@ mod tests {
                 Rect::new(0.0, 0.0, 4000.0, 300.0),
                 &m,
                 direction,
-                text,
-                one_line,
+                &text,
+                &one_line,
             );
             let slider = laid
                 .iter()

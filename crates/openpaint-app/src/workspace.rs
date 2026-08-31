@@ -2606,7 +2606,7 @@ impl Workspace {
         // the height of one is a question that never gets asked.
         let tall_of = |_: &crate::panel_ui::Control, _: f32| 0.0;
         let laid =
-            crate::panel_ui::place(&controls, origin, &m, Direction::Column, text_of, tall_of);
+            crate::panel_ui::place(&controls, origin, &m, Direction::Column, &text_of, &tall_of);
         let h = (crate::panel_ui::extent(&laid, origin).1 + m.padding * 2.0).min(screen.h);
         Rect::new(
             x.min(screen.x + screen.w - w).max(screen.x),

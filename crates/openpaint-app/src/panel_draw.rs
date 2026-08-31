@@ -122,7 +122,7 @@ pub fn show(
     // How tall a label's sentence is at the width it will get. Measured by the thing that will
     // draw it, so the room made and the room used are one answer.
     let tall_of = |c: &Control, w: f32| wrapped_height(ui.ctx(), m.body, c, w);
-    let laid = place(controls, content, m, direction, text_of, &tall_of);
+    let laid = place(controls, content, m, direction, &text_of, &tall_of);
     let (_, tall) = extent(&laid, content);
 
     // Only the panel under the pointer takes the wheel. The delta egui reports is the window's,
@@ -135,7 +135,7 @@ pub fn show(
     };
     input.scroll = clamp_scroll(input.scroll - wheel, tall, visible);
     let scrolled = Rect::new(content.x, content.y - input.scroll, content.w, content.h);
-    let placed = place(controls, scrolled, m, direction, text_of, &tall_of);
+    let placed = place(controls, scrolled, m, direction, &text_of, &tall_of);
 
     let mut changes = Vec::new();
     let pointer = resp.interact_pointer_pos();

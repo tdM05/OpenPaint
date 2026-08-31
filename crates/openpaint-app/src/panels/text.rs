@@ -1071,8 +1071,8 @@ mod tests {
             content,
             &m,
             Direction::Column,
-            |_| 40.0,
-            |_, _| 0.0,
+            &|_: &Control| 40.0,
+            &|_: &Control, _: f32| 0.0,
         );
 
         let mut pressed = 0;
