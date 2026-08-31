@@ -100,18 +100,10 @@ fn controls(live: Option<TransformState>, has_selection: bool, kernel: Kernel) -
         // **The gesture, spelled out.** The transform is driven from the canvas, and nothing on
         // the canvas says so; a box with handles is only obvious once somebody has told you.
         //
-        // Two labels rather than one sentence: a label is one row tall and is not wrapped, so a
-        // long line is drawn clipped at the panel's edge -- which reads as the panel being too
-        // narrow rather than as text that is simply long. The words are the old ones; only the
-        // break is new.
-        for line in [
-            "On the canvas: drag inside to move, a handle to scale,",
-            "just outside to rotate. Enter applies, Esc puts it back.",
-        ] {
-            controls.push(Control::Label {
-                text: line.to_owned(),
-            });
-        }
+        controls.push(Control::Label {
+            text: "On the canvas: drag inside to move, a handle to scale, just outside to                    rotate. Enter applies, Esc puts it back."
+                .to_owned(),
+        });
         // **Magnitude only.** A flipped axis is a negative scale, and a slider that ran from -1000
         // to 1000 would put 1:1 in two places and spend most of its track on sizes nobody wants.
         // So the sign belongs to the flip buttons and the slider carries how big it is -- which

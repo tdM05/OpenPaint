@@ -117,19 +117,13 @@ fn controls(
                 text: "Fill on click (bucket)".to_owned(),
                 on: wand.fill_on_click,
             });
-            // **A sentence to a label.** A label is one row tall and is not wrapped, so the old
-            // panel's paragraph would be drawn as one clipped line with its ending off the edge --
-            // which reads as the panel being too narrow rather than as text that is simply long.
-            // The words are the old ones; only the breaks are new.
-            for line in [
-                "Tolerance is how far up an anti-aliased edge still counts as the region;",
-                "Expand tucks the result under the ink so no pale fringe is left.",
-                "With Fill off the wand leaves a selection instead.",
-            ] {
-                controls.push(Control::Label {
-                    text: line.to_owned(),
-                });
-            }
+            // One sentence, one label. It was three for a while, because a label used to be one
+            // row tall whatever it said and a long line was drawn clipped at the panel's edge --
+            // which read as three paragraphs and came undone at any other width. Labels wrap now.
+            controls.push(Control::Label {
+                text: "Tolerance is how far up an anti-aliased edge still counts as the                        region; Expand tucks the result under the ink so no pale fringe is                        left. With Fill off the wand leaves a selection instead."
+                    .to_owned(),
+            });
         }
         // A tool with nothing to set says so. The alternative is a gap where the wand's settings
         // were, and a gap is indistinguishable from a panel that failed to draw (DECISIONS 6b).
