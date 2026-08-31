@@ -661,6 +661,17 @@ pub(crate) struct Painting<'a> {
     /// the same reason: it is state a panel is part-way through, and it has to survive between
     /// frames.
     pub(crate) pick: &'a mut Option<crate::panel_ui::ControlId>,
+    /// How much the Page panel's extend buttons add, in pixels.
+    ///
+    /// A panel's own setting, kept by the shell between frames like the open menu -- and handed
+    /// back so the panel does not hold a second copy. The Page panel held one for a while, and the
+    /// consequence was that the slider moved and the buttons went on adding 512.
+    pub(crate) extend_by: u32,
+    /// What the next saved brush preset will be called.
+    ///
+    /// Same reason: the shell owns it, so the panel showing it must be shown it. A panel mirroring
+    /// it cannot know when the shell clears it, which is exactly what a successful save does.
+    pub(crate) preset_name: &'a str,
     /// Which menu is drilled into, if any.
     ///
     /// Only the menu panel uses it, but it lives here for the same reason the rest does: it is
@@ -753,6 +764,13 @@ pub(crate) enum Picked {
     Text(TextAction),
     /// The text of the layer being edited changed, so its pixels have to be derived again.
     TextChanged,
+    /// The caption as the artist has set it: the words, the face, the size, where it sits.
+    ///
+    /// Carried whole for the same reason `TransformSet` is: a caption is one thing being adjusted,
+    /// and the panel that adjusts it holds a copy while it does. Writing it back through the
+    /// `&mut TextBlock` the shell already has is what keeps the undo record where it belongs --
+    /// a panel that edited the document directly would be a panel whose edits could not be undone.
+    TextSet(openpaint_core::TextBlock),
     /// A brush-library command: save, apply or forget a preset, or a colour, or load a tip.
     Brush(BrushAction),
     /// What the next saved preset will be called, which is a panel's own setting.
@@ -1029,6 +1047,8 @@ impl Ui {
                     screen.width(),
                     screen.height(),
                 );
+                // Read once, before the closure borrows what they came from.
+                let preset_name_now = preset_name.clone();
                 let mut show_panel_list = false;
                 let mut menu_request: Option<(crate::layout::Rect, (f32, f32), Anchor)> = None;
                 let mut close_menu = false;
@@ -1045,6 +1065,8 @@ impl Ui {
                                 input: panel_input.entry(panel.0).or_default(),
                                 menu: &mut menu_open,
                                 pick: &mut pick_open,
+                                extend_by: extend_amount,
+                                preset_name: &preset_name_now,
                                 ctx,
                                 wheel_shape: &mut wheel_shape,
                                 wheel_hold: &mut wheel_hold,
@@ -1091,6 +1113,14 @@ impl Ui {
                             Picked::Trim => trim = true,
                             Picked::Text(a) => text_action = Some(a),
                             Picked::TextChanged => text_changed = true,
+                            Picked::TextSet(block) => {
+                                if let Some(held) = text.as_deref_mut() {
+                                    *held = block;
+                                }
+                                // Same flag the old panel set: `apply_text_edit` takes the block
+                                // back, records the undo step and derives the pixels again.
+                                text_changed = true;
+                            }
                             Picked::Brush(a) => brush_action = Some(a),
                             Picked::PresetName(name) => preset_name = name,
                             Picked::Wand(w) => wand = w,

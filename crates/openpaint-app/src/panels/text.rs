@@ -55,18 +55,26 @@ pub(crate) fn show(
     let mut picked: Option<Picked> = None;
     let _ = (&mut *brush, &mut *color_srgb);
 
-    // The font list is the panel's only dropdown, and it belongs to a control that is not built
-    // yet, so nothing here can have a popup open. Returning early rather than falling through:
-    // drawing the panel's ordinary contents into the popup would put a second copy of the buttons
-    // on screen.
+    // The document's own block, read-only -- which is all `Status` offers. `text()` answers `None`
+    // for a raster layer, which is the same question the old panel asked and the reason it had two
+    // branches.
+    let block = state.layers.get(state.active_layer).and_then(Layer::text);
+
+    // The font list, drawn when this panel's own popup is up -- the same shape the layers panel
+    // writes for its blend dropdown. Returning early rather than falling through: drawing the
+    // panel's ordinary contents into the popup would put a second copy of the buttons on screen.
     if place == Place::Popup {
+        let block = block?;
+        let options = editor::font_options(state.font_families);
+        let chosen = editor::font_chosen(block, state.font_families).unwrap_or(0);
+        if let Some(n) = super::pick_popup(FONT, &options, chosen, ui, paint) {
+            let mut edited = block.clone();
+            if editor::set_family(&mut edited, state.font_families, n) == editor::Applied::Edited {
+                return Some(Picked::TextSet(edited));
+            }
+        }
         return None;
     }
-
-    // The document's own block, read-only -- which is all `Status` can offer and all this half of
-    // the panel needs. `text()` answers `None` for a raster layer, which is the same question the
-    // old panel asked and the reason it had two branches.
-    let block = state.layers.get(state.active_layer).and_then(Layer::text);
 
     let mut controls = Vec::new();
     if let Some(actual) = state.font_substituted {
@@ -76,13 +84,8 @@ pub(crate) fn show(
         });
     }
 
-    if block.is_some() {
-        // Said out loud rather than left blank. A panel that shows a layer *is* a text layer and
-        // then offers nothing to do with it reads as broken (DECISIONS 6b); saying where the
-        // controls are is the difference between unfinished and failed.
-        controls.push(Control::Label {
-            text: "This layer holds text. Setting it is still in the old side panel.".to_owned(),
-        });
+    if let Some(block) = block {
+        controls.extend(editor::controls_for(block, state.font_substituted));
     } else {
         controls.push(Control::Label {
             text: "The active layer is not a text layer. A text layer keeps the words rather \
@@ -122,60 +125,63 @@ pub(crate) fn show(
         text: "A .ttf or .otf, used for this session without installing it.".to_owned(),
     });
 
+    // The block as it will be after this frame's changes, so several edits in one frame -- which
+    // a slider and the field losing its caret can be -- go back as one write and one undo step.
+    let mut edited = block.cloned();
     for change in paint.show(ui, &controls) {
-        picked = match change {
+        let answer = match change {
             Change::Pressed(ADD_LAYER) => Some(Picked::Text(TextAction::AddLayer)),
             Change::Pressed(CONVERT) => Some(Picked::Text(TextAction::ConvertToRaster)),
             Change::Pressed(LOAD_FONT) => Some(Picked::Text(TextAction::LoadFontFile)),
-            // Not a catch-all out of laziness: an id this panel did not put in its own list is a
-            // bug in the renderer, and swallowing it is the silence DECISIONS 6b forbids.
-            other => {
-                eprintln!("text panel: unexpected {other:?}");
-                None
-            }
+            other => match edited.as_mut() {
+                // Everything else belongs to the caption, and the editor says what it meant.
+                Some(block) => match editor::apply(block, other) {
+                    editor::Applied::Edited | editor::Applied::Nothing => None,
+                    editor::Applied::OpenFont => {
+                        super::open_pick(FONT, &editor::font_options(state.font_families), paint)
+                    }
+                    // Shown rather than swallowed: a field that springs back with no word said is
+                    // a field that looks broken (DECISIONS 6b).
+                    editor::Applied::Rejected(why) => {
+                        eprintln!("text panel: {why}");
+                        None
+                    }
+                    editor::Applied::Unexpected(change) => {
+                        eprintln!("text panel: unexpected {change:?}");
+                        None
+                    }
+                },
+                // Not a catch-all out of laziness: with no text layer under it, an id this panel
+                // did not put in its own list is a bug in the renderer, and swallowing it is the
+                // silence DECISIONS 6b forbids.
+                None => {
+                    eprintln!("text panel: unexpected {other:?}");
+                    None
+                }
+            },
         };
+        if answer.is_some() {
+            picked = answer;
+        }
     }
-    picked
+    // One write for the frame, and only when the words actually differ: every edit here costs a
+    // re-render and a step on the undo stack.
+    picked.or_else(|| match (edited, block) {
+        (Some(now), Some(was)) if now != *was => Some(Picked::TextSet(now)),
+        _ => None,
+    })
 }
 
 /// The caption editor: the controls for one [`TextBlock`], and what a change to one means.
 ///
-/// **Written, proved, and not yet drawn.** Everything in here is a pure function of a block, so it
-/// is checked without a GPU, a font stack or a document -- the same split that makes `panel_ui`
-/// and `crop` provable.
+/// **Pure, and provable without a GPU, a font stack or a document** -- the same split that makes
+/// `panel_ui` and `crop` provable. [`show`] reads the block off the active layer, folds [`apply`]
+/// over the frame's changes into a copy, and hands the copy back as `Picked::TextSet` for the
+/// shell to write through the `&mut TextBlock` it already holds.
 ///
-/// # The seam
-///
-/// Reading the block is already possible: [`show`] does it. What is missing is a way to hand an
-/// edited one back. `panels::show` takes no `&mut TextBlock`, and no `Picked` carries one, so an
-/// edit made here would be made on a clone and dropped on the floor.
-///
-/// Three edits elsewhere close it, following `Picked::TransformSet` exactly -- which exists for
-/// the same reason, and says why in its own doc comment: a transform is one thing being adjusted,
-/// and so is a caption.
-///
-/// 1. `ui.rs`, in `Picked`: add `TextSet(openpaint_core::TextBlock)`.
-/// 2. `ui.rs`, in `render`'s `match picked`: an arm writing it through the `text` parameter that
-///    is already there and setting `text_changed` --
-///    `Picked::TextSet(b) => { if let Some(t) = text.as_deref_mut() { *t = b; } text_changed = true; }`.
-///    Nothing in `main.rs` changes: `apply_text_edit` already takes the block back and re-derives.
-/// 3. Here, in [`show`]: build [`controls_for`] instead of the "still in the old side panel"
-///    label, fold [`apply`] over the changes into a clone of the block, and answer `TextSet` when
-///    it says [`Applied::Edited`]; answer `super::open_pick(FONT, &font_options(..), paint)` on
-///    [`Applied::OpenFont`], and add a `Place::Popup` arm calling `super::pick_popup` with
-///    [`font_chosen`] and feeding what it returns to [`set_family`] -- which is the same four
-///    lines the layers panel writes for its blend dropdown.
-///
-/// The alternative -- passing `&mut TextBlock` down into `panels::show` -- was not chosen because
-/// it breaks the contract in [`super`]: a panel that edits the document directly is a panel whose
-/// edits cannot be undone, and the undo record is made by `apply_text_edit` on the way back.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the panel is written before it can be wired; see the seam above"
-    )
-)]
+/// **The panel never edits the document.** It edits a copy and asks. That is what keeps the undo
+/// record where it belongs: `apply_text_edit` takes the block back, records the step and derives
+/// the pixels again, exactly as it did for the old side panel.
 mod editor {
     use super::{
         BODY, BOLD, COLOUR, FIRST_ALIGN, FONT, ITALIC, LETTER_SPACING, LINE_HEIGHT, POS_X, POS_Y,
@@ -1109,5 +1115,62 @@ mod tests {
             );
             assert_eq!(b, block(), "{change:?} changed the block anyway");
         }
+    }
+}
+#[cfg(test)]
+mod wiring {
+    use super::*;
+    use crate::panel_ui::Change;
+
+    /// **An edit to a caption comes back out of the panel.**
+    ///
+    /// The editor was written and proved before it could be wired, so everything about it was
+    /// true of a copy nobody read. This is the one thing those tests could not say: that a change
+    /// arriving at `show` reaches the block and leaves again as something the shell can write.
+    #[test]
+    fn an_edit_folds_into_the_block_and_comes_back() {
+        let mut block = openpaint_core::TextBlock::default();
+        block.text = "Before".to_owned();
+        let was = block.clone();
+
+        // What `show` does with the frame's changes, in the same order.
+        let mut edited = block.clone();
+        assert_eq!(
+            editor::apply(&mut edited, Change::Typed(BODY, "After".to_owned())),
+            editor::Applied::Edited
+        );
+        assert_ne!(edited, was, "the fold did not change the block");
+        assert_eq!(edited.text, "After");
+
+        // And a change that alters nothing must not become a write: every one costs a re-render
+        // and a step on the undo stack.
+        let mut same = was.clone();
+        assert_eq!(
+            editor::apply(&mut same, Change::Typed(BODY, "Before".to_owned())),
+            editor::Applied::Nothing
+        );
+        assert_eq!(same, was);
+    }
+
+    /// The font list asks to be opened rather than choosing anything by itself.
+    #[test]
+    fn the_font_control_opens_its_list() {
+        let mut block = openpaint_core::TextBlock::default();
+        assert_eq!(
+            editor::apply(&mut block, Change::Pressed(FONT)),
+            editor::Applied::OpenFont
+        );
+        // And choosing from it is an edit, through the same door the popup uses.
+        let families = vec!["Inter".to_owned(), "Source Han".to_owned()];
+        let options = editor::font_options(&families);
+        let n = options
+            .iter()
+            .position(|o| o == "Source Han")
+            .expect("the list offers it");
+        assert_eq!(
+            editor::set_family(&mut block, &families, n),
+            editor::Applied::Edited
+        );
+        assert_eq!(editor::requested_family(&block), Some("Source Han"));
     }
 }

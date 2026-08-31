@@ -85,6 +85,7 @@ pub(crate) fn show(
                 | Picked::Trim
                 | Picked::Text(_)
                 | Picked::TextChanged
+                | Picked::TextSet(_)
                 | Picked::Brush(_)
                 | Picked::PresetName(_)
                 | Picked::Wand(_) => false,

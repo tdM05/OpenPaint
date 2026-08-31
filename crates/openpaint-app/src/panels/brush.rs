@@ -629,24 +629,6 @@ fn set_was_down(ui: &egui::Ui, down: bool) {
     ui.memory_mut(|m| m.data.insert_temp(id, down));
 }
 
-/// What the next saved preset will be called.
-///
-/// **A mirror of the shell's copy, and it should not have to be one.** The name belongs to the
-/// application -- it is what [`BrushAction::SavePreset`] saves under -- but [`Status`] does not carry
-/// it, so the field has nothing to show itself with and would go blank the moment the caret left.
-/// Kept here until `Status` grows a `preset_name`, at which point this goes and the field reads the
-/// one copy. See the report.
-fn remembered_name(ui: &egui::Ui) -> String {
-    let id = egui::Id::new("openpaint-brush-preset-name");
-    ui.memory(|m| m.data.get_temp::<String>(id))
-        .unwrap_or_default()
-}
-
-fn remember_name(ui: &egui::Ui, name: &str) {
-    let id = egui::Id::new("openpaint-brush-preset-name");
-    ui.memory_mut(|m| m.data.insert_temp(id, name.to_owned()));
-}
-
 /// Draw the panel and report what the artist asked for.
 pub(crate) fn show(
     ui: &mut egui::Ui,
@@ -680,7 +662,9 @@ pub(crate) fn show(
         return picked;
     }
 
-    let name = remembered_name(ui);
+    // The shell's own copy, handed in. The panel held a mirror of it for a while and could not
+    // know when the shell cleared it -- which a successful save does.
+    let name = paint.preset_name.to_owned();
     let controls = controls(brush, state.presets, state.preset_trouble, &name);
     for change in paint.show(ui, &controls) {
         if let Some(i) = source_pick(&change) {
@@ -689,11 +673,6 @@ pub(crate) fn show(
             continue;
         }
         if let Some(answered) = answer(&change, brush, color_srgb, state.presets.len(), &name) {
-            // The field's own copy of the name, written in the one place the shell's copy is set, so
-            // the two cannot come to say different things.
-            if let Picked::PresetName(typed) = &answered {
-                remember_name(ui, typed);
-            }
             picked = Some(answered);
         }
     }

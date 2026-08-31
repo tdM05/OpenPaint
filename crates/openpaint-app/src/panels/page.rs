@@ -43,7 +43,7 @@ pub(crate) fn show(
     // `Status` gains a field, the slider shows the default every frame and the buttons extend by
     // it, which stops being true the moment the slider is dragged. It answers `ExtendBy` anyway,
     // so the shell already records the value and this becomes right by deleting one line.
-    let extend_by = crate::editor::DEFAULT_EXTEND;
+    let extend_by = paint.extend_by;
 
     let controls = controls(state.page_size, state.crop_rect, extend_by);
     for change in paint.show(ui, &controls) {
