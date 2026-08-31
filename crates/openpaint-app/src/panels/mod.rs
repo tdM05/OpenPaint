@@ -33,7 +33,12 @@ pub(crate) mod colour;
 pub(crate) mod history;
 pub(crate) mod layers;
 pub(crate) mod menu;
+pub(crate) mod page;
+pub(crate) mod pages;
+pub(crate) mod select;
+pub(crate) mod text;
 pub(crate) mod tools;
+pub(crate) mod transform;
 
 pub(crate) use crate::ui::{Painting, Picked};
 
@@ -58,6 +63,11 @@ pub(crate) fn show(
         ws::LAYERS => layers::show(ui, brush, color_srgb, state, paint, place),
         ws::COLOUR => colour::show(ui, brush, color_srgb, state, paint, place),
         ws::HISTORY => history::show(ui, brush, color_srgb, state, paint, place),
+        ws::TRANSFORM => transform::show(ui, brush, color_srgb, state, paint, place),
+        ws::PAGES => pages::show(ui, brush, color_srgb, state, paint, place),
+        ws::PAGE => page::show(ui, brush, color_srgb, state, paint, place),
+        ws::TEXT => text::show(ui, brush, color_srgb, state, paint, place),
+        ws::SELECT => select::show(ui, brush, color_srgb, state, paint, place),
         // A panel the build knows about but nothing has been written for yet. Silent on purpose:
         // this is the one case that is not a bug, and it goes away as the last module lands.
         _ => None,
