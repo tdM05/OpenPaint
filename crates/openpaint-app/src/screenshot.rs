@@ -727,6 +727,19 @@ mod tests {
         (area.x + area.w / 2.0, area.y + m.row / 2.0)
     }
 
+    /// A floating window over a docked panel, to see that it is in front of it.
+    #[test]
+    #[ignore = "writes a PNG to look at rather than asserting anything"]
+    fn shot_floating_in_front() {
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let mut ws = plain_workspace();
+        ws.set_screen(screen);
+        ws.float(crate::workspace::COLOUR);
+        // Squarely over the panels down the right-hand side, which draw content of their own.
+        ws.put_window_for_test(0, Rect::new(1000.0, 120.0, 320.0, 300.0));
+        shoot("floating-in-front", screen, &[], &mut ws);
+    }
+
     /// **A drag that wanders off the hue ring keeps setting the hue.**
     ///
     /// The same latch a slider has, and for the same reason: a hand sweeping round a ring does not

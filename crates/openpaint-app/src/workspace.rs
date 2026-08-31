@@ -698,6 +698,121 @@ pub fn default_layout() -> Layout {
     l
 }
 
+/// Which divider or window edge a frame's marks belong to.
+#[derive(Clone, Debug, PartialEq)]
+enum Seam {
+    Divider {
+        path: crate::layout::Path,
+        index: usize,
+    },
+    Edge(crate::chrome::Pull),
+}
+
+/// Which seam the marks are for this frame, and whether it has been taken.
+///
+/// **Two states and no third.** It is *available* while the pointer is near it and *taken* from the
+/// instant it is pressed -- and nothing in between, because there is nothing to wait for: a divider
+/// and a window's edge are both grabbed the moment they are touched.
+///
+/// The version that answered these four cases separately gave one control three appearances. The
+/// press put it into the hold animation, which starts at no alpha at all, so it went blue on hover,
+/// **blank** for the first frames of the press, and blue again once it moved. Reported exactly that
+/// way: *"if I hold, it shows blue, for a flick, then nothing. then if drag, back to blue."*
+///
+/// A window's edge is included for the same reason its resize is: it is a divider with the screen
+/// on its far side, and it should light up under a hovering pen like one.
+#[must_use]
+fn seam_in_use(
+    preview: Option<&Preview>,
+    seams: &[crate::layout::Splitter],
+    border: Option<Rect>,
+    at: Option<(f32, f32)>,
+    m: &Metrics,
+) -> Option<(Seam, bool)> {
+    // Taken: whatever the gesture says, whether it has moved yet or not.
+    match preview {
+        Some(Preview::Waiting {
+            on: Held::Divider { path, index },
+            ..
+        })
+        | Some(Preview::Resizing { path, index }) => {
+            return Some((
+                Seam::Divider {
+                    path: path.clone(),
+                    index: *index,
+                },
+                true,
+            ));
+        }
+        Some(Preview::Waiting {
+            on: Held::Edge { pull },
+            ..
+        })
+        | Some(Preview::ResizingWindow { pull }) => {
+            return Some((Seam::Edge(*pull), true));
+        }
+        // Any other gesture owns the pointer, and a hint about something it is not doing would be
+        // a second thing to read.
+        Some(_) => return None,
+        None => {}
+    }
+    // Available: near enough to catch, with nothing else going on. A hint for a pen, which hovers;
+    // a finger gets nothing here and loses nothing.
+    let (x, y) = at?;
+    // The border first, for the same reason the hit test takes it first among these two: a window
+    // edge and a divider inside that window can be within reach of each other at the window's rim.
+    if let Some(pull) =
+        border.and_then(|r| chrome::edge_at(r, m.splitter_grab, least_window(m), x, y))
+    {
+        return Some((Seam::Edge(pull), false));
+    }
+    seams.iter().find(|s| s.rect.contains(x, y)).map(|s| {
+        (
+            Seam::Divider {
+                path: s.path.clone(),
+                index: s.index,
+            },
+            false,
+        )
+    })
+}
+
+/// What is drawn over what.
+///
+/// **Named once, here, and every tier distinct.** egui paints its layers in `Order` sequence, but
+/// *within* one order the layers that are not `Area`s come out in whatever order their map happens
+/// to iterate. Docked panel bodies and floating windows both sat on `Order::Middle`, so a docked
+/// panel sometimes came out in front of a window floating above it -- and the canvas's own
+/// overlays, drawn on `Order::Foreground`, came out in front of every window every time.
+///
+/// So each tier gets an order to itself. There are exactly six of them and exactly six things to
+/// stack, bottom to top:
+mod stack {
+    /// The workspace's own chrome: the ground it shows through, headers, tabs, dividers.
+    pub const GROUND: egui::Order = egui::Order::Background;
+    /// What a docked panel draws inside itself.
+    pub const PANELS: egui::Order = egui::Order::PanelResizeLine;
+    /// What the canvas draws over the artwork: a selection outline, a crop box, the brush ring.
+    /// Above the panels because the canvas is one of them; below the windows because a window
+    /// floating over the artwork hides what is on it.
+    pub const ARTWORK: egui::Order = egui::Order::Middle;
+    /// Floating windows, chrome and contents. **Always in front of the arrangement.**
+    pub const WINDOWS: egui::Order = egui::Order::Foreground;
+    /// What a gesture in flight draws: the wait, the armed divider, the five zones, the ghost.
+    pub const MARKS: egui::Order = egui::Order::Tooltip;
+    /// The popup, which is the topmost thing the workspace has.
+    pub const POPUP: egui::Order = egui::Order::Debug;
+}
+
+/// The order the canvas's own overlays are drawn in: above the panels, below the windows.
+///
+/// A function because the shell draws them and the stack is described here -- one place decides
+/// what is over what, and a caller cannot pick an order that happens to be wrong.
+#[must_use]
+pub fn artwork_order() -> egui::Order {
+    stack::ARTWORK
+}
+
 impl Workspace {
     /// Where the canvas panel is, for the renderer to draw into.
     #[must_use]
@@ -959,7 +1074,7 @@ impl Workspace {
         mut contents: impl FnMut(PanelId, &mut egui::Ui, Direction, Place),
     ) {
         let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Background,
+            stack::GROUND,
             egui::Id::new("workspace"),
         ));
         let m = self.theme.metrics;
@@ -1160,7 +1275,7 @@ impl Workspace {
             let content = to_egui(c.controls.rect());
             let mut ui = egui::Ui::new(
                 ctx.clone(),
-                egui::LayerId::new(egui::Order::Middle, egui::Id::new(("panel", showing.0))),
+                egui::LayerId::new(stack::PANELS, egui::Id::new(("panel", showing.0))),
                 egui::Id::new(("panel-ui", showing.0)),
                 egui::UiBuilder::new().max_rect(content),
             );
@@ -1197,7 +1312,7 @@ impl Workspace {
             painter.clone()
         } else {
             ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
+                stack::MARKS,
                 egui::Id::new("floating-marks"),
             ))
         };
@@ -1226,66 +1341,46 @@ impl Workspace {
                         marks.rect_filled(to_egui(hold_mark(&c, *tab)), m.radius, tint);
                     }
                 }
-                Held::Divider { path, index } => {
-                    if let Some(s) = seams.iter().find(|s| &s.path == path && s.index == *index) {
-                        // Grows from the hairline to the full grab width as the hold completes,
-                        // so the target you are about to get is the thing you watch appear.
-                        let t = m.splitter_hover.mul_add(*progress, m.gutter);
-                        marks.rect_filled(to_egui(centred(s.rect, s.axis, t)), t / 2.0, tint);
-                    }
-                }
                 // The whole window, so a hold on its body is as visible as a hold on a tab.
                 Held::Frame => {
                     if let Some(at) = self.area_of(working) {
                         marks.rect_filled(to_egui(at), m.radius, tint);
                     }
                 }
-                // The edges being pulled, growing exactly as a divider's do.
-                Held::Edge { pull } => {
+                // Drawn below, with every other state a seam can be in: a divider has nothing to
+                // wait for, so it has nothing to animate.
+                Held::Divider { .. } | Held::Edge { .. } => {}
+            }
+        }
+
+        // --- the divider or window edge under the pointer, or the one in use ---
+        //
+        // Drawn last of the chrome so it sits over the panels either side. Two appearances and no
+        // third: `p.edge` while it is merely available, `p.state` from the instant it is taken.
+        // See `seam_in_use` for the third one this used to have.
+        if let Some((seam, taken)) = seam_in_use(
+            preview.as_ref(),
+            &seams,
+            self.rect_of(working),
+            pointer.map(|q| (q.x, q.y)),
+            &m,
+        ) {
+            // At the *drawn* thickness rather than the grab width: the point is to show where it
+            // is, not how big the target is.
+            let t = m.splitter_hover;
+            let colour = rgb(if taken { p.state } else { p.edge });
+            match seam {
+                Seam::Divider { path, index } => {
+                    if let Some(s) = seams.iter().find(|s| s.path == path && s.index == index) {
+                        marks.rect_filled(to_egui(centred(s.rect, s.axis, t)), t / 2.0, colour);
+                    }
+                }
+                Seam::Edge(pull) => {
                     if let Some(at) = self.rect_of(working) {
-                        let t = m.splitter_hover.mul_add(*progress, m.gutter);
-                        for band in chrome::edge_bands(at, *pull, t) {
-                            marks.rect_filled(to_egui(band), t / 2.0, tint);
+                        for band in chrome::edge_bands(at, pull, t) {
+                            marks.rect_filled(to_egui(band), t / 2.0, colour);
                         }
                     }
-                }
-            }
-        }
-
-        // --- the divider under the pointer, thickened so it can be seen as well as caught ---
-        //
-        // Drawn last of the chrome so it sits over the panels either side, and only when the
-        // pointer is close: at rest the gutter is a hairline and the workspace stays quiet.
-        if let Some(pos) = pointer {
-            if preview.is_none() || matches!(preview, Some(Preview::Resizing { .. })) {
-                for s in &seams {
-                    if !s.rect.contains(pos.x, pos.y) {
-                        continue;
-                    }
-                    // At the *drawn* thickness rather than the grab width: the point is to show
-                    // where it is, not how big the target is. A hint for a pen, which hovers; a
-                    // finger gets nothing here and does not need to, because the hold is what
-                    // actually starts the gesture.
-                    let t = m.splitter_hover;
-                    marks.rect_filled(to_egui(centred(s.rect, s.axis, t)), t / 2.0, rgb(p.edge));
-                    break;
-                }
-            }
-        }
-
-        if let Some(Preview::Resizing { path, index }) = &preview {
-            if let Some(s) = seams.iter().find(|s| &s.path == path && s.index == *index) {
-                let t = m.splitter_hover;
-                marks.rect_filled(to_egui(centred(s.rect, s.axis, t)), t / 2.0, rgb(p.state));
-            }
-        }
-        // A window's edge, armed and being pulled: the same mark at the same thickness, because it
-        // is the same control with the screen on its far side.
-        if let Some(Preview::ResizingWindow { pull }) = &preview {
-            if let Some(at) = self.rect_of(working) {
-                let t = m.splitter_hover;
-                for band in chrome::edge_bands(at, *pull, t) {
-                    marks.rect_filled(to_egui(band), t / 2.0, rgb(p.state));
                 }
             }
         }
@@ -1297,7 +1392,7 @@ impl Workspace {
         // second set of rules about what the five zones mean.
         let picking = self.placing().map(|panel| {
             let landing = pointer
-                .and_then(|q| self.landing_at(panel, q.x, q.y))
+                .and_then(|q| self.landing_at(q.x, q.y))
                 .map(|(_, _, rect, zone)| crate::panel_drag::Landing { rect, zone });
             (panel, landing)
         });
@@ -1374,7 +1469,7 @@ impl Workspace {
             // two windows' layers could interleave and one's background paint over another's
             // contents.
             let top = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Middle,
+                stack::WINDOWS,
                 egui::Id::new("floating"),
             ));
             // The frame: a bar along the top that is the window's own handle, and a border.
@@ -1415,7 +1510,7 @@ impl Workspace {
                 }
                 let mut ui = egui::Ui::new(
                     ctx.clone(),
-                    egui::LayerId::new(egui::Order::Middle, egui::Id::new("floating")),
+                    egui::LayerId::new(stack::WINDOWS, egui::Id::new("floating")),
                     egui::Id::new(("floating-body", held.id.0, showing.0)),
                     egui::UiBuilder::new().max_rect(to_egui(c.controls.rect())),
                 );
@@ -1434,7 +1529,7 @@ impl Workspace {
             let theme = self.theme;
             let mut ui = egui::Ui::new(
                 ctx.clone(),
-                egui::LayerId::new(egui::Order::Foreground, egui::Id::new("workspace-popup")),
+                egui::LayerId::new(stack::POPUP, egui::Id::new("workspace-popup")),
                 egui::Id::new("workspace-popup-ui"),
                 // A popup draws its own frame, so it owns its own padding: `chrome` is not
                 // involved, and the renderer does not add any.
@@ -1720,6 +1815,12 @@ impl Workspace {
         None
     }
 
+    /// Put a floating window somewhere exact, for a screenshot that needs it over something.
+    #[cfg(test)]
+    pub fn put_window_for_test(&mut self, which: usize, rect: Rect) {
+        self.floating[which].rect = rect;
+    }
+
     /// The panel waiting to be put somewhere, if there is one.
     #[must_use]
     pub fn placing(&self) -> Option<PanelId> {
@@ -1755,7 +1856,7 @@ impl Workspace {
         let Some(waiting) = self.placing.take() else {
             return false;
         };
-        let Some((over, path, _, zone)) = self.landing_at(waiting.panel, x, y) else {
+        let Some((over, path, _, zone)) = self.landing_at(x, y) else {
             self.restore(waiting.was);
             return false;
         };
@@ -1783,26 +1884,19 @@ impl Workspace {
     ///
     /// Floating windows first, because they are above.
     #[must_use]
-    fn landing_at(
-        &self,
-        panel: PanelId,
-        x: f32,
-        y: f32,
-    ) -> Option<(Surface, crate::layout::Path, Rect, Zone)> {
-        // A window is no destination for a panel that may not float -- and nor is whatever lies
-        // *behind* the window, which is not where anybody pointed. So the answer is no destination
-        // at all, and the press puts the panel back. Answered here rather than at the drop, so the
-        // overlay does not light up a zone the press will refuse: an overlay you cannot believe is
-        // worse than none.
-        let over = match self.window_at(x, y) {
-            Some(id) if may_float(panel) => Surface::Floating(id),
-            Some(_) => return None,
-            None => Surface::Docked,
-        };
-        let area = self.area_of(over)?;
-        let leaf = self.layout_of(over)?.leaf_at(area, x, y)?;
+    fn landing_at(&self, x: f32, y: f32) -> Option<(Surface, crate::layout::Path, Rect, Zone)> {
+        // **Floating windows are not destinations, and not obstacles either.** A pick is asked
+        // where in the *arrangement* a panel goes -- that is what "put it back" means -- so the
+        // windows floating over it are simply transparent to the question. Otherwise a leaf sitting
+        // behind a palette could not be pointed at at all, which is the one thing an arrangement
+        // you can see should never be.
+        //
+        // Panels are moved *into* a window by dragging them there, which is a different gesture
+        // with a different rule (the two modes never mix by dragging).
+        let area = self.area_of(Surface::Docked)?;
+        let leaf = self.layout.leaf_at(area, x, y)?;
         Some((
-            over,
+            Surface::Docked,
             leaf.path.clone(),
             leaf.rect,
             Layout::zone_at(leaf.rect, x, y),
@@ -2721,7 +2815,7 @@ fn draw_landing(
     panel: PanelId,
 ) {
     let top = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
+        stack::MARKS,
         egui::Id::new("workspace-drop"),
     ));
     if let Some(landing) = over {
@@ -5209,40 +5303,29 @@ mod tests {
         assert!(ws.is_open(BRUSH), "the panel was left in neither tree");
     }
 
-    /// **A panel that cannot float cannot be picked into a floating window.**
+    /// **A panel that cannot float is refused, rather than floated into uselessness.**
     ///
     /// Not a rule about canvases: the canvas is drawn by the GPU *underneath* egui, so a window's
     /// own background is painted straight over the artwork. A floating canvas is a window with
     /// nothing in it and a workspace with no drawing -- and, with no *Float* in its settings, no
-    /// "Put back into..." either, so no way out.
+    /// way out of it either.
     #[test]
-    fn a_panel_that_cannot_float_is_not_offered_a_window() {
+    fn a_panel_that_cannot_float_is_refused() {
         let mut ws = bare();
-        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
-        ws.screen = screen;
-        ws.float(COLOUR);
-        ws.floating[0].rect = Rect::new(600.0, 300.0, 320.0, 320.0);
-        let window = ws.floating[0].rect;
-        let mid = (window.x + window.w / 2.0, window.y + window.h / 2.0);
+        ws.set_screen(Rect::new(0.0, 0.0, 1400.0, 900.0));
 
-        ws.start_placing(CANVAS);
-        assert!(
-            !ws.place_at(mid.0, mid.1),
-            "the window took a panel that cannot float"
-        );
-        assert!(
-            ws.is_docked(CANVAS),
-            "and the pick put it back where it was"
-        );
-        assert!(!ws.is_floating(CANVAS));
-
-        // Nor by asking directly.
         ws.float(CANVAS);
         assert!(!ws.is_floating(CANVAS), "floating it was not refused");
+        assert!(ws.is_docked(CANVAS), "and it stayed where it was");
+        assert!(
+            !ws.popup_controls(PopupKind::Settings(CANVAS))
+                .iter()
+                .any(|c| c.id() == Some(FLOAT_ID)),
+            "nor should it be offered"
+        );
 
-        // And a panel that *can* float still lands there, so this is not simply refusing windows.
-        ws.start_placing(LAYERS);
-        assert!(ws.place_at(mid.0, mid.1));
+        // And one that can float still does, so this is not simply refusing everything.
+        ws.float(LAYERS);
         assert!(ws.is_floating(LAYERS));
     }
 
@@ -5353,6 +5436,133 @@ mod tests {
         assert!(
             got.x <= narrow.w - keep && got.y <= narrow.h - keep && got.y >= narrow.y,
             "the window was stranded off the smaller screen: {got:?}"
+        );
+    }
+
+    /// **Every tier of the stack is above the one below, and no two share an order.**
+    ///
+    /// egui paints its layers in `Order` sequence, but *within* one order the layers that are not
+    /// `Area`s come out in whatever order their map happens to iterate. Two things on one order are
+    /// therefore two things whose stacking is undefined -- which is what put a docked panel in
+    /// front of a floating window, and the canvas's own overlays in front of every window.
+    #[test]
+    fn every_tier_of_the_stack_is_above_the_one_below() {
+        let tiers = [
+            ("the ground", stack::GROUND),
+            ("docked panels", stack::PANELS),
+            ("what the canvas draws", stack::ARTWORK),
+            ("floating windows", stack::WINDOWS),
+            ("a gesture's marks", stack::MARKS),
+            ("the popup", stack::POPUP),
+        ];
+        for pair in tiers.windows(2) {
+            let ((below, under), (above, over)) = (pair[0], pair[1]);
+            assert!(
+                under < over,
+                "{above} is not above {below}: {over:?} vs {under:?}"
+            );
+        }
+    }
+
+    /// **A divider is blue from the moment it is touched until it is let go.**
+    ///
+    /// It had three appearances where it has two: the press put it into the hold animation, which
+    /// starts at no alpha at all, so it went blue on hover, blank for the first frames of the
+    /// press, and blue again once it moved. Reported as *"if I hold, it shows blue, for a flick,
+    /// then nothing. then if drag, back to blue."*
+    ///
+    /// Asserted as "there is always a mark, and it is the same one" rather than as three separate
+    /// cases, because the gap between them is the bug.
+    #[test]
+    fn a_seam_is_marked_from_hover_through_to_the_drag() {
+        let m = crate::theme::Theme::default().metrics;
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let layout = default_layout();
+        let seams = layout.splitters(screen, m.splitter_grab);
+        let seam = seams.first().cloned().expect("a divider");
+        let at = Some((
+            seam.rect.x + seam.rect.w / 2.0,
+            seam.rect.y + seam.rect.h / 2.0,
+        ));
+        let want = Seam::Divider {
+            path: seam.path.clone(),
+            index: seam.index,
+        };
+
+        // Hovering it: available.
+        assert_eq!(
+            seam_in_use(None, &seams, None, at, &m),
+            Some((want.clone(), false)),
+            "hovering a divider showed nothing"
+        );
+        // Every instant of the press, including the very first: taken, not fading in.
+        for progress in [0.0_f32, 0.001, 0.5, 1.0] {
+            let waiting = Preview::Waiting {
+                progress,
+                on: Held::Divider {
+                    path: seam.path.clone(),
+                    index: seam.index,
+                },
+            };
+            assert_eq!(
+                seam_in_use(Some(&waiting), &seams, None, at, &m),
+                Some((want.clone(), true)),
+                "the mark went out {progress} of the way through the press"
+            );
+        }
+        // And moving it: still taken, still the same seam.
+        let resizing = Preview::Resizing {
+            path: seam.path.clone(),
+            index: seam.index,
+        };
+        assert_eq!(
+            seam_in_use(Some(&resizing), &seams, None, at, &m),
+            Some((want, true))
+        );
+    }
+
+    /// The same promise for a window's edge, which is a divider with the screen on its far side.
+    #[test]
+    fn a_window_edge_is_marked_from_hover_through_to_the_drag() {
+        let m = crate::theme::Theme::default().metrics;
+        let window = Rect::new(400.0, 300.0, 320.0, 260.0);
+        let at = Some((window.x + window.w, window.y + window.h / 2.0));
+        let pull = crate::chrome::Pull { x: 1, y: 0 };
+
+        assert_eq!(
+            seam_in_use(None, &[], Some(window), at, &m),
+            Some((Seam::Edge(pull), false)),
+            "hovering a window's edge showed nothing"
+        );
+        for progress in [0.0_f32, 0.001, 1.0] {
+            let waiting = Preview::Waiting {
+                progress,
+                on: Held::Edge { pull },
+            };
+            assert_eq!(
+                seam_in_use(Some(&waiting), &[], Some(window), at, &m),
+                Some((Seam::Edge(pull), true)),
+                "the mark went out {progress} of the way through the press"
+            );
+        }
+        assert_eq!(
+            seam_in_use(
+                Some(&Preview::ResizingWindow { pull }),
+                &[],
+                Some(window),
+                at,
+                &m
+            ),
+            Some((Seam::Edge(pull), true))
+        );
+
+        // Away from every edge, and while some *other* gesture owns the pointer: nothing, because
+        // a hint about something that is not happening is a second thing to read.
+        let middle = Some((window.x + window.w / 2.0, window.y + window.h / 2.0));
+        assert_eq!(seam_in_use(None, &[], Some(window), middle, &m), None);
+        assert_eq!(
+            seam_in_use(Some(&Preview::MovingWindow), &[], Some(window), at, &m),
+            None
         );
     }
 
@@ -5964,28 +6174,59 @@ mod tests {
         }
     }
 
-    /// **A panel can be put into a floating window as readily as into the arrangement.**
+    /// **A pick ignores floating windows**, both as a destination and as an obstacle.
     ///
-    /// The pick asks where, and a floating window is a where. The list it replaced could not say
-    /// this at all: it named docked panels, so putting something into a window meant dragging it,
-    /// and enabling a panel could not put it in one on purpose.
+    /// It is asked where in the *arrangement* a panel goes -- that is what "put it back" means --
+    /// so the windows floating over it are simply transparent to the question. Without that, a leaf
+    /// sitting behind a palette could not be pointed at at all, which is the one thing an
+    /// arrangement you can see should never be.
     #[test]
-    fn a_pick_can_land_in_a_floating_window() {
+    fn a_pick_ignores_floating_windows() {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
-        ws.screen = screen;
+        ws.set_screen(screen);
         ws.float(COLOUR);
-        ws.floating[0].rect = Rect::new(700.0, 300.0, 320.0, 320.0);
-        let window = ws.floating[0].rect;
 
-        assert!(put_back(&mut ws, LAYERS, COLOUR, screen));
-        assert!(
-            ws.is_floating(LAYERS),
-            "it should be in the window it was pointed at"
+        // Park the window squarely over the leaf the Layers panel is in, and point at the middle
+        // of both.
+        let slot = ws
+            .layout
+            .resolve(screen)
+            .into_iter()
+            .find(|p| p.tabs.contains(&LAYERS))
+            .expect("layers is docked");
+        let at = (
+            slot.rect.x + slot.rect.w / 2.0,
+            slot.rect.y + slot.rect.h / 2.0,
         );
-        assert!(!ws.is_docked(LAYERS), "and not also in the arrangement");
-        assert_eq!(ws.floating.len(), 1, "no second window appeared");
-        assert_eq!(ws.floating[0].rect, window, "the window did not move");
+        ws.floating[0].rect = Rect::new(at.0 - 120.0, at.1 - 120.0, 240.0, 240.0);
+        let window = ws.floating[0].rect;
+        assert!(
+            window.contains(at.0, at.1),
+            "the window should be covering the point"
+        );
+
+        ws.hide(BRUSH);
+        ws.start_placing(BRUSH);
+        let mut hand = Hand::new(&mut ws, screen);
+        hand.press(at);
+
+        assert!(
+            ws.is_docked(BRUSH),
+            "the pick landed somewhere other than the arrangement behind the window"
+        );
+        assert!(
+            !ws.is_floating(BRUSH),
+            "it should not have gone into the window"
+        );
+        let (brush, _) = ws.layout.find(BRUSH).expect("brush");
+        let (layers, _) = ws.layout.find(LAYERS).expect("layers");
+        assert_eq!(
+            brush, layers,
+            "and it should have landed in the leaf pointed at"
+        );
+        assert_eq!(ws.floating.len(), 1, "the window is still there");
+        assert_eq!(ws.floating[0].rect, window, "and has not moved");
     }
 
     /// A docked panel is offered somewhere to go; a floating one, somewhere to return to.

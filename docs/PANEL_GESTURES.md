@@ -173,12 +173,15 @@ While a pick is waiting:
   somewhere arbitrary. Cancelling a *Put back into* leaves the window floating exactly where it
   was; cancelling an enable leaves the panel off.
 
-**Not everything can go everywhere.** A panel may only be put into a floating window if its own
-settings offer *Float* — the same table decides both, so the button and the pick cannot disagree.
-The canvas is the one that says no, and the reason is not a rule about canvases: it is drawn by the
-GPU *underneath* egui, so a window's own background would be painted straight over the artwork.
-Pointing at a window with such a panel in the air is pointing at nothing, and the press puts it
-back.
+**A pick is asked about the arrangement, and only the arrangement.** Floating windows are neither
+destinations nor obstacles: they are transparent to the question. That is what "put it *back*"
+means, and it is what lets a leaf sitting behind a palette be pointed at at all. Panels go *into* a
+window by being dragged there, which is a different gesture with a different rule.
+
+Separately, a panel may only float at all if its own settings offer *Float* — the same table
+decides both, so the button and the act cannot disagree. The canvas is the one that says no, and
+the reason is not a rule about canvases: it is drawn by the GPU *underneath* egui, so a window's
+own background would be painted straight over the artwork.
 
 One pick is waiting at a time. Starting another replaces it, and **any change to the arrangement
 underneath ends it** — undo, reset, floating something else. The way back is a snapshot of the
@@ -220,6 +223,26 @@ its neighbour destroyed the one being sized.
 
 The same is true of a divider *inside* a window, which moves neither the window nor the pointer's
 relationship to it.
+
+## Floating windows are always in front
+
+Of the arrangement, of what a panel draws inside itself, and of what the canvas draws over the
+artwork — a selection outline or a crop box does not show through a palette sitting on top of it.
+
+The whole stack, bottom to top: the ground and the chrome; what a docked panel draws; what the
+canvas draws; floating windows; a gesture's own marks; the popup. **Six things, six layers, one to
+each.** Two things sharing a layer are two things whose order is undefined, and undefined came out
+as "sometimes in front" — which is exactly how it was reported.
+
+## A divider has two appearances, not three
+
+Available while the pointer is near it, taken from the instant it is pressed. Nothing in between,
+because there is nothing to wait for: a divider and a window's edge are both grabbed the moment
+they are touched, and the hold does nothing for either.
+
+It used to have a third — nothing at all — because the press put it into the hold animation, which
+begins at no alpha. So it went blue on hover, blank for the first frames of the press, and blue
+again once it moved.
 
 ## Reach, and what beats it
 

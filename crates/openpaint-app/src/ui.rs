@@ -2581,7 +2581,7 @@ impl Ui {
                 let screen = ctx.screen_rect();
                 let left = panel_rect.right();
                 let painter = ctx.layer_painter(egui::LayerId::new(
-                    egui::Order::Foreground,
+                    crate::workspace::artwork_order(),
                     egui::Id::new("status-bar"),
                 ));
                 let text = painter.layout_no_wrap(
@@ -2680,7 +2680,7 @@ impl Ui {
                 continue;
             };
             let painter = self.ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
+                crate::workspace::artwork_order(),
                 egui::Id::new(id),
             ));
             paint_handle_box(&painter, overlay, self.ctx.pixels_per_point());
@@ -2693,7 +2693,7 @@ impl Ui {
         if !status.selection.is_empty() {
             let ppp = self.ctx.pixels_per_point();
             let painter = self.ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
+                crate::workspace::artwork_order(),
                 egui::Id::new("selection-overlay"),
             ));
             for path in status.selection {
@@ -2737,7 +2737,7 @@ impl Ui {
         if let Some(cursor) = status.brush_cursor {
             let ppp = self.ctx.pixels_per_point();
             let painter = self.ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
+                crate::workspace::artwork_order(),
                 egui::Id::new("brush-cursor"),
             ));
             let centre = egui::pos2(cursor.centre[0] / ppp, cursor.centre[1] / ppp);
