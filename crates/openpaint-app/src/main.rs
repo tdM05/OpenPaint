@@ -698,7 +698,12 @@ impl Default for OpenPaint {
             brush_tip_path: None,
             repaint_at: None,
             workspace: workspace::Workspace::default(),
-            workspace_mode: false,
+            // **The workspace is the UI.** Every section of the old side panel that an artist
+            // reaches for now has a panel, so opening into the old one would be opening into the
+            // scaffolding. F2 still switches, and the old panel still holds the diagnostics --
+            // canvas memory, stroke and frame timings, the autosave line -- which have no home in
+            // the workspace yet and are the only reason it is still here.
+            workspace_mode: true,
             brushes: presets::Library::load(),
             font_substituted: None,
             selection: None,

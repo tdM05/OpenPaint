@@ -1,88 +1,80 @@
 # What is left before the old side panel can be deleted
 
-The workspace (F2) is the real UI. The old egui side panel is still there because it is still the
-only way to reach most of the application. **This file is the list of what has to move before it
-can go**, written for whoever picks this up next — including a future me who will not remember.
+The workspace is the UI: the application opens into it, and every section of the old side panel
+that an artist reaches for has a panel of its own. **F2 still switches**, and the old panel is
+still there for one reason, named at the bottom of this file.
 
-Checked against the code, not from memory: the old panel's sections are the `ui.heading(...)`
-calls in `ui.rs`, and the new ones are the arms of `workspace_panel`.
+Checked against the code, not from memory.
 
-## Already moved
+## Moved
 
-| Panel | State |
+One module each, in `crates/openpaint-app/src/panels/`. Each exports one `show`, and every one of
+them is a pure `controls(...)` building the list plus a pure `picked(...)`/`answer(...)` mapping a
+change — which is what makes them testable without a GPU.
+
+| Panel | What it holds |
 |---|---|
-| Menu | File / Edit / Layer / Select / View, all wired to the same handlers as the shortcuts |
+| Menu | File / Edit / Layer / Select / View, and the panel list |
 | Tools | six tools, with icons |
-| Layers | list, per-row eye, lock alpha, add / duplicate / merge down / delete |
-| Brush | size, opacity, hardness, spacing |
+| Brush | size, opacity, hardness, spacing, roundness, angle, flow, stabilisation; presets with a name field; the tip; all six response curves with their source pickers; reset |
+| Layers | the list with per-row eyes, blend, opacity, lock alpha, clip below, reorder, add / duplicate / merge / delete |
+| Colour | the wheel in three shapes, the hex readout, and the document palette |
+| Transform | scale, rotation, lock, flips, apply / cancel, resampling |
+| Pages | add, select, reorder, delete |
+| Page | size, extend on four sides, crop, trim |
+| Text | add, convert, load a font, and the whole caption editor |
+| Select | the four tools, the wand's three settings, fill and clear |
+| History | the depth readout, and undo / redo as buttons |
 | Canvas | the artwork itself; never a described panel |
 
-## Not moved
+History is **ahead** of the old panel rather than level with it: the old one was a readout and
+nothing else. A real list — rows you can click to walk back to — is not reachable, and
+`panels/history.rs` says exactly why in its module comment and exactly what would be needed.
 
-Nine things. Most of the application, by weight.
+## The one reason the old panel is still here
 
-1. **Transform** — scale and rotation values, flip horizontally/vertically, lock aspect,
-   resampling kernel, apply/cancel. A whole tool with no home in the new UI.
-2. **Pages** — add, delete, reorder. Core to a comics application.
-3. **Crop / resize / extend** — crop by dragging, extend by *n* pixels per edge, apply/cancel,
-   trim to canvas.
-4. **Text** — add a text layer, load a font file, convert to raster.
-5. **Brush, the other two thirds** — flow, angle, roundness, stabilisation, brush tips (load a
-   bitmap tip, back to round), presets (save, load, delete), reset to defaults.
-6. **Layers, the rest** — blend mode, layer opacity, move up/down.
-7. **Colour** — *the wheel is in*, in all three shapes, with the shape choosable in the panel.
-   What is left is the **document palette**: the swatches, saved with the document.
-8. **Select settings** — wand tolerance, expand, fill-on-click, fill with the brush colour. The
-   *commands* (all / none / invert / clear) are already in the menu.
-9. **History** — still a placeholder label.
+Three read-only sections, all diagnostics, with no home in the workspace:
 
-Deliberately **not** moving: the canvas-memory and speed readouts. They are diagnostics, not
-artist tools, and the workspace is not where they belong.
+- **View** — zoom and rotation as numbers.
+- **Canvas memory** — GPU tiles resident, tiles spilled to the CPU, and the traffic between.
+- **Speed** — stroke and frame timings, pen sample rate, step size, and the autosave line.
 
-## What blocks doing these in parallel
+They were always meant to stay out of the workspace: they are development instruments, not artist
+tools, and a panel of them beside the brush settings would be a workspace that mixes two audiences.
+But **deleting the old panel deletes them**, so one of these has to happen first:
 
-Two things, and both have to be done first or every worker invents its own version.
+1. A **Diagnostics** panel, listed in `PANELS` like any other and simply not in the default
+   arrangement — reached from the panel list when it is wanted. Cheapest, and it keeps them out of
+   the artist's way without throwing them away.
+2. Or they move into the workspace's own settings popup, which is already where the look is set.
+3. Or they are genuinely no longer wanted, and go.
 
-### Three control kinds are missing
+Until one of those, `F2` is the way to them and the old panel earns its place.
 
-| Kind | Needed by |
-|---|---|
-| **Pick** — a dropdown | blend mode, resampling kernel |
-| **Text** — a typed field | preset names, layer rename, page size, transform values |
-| ~~**Custom** — drawn by code~~ | **done**, and the colour wheel is drawn with it |
+## What the vocabulary still lacks
 
-`text_field.rs` already holds the editing logic (caret, selection, word motion, UTF-8 safe,
-fuzzed); it needs a `Control::Text`, a caret to draw and keyboard events.
+Three things the ported panels wanted and did without. None is blocking; each shows as a small
+compromise argued in a comment where it bites.
 
-`Control::Custom` is done: the engine still decides where it goes and how tall it is, and hands
-the panel the rectangle back through `PanelInput`. The colour wheel is the worked example --- one
-custom control, everything around it described as usual.
-
-### `ui.rs` is one function with an arm per panel
-
-At ~2,800 lines with every panel in one `match`, two people cannot work on two panels without
-colliding — which is exactly what cost a night already.
-
-**The fix is also the better architecture: one module per panel.** Each exports
-
-```rust
-pub fn controls(state: &PanelState<'_>) -> Vec<Control>;
-pub fn apply(change: Change, state: &PanelState<'_>) -> Option<Picked>;
-```
-
-and `ui.rs` keeps one line each. Then every worker owns a file nobody else touches, and the
-descriptor design finally shows up in the file layout instead of only in the types.
-
-## Suggested order
-
-1. The three control kinds, and split one existing panel out as the pattern to copy.
-2. Then the nine, in parallel, one module each.
-3. Delete the old side panel, `F2`, and everything that only it used.
+- **A disabled state.** A command that cannot apply right now has two shapes in these panels, and
+  the panels converged on when to use each: one inside a *positional* group stays and refuses out
+  loud, because omitting it slides its neighbours and the same spot starts meaning two different
+  things; a single conditional button is replaced by a label naming what it waits for. Both are
+  right, and both would be better as a control that is visibly *there but not now*.
+- **A destructive row action.** `RowMark` is a switch: it reports a flipped state and the engine
+  obeys. "Forget this preset" and "forget this colour" are not states, and two panels independently
+  declined to dress a delete as a toggle. Both put a button under the row instead, which costs a
+  row each.
+- **A subtitle on a row.** The old panel's preset rows carried "Size 8, spacing 0.25, tip …" as
+  hover text. There is no hover in the vocabulary — and a pen has none to give — so that
+  information is gone rather than moved.
 
 ## Two things worth knowing before trusting this work
 
-- **An agent's report is not evidence.** One reported a set of icons as correct; it rendered as
-  overlapping wedges, which only a screenshot caught. Render it and look.
-- **The panels that touch a live document** — transform, pages, crop — cannot be screenshotted the
-  way the chrome can, because there is no document behind a headless frame. They need the most
-  scrutiny and the most sabotage.
+- **An agent's report is not evidence.** Nine panels were written in parallel and all nine reported
+  clean. The screenshots then showed every explanatory label clipped at the panel's edge, in every
+  one of them — because `Control::Label` was one row tall whatever it said, and four of the nine
+  had quietly worked around it by splitting a sentence into three labels. Render it and look.
+- **The screenshot has to draw the real thing.** The first version of the panel screenshot drew
+  `filler` — stand-in sliders under the ported panels' names. It looked entirely convincing and
+  said nothing at all.
