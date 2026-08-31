@@ -28,7 +28,6 @@
 //! it.
 
 use crate::editor::Tool;
-use crate::panel_ui::Direction;
 use crate::workspace::{Anchor, Place};
 use egui::ViewportId;
 use openpaint_core::{Blend, Brush, Curve, Layer, Response, Source};
@@ -642,139 +641,37 @@ fn response_editor(ui: &mut egui::Ui, label: &str, response: &mut Response) {
 
 /// What each panel of the workspace shows.
 ///
-/// **The seam.** Everything above this line is layout and chrome, which are ours; everything below
-/// is widgets, which are egui's for now. Replacing the widget layer later means rewriting this
-/// function and nothing else — which is what "a panel is a narrow trait" was promising when the
-/// plan was made.
-///
-/// Deliberately a first pass. These are the controls needed to prove the workspace works — a
-/// slider you can drag, a list you can click, colours you can pick — not the full set, which comes
-/// as the old panel's sections are ported across one at a time.
-/// The read-only state a workspace panel draws from.
-///
-/// A struct for the same reason `Status` is one: `workspace_panel` grew past the argument lint,
-/// and that is a signal rather than a lint to silence. It is also the shape the seam wants — when
-/// the widget layer is replaced, what a panel *needs* is written down in one place.
-struct PanelState<'a> {
-    layers: &'a [Layer],
-    active_layer: usize,
-    tool: Tool,
-    select_tool: Option<SelectTool>,
-}
-
-/// The menus, and what each one is called.
-///
-/// The names live here and the commands live in [`menu_items`], because a menu's contents depend
-/// on the document -- Delete is not offered when there is one layer left -- and a table cannot
-/// know that.
-const MENUS: &[(&str, ())] = &[
-    ("File", ()),
-    ("Edit", ()),
-    ("Layer", ()),
-    ("Select", ()),
-    ("View", ()),
-];
-
-/// How big a menu's drop-down needs to be.
-///
-/// Measured from the items it is about to show, because the workspace places the popup before the
-/// panel draws into it: a guess would either clip the longest command or leave a margin of nothing
-/// beside the shortest.
-fn menu_size(which: u32, active_layer: usize, layers: usize, paint: &Painting<'_>) -> (f32, f32) {
-    let m = &paint.theme.metrics;
-    let controls: Vec<crate::panel_ui::Control> = menu_items(which, active_layer, layers)
-        .into_iter()
-        .map(|(name, _)| crate::panel_ui::Control::Button { id: 0, text: name })
-        .collect();
-    let text_of =
-        |c: &crate::panel_ui::Control| crate::panel_draw::text_width(paint.ctx, m.body, c);
-    let widest = controls.iter().map(&text_of).fold(0.0_f32, f32::max);
-    let origin = crate::layout::Rect::new(0.0, 0.0, widest + m.padding * 2.0, 4000.0);
-    let laid = crate::panel_ui::place(&controls, origin, m, Direction::Column, text_of);
-    let tall = crate::panel_ui::extent(&laid, origin).1;
-    (widest + m.padding * 4.0, tall + m.padding * 2.0)
-}
-
-/// What one menu offers, given the document it is offering it for.
-///
-/// **Commands that cannot be carried out are not offered.** Deleting the last layer would leave
-/// nothing to paint on, and a menu entry that refuses when pressed teaches you not to trust the
-/// menu (DECISIONS 6b).
-fn menu_items(which: u32, active_layer: usize, layers: usize) -> Vec<(String, Picked)> {
-    let named = |name: &str, what: Picked| (name.to_owned(), what);
-    match which {
-        0 => vec![
-            named("New", Picked::Command(Command::New)),
-            named("Open", Picked::Command(Command::Open)),
-            named("Save", Picked::Command(Command::Save)),
-            named("Save As", Picked::Command(Command::SaveAs)),
-            named("Export PNG", Picked::Command(Command::ExportPng)),
-        ],
-        1 => vec![
-            named("Undo", Picked::Command(Command::Undo)),
-            named("Redo", Picked::Command(Command::Redo)),
-            named("Fill selection", Picked::Selection(SelectAction::Fill)),
-        ],
-        2 => {
-            let mut items = vec![
-                named("Add", Picked::Layer(LayerAction::Add)),
-                named(
-                    "Duplicate",
-                    Picked::Layer(LayerAction::Duplicate(active_layer)),
-                ),
-                named(
-                    "Merge down",
-                    Picked::Layer(LayerAction::MergeDown(active_layer)),
-                ),
-            ];
-            if layers > 1 {
-                items.push(named(
-                    "Delete",
-                    Picked::Layer(LayerAction::Delete(active_layer)),
-                ));
-            }
-            items
-        }
-        3 => vec![
-            named("All", Picked::Selection(SelectAction::All)),
-            named("Deselect", Picked::Selection(SelectAction::None)),
-            named("Invert", Picked::Selection(SelectAction::Invert)),
-            named("Clear", Picked::Selection(SelectAction::Clear)),
-        ],
-        _ => vec![
-            named("Fit", Picked::Command(Command::ZoomFit)),
-            named("Actual size", Picked::Command(Command::ZoomActual)),
-            named("Settings", Picked::Settings),
-        ],
-    }
-}
-
 /// Everything a described panel needs in order to be drawn.
 ///
-/// A struct for the same reason `PanelState` is one: the argument list grew past the lint, and
+/// **The seam.** What a panel says lives in [`crate::panels`], one module each, and none of it
+/// knows what a slider looks like. This is the whole of what it may use to draw: replacing the
+/// widget layer later means rewriting `show` below and nothing else, which is what "a panel is a
+/// narrow trait" was promising when the plan was made.
+///
+/// A struct for the same reason `Status` is one: the argument list grew past the lint, and
 /// that is a signal rather than a lint to silence. These three always travel together --- the look,
 /// which way the controls run, and the gesture the panel is part-way through.
-struct Painting<'a> {
-    theme: &'a crate::theme::Theme,
-    direction: crate::panel_ui::Direction,
-    input: &'a mut crate::panel_draw::PanelInput,
+pub(crate) struct Painting<'a> {
+    pub(crate) theme: &'a crate::theme::Theme,
+    pub(crate) direction: crate::panel_ui::Direction,
+    pub(crate) input: &'a mut crate::panel_draw::PanelInput,
     /// Which menu is drilled into, if any.
     ///
     /// Only the menu panel uses it, but it lives here for the same reason the rest does: it is
     /// state a panel is part-way through, and it has to survive between frames.
-    menu: &'a mut Option<u32>,
+    pub(crate) menu: &'a mut Option<u32>,
     /// For measuring text, which only something holding the fonts can do.
-    ctx: &'a egui::Context,
+    pub(crate) ctx: &'a egui::Context,
     /// Which colour wheel the artist has chosen. A setting, kept where the other half-finished UI
     /// state is kept.
-    wheel_shape: &'a mut crate::colour_wheel::Shape,
+    pub(crate) wheel_shape: &'a mut crate::colour_wheel::Shape,
     /// Which part of the wheel a drag took hold of, if one has.
-    wheel_hold: &'a mut Option<crate::colour_wheel::Region>,
+    pub(crate) wheel_hold: &'a mut Option<crate::colour_wheel::Region>,
 }
 
 impl Painting<'_> {
     /// Draw a list of controls and report what changed.
-    fn show(
+    pub(crate) fn show(
         &mut self,
         ui: &mut egui::Ui,
         controls: &[crate::panel_ui::Control],
@@ -783,444 +680,27 @@ impl Painting<'_> {
     }
 }
 
+/// Draw one of the workspace's panels.
+///
+/// A hand-off now: what each panel shows lives in [`crate::panels`], one module each. This keeps
+/// the shape of the call in one place -- what a panel is given, and that it answers with at most
+/// one [`Picked`] per frame.
 fn workspace_panel(
     panel: crate::layout::PanelId,
     ui: &mut egui::Ui,
     brush: &mut Brush,
     color_srgb: &mut [u8; 3],
-    state: &PanelState<'_>,
+    state: &Status<'_>,
     paint: &mut Painting<'_>,
     place: Place,
 ) -> Option<Picked> {
-    let PanelState {
-        layers,
-        active_layer,
-        tool,
-        select_tool,
-    } = *state;
-    use crate::workspace as ws;
     ui.spacing_mut().item_spacing.y = 5.0;
-    let mut picked = None;
-
-    match panel {
-        ws::MENU => {
-            // **A menu drops down under its own button.** It replaced the strip's contents at
-            // first, which was a mistake: the menu bar is a landmark, and replacing it makes you
-            // lose your place. Touch-friendliness comes from the size of the targets and from
-            // being able to dismiss it by pressing anywhere else, not from refusing to float
-            // anything -- the menus on a phone are overlays too.
-            //
-            // The floating part is the workspace's popup, the same object the panel list and the
-            // panel settings use. What is in it is this panel's business; where it goes, what
-            // closes it and what a press inside it means are the workspace's.
-            use crate::panel_ui::{Change, Control};
-            const PANELS_LIST: u32 = 1 << 20;
-            const FIRST_ITEM: u32 = 1 << 21;
-
-            match place {
-                Place::Panel => {
-                    let mut controls = vec![Control::Label {
-                        text: "OpenPaint".to_owned(),
-                    }];
-                    for (i, (name, _)) in MENUS.iter().enumerate() {
-                        controls.push(Control::Choice {
-                            id: u32::try_from(i).unwrap_or(u32::MAX),
-                            text: (*name).to_owned(),
-                            // Lit while its menu is down, so there is never any doubt which list
-                            // you are looking at.
-                            selected: *paint.menu == Some(u32::try_from(i).unwrap_or(u32::MAX)),
-                            icon: None,
-                        });
-                    }
-                    controls.push(Control::Separator);
-                    controls.push(Control::Button {
-                        id: PANELS_LIST,
-                        text: "Panels".to_owned(),
-                    });
-
-                    let direction = paint.direction;
-                    for change in paint.show(ui, &controls) {
-                        match change {
-                            Change::Pressed(PANELS_LIST) => picked = Some(Picked::PanelList),
-                            Change::Chose(which) if *paint.menu == Some(which) => {
-                                // Pressing the open menu's own button puts it away, which is what
-                                // every menu bar does and the only way to close one without
-                                // choosing something from it.
-                                *paint.menu = None;
-                                picked = Some(Picked::CloseMenu);
-                            }
-                            Change::Chose(which) => {
-                                *paint.menu = Some(which);
-                                if let Some(at) = paint.input.pressed_rect {
-                                    let size = menu_size(which, active_layer, layers.len(), paint);
-                                    picked = Some(Picked::OpenMenu {
-                                        at,
-                                        size,
-                                        // A menu bar running down the side drops its items out to
-                                        // the side; one running across drops them below. The panel
-                                        // does not decide which way it runs, so it asks.
-                                        side: if direction == Direction::Column {
-                                            Anchor::Right
-                                        } else {
-                                            Anchor::Below
-                                        },
-                                    });
-                                }
-                            }
-                            other => eprintln!("menu panel: unexpected {other:?}"),
-                        }
-                    }
-                }
-                Place::Popup => {
-                    let Some(which) = *paint.menu else {
-                        return picked;
-                    };
-                    let items = menu_items(which, active_layer, layers.len());
-                    let controls: Vec<Control> = items
-                        .iter()
-                        .enumerate()
-                        .map(|(i, item)| Control::Button {
-                            id: FIRST_ITEM + u32::try_from(i).unwrap_or(0),
-                            text: item.0.clone(),
-                        })
-                        .collect();
-                    for change in paint.show(ui, &controls) {
-                        match change {
-                            Change::Pressed(id) if id >= FIRST_ITEM => {
-                                picked = items
-                                    .get((id - FIRST_ITEM) as usize)
-                                    .map(|(_, what)| what.clone());
-                                // A menu left open over the canvas is a menu in the way.
-                                *paint.menu = None;
-                            }
-                            other => eprintln!("menu popup: unexpected {other:?}"),
-                        }
-                    }
-                }
-            }
-        }
-        ws::TOOLS => {
-            // A wrapped grid, so the rail works whether it is a column down the side or a strip
-            // along the bottom. Nothing here knows which it currently is: `Direction::Wrap` is the
-            // panel's default in the table, and wrapping is honest here because every button is
-            // the same width.
-            //
-            // Painting tools and selection tools are one set on purpose: to the artist they are
-            // all "what the pen does next", and the fact that one lives on `Editor` and the other
-            // on `Select` is our bookkeeping, not theirs.
-            //
-            // Named rather than drawn with glyphs, for now. The glyphs needed a tooltip to be
-            // readable at all, and a tooltip is something only a pointer that hovers can reach --
-            // which is the thing this UI is explicitly not built around (§1b). Icons replace the
-            // words when there are icons worth using.
-            use crate::icons::Symbol;
-            use crate::panel_ui::{Change, Control};
-            let items: [(&str, Symbol, Picked); 6] = [
-                ("Brush", Symbol::Brush, Picked::Paint(Tool::Brush)),
-                ("Eraser", Symbol::Eraser, Picked::Paint(Tool::Eraser)),
-                ("Lasso", Symbol::Lasso, Picked::Select(SelectTool::Lasso)),
-                ("Rect", Symbol::RectSelect, Picked::Select(SelectTool::Rect)),
-                ("Wand", Symbol::Wand, Picked::Select(SelectTool::Wand)),
-                (
-                    "Move",
-                    Symbol::MoveSelection,
-                    Picked::Select(SelectTool::Move),
-                ),
-            ];
-            let controls: Vec<Control> = items
-                .iter()
-                .enumerate()
-                .map(|(i, (name, symbol, what))| Control::Choice {
-                    id: u32::try_from(i).unwrap_or(u32::MAX),
-                    text: (*name).to_owned(),
-                    // The word and the picture both, so the icon set decides which is shown and
-                    // the rail needs no second table when somebody chooses Words.
-                    icon: Some(*symbol),
-                    selected: match what {
-                        // A paint tool reads as chosen only when no selection tool is up, since a
-                        // selection tool is what the pen is currently doing.
-                        Picked::Paint(t) => select_tool.is_none() && tool == *t,
-                        Picked::Select(t) => select_tool == Some(*t),
-                        Picked::Layer(_)
-                        | Picked::PanelList
-                        | Picked::Selection(_)
-                        | Picked::Command(_)
-                        | Picked::OpenMenu { .. }
-                        | Picked::CloseMenu
-                        | Picked::Settings => false,
-                    },
-                })
-                .collect();
-
-            for change in paint.show(ui, &controls) {
-                picked = match change {
-                    Change::Chose(i) => items.get(i as usize).map(|(_, _, what)| what.clone()),
-                    other => {
-                        eprintln!("tools panel: unexpected {other:?}");
-                        None
-                    }
-                };
-            }
-        }
-        ws::BRUSH => {
-            // **The first panel described rather than drawn.** Nothing below says what a slider
-            // looks like or how a drag becomes a number; it says what the controls *are* and what
-            // they currently hold, and applies what comes back.
-            //
-            // The reason this one went first: it is four sliders and nothing else, so if the
-            // descriptor layer could not carry it there would be no point carrying on — and it is
-            // small enough that finding out costs an afternoon rather than a rewrite.
-            use crate::panel_ui::{Change, Control};
-            const SIZE: u32 = 0;
-            const OPACITY: u32 = 1;
-            const HARDNESS: u32 = 2;
-            const SPACING: u32 = 3;
-
-            let controls = vec![
-                Control::Slider {
-                    id: SIZE,
-                    text: "Size".to_owned(),
-                    value: brush.radius,
-                    min: 0.5,
-                    max: 400.0,
-                    unit: "px",
-                    // Logarithmic, because one step at radius 4 should feel like one step at
-                    // radius 40 — which is what a paint app means by size.
-                    log: true,
-                },
-                Control::Slider {
-                    id: OPACITY,
-                    text: "Opacity".to_owned(),
-                    value: brush.opacity,
-                    min: 0.0,
-                    max: 1.0,
-                    unit: "",
-                    log: false,
-                },
-                Control::Slider {
-                    id: HARDNESS,
-                    text: "Hardness".to_owned(),
-                    value: brush.hardness,
-                    min: 0.0,
-                    max: 1.0,
-                    unit: "",
-                    log: false,
-                },
-                Control::Slider {
-                    id: SPACING,
-                    text: "Spacing".to_owned(),
-                    value: brush.spacing,
-                    min: 0.01,
-                    max: 1.0,
-                    unit: "",
-                    log: false,
-                },
-            ];
-            for change in paint.show(ui, &controls) {
-                match change {
-                    Change::Set(SIZE, v) => brush.radius = v,
-                    Change::Set(OPACITY, v) => brush.opacity = v,
-                    Change::Set(HARDNESS, v) => brush.hardness = v,
-                    Change::Set(SPACING, v) => brush.spacing = v,
-                    // Not a catch-all out of laziness: an id this panel did not put in its own
-                    // list is a bug in the renderer, and swallowing it would be exactly the kind
-                    // of silence §6b forbids.
-                    other => eprintln!("brush panel: unexpected {other:?}"),
-                }
-            }
-        }
-        ws::LAYERS => {
-            // The second panel described rather than drawn, and the one that exercises the rest of
-            // the vocabulary: a list, a pair of switches, and commands.
-            use crate::panel_ui::{Change, Control};
-            // Rows are numbered by layer index, so the ids above them start where no document
-            // could reach. A row and a button sharing an id would be a silent mis-hit.
-            const FIRST_VISIBILITY: u32 = 1 << 19;
-            const FIRST_COMMAND: u32 = 1 << 20;
-            const LOCK_ALPHA: u32 = FIRST_COMMAND + 1;
-            const ADD: u32 = FIRST_COMMAND + 2;
-            const DUPLICATE: u32 = FIRST_COMMAND + 3;
-            const MERGE_DOWN: u32 = FIRST_COMMAND + 4;
-            const DELETE: u32 = FIRST_COMMAND + 5;
-
-            let mut controls = Vec::new();
-            // Top of the list is the top of the stack, which is how every layers panel reads and
-            // the opposite of how the document stores it.
-            for (index, layer) in layers.iter().enumerate().rev() {
-                let row = u32::try_from(index).unwrap_or(u32::MAX);
-                controls.push(Control::Row {
-                    id: row,
-                    text: layer.name.clone(),
-                    selected: index == active_layer,
-                    // The eye, on the row it belongs to. Hiding a layer used to mean selecting it
-                    // first and then finding a switch below the list, which is two steps for
-                    // something every paint application does in one.
-                    mark: Some(crate::panel_ui::RowMark {
-                        id: FIRST_VISIBILITY + row,
-                        on: layer.visible,
-                    }),
-                    swatch: None,
-                });
-            }
-            let active = layers.get(active_layer);
-            controls.push(Control::Separator);
-            controls.push(Control::Toggle {
-                id: LOCK_ALPHA,
-                text: "Lock alpha".to_owned(),
-                on: active.is_some_and(|l| l.lock_alpha),
-            });
-            controls.push(Control::Separator);
-            for (id, text) in [
-                (ADD, "Add"),
-                (DUPLICATE, "Duplicate"),
-                (MERGE_DOWN, "Merge down"),
-                (DELETE, "Delete"),
-            ] {
-                controls.push(Control::Button {
-                    id,
-                    text: text.to_owned(),
-                });
-            }
-
-            for change in paint.show(ui, &controls) {
-                picked = match change {
-                    Change::Chose(index) => {
-                        Some(Picked::Layer(LayerAction::Select(index as usize)))
-                    }
-                    Change::Toggled(id, visible)
-                        if (FIRST_VISIBILITY..FIRST_COMMAND).contains(&id) =>
-                    {
-                        Some(Picked::Layer(LayerAction::SetVisible {
-                            index: (id - FIRST_VISIBILITY) as usize,
-                            visible,
-                        }))
-                    }
-                    Change::Toggled(LOCK_ALPHA, lock) => {
-                        Some(Picked::Layer(LayerAction::SetLockAlpha {
-                            index: active_layer,
-                            lock,
-                        }))
-                    }
-                    Change::Pressed(ADD) => Some(Picked::Layer(LayerAction::Add)),
-                    Change::Pressed(DUPLICATE) => {
-                        Some(Picked::Layer(LayerAction::Duplicate(active_layer)))
-                    }
-                    Change::Pressed(MERGE_DOWN) => {
-                        Some(Picked::Layer(LayerAction::MergeDown(active_layer)))
-                    }
-                    // Deleting the last layer would leave a document with nothing to paint on, so
-                    // the command is refused out loud rather than quietly doing nothing (§6b).
-                    Change::Pressed(DELETE) if layers.len() > 1 => {
-                        Some(Picked::Layer(LayerAction::Delete(active_layer)))
-                    }
-                    Change::Pressed(DELETE) => {
-                        eprintln!("layers: a document needs at least one layer");
-                        None
-                    }
-                    other => {
-                        eprintln!("layers panel: unexpected {other:?}");
-                        None
-                    }
-                };
-            }
-        }
-        ws::COLOUR => {
-            // **The first thing that genuinely cannot be described**, and so the first `Custom`.
-            // A hue ring is not a list of controls, and pretending otherwise would have meant a
-            // control kind that existed for one panel.
-            //
-            // What is described is everything around it: the wheel's shape, and the hex value.
-            // The engine still decides where the wheel goes and how tall it is, so it stacks and
-            // scrolls like anything else.
-            use crate::colour_wheel::{Hsv, Shape};
-            use crate::panel_ui::{Change, Control};
-            const WHEEL: u32 = 0;
-            const FIRST_SHAPE: u32 = 1;
-            const SHAPES: [(&str, Shape); 3] = [
-                ("Ring", Shape::Ring),
-                ("Triangle", Shape::Triangle),
-                ("Square", Shape::Square),
-            ];
-
-            let colour = Hsv::from_srgb8(*color_srgb);
-            let mut controls = vec![Control::Custom {
-                id: WHEEL,
-                // Square, and generous: a wheel small enough to fit anywhere is one you cannot
-                // pick a colour with.
-                height: 190.0,
-            }];
-            controls.push(Control::Label {
-                text: format!(
-                    "#{:02X}{:02X}{:02X}",
-                    color_srgb[0], color_srgb[1], color_srgb[2]
-                ),
-            });
-            controls.push(Control::Separator);
-            controls.extend(
-                SHAPES
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (name, shape))| Control::Choice {
-                        id: FIRST_SHAPE + u32::try_from(i).unwrap_or(0),
-                        text: (*name).to_owned(),
-                        selected: *paint.wheel_shape == *shape,
-                        icon: None,
-                    }),
-            );
-
-            for change in paint.show(ui, &controls) {
-                match change {
-                    Change::Chose(id) if id >= FIRST_SHAPE => {
-                        if let Some((_, shape)) = SHAPES.get((id - FIRST_SHAPE) as usize) {
-                            *paint.wheel_shape = *shape;
-                        }
-                    }
-                    other => eprintln!("colour panel: unexpected {other:?}"),
-                }
-            }
-
-            // Drawn after the controls, into the rectangle the engine gave it.
-            if let Some((_, at)) = paint
-                .input
-                .custom
-                .iter()
-                .find(|(id, _)| *id == WHEEL)
-                .copied()
-            {
-                let where_it_is = crate::panel_draw::WheelAt {
-                    within: at,
-                    shape: *paint.wheel_shape,
-                    colour,
-                };
-                if let Some(picked) = crate::panel_draw::draw_wheel(
-                    ui.painter(),
-                    paint.theme,
-                    where_it_is,
-                    paint.input,
-                    paint.wheel_hold,
-                ) {
-                    *color_srgb = picked.to_srgb8();
-                }
-            }
-        }
-        ws::HISTORY => {
-            // A described placeholder rather than a drawn one, so the day this panel gets its
-            // real list there is no egui left in it to remove first.
-            let controls = [crate::panel_ui::Control::Label {
-                text: "Undo history moves here once the old panel is ported.".to_owned(),
-            }];
-            for change in paint.show(ui, &controls) {
-                eprintln!("history panel: unexpected {change:?}");
-            }
-        }
-        _ => {}
-    }
-    picked
+    crate::panels::show(panel, ui, brush, color_srgb, state, paint, place)
 }
 
 /// What a workspace panel asked for.
 #[derive(Clone, Debug, PartialEq)]
-enum Picked {
+pub(crate) enum Picked {
     Paint(Tool),
     Select(SelectTool),
     /// Open the workspace's panel list.
@@ -1507,12 +987,6 @@ impl Ui {
                     screen.width(),
                     screen.height(),
                 );
-                let state = PanelState {
-                    layers: status.layers,
-                    active_layer: status.active_layer,
-                    tool: status.tool,
-                    select_tool: status.select_tool,
-                };
                 let mut show_panel_list = false;
                 let mut menu_request: Option<(crate::layout::Rect, (f32, f32), Anchor)> = None;
                 let mut close_menu = false;
@@ -1522,7 +996,7 @@ impl Ui {
                 let theme = ws.theme;
                 ws.show(ctx, area, |panel, ui, direction, place| {
                     if let Some(picked) =
-                        workspace_panel(panel, ui, brush, &mut color_srgb, &state,
+                        workspace_panel(panel, ui, brush, &mut color_srgb, &status,
                             &mut Painting {
                                 theme: &theme,
                                 direction,
@@ -2863,59 +2337,5 @@ impl Ui {
             transform_state,
             command,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// **A menu never offers something it would refuse.** Deleting the last layer would leave
-    /// nothing to paint on, and an entry that refuses when pressed teaches you not to trust the
-    /// menu at all.
-    #[test]
-    fn the_layer_menu_hides_delete_when_there_is_one_layer_left() {
-        let names = |items: &[(String, Picked)]| -> Vec<String> {
-            items.iter().map(|(n, _)| n.clone()).collect()
-        };
-        assert!(!names(&menu_items(2, 0, 1)).contains(&"Delete".to_owned()));
-        assert!(names(&menu_items(2, 0, 2)).contains(&"Delete".to_owned()));
-    }
-
-    /// Every menu offers something, and every entry is named.
-    ///
-    /// A menu that drilled into an empty strip would be a dead end with only the way back in it,
-    /// and there would be no telling that from a menu that failed to load.
-    #[test]
-    fn every_menu_offers_something_you_can_press() {
-        for (which, (name, ())) in MENUS.iter().enumerate() {
-            let items = menu_items(u32::try_from(which).expect("small"), 0, 4);
-            assert!(!items.is_empty(), "the {name} menu is empty");
-            for (label, _) in &items {
-                assert!(!label.is_empty(), "an unnamed entry in the {name} menu");
-            }
-        }
-    }
-
-    /// A menu's entries act on the layer that is actually active.
-    ///
-    /// The index is baked in when the entry is built, so building it against the wrong one would
-    /// send Duplicate at whichever layer happened to be first.
-    #[test]
-    fn layer_menu_entries_act_on_the_active_layer() {
-        let items = menu_items(2, 3, 5);
-        assert!(
-            items
-                .iter()
-                .any(|(n, what)| n == "Duplicate"
-                    && *what == Picked::Layer(LayerAction::Duplicate(3))),
-            "Duplicate does not name the active layer"
-        );
-        assert!(
-            items
-                .iter()
-                .any(|(n, what)| n == "Delete" && *what == Picked::Layer(LayerAction::Delete(3))),
-            "Delete does not name the active layer"
-        );
     }
 }

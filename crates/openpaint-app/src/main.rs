@@ -50,6 +50,7 @@ mod layout;
 mod panel_drag;
 mod panel_draw;
 mod panel_ui;
+mod panels;
 mod perf;
 mod presets;
 mod renderer;
