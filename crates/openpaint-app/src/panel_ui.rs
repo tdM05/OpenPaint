@@ -100,12 +100,6 @@ pub enum Control {
     /// same way the menu opens its own items.
     ///
     /// [`Choice`]: Control::Choice
-    // Used by the tests already, and by the panels being ported; `expect` rather than `allow` so
-    // it stops compiling the moment a panel does, and cannot be left behind.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the panels that use it are being ported")
-    )]
     Pick {
         id: ControlId,
         text: String,

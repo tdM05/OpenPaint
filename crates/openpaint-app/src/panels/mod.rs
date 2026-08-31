@@ -63,3 +63,101 @@ pub(crate) fn show(
         _ => None,
     }
 }
+
+/// How big a list of words needs to be, laid out as a popup.
+///
+/// The same measurement the popup itself will do, so the box is the size of what goes in it. A
+/// second guess here would show as a list clipped along one edge, which reads as the popup being
+/// broken rather than as arithmetic.
+#[must_use]
+pub(crate) fn list_size(options: &[String], paint: &Painting<'_>) -> (f32, f32) {
+    use crate::panel_ui::{extent, place, Control, Direction};
+    let m = &paint.theme.metrics;
+    let controls: Vec<Control> = options
+        .iter()
+        .map(|text| Control::Button {
+            id: 0,
+            text: text.clone(),
+        })
+        .collect();
+    let text_of = |c: &Control| crate::panel_draw::text_width(paint.ctx, m.body, c);
+    let widest = controls.iter().map(&text_of).fold(0.0_f32, f32::max);
+    // Tall enough not to matter: the list is laid out into it and then measured, so nothing here
+    // decides the height.
+    let origin = crate::layout::Rect::new(0.0, 0.0, widest + m.padding * 2.0, 4000.0);
+    let laid = place(&controls, origin, m, Direction::Column, text_of);
+    let tall = extent(&laid, origin).1;
+    (
+        widest + m.padding * 4.0,
+        m.padding.mul_add(2.0, tall).min(600.0),
+    )
+}
+
+/// Open a [`crate::panel_ui::Control::Pick`]'s list, anchored to the control that was pressed.
+///
+/// **The anchor is the control, not the pointer.** A list belongs under its own button; opening it
+/// wherever the finger happened to land is how a menu ends up half off the screen with no
+/// explanation. `pressed_rect` is filled by the engine for exactly this.
+///
+/// Returns what the shell should do, or `None` when there is nothing to anchor to -- which happens
+/// only if the press did not come from a control, and then opening nothing is the right answer.
+pub(crate) fn open_pick(
+    id: crate::panel_ui::ControlId,
+    options: &[String],
+    paint: &mut Painting<'_>,
+) -> Option<Picked> {
+    let at = paint.input.pressed_rect?;
+    let size = list_size(options, paint);
+    *paint.pick = Some(id);
+    Some(Picked::OpenMenu {
+        at,
+        size,
+        // Down the panel, a list belongs beside its control; across it, beneath. The same reading
+        // the menu bar makes, for the same reason: the popup must not cover the thing it is about.
+        side: if paint.direction == crate::panel_ui::Direction::Column {
+            crate::workspace::Anchor::Right
+        } else {
+            crate::workspace::Anchor::Below
+        },
+    })
+}
+
+/// Draw an open pick's list and report which option was chosen.
+///
+/// Called from the panel's `Place::Popup` arm. Answers `None` while the list is merely open, and
+/// closes it on a choice -- so a panel writes the same four lines whatever its list is of.
+pub(crate) fn pick_popup(
+    id: crate::panel_ui::ControlId,
+    options: &[String],
+    chosen: usize,
+    ui: &mut egui::Ui,
+    paint: &mut Painting<'_>,
+) -> Option<usize> {
+    use crate::panel_ui::{Change, Control};
+    if *paint.pick != Some(id) {
+        return None;
+    }
+    let controls: Vec<Control> = options
+        .iter()
+        .enumerate()
+        .map(|(i, text)| Control::Choice {
+            id: u32::try_from(i).unwrap_or(u32::MAX),
+            text: text.clone(),
+            selected: i == chosen,
+            // No icon: a list of words is a list of words, and half of them having a picture would
+            // be worse than none of them having one.
+            icon: None,
+        })
+        .collect();
+    let mut answer = None;
+    for change in paint.show(ui, &controls) {
+        match change {
+            Change::Chose(i) => {
+                answer = Some(i as usize);
+                *paint.pick = None;
+            }
+            other => eprintln!("pick {id}: unexpected {other:?}"),
+        }
+    }
+    answer
+}

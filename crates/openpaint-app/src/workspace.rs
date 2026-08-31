@@ -126,6 +126,41 @@ pub const PANELS: &[PanelKind] = &[
         direction: Direction::Column,
         settings: &[Setting::Floating],
     },
+    PanelKind {
+        id: PanelId(7),
+        name: "Transform",
+        header: HeaderStyle::Named,
+        direction: Direction::Column,
+        settings: &[Setting::Floating],
+    },
+    PanelKind {
+        id: PanelId(8),
+        name: "Pages",
+        header: HeaderStyle::Named,
+        direction: Direction::Column,
+        settings: &[Setting::Floating],
+    },
+    PanelKind {
+        id: PanelId(9),
+        name: "Page",
+        header: HeaderStyle::Named,
+        direction: Direction::Column,
+        settings: &[Setting::Floating],
+    },
+    PanelKind {
+        id: PanelId(10),
+        name: "Text",
+        header: HeaderStyle::Named,
+        direction: Direction::Column,
+        settings: &[Setting::Floating],
+    },
+    PanelKind {
+        id: PanelId(11),
+        name: "Select",
+        header: HeaderStyle::Named,
+        direction: Direction::Column,
+        settings: &[Setting::Floating],
+    },
 ];
 
 pub const MENU: PanelId = PanelId(0);
@@ -135,6 +170,11 @@ pub const BRUSH: PanelId = PanelId(3);
 pub const LAYERS: PanelId = PanelId(4);
 pub const COLOUR: PanelId = PanelId(5);
 pub const HISTORY: PanelId = PanelId(6);
+pub const TRANSFORM: PanelId = PanelId(7);
+pub const PAGES: PanelId = PanelId(8);
+pub const PAGE: PanelId = PanelId(9);
+pub const TEXT: PanelId = PanelId(10);
+pub const SELECT: PanelId = PanelId(11);
 
 /// Whether a panel may live in a floating window.
 ///
@@ -692,6 +732,16 @@ pub fn default_layout() -> Layout {
     l.insert(&[1, 2], Zone::Bottom, BRUSH);
     l.insert(&[1, 2, 1], Zone::Bottom, COLOUR);
     l.insert(&[1, 2, 0], Zone::Center, HISTORY);
+    // **Tabs, not more splits.** The task panels -- what you reach for while doing one thing and
+    // put away after -- go beside the panel they belong with rather than each taking a band of the
+    // window. Twelve panels laid out at once is a workspace nobody could read, and the arrangement
+    // is the artist's to change anyway; what matters is that every panel is *somewhere* on opening,
+    // because a panel nobody can find is a panel nobody has.
+    l.insert(&[1, 2, 0], Zone::Center, PAGES);
+    l.insert(&[1, 2, 0], Zone::Center, PAGE);
+    l.insert(&[1, 2, 1], Zone::Center, TRANSFORM);
+    l.insert(&[1, 2, 1], Zone::Center, SELECT);
+    l.insert(&[1, 2, 1], Zone::Center, TEXT);
     l.set_weight(&[1, 2, 0], 0.42);
     l.set_weight(&[1, 2, 1], 0.30);
     l.set_weight(&[1, 2, 2], 0.28);
@@ -4812,6 +4862,7 @@ mod tests {
         for k in PANELS {
             let mut ws = bare();
             ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+            assert!(ws.is_open(k.id), "{} is not in the default layout", k.name);
             let controls = ws.popup_controls(PopupKind::Settings(k.id));
             assert!(
                 controls.iter().any(|c| c.id() == Some(REMOVE_ID)),
@@ -6865,11 +6916,18 @@ mod tests {
         );
         // On the *tab*, which is the only thing that acts for a panel. The middle of the header
         // is the panel strip, and pressing that used to move whichever panel was on show.
-        let tab = chrome.tabs.first().expect("a named header has a tab").rect;
+        // **Brush's own tab**, named rather than "whichever is on show": the leaf holds several
+        // now, and `active` is whichever was added last.
+        let index = brush
+            .tabs
+            .iter()
+            .position(|p| *p == BRUSH)
+            .expect("brush is in this leaf");
+        let tab = chrome.tabs[index].rect;
         let (px, py) = (tab.x + tab.w / 2.0, tab.y + tab.h / 2.0);
         let target = Target::Tab {
             path: brush.path.clone(),
-            tab: brush.active,
+            tab: index,
         };
         let canvas = placed
             .iter()

@@ -18,12 +18,8 @@ pub(crate) fn show(
     place: Place,
 ) -> Option<Picked> {
     let mut picked: Option<Picked> = None;
-    let _ = (&mut *brush, &mut *color_srgb, state, place);
-    let layers = state.layers;
-    let active_layer = state.active_layer;
-    let tool = state.tool;
-    let select_tool = state.select_tool;
-    let _ = (layers, active_layer, tool, select_tool);
+    let _ = (&mut *brush, &mut *color_srgb);
+    let (layers, active_layer) = (state.layers, state.active_layer);
     // The second panel described rather than drawn, and the one that exercises the rest of
     // the vocabulary: a list, a pair of switches, and commands.
     use crate::panel_ui::{Change, Control};
@@ -36,6 +32,33 @@ pub(crate) fn show(
     const DUPLICATE: u32 = FIRST_COMMAND + 3;
     const MERGE_DOWN: u32 = FIRST_COMMAND + 4;
     const DELETE: u32 = FIRST_COMMAND + 5;
+    const BLEND: u32 = FIRST_COMMAND + 6;
+
+    let active = layers.get(active_layer);
+    let modes: Vec<String> = openpaint_core::Blend::ALL
+        .iter()
+        .map(|b| b.label().to_owned())
+        .collect();
+
+    // The dropdown's other half. Drawn when this panel's own popup is up, which is the only time
+    // it can be: one popup at a time, and the workspace decides where it goes.
+    if place == Place::Popup {
+        let chosen = active.map_or(0, |l| {
+            openpaint_core::Blend::ALL
+                .iter()
+                .position(|b| *b == l.blend)
+                .unwrap_or(0)
+        });
+        if let Some(n) = super::pick_popup(BLEND, &modes, chosen, ui, paint) {
+            if let Some(blend) = openpaint_core::Blend::ALL.get(n) {
+                picked = Some(Picked::Layer(LayerAction::SetBlend {
+                    index: active_layer,
+                    blend: *blend,
+                }));
+            }
+        }
+        return picked;
+    }
 
     let mut controls = Vec::new();
     // Top of the list is the top of the stack, which is how every layers panel reads and
@@ -56,8 +79,15 @@ pub(crate) fn show(
             swatch: None,
         });
     }
-    let active = layers.get(active_layer);
     controls.push(Control::Separator);
+    // **How a layer combines with what is under it.** Three today and more later, which is why it
+    // is a dropdown rather than three choices: a row of buttons stops being readable long before a
+    // list does.
+    controls.push(Control::Pick {
+        id: BLEND,
+        text: "Blend".to_owned(),
+        value: active.map_or_else(String::new, |l| l.blend.label().to_owned()),
+    });
     controls.push(Control::Toggle {
         id: LOCK_ALPHA,
         text: "Lock alpha".to_owned(),
@@ -85,6 +115,7 @@ pub(crate) fn show(
                     visible,
                 }))
             }
+            Change::Pressed(BLEND) => super::open_pick(BLEND, &modes, paint),
             Change::Toggled(LOCK_ALPHA, lock) => Some(Picked::Layer(LayerAction::SetLockAlpha {
                 index: active_layer,
                 lock,

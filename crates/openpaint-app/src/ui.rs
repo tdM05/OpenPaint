@@ -655,6 +655,12 @@ pub(crate) struct Painting<'a> {
     pub(crate) theme: &'a crate::theme::Theme,
     pub(crate) direction: crate::panel_ui::Direction,
     pub(crate) input: &'a mut crate::panel_draw::PanelInput,
+    /// Which [`crate::panel_ui::Control::Pick`] has its list open, if any.
+    ///
+    /// The control's id, and one at a time because one popup is open at a time. Beside `menu` for
+    /// the same reason: it is state a panel is part-way through, and it has to survive between
+    /// frames.
+    pub(crate) pick: &'a mut Option<crate::panel_ui::ControlId>,
     /// Which menu is drilled into, if any.
     ///
     /// Only the menu panel uses it, but it lives here for the same reason the rest does: it is
@@ -839,6 +845,8 @@ pub struct Ui {
     panel_input: std::collections::HashMap<u32, crate::panel_draw::PanelInput>,
     /// Which menu the menu strip is drilled into, if any.
     menu_open: Option<u32>,
+    /// Which control's dropdown is open, if any. Kept between frames, like `menu_open`.
+    pick_open: Option<crate::panel_ui::ControlId>,
     /// Which colour wheel the artist chose.
     wheel_shape: crate::colour_wheel::Shape,
     /// Which part of the wheel a drag has hold of.
@@ -873,6 +881,7 @@ impl Ui {
             preset_name: String::new(),
             panel_input: std::collections::HashMap::new(),
             menu_open: None,
+            pick_open: None,
             wheel_shape: crate::colour_wheel::Shape::default(),
             wheel_hold: None,
         }
@@ -973,6 +982,7 @@ impl Ui {
         // back the moment it does not.
         let mut panel_input = std::mem::take(&mut self.panel_input);
         let mut menu_open = self.menu_open;
+        let mut pick_open = self.pick_open;
         let mut wheel_shape = self.wheel_shape;
         let mut wheel_hold = self.wheel_hold;
         let output = self.ctx.run(input, |ctx| {
@@ -1002,6 +1012,7 @@ impl Ui {
                                 direction,
                                 input: panel_input.entry(panel.0).or_default(),
                                 menu: &mut menu_open,
+                                pick: &mut pick_open,
                                 ctx,
                                 wheel_shape: &mut wheel_shape,
                                 wheel_hold: &mut wheel_hold,
@@ -2247,6 +2258,7 @@ impl Ui {
         // of the left edge the panel covers", and only the panel can answer that.
         self.panel_input = panel_input;
         self.menu_open = menu_open;
+        self.pick_open = pick_open;
         self.wheel_shape = wheel_shape;
         self.wheel_hold = wheel_hold;
         let scale = self.ctx.pixels_per_point();
