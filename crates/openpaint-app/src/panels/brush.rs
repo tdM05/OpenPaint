@@ -688,9 +688,9 @@ pub(crate) fn show(
     // down, and a curve needs two gestures -- one to place a point and one to take it away -- which
     // a pen and a mouse both have. Without the distinction a right-click would first add a point on
     // the way down and then remove it again, and a right-drag would move one. The alternative was a
-    // field on `PanelInput`, which is another file. See the report.
-    let (primary, remove) = ui.input(|i| (i.pointer.primary_down(), i.pointer.secondary_clicked()));
-    let down = paint.input.pressed && primary;
+    // field on `PanelInput`, which is where it now lives.
+    let remove = paint.input.other_clicked;
+    let down = paint.input.pressed;
     let fresh = down && !was_down(ui);
     set_was_down(ui, down);
     if !down {

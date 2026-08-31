@@ -364,15 +364,10 @@ pub(crate) fn show(
         }
     }
     if let Some(at) = swatches_at {
-        // **The one thing a described control could not do.** `PanelInput` reports where the
-        // pointer is and whether it is down, which is what a wheel needs; a palette needs the
-        // press *edges* and which button it was, and putting those there is `panel_draw`'s
-        // business rather than something to be guessed at a second time here. So they are read
-        // raw -- and only ever acted on with the pointer over a swatch of this panel, since
-        // `input.pointer` comes from the panel's own response and is already `None` when
-        // something else is on top of it.
-        let (used, forgot) =
-            ui.input(|i| (i.pointer.primary_clicked(), i.pointer.secondary_clicked()));
+        // Which button, and the moment it went down -- both from the engine, which is where
+        // knowing about buttons belongs. `pressed` alone says only that one is *held*, and a
+        // right-click held over a swatch would forget a colour every frame.
+        let (used, forgot) = (paint.input.clicked, paint.input.other_clicked);
         let grid = Grid::of(&paint.theme.metrics);
         let on = paint
             .input

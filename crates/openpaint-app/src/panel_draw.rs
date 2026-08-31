@@ -54,6 +54,17 @@ pub struct PanelInput {
     /// pointer rather than a change.
     pub pointer: Option<(f32, f32)>,
     pub pressed: bool,
+    /// The moment the main button went down, and the moment the other one did.
+    ///
+    /// **Edges, and which button.** `pressed` says a button is *held*, which is what a wheel or a
+    /// curve wants; a palette wants to know a click happened, and a delete wants to know it was
+    /// the other button. Without both, a right-click that removes a swatch removes one every frame
+    /// it is held down, and a right-drag across the palette empties it.
+    ///
+    /// Two panels reached around this into `ui.input` for want of it, which is the seam this layer
+    /// exists to keep. Reported here so nothing has to.
+    pub clicked: bool,
+    pub other_clicked: bool,
     /// Where the control that was last pressed sits.
     ///
     /// For anchoring something to the control that opened it -- a menu belongs under its own
@@ -236,6 +247,13 @@ pub fn show(
     }
     input.pointer = resp.hover_pos().or(pointer).map(|q| (q.x, q.y));
     input.pressed = down;
+    // Only while this panel has the pointer: a click anywhere on the window is not a click on
+    // whatever this panel happens to be drawing under it.
+    let over = input.pointer.is_some();
+    let (main_down, other_down) =
+        ui.input(|i| (i.pointer.primary_pressed(), i.pointer.secondary_pressed()));
+    input.clicked = over && main_down;
+    input.other_clicked = over && other_down;
 
     let hover = resp
         .hover_pos()

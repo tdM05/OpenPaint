@@ -870,6 +870,70 @@ mod tests {
         assert!(input.editing.is_none());
     }
 
+    /// **Which button, and the moment it went down** -- both, and only over this panel.
+    ///
+    /// `pressed` says a button is *held*, which is what a wheel wants. A palette wants to know a
+    /// click happened and a delete wants to know it was the other button: without both, a
+    /// right-click held over a swatch forgets a colour every frame, and a right-drag across the
+    /// palette empties it. Two panels reached around this into raw egui for want of it.
+    #[test]
+    fn a_custom_control_is_told_which_button_and_when() {
+        let area = Rect::new(0.0, 0.0, 200.0, 120.0);
+        let one = [Control::Custom {
+            id: 5,
+            height: 80.0,
+        }];
+        let inside = (area.x + area.w / 2.0, area.y + 40.0);
+
+        // Nothing pressed: neither edge.
+        let (_, quiet) = type_into(&one, area, &[vec![Poke::Move(inside.0, inside.1)]]);
+        assert!(!quiet.clicked && !quiet.other_clicked);
+
+        // The main button going down is an edge, and it is not the other one.
+        let (_, tapped) = type_into(
+            &one,
+            area,
+            &[vec![
+                Poke::Move(inside.0, inside.1),
+                Poke::Press(inside.0, inside.1),
+            ]],
+        );
+        assert!(tapped.clicked, "a press over the panel was not reported");
+        assert!(!tapped.other_clicked, "and it was not the other button");
+
+        // **Held is not clicked.** The frame after the press reports the button still down and no
+        // new edge -- which is the whole difference, and the bug the two panels were working
+        // around.
+        let (_, held) = type_into(
+            &one,
+            area,
+            &[
+                vec![
+                    Poke::Move(inside.0, inside.1),
+                    Poke::Press(inside.0, inside.1),
+                ],
+                vec![Poke::Move(inside.0 + 1.0, inside.1)],
+            ],
+        );
+        assert!(held.pressed, "the button should still be down");
+        assert!(!held.clicked, "holding it is not clicking it again");
+
+        // And a press with the pointer off the panel is not this panel's.
+        let outside = (area.x + area.w + 20.0, area.y + area.h + 20.0);
+        let (_, elsewhere) = type_into(
+            &one,
+            area,
+            &[vec![
+                Poke::Move(outside.0, outside.1),
+                Poke::Press(outside.0, outside.1),
+            ]],
+        );
+        assert!(
+            !elsewhere.clicked,
+            "a press elsewhere was taken as this panel's"
+        );
+    }
+
     /// A pick answers by asking to be opened. It chooses nothing by itself.
     #[test]
     fn a_pick_asks_to_be_opened() {
