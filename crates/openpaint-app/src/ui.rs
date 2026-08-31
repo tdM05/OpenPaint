@@ -706,6 +706,9 @@ fn workspace_panel(
 
 /// What a workspace panel asked for.
 #[derive(Clone, Debug, PartialEq)]
+// The panels that produce the last dozen of these are being written; `expect` rather than `allow`
+// so this stops compiling the moment the last one lands and cannot be left behind.
+#[expect(dead_code, reason = "the panels that produce them are being ported")]
 pub(crate) enum Picked {
     Paint(Tool),
     Select(SelectTool),
@@ -727,6 +730,35 @@ pub(crate) enum Picked {
     Selection(SelectAction),
     /// Something the application has to do: open a dialog, walk history, fit the view.
     Command(Command),
+    /// A page command: add, delete, reorder, or go to one.
+    Page(PageAction),
+    /// A transform command: begin one, apply it, put it back.
+    Transform(TransformAction),
+    /// The transform as the artist has set it: scale, rotation, whether the axes are locked, and
+    /// which resampling the apply will use.
+    ///
+    /// Carried whole rather than as a stream of small edits, because a transform is one thing being
+    /// adjusted -- and because two of its numbers move together when the axes are locked, which a
+    /// per-field message could not say.
+    TransformSet(TransformState),
+    /// A crop command: start dragging one, apply it, put it back.
+    Crop(CropAction),
+    /// Grow the page on one side, by that many pixels.
+    Extend(openpaint_core::Side, u32),
+    /// How much the extend buttons add, which is a panel's own setting.
+    ExtendBy(u32),
+    /// Throw away the pixels outside the page, for good.
+    Trim,
+    /// A text command: add a layer, convert it, load a font.
+    Text(TextAction),
+    /// The text of the layer being edited changed, so its pixels have to be derived again.
+    TextChanged,
+    /// A brush-library command: save, apply or forget a preset, or a colour, or load a tip.
+    Brush(BrushAction),
+    /// What the next saved preset will be called, which is a panel's own setting.
+    PresetName(String),
+    /// The wand's settings, which belong to the tool rather than to the document.
+    Wand(WandSettings),
 }
 
 /// Draw a box with its eight handles.
@@ -1046,6 +1078,22 @@ impl Ui {
                             }
                             Picked::CloseMenu => close_menu = true,
                             Picked::Settings => show_settings = true,
+                            Picked::Page(a) => page_action = Some(a),
+                            Picked::Transform(a) => transform_action = Some(a),
+                            Picked::TransformSet(t) => {
+                                lock_aspect = t.lock_aspect;
+                                kernel = t.kernel;
+                                transform_state = Some(t);
+                            }
+                            Picked::Crop(a) => crop_action = Some(a),
+                            Picked::Extend(side, by) => extend = Some((side, by)),
+                            Picked::ExtendBy(by) => extend_amount = by,
+                            Picked::Trim => trim = true,
+                            Picked::Text(a) => text_action = Some(a),
+                            Picked::TextChanged => text_changed = true,
+                            Picked::Brush(a) => brush_action = Some(a),
+                            Picked::PresetName(name) => preset_name = name,
+                            Picked::Wand(w) => wand = w,
                         }
                     }
                 });

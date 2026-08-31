@@ -66,13 +66,28 @@ pub(crate) fn show(
                 // selection tool is what the pen is currently doing.
                 Picked::Paint(t) => select_tool.is_none() && tool == *t,
                 Picked::Select(t) => select_tool == Some(*t),
+                // Nothing else in this table, and nothing else ever should be: the rail is
+                // tools. Listed rather than caught, so a variant added later stops here and is
+                // thought about instead of silently reading as "not chosen".
                 Picked::Layer(_)
                 | Picked::PanelList
                 | Picked::Selection(_)
                 | Picked::Command(_)
                 | Picked::OpenMenu { .. }
                 | Picked::CloseMenu
-                | Picked::Settings => false,
+                | Picked::Settings
+                | Picked::Page(_)
+                | Picked::Transform(_)
+                | Picked::TransformSet(_)
+                | Picked::Crop(_)
+                | Picked::Extend(..)
+                | Picked::ExtendBy(_)
+                | Picked::Trim
+                | Picked::Text(_)
+                | Picked::TextChanged
+                | Picked::Brush(_)
+                | Picked::PresetName(_)
+                | Picked::Wand(_) => false,
             },
         })
         .collect();
