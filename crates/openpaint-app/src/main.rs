@@ -3421,6 +3421,27 @@ impl OpenPaint {
             "brush\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}",
             b.radius, b.hardness, b.spacing, b.roundness, b.angle, b.flow, b.opacity
         );
+        // Each parameter under its own name as well, so an assertion can be about one slider
+        // rather than about a seven-column row nobody can read.
+        let _ = writeln!(o, "brush.size\t{:.3}", b.radius);
+        let _ = writeln!(o, "brush.hardness\t{:.3}", b.hardness);
+        let _ = writeln!(o, "brush.spacing\t{:.3}", b.spacing);
+        let _ = writeln!(o, "brush.roundness\t{:.3}", b.roundness);
+        let _ = writeln!(o, "brush.angle\t{:.3}", b.angle);
+        let _ = writeln!(o, "brush.flow\t{:.3}", b.flow);
+        let _ = writeln!(o, "brush.opacity\t{:.3}", b.opacity);
+        let _ = writeln!(o, "brush.stabilization\t{:.1}", b.stabilization_ms);
+        // What drives each of the six, and how many points its curve has -- the curve editors are
+        // the only controls here with no value of their own to check.
+        for (name, r) in b.clone().responses_mut() {
+            let _ = writeln!(
+                o,
+                "response.{}\t{}\t{}",
+                name.to_lowercase(),
+                r.source.label(),
+                r.curve.points().len()
+            );
+        }
         let _ = writeln!(o, "brush-tip\t{}", match b.tip {
                 openpaint_core::dab::Tip::Stamp(_) => "bitmap",
                 openpaint_core::dab::Tip::Round(_) => "round",

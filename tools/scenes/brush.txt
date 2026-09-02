@@ -1,0 +1,63 @@
+# The Brush panel. Its list is many times taller than the window, so every press here also
+# exercises the harness scrolling a control into view.
+#
+# Sliders are named by id rather than by label on purpose: six of this panel's labels -- Size,
+# Flow, Hardness, Spacing, Roundness, Angle -- belong to two controls each, the slider and the
+# picker that says what drives it. A person tells them apart by where they are; a script cannot,
+# and must say which it means.
+tab Brush
+expect brush.size 8.000
+expect brush.hardness 0.500
+expect brush.spacing 0.250
+expect brush.roundness 1.000
+expect brush-tip round
+
+# The five shape sliders.
+slide brush:1048577 0.75
+about brush.size 75 30
+slide brush:1048578 0.9
+about brush.hardness 0.9
+slide brush:1048579 0.5
+about brush.spacing 0.5
+slide brush:1048580 0.4
+about brush.roundness 0.4
+slide brush:1048581 0.25
+about brush.angle 0.25
+shot brush-shape
+
+# Stabilization, flow and opacity.
+slide brush:1048582 0.5
+about brush.stabilization 100 25
+slide brush:1048583 0.5
+about brush.flow 0.5
+slide brush:1048584 0.6
+about brush.opacity 0.6
+shot brush-flow
+
+# What drives each parameter: a Pick whose list is the five modulation sources.
+expect response.size Pressure	2
+press brush:1048832
+shot brush-source-open
+press Velocity
+expect response.size Velocity	2
+
+# And back to defaults, which must move every one of them home.
+press Reset to defaults
+expect brush.size 8.000
+expect brush.hardness 0.500
+expect brush.spacing 0.250
+expect brush.roundness 1.000
+expect brush.angle 0.000
+expect brush.flow 1.000
+expect brush.opacity 1.000
+expect response.size Pressure	2
+shot brush-reset
+
+# The curve editor under each picker: a press on empty track adds a point, a right-click on a
+# point takes it away. 1049088 is Size's curve (FIRST_CURVE + 0).
+expect response.size Pressure	2
+press brush:1049088
+expect response.size Pressure	3
+shot brush-curve
+rpress brush:1049088
+expect response.size Pressure	2

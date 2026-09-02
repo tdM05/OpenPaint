@@ -152,6 +152,14 @@ $saved = Join-Path $env:LOCALAPPDATA 'OpenPaint\workspace.json'
 $stash = "$saved.driving"
 if (-not $KeepWorkspace -and (Test-Path $saved)) { Move-Item $saved $stash -Force }
 
+# The saved brushes, set aside for the length of the run. They are an app resource in the same
+# directory as everything else here, a run can create and delete them (Save brush / Forget), and a
+# harness that mis-resolves one name can wipe the lot -- which is not a hypothetical, it happened.
+# Nothing driven here is allowed to cost the artist a brush they made.
+$brushes = Join-Path $env:LOCALAPPDATA 'OpenPaint' | Join-Path -ChildPath 'brushes.json'
+$brushStash = "$brushes.driving"
+if (Test-Path $brushes) { Move-Item $brushes $brushStash -Force }
+
 # **And the artist's recovered work is set aside, never answered.** A crashed session leaves a
 # file here and the app opens asking what to do with it. The only two answers are Recover and
 # Discard, and Discard destroys unsaved work that is not mine to destroy -- so the run never sees
@@ -201,6 +209,7 @@ try {
     function Read-Atlas {
         $found = @{}
         $tabs = @{}
+        $twins = @{}
         $panel = ''
         $view = $null
         # The app truncates this at the top of every frame and fills it as the panels draw, so a
@@ -237,16 +246,33 @@ try {
             if ($f.Count -lt 6) { continue }
             $rect = [pscustomobject]@{
                 X = [int]$f[1]; Y = [int]$f[2]; W = [int]$f[3]; H = [int]$f[4]
-                Panel = $panel; View = $view; Label = $f[5]
+                Panel = $panel; View = $view; Label = $f[5]; Id = $f[0]
             }
             # Indexed under four keys, so a step can say the label, the control's own id, or
             # `Panel:label` when two panels both have an "Opacity".
+            #
+            # **A name that fits two controls is recorded as fitting two**, and pressing it is an
+            # error. First-wins looks harmless and is not: the brush panel has a Size slider and a
+            # Size response picker, a Flow slider and a Flow response picker, and `brush:flow`
+            # quietly resolved to whichever the layout reached first. A run meaning to drag a
+            # slider opened a dropdown instead, went on pressing things underneath it, and
+            # destroyed the artist's saved brushes. Silently choosing between two controls with the
+            # same name is the exact failure the atlas exists to prevent.
             foreach ($k in @($f[5], $f[0], "${panel}:$($f[5])", "${panel}:$($f[0])")) {
                 $k = $k.Trim().ToLower()
-                if ($k -and -not $found.ContainsKey($k)) { $found[$k] = $rect }
+                if (-not $k) { continue }
+                if ($found.ContainsKey($k)) {
+                    # Ambiguity is a property of the *key*, not of the control: one control is
+                    # filed under four keys and they share one object, so recording it on the
+                    # object made every alias of the first control look ambiguous too.
+                    if (-not $twins.ContainsKey($k)) { $twins[$k] = @($found[$k].Id) }
+                    if ($twins[$k] -notcontains $f[0]) { $twins[$k] += ,$f[0] }
+                } else {
+                    $found[$k] = $rect
+                }
             }
         }
-        return @($found, $tabs)
+        return @($found, $tabs, $twins)
     }
 
     # Turn the wheel over a point. Injected like everything else here, because the app only gives
@@ -268,17 +294,37 @@ try {
     # which is a test that passes by pressing the wrong thing. So: scroll until the atlas says it
     # is inside, then press. Returns the rectangle as it is now.
     function Bring-Into-View([string]$name) {
-        for ($try = 0; $try -lt 24; $try++) {
+        # How far one notch goes is the app's business, so it is measured rather than assumed --
+        # and then used to travel. One notch at a time was fine for a layer list and hopeless for
+        # the brush panel, whose controls run to four thousand pixels inside a slot two hundred
+        # and fifty tall: sixty notches from top to bottom, and a fixed budget of twenty-four
+        # reported a control that is perfectly reachable as unreachable.
+        $per = 0.0
+        for ($try = 0; $try -lt 60; $try++) {
             $r = Rect-Of $name
             $v = $r.View
             if (-not $v) { return $r }
-            $top = $r.Y
-            $bot = $r.Y + $r.H
-            if ($top -ge $v.Y -and $bot -le ($v.Y + $v.H)) { return $r }
-            # One notch at a time, re-reading in between: how far a notch goes is the app's
-            # business, and guessing it is how a scroll overshoots and calls the miss a pass.
-            $notches = if ($bot -gt ($v.Y + $v.H)) { -1 } else { 1 }
-            Wheel-At ($v.X + [int]($v.W / 2)) ($v.Y + [int]($v.H / 2)) $notches
+            if ($r.Y -ge $v.Y -and ($r.Y + $r.H) -le ($v.Y + $v.H)) { return $r }
+            $mx = $v.X + [int]($v.W / 2)
+            $my = $v.Y + [int]($v.H / 2)
+            # How far short, in pixels, and which way.
+            $short = if (($r.Y + $r.H) -gt ($v.Y + $v.H)) {
+                ($r.Y + $r.H) - ($v.Y + $v.H - 4)
+            } else {
+                $r.Y - ($v.Y + 4)
+            }
+            if ($per -le 0) {
+                # Measure one notch before spending any.
+                $was = $v.Scroll
+                Wheel-At $mx $my $(if ($short -gt 0) { -1 } else { 1 })
+                $now = (Rect-Of $name).View.Scroll
+                $per = [Math]::Abs($now - $was)
+                if ($per -le 0) { throw "'$name' is in a panel that will not scroll" }
+                continue
+            }
+            $want = [int][Math]::Ceiling([Math]::Abs($short) / $per)
+            $go = [Math]::Min($want, 20)
+            Wheel-At $mx $my $(if ($short -gt 0) { -$go } else { $go })
         }
         throw "'$name' will not come into view in its panel"
     }
@@ -289,7 +335,13 @@ try {
         $a = Read-Atlas
         $table = if ($Tab) { $a[1] } else { $a[0] }
         $k = $name.Trim().ToLower()
-        if ($table.ContainsKey($k)) { return $table[$k] }
+        if ($table.ContainsKey($k)) {
+            if (-not $Tab -and $a[2].ContainsKey($k)) {
+                throw ("'$name' is the name of $($a[2][$k].Count) controls in " +
+                       "$($table[$k].Panel) (ids $($a[2][$k] -join ', ')). Say which by id.")
+            }
+            return $table[$k]
+        }
         $near = @($table.Keys | Where-Object { $_.StartsWith($k + ' ') -or $_.StartsWith($k + ':') })
         if ($near.Count -eq 1) { return $table[$near[0]] }
         $what = if ($Tab) { 'tab' } else { 'control' }
@@ -472,9 +524,13 @@ try {
                 Expect-State $k $v
             }
             'about' {
-                $rest = $step.Trim().Substring(5).Trim()
-                $k, $v = $rest -split '\s+', 2
-                Expect-Near $k ([double]$v)
+                # `about KEY VALUE [TOLERANCE]`. A log slider set by fraction lands where the
+                # curve puts it, so the scene says how close is close enough.
+                if ($a.Count -ge 4) {
+                    Expect-Near $a[1] ([double]$a[2]) ([double]$a[3])
+                } else {
+                    Expect-Near $a[1] ([double]$a[2])
+                }
             }
             'state' {
                 # Print the whole of it, for a step that is exploring rather than asserting.
@@ -525,6 +581,8 @@ try {
     Start-Sleep -Milliseconds 500
     Save-Shot $Shot
     if ($checks.Count) {
+        # Beside the pictures, so the result of a run outlives the console it scrolled past.
+        $checks | Set-Content -LiteralPath (Join-Path $outDir "$Shot.checks") -Encoding utf8
         Write-Output '--- checks ---'
         $checks | Write-Output
     }
@@ -533,6 +591,10 @@ try {
 finally {
     if (-not $Keep -and -not $proc.HasExited) { $proc.Kill(); $proc.WaitForExit(3000) }
     if (Test-Path $stash) { Move-Item $stash $saved -Force }
+    if (Test-Path $brushStash) {
+        if (Test-Path $brushes) { Remove-Item $brushes -Force }
+        Move-Item $brushStash $brushes -Force
+    }
     if (Test-Path $recStash) {
         if (Test-Path $rec) { Remove-Item $rec -Recurse -Force }
         Move-Item $recStash $rec -Force
