@@ -163,7 +163,7 @@ impl Autosave {
             if self.live {
                 // A failure here is not worth telling anyone about: the worst outcome is being
                 // offered a recovery that turns out to be identical to the saved file.
-                let _ = std::fs::remove_file(path);
+                remove_document(path);
             }
         }
         self.live = false;
@@ -196,6 +196,7 @@ impl Autosave {
 /// is not a recovery copy at all, and offering the older of two — and none of them would be
 /// noticed by hand until the day they mattered.
 fn scan(dir: &Path, ours: Option<&Path>) -> Option<Recoverable> {
+    sweep_orphans(dir);
     let mut best: Option<Recoverable> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
@@ -237,6 +238,49 @@ impl Default for Autosave {
     }
 }
 
+/// Delete a document and the two files SQLite keeps beside it.
+///
+/// **A document is three files, not one.** SQLite in WAL mode writes `-shm` and `-wal` alongside,
+/// and removing only the one we named left both of them behind on every clean exit -- so a data
+/// directory collected two orphans per session and never gave any of them back. Thirty-five pairs
+/// had piled up in one artist's before anyone looked.
+///
+/// They are harmless to *recovery* -- `scan` only considers files with the document extension --
+/// which is exactly why nothing noticed.
+fn remove_document(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    for side in ["-shm", "-wal"] {
+        let mut beside = path.as_os_str().to_owned();
+        beside.push(side);
+        let _ = std::fs::remove_file(std::path::Path::new(&beside));
+    }
+}
+
+/// Throw away side files whose document has gone.
+///
+/// Run when the recovery folder is read, so a directory that collected orphans under the old
+/// behaviour empties itself out rather than needing anyone to know they are there. Only ever
+/// removes a `-shm` or `-wal` whose own document is absent: one with a document beside it belongs
+/// to a copy that may still be offered, and one of those is somebody's unsaved work.
+fn sweep_orphans(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.to_str() else { continue };
+        let Some(stem) = name
+            .strip_suffix("-shm")
+            .or_else(|| name.strip_suffix("-wal"))
+        else {
+            continue;
+        };
+        if !std::path::Path::new(stem).exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// The directory recovery copies live in, created if needed.
 fn recovery_dir() -> Option<PathBuf> {
     let dir = dirs::data_local_dir()?.join("OpenPaint").join("recovery");
@@ -258,6 +302,58 @@ fn session_file() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// A recovery copy is three files, and all three go.
+    ///
+    /// **SQLite writes `-shm` and `-wal` beside the document**, and discarding only the one we
+    /// named left both behind on every clean exit -- two orphans per session, kept for ever.
+    /// Thirty-five pairs had collected in one artist's data directory before anyone looked, and
+    /// nothing noticed because `scan` ignores anything without the document extension, so recovery
+    /// itself was never confused by them.
+    ///
+    /// The sweep is the other half: a directory that collected them under the old behaviour has to
+    /// empty itself rather than wait for somebody to know they are there. It removes a side file
+    /// only when its own document is gone -- one with a document beside it belongs to a copy that
+    /// may still be offered, and that is somebody's unsaved work.
+    #[test]
+    fn a_discarded_recovery_takes_its_side_files_with_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "openpaint-sidefiles-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("a temp directory");
+
+        let doc = dir.join("session-1.openpaint");
+        let shm = dir.join("session-1.openpaint-shm");
+        let wal = dir.join("session-1.openpaint-wal");
+        for f in [&doc, &shm, &wal] {
+            std::fs::write(f, b"x").expect("write");
+        }
+        super::remove_document(&doc);
+        assert!(!doc.exists(), "the document should be gone");
+        assert!(
+            !shm.exists() && !wal.exists(),
+            "and so should both side files"
+        );
+
+        // An orphan pair from before this existed, and a live one that must be left alone.
+        let orphan = dir.join("session-2.openpaint-shm");
+        let keep_doc = dir.join("session-3.openpaint");
+        let keep_side = dir.join("session-3.openpaint-wal");
+        for f in [&orphan, &keep_doc, &keep_side] {
+            std::fs::write(f, b"x").expect("write");
+        }
+        super::sweep_orphans(&dir);
+        assert!(!orphan.exists(), "a side file with no document is litter");
+        assert!(
+            keep_doc.exists() && keep_side.exists(),
+            "a side file whose document is still there belongs to a copy somebody may need"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

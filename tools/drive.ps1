@@ -173,12 +173,42 @@ public class Win {
 #
 # So a stash that is already there is treated as evidence of an interrupted run and restored first.
 # It is never evidence of anything else: nothing but this script writes those names.
+# **Getting rid of what this run made, without ever stranding what the artist had.**
+#
+# The application writes a recovery copy into its own folder at start-up and holds the file open,
+# and killing it does not always let go before the next line runs. Deleting that folder then throws
+# -- and the throw was inside the very block that puts the artist's folder back, so a locked file
+# of ours left their work in a `.driving` stash. The harm this stashing exists to prevent, reached
+# by a third route.
+#
+# So: try a few times, and if the lock outlasts us, shove it aside under a name nothing looks at
+# rather than give up. Putting theirs back is the part that must not fail.
+function Discard([string]$path) {
+    if (-not (Test-Path $path)) {
+        return
+    }
+    for ($i = 0; $i -lt 12; $i++) {
+        try {
+            Remove-Item $path -Recurse -Force -ErrorAction Stop
+            return
+        } catch {
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    # Still held. Out of the way is as good as gone for our purposes, and it can be swept up later.
+    try {
+        Move-Item $path "$path.stuck-$(Get-Random)" -Force -ErrorAction Stop
+    } catch {
+        Write-Output "could not clear $path -- the artist's copy is put back beside it"
+    }
+}
+
 function Restore-Stash([string]$live, [string]$stash) {
     if (-not (Test-Path $stash)) {
         return
     }
     Write-Output "putting back what an interrupted run left aside: $live"
-    if (Test-Path $live) { Remove-Item $live -Recurse -Force }
+    Discard $live
     Move-Item $stash $live -Force
 }
 
@@ -191,6 +221,30 @@ if (-not (Test-Path $exe)) {
 }
 $outDir = Join-Path $root 'target\drive'
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+# **Refuse to run while the artist has OpenPaint open.**
+#
+# Everything below moves their workspace, brushes, theme and recovery copies aside for the length
+# of the run and puts them back at the end. That is safe when nothing else is using them and
+# actively dangerous when something is: a running OpenPaint holds the path of its own recovery copy
+# for as long as it lives, so while the folder is swapped its autosaves land in the run's folder
+# and are thrown away with it. For those minutes the work on their screen has no recovery copy at
+# all, and a crash would take it.
+#
+# It also explains two things that looked like harness faults and were not: a recovery file that
+# could not be deleted because their application had it open, and one that kept reappearing under
+# the same name because it was theirs and still being written.
+#
+# Their copy runs from `target\release`; this launches `target\drive-build\release`, so the two are
+# told apart by path rather than by name. Never kill it -- that is not a trade to make on somebody
+# else's behalf, and the whole point of the separate build directory was to avoid needing to.
+$theirs = @(Get-Process openpaint -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -and $_.Path -ne $exe })
+if ($theirs.Count) {
+    throw ("OpenPaint is already running (pid $($theirs[0].Id), $($theirs[0].Path)). " +
+           'Close it before driving: this moves the workspace, brushes, theme and recovery copies ' +
+           'aside, and a running copy would lose its autosaves into the gap.')
+}
 
 # A fresh workspace every run, so a picture is of the code and not of whatever was saved last.
 # `-KeepWorkspace` is for the one thing that needs the opposite: proving a saved one still loads.
@@ -255,6 +309,11 @@ $env:OPENPAINT_TRACE_INPUT = '1'
 # rather than on a picture of one.
 $state = Join-Path $outDir "$Shot.now"
 $env:OPENPAINT_STATE = $state
+
+# When this run began. Nothing of the artist's can be newer than this -- they are not at the
+# machine, and their folder is set aside before the application is even started -- so it is a safe
+# line to sweep behind. See the `finally` at the foot of this file.
+$startedAt = Get-Date
 
 $log = Join-Path $outDir "$Shot.log"
 $proc = Start-Process -FilePath $exe -PassThru -RedirectStandardOutput $log `
@@ -926,18 +985,42 @@ try {
     if ($failed) { throw "${Shot}: one or more checks failed" }
 }
 finally {
-    if (-not $Keep -and -not $proc.HasExited) { $proc.Kill(); $proc.WaitForExit(3000) }
-    if (Test-Path $stash) { Move-Item $stash $saved -Force }
-    if (Test-Path $brushStash) {
-        if (Test-Path $brushes) { Remove-Item $brushes -Force }
-        Move-Item $brushStash $brushes -Force
+    # Each of these is independent, and each is wrapped: one that throws must not stop the three
+    # after it from putting the artist's files back.
+    if (-not $Keep -and -not $proc.HasExited) { $proc.Kill(); $proc.WaitForExit(5000) }
+    foreach ($pair in @(
+            @($stash, $saved),
+            @($brushStash, $brushes),
+            @($lookStash, $look),
+            @($recStash, $rec))) {
+        try {
+            if (Test-Path $pair[0]) {
+                Discard $pair[1]
+                Move-Item $pair[0] $pair[1] -Force
+            }
+        } catch {
+            Write-Output "could not put back $($pair[1]): $_"
+        }
     }
-    if (Test-Path $lookStash) {
-        if (Test-Path $look) { Remove-Item $look -Force }
-        Move-Item $lookStash $look -Force
-    }
-    if (Test-Path $recStash) {
-        if (Test-Path $rec) { Remove-Item $rec -Recurse -Force }
-        Move-Item $recStash $rec -Force
+
+    # **And nothing this run wrote is left among the artist's recovery copies.**
+    # The application holds the path of its own copy for as long as it is alive, and that path is
+    # the same string once their folder is back -- so a write that lands after the restore lands in
+    # theirs. One did: a 278 KB copy of a test stroke sat in an artist's recovery folder, where the
+    # application would have offered it to them as their own unsaved work.
+    #
+    # Only files newer than this run can possibly be ours, and nothing of theirs can be: their
+    # folder was set aside before the application was started.
+    try {
+        if (Test-Path $rec) {
+            Get-ChildItem -LiteralPath $rec -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -gt $startedAt } |
+                ForEach-Object {
+                    Write-Output "cleared this run's own recovery copy: $($_.Name)"
+                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                }
+        }
+    } catch {
+        Write-Output "could not sweep this run's recovery copies: $_"
     }
 }

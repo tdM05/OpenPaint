@@ -29,13 +29,17 @@ Ranked by how soon an artist would have met it.
 | 13 | The View menu was the `_` arm of its match, so any id not one of the five drew View's items under another menu's name. | `panels/menu.rs` | fixed |
 | 14 | Dead code that had outlived its purpose: `Picked::TextChanged` had no producer and never would; `Change::Picked` was a placeholder for a round trip since written another way; the `expect(dead_code)` on `Picked` was worded to stop compiling when the port finished, and it had. | `ui.rs`, `panel_ui.rs` | fixed |
 | 15 | Stale module docs: `text.rs` said its caption editor was "not drawn yet" — it is fully wired, and a reader trusting the header would skip fourteen live controls — and `page.rs` described a blocker that had been lifted. `docs/PANEL_GESTURES.md` promised a hold that `window_target` has never done. | docs | fixed |
+| 15a | **Discarding a recovery copy left its SQLite side files behind.** A document is three files in WAL mode, and only the one we named was removed — so every clean exit left a `-shm` and a `-wal` orphan, kept for ever. Thirty-five pairs had collected in one data directory. Nothing noticed because `scan` ignores anything without the document extension, so recovery itself was never confused by them. Both go now, and the folder sweeps orphans whose document has gone when it is read, so a directory that collected them empties itself. | `autosave.rs` | fixed, with a test |
 | 16 | A menu popup's last item overhangs its own box by about two thirds of a point. A hand can hit it; nothing is visibly wrong. | `panels/mod.rs::list_size` | open, cosmetic |
 | 17 | **A layer's properties are outside history** — opacity, blend, visibility, alpha lock, clipping, and its name. That is a deliberate decision written into `main.rs` ("a switch in the undo stack would make Ctrl+Z toggle settings instead of reversing artwork"), and it differs from CSP EX, where every one of them is in the History palette. Left alone: overturning a stated decision is the artist's call, and a slider needs a coalescing policy before it can go in a stack at all. | `main.rs` | **for the artist to decide** |
 
-Two of these were found in the harness rather than the application, and both could have cost the
+Three of these were found in the harness rather than the application, and each could have cost the
 artist work, so they are written here too: a name that matched two controls was resolved silently
-to one of them (which deleted the saved brushes), and killing a sweep mid-run stranded the artist's
-workspace, brushes and recovery copies in a stash. Both are fixed; see `docs/DRIVING.md`.
+to one of them (which deleted the saved brushes); killing a sweep mid-run stranded the artist's
+workspace, brushes and recovery copies in a stash; and worst, a run would set those things aside
+**while the artist had OpenPaint open**, so for the length of it their live session's autosaves
+landed in the run's folder and were thrown away with it. `drive.ps1` now refuses to start while
+their copy is running. All three are fixed; see `docs/DRIVING.md`.
 
 ## What is covered
 

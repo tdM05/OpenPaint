@@ -114,8 +114,19 @@ the list was already scrolled", and the log only says what input arrived, never 
   recovery copies then sit in a `.driving` stash with the live ones missing, which is precisely
   the harm the stashing exists to prevent. Nothing but this script writes those names, so a
   stash is never evidence of anything else.
-- **Never kill the artist's running OpenPaint** to free the build lock. Build to
+- **Never kill the artist's running OpenPaint**, for the build lock or for anything else. Build to
   `target/drive-build`, which is why that flag is in every command above.
+- **Do not drive at all while they have it open**, and `drive.ps1` now refuses to. Everything here
+  moves their workspace, brushes, theme and recovery copies aside for the length of a run and puts
+  them back at the end. That is safe when nothing else is using them and actively dangerous when
+  something is: a running OpenPaint holds the path of its own recovery copy for as long as it
+  lives, so while the folder is swapped its autosaves land in the run's folder and are thrown away
+  with it. For those minutes the work on their screen has no recovery copy at all.
+
+  Their copy runs from `targetelease` and this launches `target\drive-buildelease`, so the two
+  are told apart by path rather than by name. It also explains two things that look like harness
+  faults and are not: a recovery file that cannot be deleted because their application has it open,
+  and one that keeps reappearing under the same name because it is theirs and still being written.
 - `workspace.json`, `brushes.json` and `theme.json` are stashed the same way, so a run tests the
   code and not whatever the last one left. `-KeepWorkspace` is for the one case that wants the
   opposite. The brush library is on that list because a run can create and delete brushes, and a
