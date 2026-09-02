@@ -2564,7 +2564,14 @@ impl OpenPaint {
             return;
         };
         match renderer.save_document(document, &path, &meta) {
-            Ok(tiles) => self.autosave.record(started.elapsed(), tiles),
+            Ok(tiles) => {
+                self.autosave.record(started.elapsed(), tiles);
+                // The panel carries a line saying when the last copy was written, and this is the
+                // only thing that changes it. Without a frame it says "due within a minute" for as
+                // long as nobody touches anything -- which is exactly the stretch during which the
+                // copy it is describing was made. A frame a minute is nothing.
+                self.request_redraw();
+            }
             Err(e) => {
                 // Not a status message: autosave is background work the user did not ask for, and
                 // interrupting them about it every minute would be worse than the failure. The

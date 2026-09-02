@@ -40,7 +40,8 @@ Get-ChildItem -Path $root -Filter 'openpaint-*.png' -File -ErrorAction SilentlyC
 # The bitmap-tip scenario loads a PNG through the application's own file dialog, so one has to
 # exist at a known path. Drawn here rather than kept in the repository: it is a fixture of the
 # suite, not an asset of the application, and a few lines of arithmetic are clearer than a blob.
-$tip = Join-Path $root 'target\drive	ip.png'
+$tip = Join-Path $root 'target' | Join-Path -ChildPath 'drive' |
+    Join-Path -ChildPath 'stamp-fixture.png'
 if (-not (Test-Path $tip)) {
     Add-Type -AssemblyName System.Drawing
     $n = 96

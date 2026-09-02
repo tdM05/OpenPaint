@@ -6,7 +6,9 @@
 # arrives through a native file dialog, and until the harness learned to type a path into one there
 # was no way in.
 #
-# The image is written by the sweep before it runs, so the path is known.
+# The image is written by the sweep before it runs, so the path is known. It is called
+# `stamp-fixture.png` rather than `tip.png` because this scenario's own screenshots are called
+# `tip*.png` -- the picture would have overwritten the fixture it loads.
 tab Brush
 expect brush-tip round
 press brush:1048590
@@ -14,10 +16,12 @@ absent Back to a round tip
 
 # The dialog is native and runs on its own thread; it needs a good while to appear and take the
 # keyboard, and a path typed before it has goes into the application instead.
-press Load brush tip
+# By id: the button's label ends in a U+2026 ellipsis, and a scene file has no business
+# carrying one. 1048587 is LOAD_TIP.
+press brush:1048587
 wait 3000
 expect dialog true
-type C:\Users\taddm\code\OpenPaint\target\drive\tip.png
+type C:\Users\taddm\code\OpenPaint\target\drive\stamp-fixture.png
 wait 1000
 key enter
 wait 2500

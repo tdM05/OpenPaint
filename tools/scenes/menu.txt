@@ -48,8 +48,10 @@ expect status New document
 # not stand between the press and the dialog. Cancelling must leave the document untouched.
 press Menu:File
 press Menu:Open
+wait 2500
 expect dialog true
 key escape
+wait 900
 expect dialog false
 expect file -
 expect dirty false
@@ -60,8 +62,10 @@ shot menu-open
 # dialog too -- and a cancelled save must not invent a path.
 press Menu:File
 press Menu:Save
+wait 2500
 expect dialog true
 key escape
+wait 900
 expect dialog false
 expect file -
 expect dirty false
@@ -69,8 +73,10 @@ expect dirty false
 # File > Save As always shows the picker, whether or not the document has a file.
 press Menu:File
 press Menu:Save As
+wait 2500
 expect dialog true
 key escape
+wait 900
 expect dialog false
 expect file -
 expect dirty false

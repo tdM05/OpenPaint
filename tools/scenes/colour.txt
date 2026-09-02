@@ -1,13 +1,17 @@
 # The Colour panel: the wheel, the palette, and the three wheel shapes.
+#
+# **Pressed at a fixed point rather than dragged.** A drag across the wheel lands wherever the
+# interpolation and the panel's scroll offset put it, which is not the same pixel twice: the same
+# scene gave 040480 on one run and 090980 on the next, and an assertion that changes between runs
+# teaches you to ignore assertions. A press at an offset inside the control is the same colour
+# every time, and it is still the artist's gesture.
 tab Colour
 expect palette 0
 expect colour 141418
 
-# Dragging inside the wheel changes the paint colour. The wheel is control 0 in this panel, and
-# what is asserted is the colour afterwards -- a wheel that answered a constant, or answered
-# nothing, would have passed on a screenshot.
-slide colour:0 0.7
-expect colour 040480
+# The middle of the square inside the ring: a mid saturation and value of the starting hue.
+pressat colour:0 188 142
+expect colour 414180
 shot colour-picked
 
 # Keeping a colour puts a chip in the document's palette. A second colour makes a second chip --
@@ -16,18 +20,18 @@ press Keep this colour
 expect palette 1
 press Keep this colour
 expect palette 1
-slide colour:0 0.3
+pressat colour:0 120 90
+expect colour ccccd7
 press Keep this colour
 expect palette 2
 shot colour-kept
 
 # The swatch grid is control 16: left-click a chip to paint with it, right-click to forget it.
 # The chips are row-sized squares from the left of a box the full width of the panel, so a press
-# has to say which chip it means -- the middle of the box is empty space. Pressing one paints with
-# it: the colour has to become that chip's, which is the first one kept above.
-slide colour:0 0.9
+# has to say which chip it means -- the middle of the box is empty space. Pressing the first one
+# has to bring back the first colour kept, which is the one from the middle of the square.
 pressat colour:16 16 16
-expect colour 040480
+expect colour 414180
 shot colour-used
 rpressat colour:16 16 16
 expect palette 1

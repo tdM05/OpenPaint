@@ -218,11 +218,11 @@ expect selection true
 # `expect` wants them exact and `about` cannot read a two-number line -- so what is asserted here is
 # what the pixels do, which is the difference the lock makes and has nothing to do with the panel.
 #
-# **The one thing this scene still cannot say** is "those two numbers are equal", which is what the
-# projection actually promises. It would take either two single-valued keys, `transform.scale-x`
-# and `transform.scale-y`, which `about` could then check to a tolerance apiece, or a step that
-# compares two keys. Until then the equality is covered by `transform_box`'s own tests and the
-# scene checks the consequence instead.
+# **And it can now say "those two numbers are equal"**, which is what the projection actually
+# promises: `transform.scale-x` and `transform.scale-y` are reported on their own as well as
+# together, so each can be checked to a tolerance and a lock that moved only one axis fails. The
+# pixel check below stays, because it is a statement about the artwork rather than about the panel,
+# and the two together say the lock reaches both.
 #
 # The bottom-right handle is at (1120,920) and it is dragged straight down to (1120,1180). Unlocked
 # that stretches the height alone: the content still ends at x 1120, so the box out to its right
@@ -235,6 +235,9 @@ expect transform.lock false
 ink 1135 900 1235 1010 0
 drag 1120 920 1120 1180
 expect dragging true
+# Unlocked, the drag is all height: x stays where it was and y grows by the ratio above.
+about transform.scale-x 1.0 0.02
+about transform.scale-y 1.57 0.2
 ink 1135 900 1235 1010 0
 shot transform-corner-unlocked
 press Transform:Apply
@@ -250,6 +253,10 @@ expect transform.lock true
 drag 1120 920 1120 1180
 expect dragging true
 expect transform.lock true
+# Locked, the projection puts the same number on both axes -- which is the promise, and which
+# nothing could say until each axis was reported on its own.
+about transform.scale-x 1.28 0.15
+about transform.scale-y 1.28 0.15
 ink 1135 900 1235 1010 20
 shot transform-corner-locked
 press Transform:Apply
