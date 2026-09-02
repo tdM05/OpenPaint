@@ -882,6 +882,14 @@ try {
                     $t = $i / 12.0
                     Point-At ([int]($x0 + ($x1 - $x0) / 2 + ($to - ($x0 + ($x1 - $x0) / 2)) * $t)) $y
                 }
+                # **Land on the end of the drag before letting go.** A slider follows the pointer
+                # while it is latched, so the value is whatever the last pose said -- and releasing
+                # in the same breath as the final move let the release be processed first. The
+                # slider then stopped wherever the previous sample had reached, which is why the
+                # same fraction gave 75 on one run and 132 on the next. An assertion that changes
+                # between runs teaches you to ignore assertions.
+                Point-At $to $y
+                Start-Sleep -Milliseconds 150
                 [Win]::mouse_event([Win]::LUP, 0, 0, 0, [IntPtr]::Zero)
                 Start-Sleep -Milliseconds 300
             }

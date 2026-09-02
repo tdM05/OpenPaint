@@ -185,7 +185,7 @@ drag 700 450 700 850
 ink 660 600 690 700 0
 key ctrl+z
 slide brush:1048577 0.85
-about brush.size 75 15
+about brush.size 126 20
 drag 700 450 700 850
 ink 660 600 690 700 20
 shot brush-wide
