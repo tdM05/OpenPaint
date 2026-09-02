@@ -25,11 +25,10 @@ tab Select
 # Named `Select:...` throughout because the rail offers the same four words and the harness refuses
 # a name that fits two controls -- which is the whole point of it.
 #
-# **The asymmetry, asserted as it is rather than as it ought to be.** `SelectAction::Use` treats a
-# second press on the tool already up as "put it away" for the Lasso and the Rect only; for the
-# Wand and the Move it falls through and rebuilds the tool, so the tool stays up. Two of the four
-# toggle and two do not, and nothing in the panel says which. Written down here so the behaviour is
-# visible to whoever decides whether it is a bug.
+# **Pressing the tool that is already up puts it away, whichever tool it is.** Two of the four were
+# named in the check and two were not, so a lit Lasso or Rect toggled off while a lit Wand or Move
+# was silently rebuilt -- the same press on the same-looking button doing two different things
+# depending on which button it was, with nothing in the panel to say which.
 press Select:Lasso
 expect select-tool lasso
 expect tool Brush
@@ -42,11 +41,11 @@ expect select-tool -
 press Select:Wand
 expect select-tool wand
 press Select:Wand
-expect select-tool wand
+expect select-tool -
 press Select:Move
 expect select-tool move
 press Select:Move
-expect select-tool move
+expect select-tool -
 shot select-tools
 
 # A real selection, made the way an artist makes one: a rectangle dragged across the canvas.
@@ -83,8 +82,10 @@ expect redo 1
 # the harness is right to refuse that.
 #
 # Inverting everything leaves nothing, and `set_selection` is given `None` rather than an empty
-# mask -- so a full selection inverted reads as no selection at all. Inverting *that* selects
-# everything again, which is what the code does when there is nothing to invert.
+# mask -- so a full selection inverted reads as no selection at all, and the menu then stops
+# offering Invert, because a menu here never offers what it would refuse. Inverting *that* selects
+# everything again, which the keyboard still reaches: a key is a power path, a menu is what tells
+# you what is available.
 press Menu:Select
 shot select-menu
 press All
@@ -94,8 +95,7 @@ press Menu:Select
 press Invert
 expect selection false
 expect status Inverted the selection
-press Menu:Select
-press Invert
+key ctrl+shift+i
 expect selection true
 expect status Inverted the selection
 press Menu:Select

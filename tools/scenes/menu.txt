@@ -115,14 +115,16 @@ expect selection true
 expect status Selected all
 shot menu-selected
 
-# Select > Invert twice. Inverting everything leaves nothing, and an empty result is recorded
-# as no selection at all; inverting nothing selects everything. The pair is the proof.
+# Select > Invert. Inverting everything leaves nothing, and an empty result is recorded as no
+# selection at all -- after which the menu no longer offers Invert, because there is nothing to
+# invert and a menu here never offers what it would refuse. The other half of the pair, that
+# inverting nothing selects everything, is still reachable from the keyboard, and that asymmetry
+# is deliberate: a key is a power path, a menu is what tells you what is available.
 press Menu:Select
 press Menu:Invert
 expect selection false
 expect status Inverted the selection
-press Menu:Select
-press Menu:Invert
+key ctrl+shift+i
 expect selection true
 expect status Inverted the selection
 

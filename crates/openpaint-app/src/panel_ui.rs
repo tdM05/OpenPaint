@@ -316,10 +316,9 @@ pub fn place<'a>(
         // where the list is whole. Buttons are exempt: a rail of them may legitimately share a
         // name, and a label is the only kind of control whose whole purpose is what it says.
         debug_assert!(
-            !matches!(control, Control::Label { .. })
-                || out.last().is_none_or(|p: &Placed<'_>| {
-                    !matches!(p.control, Control::Label { text } if text == text_of_control(control))
-                }),
+            !matches!(control, Control::Label { .. }) || out.last().is_none_or(|p: &Placed<'_>| {
+                !matches!(p.control, Control::Label { text } if text == text_of_control(control))
+            }),
             "the same sentence twice in a row: {:?}",
             text_of_control(control)
         );

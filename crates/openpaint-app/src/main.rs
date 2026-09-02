@@ -1689,11 +1689,21 @@ impl OpenPaint {
         let page = self.editor.page_rect();
         match action {
             ui::SelectAction::Use(tool) => {
-                let already = matches!(
-                    (&self.select, tool),
-                    (Some(Select::Lasso { .. }), ui::SelectTool::Lasso)
-                        | (Some(Select::Rect { .. }), ui::SelectTool::Rect)
-                );
+                // **Pressing the tool that is already up puts it away, whichever tool it is.**
+                // Two of the four were listed here and two were not, so a lit Lasso or Rect
+                // toggled off while a lit Wand or Move fell through and was rebuilt -- the same
+                // press on the same-looking button doing two different things depending on which
+                // button it was. Asked of the tool rather than of a list, so a fifth tool cannot
+                // be added and quietly left out of it.
+                let already = self.select.as_ref().is_some_and(|up| {
+                    matches!(
+                        (up, tool),
+                        (Select::Lasso { .. }, ui::SelectTool::Lasso)
+                            | (Select::Rect { .. }, ui::SelectTool::Rect)
+                            | (Select::Wand { .. }, ui::SelectTool::Wand)
+                            | (Select::Move { .. }, ui::SelectTool::Move)
+                    )
+                });
                 self.select = if already {
                     None
                 } else {
