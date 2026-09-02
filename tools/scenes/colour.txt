@@ -1,0 +1,36 @@
+# The Colour panel: the wheel, the palette, and the three wheel shapes.
+tab Colour
+expect palette 0
+expect colour 141418
+
+# Dragging inside the wheel changes the paint colour. The wheel is control 0 in this panel.
+slide colour:0 0.7
+shot colour-picked
+
+# Keeping a colour puts a chip in the document's palette. A second colour makes a second chip --
+# the same colour twice does not, and that refusal is deliberate (Document::add_to_palette).
+press Keep this colour
+expect palette 1
+press Keep this colour
+expect palette 1
+slide colour:0 0.3
+press Keep this colour
+expect palette 2
+shot colour-kept
+
+# The swatch grid is control 16: left-click a chip to paint with it, right-click to forget it.
+# The chips are row-sized squares from the left of a box the full width of the panel, so a press
+# has to say which chip it means -- the middle of the box is empty space.
+pressat colour:16 16 16
+shot colour-used
+rpressat colour:16 16 16
+expect palette 1
+shot colour-forgotten
+
+# The three wheel shapes. Nothing in the document changes, so the picture is the evidence.
+press Triangle
+shot colour-triangle
+press Square
+shot colour-square
+press Ring
+shot colour-ring

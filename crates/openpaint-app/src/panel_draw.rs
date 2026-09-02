@@ -134,6 +134,19 @@ pub fn show(
         0.0
     };
     input.scroll = clamp_scroll(input.scroll - wheel, tall, visible);
+    // Whether this panel is being offered the wheel at all, for whoever is driving: a panel that
+    // will not scroll is either not hovered or has nowhere to go, and those are different bugs.
+    let offered = (resp.hovered(), wheel);
+    if std::env::var_os("OPENPAINT_TRACE_INPUT").is_some() {
+        let raw = ui.input(|i| i.raw_scroll_delta.y);
+        if raw != 0.0 {
+            println!(
+                "panel wheel: raw={raw:+.1} taken={wheel:+.1} hovered={} scroll={:.1}                  tall={tall:.1} visible={visible:.1}",
+                resp.hovered(),
+                input.scroll
+            );
+        }
+    }
     let scrolled = Rect::new(content.x, content.y - input.scroll, content.w, content.h);
     let placed = place(controls, scrolled, m, direction, &text_of, &tall_of);
 
@@ -248,7 +261,7 @@ pub fn show(
             input.custom.push((*id, p.rect));
         }
     }
-    report_controls(&placed, m, content, input.scroll, tall, ui.ctx());
+    report_controls(&placed, m, content, input.scroll, tall, offered, ui.ctx());
     input.pointer = resp.hover_pos().or(pointer).map(|q| (q.x, q.y));
     input.pressed = down;
     // Only while this panel has the pointer: a click anywhere on the window is not a click on
@@ -727,7 +740,11 @@ pub fn report_panel(name: &str) {
     let Some(path) = std::env::var_os("OPENPAINT_CONTROLS") else {
         return;
     };
-    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+    {
         use std::io::Write as _;
         let _ = writeln!(f, "# {name}");
     }
@@ -738,7 +755,11 @@ pub fn report_tab(name: &str, rect: crate::layout::Rect, ppp: f32) {
     let Some(path) = std::env::var_os("OPENPAINT_CONTROLS") else {
         return;
     };
-    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+    {
         use std::io::Write as _;
         let _ = writeln!(
             f,
@@ -767,6 +788,7 @@ fn report_controls(
     content: Rect,
     scroll: f32,
     tall: f32,
+    offered: (bool, f32),
     ctx: &egui::Context,
 ) {
     use std::fmt::Write as _;
@@ -783,13 +805,15 @@ fn report_controls(
     // confident nowhere and calls it a pass.
     let _ = writeln!(
         out,
-        "$	{:.0}	{:.0}	{:.0}	{:.0}	{:.0}	{:.0}",
+        "$	{:.0}	{:.0}	{:.0}	{:.0}	{:.0}	{:.0}	{}	{:.1}",
         content.x * ppp,
         content.y * ppp,
         content.w * ppp,
         content.h * ppp,
         scroll * ppp,
-        tall * ppp
+        tall * ppp,
+        offered.0,
+        offered.1
     );
     for p in placed {
         let Some(id) = p.control.id() else { continue };
@@ -832,7 +856,11 @@ fn report_controls(
     }
     // Appended, because every panel reports its own and the harness reads the lot. Truncated by
     // whoever starts the run.
-    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+    {
         use std::io::Write as _;
         let _ = f.write_all(out.as_bytes());
     }

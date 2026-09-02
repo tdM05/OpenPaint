@@ -3442,10 +3442,14 @@ impl OpenPaint {
                 r.curve.points().len()
             );
         }
-        let _ = writeln!(o, "brush-tip\t{}", match b.tip {
+        let _ = writeln!(
+            o,
+            "brush-tip\t{}",
+            match b.tip {
                 openpaint_core::dab::Tip::Stamp(_) => "bitmap",
                 openpaint_core::dab::Tip::Round(_) => "round",
-            });
+            }
+        );
         let _ = writeln!(o, "palette\t{}", doc.palette().len());
         let _ = writeln!(o, "selection\t{}", self.selection.is_some());
         let _ = writeln!(
@@ -3504,8 +3508,7 @@ impl OpenPaint {
         if let Some(path) = std::env::var_os("OPENPAINT_CONTROLS") {
             let _ = std::fs::write(path, b"");
         }
-        // And what the frame is about to draw, for the same reader.
-        self.report_state();
+
         // Before anything reads the canvas: the floating pixels of a transform are produced per
         // frame rather than per pointer sample, so this is where they catch up.
         self.refresh_float();
@@ -3864,6 +3867,15 @@ impl OpenPaint {
             }
             Err(wgpu::SurfaceError::Timeout) => {}
         }
+
+        // What the application now *is*, for whoever is driving it.
+        //
+        // At the end of the frame rather than the start, because the answer has to be about the
+        // frame that just happened. Painting here is demand-driven: nothing redraws on its own, so
+        // the last frame after an action is the last word -- and reported from the top it was the
+        // state *before* that frame's presses were applied. Right-clicking a swatch away left a
+        // file still saying the swatch was there, for as long as nothing else moved.
+        self.report_state();
     }
 
     /// The real body of [`ApplicationHandler::window_event`], wrapped by the

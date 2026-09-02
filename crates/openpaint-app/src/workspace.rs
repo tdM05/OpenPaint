@@ -1256,16 +1256,33 @@ impl Workspace {
             if self.placing.is_some() {
                 self.cancel_placing();
             } else if let Some(pos) = pointer {
-                let kind = header_under(
+                let on_header = header_under(
                     &placed,
                     &m,
                     |pl| self.direction_of(showing_of(pl)),
                     |pl, i| measure(ctx, m.label, pl.tabs.get(i).copied()),
                     pos.x,
                     pos.y,
-                )
-                .map_or(PopupKind::Panels, PopupKind::Settings);
-                self.open_popup_at(ctx, kind, pos.x, pos.y, screen);
+                );
+                // **A panel's contents get the other button first.** The list is what a secondary
+                // press means on the workspace itself -- its ground, its gutters, the artwork --
+                // and a panel that uses the button inside its own body means something else by it.
+                // Right-clicking a swatch to forget it, or a curve point to remove it, did the
+                // thing *and* threw the whole panel list over the panel it had just done it in.
+                //
+                // The route out of an empty workspace survives: a workspace with no panels is all
+                // ground, and the canvas draws no contents of its own, so both still answer.
+                let in_contents = on_header.is_none()
+                    && self.contents_under(
+                        &placed,
+                        |pl, i| measure(ctx, m.label, pl.tabs.get(i).copied()),
+                        pos.x,
+                        pos.y,
+                    );
+                if !in_contents {
+                    let kind = on_header.map_or(PopupKind::Panels, PopupKind::Settings);
+                    self.open_popup_at(ctx, kind, pos.x, pos.y, screen);
+                }
             }
         }
         let on_popup = popup_press(
@@ -2646,6 +2663,54 @@ impl Workspace {
     /// For reaching it from a control rather than from a press: there is no pointer position to
     /// open it at, and no window to measure against until the next frame begins. So it is a
     /// request, honoured at the top of `show`.
+    /// Whether this point is inside the drawn contents of a panel, rather than on the workspace.
+    ///
+    /// The counterpart to [`header_under`]: that says "this is the workspace's chrome for a panel",
+    /// this says "this is the panel's own inside". Between them they divide the window, and what is
+    /// left -- ground, gutters, the artwork -- is the workspace's own.
+    ///
+    /// The canvas is deliberately not counted. Its body is the artwork, painted by the GPU before egui
+    /// ran, and it draws no controls (see the `showing == CANVAS` skip in `show`), so there is nothing
+    /// there to have a use for the other button. That is also what keeps the panel list reachable on a
+    /// screen with everything closed.
+    fn contents_under(
+        &self,
+        placed: &[crate::layout::Placed],
+        mut measure: impl FnMut(&crate::layout::Placed, usize) -> f32,
+        x: f32,
+        y: f32,
+    ) -> bool {
+        let m = self.theme.metrics;
+        // Floating windows first: they are painted over the arrangement, so they answer first too.
+        let floating = self.floating.iter().rev().any(|held| {
+            let showing = held
+                .layout
+                .resolve(inset(held.rect, m.gutter))
+                .first()
+                .map(showing_of);
+            showing.is_some_and(|p| p != CANVAS) && held.rect.contains(x, y)
+        });
+        if floating {
+            return true;
+        }
+        // The slots this frame already resolved, rather than a second resolve that could differ --
+        // the same lesson `header_under` carries.
+        placed.iter().any(|slot| {
+            let showing = showing_of(slot);
+            if showing == CANVAS {
+                return false;
+            }
+            let c = chrome::panel(
+                slot,
+                &m,
+                style_of(slot),
+                along_of(slot, self.direction_of(showing)),
+                |i| measure(slot, i),
+            );
+            c.controls.rect().contains(x, y)
+        })
+    }
+
     pub fn open_panel_list(&mut self) {
         self.popup_wanted = Some(PopupKind::Panels);
     }
@@ -3848,6 +3913,56 @@ mod tests {
             found,
             Some(TOOLS),
             "a secondary press on the visible handle found no header"
+        );
+    }
+
+    /// A panel's contents keep the other button; the workspace's own ground is what offers the list.
+    ///
+    /// The secondary press is one rule with three answers -- a panel's header offers that panel's
+    /// settings, a panel's body is the panel's own business, and everything else offers the list
+    /// of panels. The middle one was missing, so right-clicking a swatch to forget it forgot the
+    /// swatch *and* threw the whole panel list over the panel it had just done it in. Every
+    /// right-click gesture inside a panel had the same collision.
+    #[test]
+    fn a_panels_contents_keep_the_other_button() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.screen = screen;
+        let m = ws.theme.metrics;
+        let placed = ws.layout.resolve(inset(screen, m.gutter));
+        let label = |_: &crate::layout::Placed, _: usize| 46.0_f32;
+
+        let slot = placed
+            .iter()
+            .find(|p| p.tabs.contains(&COLOUR))
+            .expect("the colour panel");
+        let c = chrome::panel(slot, &m, style_of(slot), Along::Down, |_| 46.0);
+
+        let body = c.controls.rect();
+        assert!(
+            ws.contents_under(&placed, label, body.x + body.w / 2.0, body.y + body.h / 2.0),
+            "inside a panel's controls is the panel's own"
+        );
+        assert!(
+            !ws.contents_under(
+                &placed,
+                label,
+                c.header.x + c.header.w / 2.0,
+                c.header.y + c.header.h / 2.0
+            ),
+            "a header is the workspace's chrome, not the panel's contents"
+        );
+
+        // And the artwork is not contents, which is what keeps the list reachable when every
+        // panel that draws anything has been closed.
+        let canvas = placed
+            .iter()
+            .find(|p| p.tabs.contains(&CANVAS))
+            .expect("the canvas");
+        let r = canvas.rect;
+        assert!(
+            !ws.contents_under(&placed, label, r.x + r.w / 2.0, r.y + r.h / 2.0),
+            "the canvas draws no controls, so it has no use for the other button"
         );
     }
 

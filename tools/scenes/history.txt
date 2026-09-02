@@ -1,0 +1,17 @@
+# The History panel. Its two buttons exist only when there is something to undo or redo, which is
+# the thing worth driving: a fresh document must show neither.
+tab History
+expect undo 0
+expect redo 0
+shot history-empty
+
+drag 700 400 1100 800
+expect undo 1
+press Undo
+expect undo 0
+expect redo 1
+shot history-undone
+press Redo
+expect undo 1
+expect redo 0
+shot history-redone

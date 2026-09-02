@@ -279,7 +279,13 @@ try {
     # the wheel to the panel the pointer is actually over.
     function Wheel-At([int]$x, [int]$y, [int]$notches) {
         Point-At $x $y
-        Start-Sleep -Milliseconds 60
+        # **Let a frame happen before turning the wheel.** Only the panel under the pointer takes
+        # the wheel, and egui decides which that is from the layer under the pointer *as of the
+        # last frame* -- the same characteristic `main.rs` names where it declines to zoom. Painting
+        # here is demand-driven, so straight after a click the frame that learns where the pointer
+        # went may not have happened yet, and the notch is simply lost. It read as panels that
+        # scrolled sometimes.
+        Start-Sleep -Milliseconds 250
         for ($i = 0; $i -lt [Math]::Abs($notches); $i++) {
             [Win]::mouse_event([Win]::WHEEL, 0, 0, [uint32]$(if ($notches -gt 0) { 120 } else { [uint32]4294967176 }), [IntPtr]::Zero)
             Start-Sleep -Milliseconds 40
@@ -319,14 +325,26 @@ try {
                 Wheel-At $mx $my $(if ($short -gt 0) { -1 } else { 1 })
                 $now = (Rect-Of $name).View.Scroll
                 $per = [Math]::Abs($now - $was)
-                if ($per -le 0) { throw "'$name' is in a panel that will not scroll" }
+                if ($per -le 0) {
+                    # One more, with a longer settle, before believing it.
+                    Start-Sleep -Milliseconds 400
+                    Wheel-At $mx $my $(if ($short -gt 0) { -1 } else { 1 })
+                    $per = [Math]::Abs((Rect-Of $name).View.Scroll - $was)
+                }
+                if ($per -le 0) {
+                    throw ("'$name' is at $($r.Y)..$($r.Y + $r.H) in $($v.Panel), whose window is " +
+                           "$($v.Y)..$($v.Y + $v.H) at scroll $($v.Scroll) of $($v.Tall); one " +
+                           'notch moved it nowhere.')
+                }
                 continue
             }
             $want = [int][Math]::Ceiling([Math]::Abs($short) / $per)
             $go = [Math]::Min($want, 20)
             Wheel-At $mx $my $(if ($short -gt 0) { -$go } else { $go })
         }
-        throw "'$name' will not come into view in its panel"
+        $r = Rect-Of $name
+        throw ("'$name' is at $($r.Y)..$($r.Y + $r.H) and will not come into " +
+               "$($r.View.Y)..$($r.View.Y + $r.View.H) (scroll $($r.View.Scroll) of $($r.View.Tall))")
     }
 
     # The rectangle a name means, or a stop. Whole label first, then a label that starts with it --
@@ -443,7 +461,11 @@ try {
         Start-Sleep -Milliseconds 300
     }
 
+    # A step that fails says why, and shows what it was looking at. A message about a control
+    # that would not come into view is a guess until you can see the screen it was on.
+    $script:onScreen = $true
     foreach ($step in $steps) {
+      try {
         $a = $step.Trim() -split '\s+'
         # A control's name has spaces in it -- "Merge down", "Clip to the layer below" -- so the
         # name is everything after the verb, not the next token.
@@ -551,6 +573,19 @@ try {
                 $r = Bring-Into-View $rest
                 Click-At ($r.X + [int]($r.W / 2)) ($r.Y + [int]($r.H / 2)) -Right
             }
+            'pressat' {
+                # `pressat NAME DX DY` -- a press at an offset from the control's top-left corner,
+                # for a `Custom` that draws several things inside one rectangle. The palette is a
+                # grid of chips in a box far wider than the chips, so the middle of that box is
+                # empty space: pressing it does nothing, correctly, and a scene that means "the
+                # first swatch" has to say where the first swatch is.
+                $r = Bring-Into-View ($rest -replace '\s+\S+\s+\S+$', '')
+                Click-At ($r.X + [int]$a[-2]) ($r.Y + [int]$a[-1])
+            }
+            'rpressat' {
+                $r = Bring-Into-View ($rest -replace '\s+\S+\s+\S+$', '')
+                Click-At ($r.X + [int]$a[-2]) ($r.Y + [int]$a[-1]) -Right
+            }
             'wheel' {
                 # `wheel X Y N` -- N notches at a point, for testing the wheel itself.
                 Wheel-At ([int]$a[1]) ([int]$a[2]) ([int]$a[3])
@@ -576,6 +611,12 @@ try {
             }
             default { throw "no such step: $($a[0])" }
         }
+      }
+      catch {
+        Save-Shot "$Shot-failed"
+        Write-Output "the step that failed was: $step"
+        throw
+      }
     }
 
     Start-Sleep -Milliseconds 500
