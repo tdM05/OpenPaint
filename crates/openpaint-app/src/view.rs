@@ -125,6 +125,15 @@ impl View {
     }
 
     #[must_use]
+    /// The page point the viewport is looking at.
+    ///
+    /// Exposed so the application can say where the view is when asked to describe itself: panning
+    /// moves this and nothing else, so without it a pan is a gesture with no consequence to check.
+    #[must_use]
+    pub fn center(&self) -> (f32, f32) {
+        self.center
+    }
+
     pub fn scale(&self) -> f32 {
         self.scale
     }

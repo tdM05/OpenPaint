@@ -276,6 +276,7 @@ pub fn show(
         .hover_pos()
         .and_then(|p| hit(&placed, p.x, p.y).and_then(|(c, _)| c.id()));
     let painter = ui.painter_at(area);
+    draw_scroll_mark(&painter, content, input.scroll, tall, visible, theme);
     for p in &placed {
         draw(&painter, p, theme, direction, hover, input.latch);
         // The field with the caret shows what is being typed, not what was last committed -- and
@@ -730,6 +731,59 @@ pub fn text_well(r: Rect, m: &crate::theme::Metrics, left: f32) -> Rect {
         (r.x + r.w - m.padding * 0.5 - left).max(m.row),
         (r.h - m.padding * 0.5).max(m.row * 0.6),
     )
+}
+
+/// A thin mark down the edge of a panel that has more in it than it is showing.
+///
+/// **Because a panel that scrolls with no sign that it scrolls is a panel with a hidden half.**
+/// The brush panel's list is three thousand pixels of controls inside a slot two hundred and fifty
+/// tall: four rows on screen out of forty, and nothing at all to say the other thirty-six exist.
+/// The wheel has always worked; there was simply no way to find that out except by trying it.
+///
+/// Quiet, but not invisible. The first version used the edge colour, which is a shade off the
+/// header behind it -- present in the pixels and not present to a reader, which is the same as not
+/// being there. The track is the header colour and the thumb is `dim`, the colour this theme
+/// already uses for text you are meant to be able to read but not to look at.
+///
+/// Two units wide, hard against the right-hand side, and not draggable: what it does is answer "is
+/// there more, and where am I", which is the whole of what a reader needs from it. A panel that
+/// fits gets nothing, because there is nothing to say.
+fn draw_scroll_mark(
+    painter: &egui::Painter,
+    content: Rect,
+    scroll: f32,
+    tall: f32,
+    visible: f32,
+    theme: &crate::theme::Theme,
+) {
+    if tall <= visible || visible <= 0.0 {
+        return;
+    }
+    let m = &theme.metrics;
+    let p = &theme.palette;
+    let width = 2.0_f32;
+    let track = Rect::new(content.x + content.w - width, content.y, width, visible);
+    painter.rect_filled(to_egui(track), m.radius, color(p.header));
+    // Long enough to grab hold of with the eye even when the list is enormous: a thumb of two
+    // pixels on a list forty screens long says "there is more" and nothing else.
+    let share = (visible / tall).clamp(0.0, 1.0);
+    let thumb = (visible * share).max(m.row * 0.75).min(visible);
+    let room = (visible - thumb).max(0.0);
+    let at = if tall > visible {
+        (scroll / (tall - visible)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    painter.rect_filled(
+        to_egui(Rect::new(
+            track.x,
+            room.mul_add(at, track.y),
+            track.w,
+            thumb,
+        )),
+        m.radius,
+        color(p.dim),
+    );
 }
 
 /// Say which panel the controls that follow belong to.

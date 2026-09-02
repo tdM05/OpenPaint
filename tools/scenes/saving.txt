@@ -1,0 +1,80 @@
+# Saving over a document that already has a path, and the three answers to the unsaved-changes
+# question. Neither had ever been driven: every save so far went through Save As and a picker, so
+# the branch that writes straight to `document_path`, clears dirty and drops the session's
+# recovery copy had never once run.
+
+# A document with a path. Save As is the only way to give it one, and answering Windows' replace
+# prompt is the only way to run this twice.
+drag 700 450 1150 850
+expect dirty true
+expect file -
+key ctrl+shift+s
+wait 3000
+expect dialog true
+type C:\Users\taddm\code\OpenPaint\target\drive\saving.openpaint
+wait 1000
+key enter
+wait 900
+key alt+y
+wait 2500
+expect dialog false
+expect file saving.openpaint
+expect dirty false
+
+# **Now Ctrl+S with a path.** No dialog at all -- that is the whole point of the branch -- and the
+# document stops being dirty because the file now has what is on screen.
+press Layers:Add
+expect layers 2
+expect dirty true
+key ctrl+s
+wait 1500
+expect dialog false
+expect dirty false
+expect file saving.openpaint
+shot saving-saved
+
+# The unsaved-changes question, and the two answers that are not Cancel.
+#
+# Discard throws the edits away and goes on with what was asked -- here a new document, which comes
+# back to one layer with nothing on it.
+drag 600 350 900 600
+expect dirty true
+key ctrl+n
+wait 900
+expect confirm true
+shot saving-asked
+press Discard changes
+wait 1200
+expect confirm false
+expect layers 1
+expect dirty false
+expect file -
+ink 600 400 800 600 0
+
+# Cancel leaves everything exactly as it was, which is the answer that has to be safe.
+drag 700 450 1150 850
+expect dirty true
+key ctrl+n
+wait 900
+expect confirm true
+press Cancel
+wait 800
+expect confirm false
+expect dirty true
+ink 850 550 1000 700 20
+
+# Save first hands the question to the file dialog rather than answering it here. The document has
+# no path again, so it is Save As that opens; dismissed, because what is being checked is that the
+# answer routes there at all.
+key ctrl+n
+wait 900
+expect confirm true
+press Save first
+wait 3000
+expect confirm false
+expect dialog true
+key escape
+wait 900
+expect dialog false
+expect dirty true
+shot saving-cancelled

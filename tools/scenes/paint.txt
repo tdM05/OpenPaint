@@ -19,10 +19,18 @@ expect undo 1
 expect redo 0
 ink 600 400 800 600 20
 shot paint-redone
+# **And the eraser actually takes ink off.** It had been driven and never proven: the assertion
+# after it was about the undo depth, which rises for any recorded operation whether or not a single
+# pixel changed. The eraser is dragged across the same box the brush filled, and the box has to
+# come back empty.
 press Eraser
-drag 520 620 880 380
-expect undo 2
 expect tool Eraser
+ink 640 430 760 550 5
+# Back along the line the brush drew, so the eraser covers what the brush laid down. A stroke
+# beside it takes off only where the two happen to overlap, which is a weaker claim than it looks.
+drag 500 300 900 700
+expect undo 2
+ink 640 430 760 550 0
 shot paint-erased
 key ctrl+z
 expect undo 1

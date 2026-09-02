@@ -3611,6 +3611,14 @@ impl OpenPaint {
                 .map_or_else(|| "-".to_owned(), |n| n.to_string_lossy().into_owned())
         );
         let _ = writeln!(o, "zoom\t{:.4}", self.view.scale());
+        // Where the view is looking, so panning has a witness -- nothing else moves this, and
+        // without it space-drag and a middle-drag are two gestures with no consequence to check.
+        let _ = writeln!(
+            o,
+            "pan	{:.0}	{:.0}",
+            self.view.center().0,
+            self.view.center().1
+        );
         let _ = writeln!(o, "rotation\t{:.4}", self.view.rotation());
         let _ = writeln!(o, "confirm\t{}", self.pending_confirm.is_some());
         let _ = writeln!(o, "recovery\t{}", self.recovery.is_some());

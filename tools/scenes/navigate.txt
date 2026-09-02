@@ -1,0 +1,58 @@
+# Moving about the page, and picking a colour off it. None of this had ever been driven: the log
+# claimed the wheel was covered by the harness scrolling a panel, which is a different code path
+# entirely, and panning was out of reach until the harness learned to hold a key across a drag.
+
+# The wheel zooms about the pointer when the pointer is over the artwork.
+expect zoom 0.5916
+wheel 900 700 3
+about zoom 0.79 0.05
+shot navigate-zoomed-in
+wheel 900 700 -3
+about zoom 0.5916 0.02
+
+# ...and not when it is over a panel, which is the rule that keeps a panel scrollable at all.
+# The Layers panel's list is taller than its slot, so the wheel there has somewhere to go.
+wheel 1975 300 -3
+about zoom 0.5916 0.02
+
+# A middle-button drag pans, and so does space held down over a left drag. Both move the point the
+# viewport is looking at and nothing else.
+expect pan 1024	1024
+middle 900 700 1100 850
+expect pan 686	770
+key 0
+expect pan 1024	1024
+holding space drag 900 700 750 600
+expect pan 1278	1193
+shot navigate-panned
+key 0
+expect pan 1024	1024
+
+# Fit and actual size, from the View menu rather than the keyboard -- two ways in, one behaviour.
+press Menu:View
+press Actual size
+about zoom 1 0.001
+press Menu:View
+press Fit
+about zoom 0.5916 0.02
+shot navigate-fitted
+
+# Alt+click picks the colour under the pointer, sampled from the composited image rather than from
+# one layer. It is advertised in a label on the brush panel and had never been pressed.
+# The stroke goes down first, in the colour the brush already has. Picking the paper up before
+# painting would leave the brush loaded with the paper's own colour, and the stroke would be there
+# and invisible -- which is what the first version of this did.
+expect colour 141418
+drag 700 450 1150 850
+ink 850 550 1000 700 20
+
+# Off the line: the paper's own colour as the composite reports it, not the constant it was
+# authored from, because what is sampled is what is on screen.
+holding alt click 900 400
+expect colour faf9f6
+
+# And on it. The line runs 700,450 to 1150,850, so at x=925 it is at y=650; a point beside it
+# samples the paper and would prove nothing.
+holding alt click 925 650
+expect colour 141418
+shot navigate-picked

@@ -226,3 +226,31 @@ expect layers 2
 expect layer-names Layer 1, Layer 2
 expect dirty true
 shot menu-settings
+
+# --- What the menus do NOT offer ---
+#
+# Every rule about hiding a command that would be refused was enforced by unit tests and by nothing
+# that had ever looked at the running application. `absent` is the assertion for them. It passes
+# trivially when the panel holding the item is not showing either, so each block opens its menu
+# first and checks something that IS there alongside what is not.
+
+# Nothing selected: Select offers only All, and Edit does not offer Fill.
+key ctrl+d
+expect selection false
+press Menu:Select
+press All
+press Menu:Select
+press Deselect
+expect selection false
+press Menu:Select
+absent Menu:Deselect
+absent Menu:Invert
+absent Menu:Clear
+press Menu:All
+expect selection true
+press Menu:Select
+press Menu:Deselect
+press Menu:Edit
+absent Menu:Fill selection
+press Menu:Undo
+shot menu-absences

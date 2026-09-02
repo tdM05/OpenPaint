@@ -41,6 +41,12 @@
     key NAME            a key by name: b, e, f2, f3, ctrl+z, escape, enter
     type TEXT           the text, as typing
     wait MS             let the app catch up
+    middle X1 Y1 X2 Y2  a middle-button drag, which is how the canvas is panned
+    holding KEY STEP    hold space, alt, ctrl or shift down and do one step inside it -- what
+                        space-to-pan and alt-click-to-pick need, and what `key` cannot say
+    absent NAME         that control is NOT on screen -- the assertion for every rule about
+                        hiding a command that would be refused. Note that it passes trivially if
+                        the panel holding it is not showing either, so open the menu first.
     ink X1 Y1 X2 Y2 N   at least N dark pixels in that box of the page (N=0 means none at all)
 
     tab NAME            bring that panel's tab to the front
@@ -106,6 +112,13 @@ public class Win {
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
     [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
     public const uint LDOWN = 0x0002, LUP = 0x0004, RDOWN = 0x0008, RUP = 0x0010, WHEEL = 0x0800;
+    public const uint MDOWN = 0x0020, MUP = 0x0040;
+    // A key that stays down while something else happens. `SendKeys` cannot express that: it
+    // sends whole keystrokes, so space-to-pan and Alt+click -- both of which are a key held
+    // *across* a drag or a press -- were simply not reachable.
+    [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, IntPtr extra);
+    public const uint KEYUP = 0x0002;
+    public const byte VK_SPACE = 0x20, VK_MENU = 0x12, VK_CONTROL = 0x11, VK_SHIFT = 0x10;
     public const uint MOVE = 0x0001, ABSOLUTE = 0x8000, VIRTUALDESK = 0x4000;
 
     // **Motion has to be injected, not assigned.**
@@ -564,8 +577,9 @@ try {
     # A step that fails says why, and shows what it was looking at. A message about a control
     # that would not come into view is a guess until you can see the screen it was on.
     $script:onScreen = $true
-    foreach ($step in $steps) {
-      try {
+    # One step, as a function, so a step can contain a step -- which `holding` needs: it presses a
+    # key, does one thing, and lets go.
+    function Do-Step([string]$step) {
         $a = $step.Trim() -split '\s+'
         # A control's name has spaces in it -- "Merge down", "Clip to the layer below" -- so the
         # name is everything after the verb, not the next token.
@@ -733,6 +747,59 @@ try {
                     $script:failed = $true
                 }
             }
+            'absent' {
+                # `absent NAME` -- that control is NOT on screen. **The harness had no way to say
+                # this**, so every rule about hiding a command that would be refused -- Delete on
+                # the only layer, Merge down at the bottom, the selection commands with nothing
+                # selected -- was enforced by unit tests and by nothing that had ever looked at
+                # the running application. A scenario could narrate that an item disappears and
+                # then not check it, which one did.
+                $gone = $false
+                try { [void](Rect-Of $rest) } catch { $gone = $true }
+                if ($gone) {
+                    [void]$checks.Add("  ok    '$rest' is not on screen")
+                } else {
+                    [void]$checks.Add("  FAIL  '$rest' is on screen and should not be")
+                    $script:failed = $true
+                }
+            }
+            'middle' {
+                # `middle X1 Y1 X2 Y2` -- a middle-button drag, which is how the canvas is panned
+                # without touching the keyboard.
+                Point-At $a[1] $a[2]
+                Start-Sleep -Milliseconds 80
+                [Win]::mouse_event([Win]::MDOWN, 0, 0, 0, [IntPtr]::Zero)
+                Start-Sleep -Milliseconds 60
+                for ($i = 1; $i -le 20; $i++) {
+                    $t = $i / 20
+                    Point-At ([int]([int]$a[1] + ([int]$a[3] - [int]$a[1]) * $t)) `
+                             ([int]([int]$a[2] + ([int]$a[4] - [int]$a[2]) * $t))
+                }
+                [Win]::mouse_event([Win]::MUP, 0, 0, 0, [IntPtr]::Zero)
+                Start-Sleep -Milliseconds 300
+            }
+            'holding' {
+                # `holding KEY <step...>` -- hold a key down, do one step, let go. Space+drag pans;
+                # Alt+click picks the colour under the pointer. Neither can be said with `key`,
+                # which sends a whole keystroke and is over before the drag begins.
+                $vk = switch ($a[1].ToLower()) {
+                    'space' { [Win]::VK_SPACE }
+                    'alt'   { [Win]::VK_MENU }
+                    'ctrl'  { [Win]::VK_CONTROL }
+                    'shift' { [Win]::VK_SHIFT }
+                    default { throw "cannot hold $($a[1])" }
+                }
+                [Win]::keybd_event($vk, 0, 0, [IntPtr]::Zero)
+                Start-Sleep -Milliseconds 250
+                try {
+                    $inner = $step.Trim().Substring($a[0].Length).Trim()
+                    $inner = $inner.Substring($a[1].Length).Trim()
+                    Do-Step $inner
+                } finally {
+                    [Win]::keybd_event($vk, 0, [Win]::KEYUP, [IntPtr]::Zero)
+                    Start-Sleep -Milliseconds 250
+                }
+            }
             'wheel' {
                 # `wheel X Y N` -- N notches at a point, for testing the wheel itself.
                 Wheel-At ([int]$a[1]) ([int]$a[2]) ([int]$a[3])
@@ -758,12 +825,16 @@ try {
             }
             default { throw "no such step: $($a[0])" }
         }
-      }
-      catch {
-        Save-Shot "$Shot-failed"
-        Write-Output "the step that failed was: $step"
-        throw
-      }
+    }
+
+    foreach ($step in $steps) {
+        try {
+            Do-Step $step
+        } catch {
+            Save-Shot "$Shot-failed"
+            Write-Output "the step that failed was: $step"
+            throw
+        }
     }
 
     Start-Sleep -Milliseconds 500

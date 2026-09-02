@@ -1,0 +1,69 @@
+# What the application does NOT offer, from a document it has just started.
+#
+# Every rule about hiding a command that would be refused lived in a unit test and in nothing that
+# had ever looked at the running application -- and the harness had no way to say "this is not on
+# screen" at all until now. A scenario could narrate that an item disappears and then not check it,
+# and one did.
+#
+# `absent` passes trivially when the panel holding the item is not showing either, so every block
+# here checks something that IS there alongside what is not.
+
+# One layer, and it is the bottom one: nothing to delete into, nothing underneath to merge into.
+expect layers 1
+press Menu:Layer
+absent Menu:Delete
+absent Menu:Merge down
+press Menu:Duplicate
+expect layers 2
+shot absences-one-layer
+
+# Two, with the upper one active: both appear, and both work.
+press Menu:Layer
+press Menu:Delete
+expect layers 1
+press Layers:Add
+expect layers 2
+press Menu:Layer
+press Menu:Merge down
+expect layers 1
+
+# The bottom layer of a stack of two: Delete is offered, Merge down is not.
+press Layers:Add
+expect layers 2
+press layers:0
+expect active.name Layer 1
+press Menu:Layer
+absent Menu:Merge down
+press Menu:Delete
+expect layers 1
+shot absences-layers
+
+# Nothing selected: the Select menu offers only All, and Edit does not offer Fill.
+expect selection false
+press Menu:Select
+absent Menu:Deselect
+absent Menu:Invert
+absent Menu:Clear
+press Menu:All
+expect selection true
+press Menu:Select
+press Menu:Invert
+expect selection false
+press Menu:Edit
+absent Menu:Fill selection
+press Menu:Undo
+shot absences-selection
+
+# None of the caption editor exists until the active layer is a text layer, and the wrap width
+# exists only while wrapping is on.
+tab Text
+absent text:Caption
+press Add text layer
+expect active.kind text
+# A caption does not wrap to begin with, so there is no width to set.
+absent text:Width
+press text:Wrap
+press text:Width
+press text:Wrap
+absent text:Width
+shot absences-text
