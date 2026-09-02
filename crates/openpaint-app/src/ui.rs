@@ -779,6 +779,88 @@ pub(crate) enum Picked {
     Wand(WandSettings),
 }
 
+/// The two prompts that stop everything until they are answered.
+///
+/// **Drawn whichever UI is up.** They used to sit at the end of the old side panel's branch, and
+/// the workspace returns before it -- so in the workspace they were never drawn at all, while
+/// `Status::recovery` and `Status::confirm` went on refusing every pen stroke (`decide_capture`).
+/// A leftover recovery file from any previous crash therefore made the brush do nothing, for good,
+/// with nothing on screen to say why. Reported as "most things do not work".
+///
+/// A prompt that blocks input and cannot be seen is the worst thing in this file; it belongs to
+/// the application rather than to either UI, and now it is drawn like it.
+fn prompts(
+    ctx: &egui::Context,
+    recovery: Option<&str>,
+    confirm: Option<&'static str>,
+) -> (Option<RecoveryChoice>, Option<ConfirmChoice>) {
+    let mut answers = (None, None);
+    // Recovered work gets its own window rather than being folded into the unsaved-changes
+    // prompt: the question is different (there is nothing to save yet) and so are the
+    // answers. If a third prompt ever appears, that is the point at which these should
+    // become one general one -- two is not yet worth the indirection.
+    if let Some(what) = recovery {
+        egui::Window::new("Recovered work")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("OpenPaint closed with unsaved changes.");
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(what).strong());
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        // Recover first and leftmost: it is the answer that loses nothing, and
+                        // the one the artist almost always wants.
+                        if ui.button("Recover").clicked() {
+                            answers.0 = Some(RecoveryChoice::Recover);
+                        }
+                        if ui.button("Discard").clicked() {
+                            answers.0 = Some(RecoveryChoice::Discard);
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Recovering opens it as unsaved work pointed at the original                                  file, so nothing is overwritten until you save.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                });
+    }
+
+    if let Some(what) = confirm {
+        egui::Window::new("Unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "This document has changes that are not in a file. Save before you {what}?"
+                ));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    // Save first, and leftmost, because it is the answer that loses nothing.
+                    if ui.button("Save").clicked() {
+                        answers.1 = Some(ConfirmChoice::SaveFirst);
+                    }
+                    if ui.button("Discard").clicked() {
+                        answers.1 = Some(ConfirmChoice::Discard);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answers.1 = Some(ConfirmChoice::Cancel);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("Enter saves, Escape cancels.")
+                        .small()
+                        .weak(),
+                );
+            });
+    }
+    answers
+}
+
 /// Draw a box with its eight handles.
 ///
 /// Two strokes for the outline and two fills for each handle, dark under light, because the
@@ -1149,6 +1231,18 @@ impl Ui {
                 // Where the *renderer* draws, which still needs an answer with the canvas panel
                 // closed, and the whole surface is the only honest fallback. Where the *pen* may
                 // go is a different question, and the workspace is asked it directly.
+                // Before the return below, because the workspace path never reaches the old
+                // panel's end -- which is exactly how these came to be invisible.
+                let answered = prompts(ctx, status.recovery, status.confirm);
+                recovery_choice = answered.0.or(recovery_choice);
+                confirm_choice = answered.1.or(confirm_choice);
+                if std::env::var_os("OPENPAINT_TRACE_INPUT").is_some() {
+                    println!(
+                        "ui: screen {:?} scale {scale} canvas {:?}",
+                        (screen.width(), screen.height()),
+                        ws.canvas_rect()
+                    );
+                }
                 panel_canvas = Some(px(ws.canvas_rect().unwrap_or(crate::layout::Rect::new(
                     0.0,
                     0.0,
@@ -2160,70 +2254,10 @@ impl Ui {
                 painter.galley(at + pad, text, egui::Color32::WHITE);
             }
 
+            let answered = prompts(ctx, status.recovery, status.confirm);
+            recovery_choice = answered.0.or(recovery_choice);
+            confirm_choice = answered.1.or(confirm_choice);
 
-            // Recovered work gets its own window rather than being folded into the unsaved-changes
-            // prompt: the question is different (there is nothing to save yet) and so are the
-            // answers. If a third prompt ever appears, that is the point at which these should
-            // become one general one -- two is not yet worth the indirection.
-            if let Some(what) = status.recovery {
-                egui::Window::new("Recovered work")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ctx, |ui| {
-                        ui.label("OpenPaint closed with unsaved changes.");
-                        ui.add_space(4.0);
-                        ui.label(egui::RichText::new(what).strong());
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            // Recover first and leftmost: it is the answer that loses nothing, and
-                            // the one the artist almost always wants.
-                            if ui.button("Recover").clicked() {
-                                recovery_choice = Some(RecoveryChoice::Recover);
-                            }
-                            if ui.button("Discard").clicked() {
-                                recovery_choice = Some(RecoveryChoice::Discard);
-                            }
-                        });
-                        ui.label(
-                            egui::RichText::new(
-                                "Recovering opens it as unsaved work pointed at the original                                  file, so nothing is overwritten until you save.",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                    });
-            }
-
-            if let Some(what) = status.confirm {
-                egui::Window::new("Unsaved changes")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ctx, |ui| {
-                        ui.label(format!(
-                            "This document has changes that are not in a file. Save before you {what}?"
-                        ));
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            // Save first, and leftmost, because it is the answer that loses nothing.
-                            if ui.button("Save").clicked() {
-                                confirm_choice = Some(ConfirmChoice::SaveFirst);
-                            }
-                            if ui.button("Discard").clicked() {
-                                confirm_choice = Some(ConfirmChoice::Discard);
-                            }
-                            if ui.button("Cancel").clicked() {
-                                confirm_choice = Some(ConfirmChoice::Cancel);
-                            }
-                        });
-                        ui.label(
-                            egui::RichText::new("Enter saves, Escape cancels.")
-                                .small()
-                                .weak(),
-                        );
-                    });
-            }
         });
 
         // Paint the crop rectangle and the transform box over the canvas. Deliberately painted,

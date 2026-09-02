@@ -21,3 +21,5 @@ openpaint-document.openpaint*
 
 # Cargo puts a target directory beside whichever manifest it was run from.
 target/
+target/drive/
+target/drive-build/

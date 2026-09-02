@@ -255,6 +255,8 @@ fn load_layout() -> Option<Loaded> {
                 );
                 return None;
             }
+            let mut layout = layout;
+            add_missing_panels(&mut layout, &floating);
             Some((layout, options, floating))
         }
         Err(e) => {
@@ -263,6 +265,62 @@ fn load_layout() -> Option<Loaded> {
                 path.display()
             );
             None
+        }
+    }
+}
+
+/// Put back any panel this build has that the saved workspace does not.
+///
+/// **A workspace saved before a panel existed has no idea it exists.** Nothing notices and nothing
+/// says so: the panel is simply not there, in a UI whose whole premise is that the arrangement is
+/// yours to keep. It happened -- an arrangement saved before this round of panels went on opening
+/// without a *brush* panel, reported as "most things do not work, brush doesn't even work now",
+/// and the only way to find out was to go looking in the panel list for something nobody had any
+/// reason to think was missing.
+///
+/// A panel is put where the built-in arrangement puts it: beside the panels it belongs with,
+/// because that is an answer somebody already thought about. Failing that -- none of its
+/// neighbours is in the saved workspace either -- the first leaf, on the rule that somewhere
+/// visible beats somewhere clever.
+///
+/// **Which tab is in front does not change.** Restoring five panels at once would otherwise leave
+/// the fifth on show in every leaf it touched, and the artist would open their own workspace to
+/// find it rearranged.
+fn add_missing_panels(layout: &mut Layout, floating: &[Floating]) {
+    let unit = Rect::new(0.0, 0.0, 1.0, 1.0);
+    let built_in = default_layout();
+    let belongs_with = built_in.resolve(unit);
+
+    for k in PANELS {
+        let anywhere = |p: PanelId, l: &Layout| {
+            l.find(p).is_some() || floating.iter().any(|f| f.layout.find(p).is_some())
+        };
+        if anywhere(k.id, layout) {
+            continue;
+        }
+        // Somebody it sits with in the built-in arrangement, who is in this workspace.
+        let neighbour = belongs_with
+            .iter()
+            .find(|slot| slot.tabs.contains(&k.id))
+            .and_then(|slot| {
+                slot.tabs
+                    .iter()
+                    .copied()
+                    .find(|p| *p != k.id && layout.find(*p).is_some())
+            });
+        let path = neighbour
+            .and_then(|n| layout.find(n))
+            .map(|(path, _)| path)
+            .or_else(|| layout.resolve(unit).first().map(|s| s.path.clone()))
+            .unwrap_or_default();
+        let showing = layout
+            .resolve(unit)
+            .into_iter()
+            .find(|s| s.path == path)
+            .map(|s| s.active);
+        layout.insert(&path, Zone::Center, k.id);
+        if let Some(active) = showing {
+            layout.set_active(&path, active);
         }
     }
 }
@@ -742,6 +800,13 @@ pub fn default_layout() -> Layout {
     l.insert(&[1, 2, 1], Zone::Center, TRANSFORM);
     l.insert(&[1, 2, 1], Zone::Center, SELECT);
     l.insert(&[1, 2, 1], Zone::Center, TEXT);
+    // **And the panel on show is the one you came for.** `insert` shows what it just added, which
+    // is right when the artist puts a panel somewhere and wrong here: adding four task panels as
+    // tabs left the workspace opening on Page and Text, with Layers and Brush behind them. The
+    // arrangement is the artist's to change; which tab is in front on a fresh workspace is not
+    // something they asked for.
+    l.set_active(&[1, 2, 0], 0);
+    l.set_active(&[1, 2, 1], 0);
     l.set_weight(&[1, 2, 0], 0.42);
     l.set_weight(&[1, 2, 1], 0.30);
     l.set_weight(&[1, 2, 2], 0.28);
@@ -1126,6 +1191,25 @@ impl Workspace {
         self.set_screen(screen);
 
         let placed = self.layout.resolve(screen);
+        // **A window with no console has no stderr.** Tracing a GUI application by printing is
+        // printing into nothing, which is worse than not tracing: it looks like the code never
+        // ran. The file is named by the caller, so nothing is written unless somebody asked.
+        if let Some(path) = std::env::var_os("OPENPAINT_TRACE_LAYOUT") {
+            use std::fmt::Write as _;
+            let mut out = String::new();
+            let _ = writeln!(out, "screen {:?}", (screen.w, screen.h));
+            let _ = writeln!(out, "canvas {:?}", self.canvas_rect);
+            for slot in &placed {
+                let _ = writeln!(
+                    out,
+                    "  {:?} {:?} {:?}",
+                    slot.path,
+                    (slot.rect.x, slot.rect.y, slot.rect.w, slot.rect.h),
+                    slot.tabs.iter().map(|p| name_of(*p)).collect::<Vec<_>>()
+                );
+            }
+            let _ = std::fs::write(path, out);
+        }
 
         // --- input, before drawing, so the drop overlay reflects this frame's pointer ---
         let (pointer, pressed, released, down, now_ms) = ctx.input(|i| {
@@ -5680,6 +5764,119 @@ mod tests {
         // And away from every edge, with nothing held at all.
         let middle = Some((window.x + window.w / 2.0, window.y + window.h / 2.0));
         assert_eq!(seam_in_use(None, &[], Some(window), middle, &m), None);
+    }
+
+    /// What the default arrangement actually resolves to, printed.
+    #[test]
+    #[ignore = "prints the layout to look at"]
+    fn dump_default_layout() {
+        let ws = bare();
+        for size in [(1067.0, 667.0), (1400.0, 900.0), (930.0, 600.0)] {
+            let screen = Rect::new(0.0, 0.0, size.0, size.1);
+            eprintln!("--- {size:?} ---");
+            for slot in ws.layout.resolve(screen) {
+                eprintln!(
+                    "  {:?} {:?} tabs={:?} active={}",
+                    slot.path,
+                    (slot.rect.x, slot.rect.y, slot.rect.w, slot.rect.h),
+                    slot.tabs.iter().map(|p| name_of(*p)).collect::<Vec<_>>(),
+                    slot.active
+                );
+            }
+        }
+    }
+
+    /// **A workspace saved before a panel existed gets that panel back.**
+    ///
+    /// Nothing noticed and nothing said so: the panel was simply not there, in a UI whose whole
+    /// premise is that the arrangement is yours to keep. Reported as "most things do not work --
+    /// brush doesn't even work now", because an arrangement saved before this round of panels went
+    /// on opening with no brush panel in it at all.
+    #[test]
+    fn a_saved_workspace_gains_the_panels_this_build_has() {
+        // An old workspace: a canvas, a menu, and one panel beside them. Everything else this
+        // build knows about postdates it.
+        let mut old = Layout::single(CANVAS);
+        old.insert(&[], Zone::Top, MENU);
+        old.insert(&[1], Zone::Right, LAYERS);
+        let before = old.clone();
+
+        add_missing_panels(&mut old, &[]);
+
+        let unit = Rect::new(0.0, 0.0, 1.0, 1.0);
+        for k in PANELS {
+            assert!(
+                old.find(k.id).is_some(),
+                "{} was not put back into an old workspace",
+                k.name
+            );
+        }
+        // What was already there has not been rearranged: same leaves, same order, same shape.
+        let was: Vec<Vec<PanelId>> = before.resolve(unit).into_iter().map(|s| s.tabs).collect();
+        let now = old.resolve(unit);
+        assert_eq!(now.len(), was.len(), "the arrangement was restructured");
+        for (leaf, old_tabs) in now.iter().zip(&was) {
+            assert!(
+                leaf.tabs.starts_with(old_tabs),
+                "a leaf's own panels moved: {:?} no longer starts with {old_tabs:?}",
+                leaf.tabs
+            );
+        }
+        // And the panel on show in each leaf is the one that was on show.
+        for (leaf, old_leaf) in now.iter().zip(before.resolve(unit)) {
+            assert_eq!(
+                leaf.tabs.get(leaf.active),
+                old_leaf.tabs.get(old_leaf.active),
+                "restoring a panel changed which tab was in front"
+            );
+        }
+    }
+
+    /// A panel already floating counts as present: it must not come back docked as well.
+    #[test]
+    fn a_floating_panel_is_not_restored_a_second_time() {
+        let mut ws = bare();
+        ws.set_screen(Rect::new(0.0, 0.0, 1400.0, 900.0));
+        ws.float(BRUSH);
+        let floating = ws.floating.clone();
+        let mut layout = ws.layout.clone();
+        assert!(layout.find(BRUSH).is_none(), "it is floating, not docked");
+
+        add_missing_panels(&mut layout, &floating);
+
+        assert!(
+            layout.find(BRUSH).is_none(),
+            "a floating panel was restored into the arrangement as a second copy"
+        );
+    }
+
+    /// **A fresh workspace shows the panels you work in**, not whichever was added last.
+    ///
+    /// `insert` shows what it just added, which is right when the artist puts a panel somewhere and
+    /// wrong when the default arrangement is being built: adding the task panels as tabs left the
+    /// workspace opening on Page and Text with Layers and Brush hidden behind them. Reported as
+    /// "most things do not work -- brush doesn't even work now", because the brush panel was not
+    /// on screen at all.
+    #[test]
+    fn a_fresh_workspace_shows_the_panels_you_work_in() {
+        let ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let showing: Vec<PanelId> = ws.layout.resolve(screen).iter().map(showing_of).collect();
+        for want in [MENU, TOOLS, CANVAS, LAYERS, BRUSH, COLOUR] {
+            assert!(
+                showing.contains(&want),
+                "{} is not on show in a fresh workspace: {showing:?}",
+                name_of(want)
+            );
+        }
+        // And every panel is still *somewhere*, behind a tab if not in front of one.
+        for k in PANELS {
+            assert!(
+                ws.is_open(k.id),
+                "{} is not in the workspace at all",
+                k.name
+            );
+        }
     }
 
     /// **One window at a time.** After moving one, moving another must move *that* one.

@@ -885,14 +885,26 @@ impl OpenPaint {
     /// mid-line, because the capture was already granted. That is what capture *means*, and it is
     /// the better behaviour — a modifier should not silently truncate a stroke in progress.
     fn decide_capture(&mut self, sample: &PenSample) -> Capture {
-        if self.ui_blocks_point(sample.x, sample.y)
-            // A panel or divider in the artist's hand owns the pointer wherever it goes -- one
-            // carried over the canvas must not also paint on it.
-            || (self.workspace_mode && self.workspace.busy())
-            || self.nav.is_active()
-            || self.pending_confirm.is_some()
-            || self.recovery.is_some()
-        {
+        let refused = if self.ui_blocks_point(sample.x, sample.y) {
+            Some("the UI has that point")
+        } else if self.workspace_mode && self.workspace.busy() {
+            Some("a panel gesture owns the pointer")
+        } else if self.nav.is_active() {
+            Some("the view is being navigated")
+        } else if self.pending_confirm.is_some() {
+            Some("a prompt is up")
+        } else if self.recovery.is_some() {
+            Some("the recovery prompt is up")
+        } else {
+            None
+        };
+        if let Some(why) = refused {
+            // **Said out loud.** A press that paints nothing is indistinguishable from a broken
+            // brush, and every one of the reasons above is invisible from outside. This is the
+            // line that would have found it in a minute rather than a day.
+            if std::env::var_os("OPENPAINT_TRACE_INPUT").is_some() {
+                println!("pen: refused at ({:.0},{:.0}) -- {why}", sample.x, sample.y);
+            }
             return Capture::None;
         }
         // A transform in the air is modal, and sits here rather than below the tools for the same
@@ -3718,8 +3730,15 @@ impl OpenPaint {
                 }
                 // Re-fit if the user hasn't taken manual control of the view.
                 self.view.surface_resized();
-                self.request_redraw();
-                return;
+                // **And tell the UI.** This used to return here, so egui never heard that the
+                // window had changed size and went on laying the whole workspace out for whatever
+                // size it started at: panels off the right-hand edge, presses landing where the
+                // controls used to be, and the canvas mapped to a surface that was no longer
+                // there. Everything about the application looked broken and the layout itself was
+                // correct the whole time -- it was being drawn for a window that no longer
+                // existed.
+                //
+                // No `return`: it falls through to `on_window_event` below with everything else.
             }
             WindowEvent::RedrawRequested => {
                 // Render only. Input is drained in `about_to_wait`; draining it
@@ -3730,6 +3749,10 @@ impl OpenPaint {
             _ => {}
         }
 
+        // A resize is not "left over" -- it has already been acted on above -- but egui still has
+        // to hear it, so it reaches `on_window_event` like everything else and its `consumed`
+        // answer is ignored: nothing below cares about a resize.
+        //
         // The debug panel gets first refusal on anything left. If it took the
         // event, it must not also become a brush stroke.
         //

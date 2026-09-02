@@ -209,6 +209,14 @@ impl InputBackend for PenBackend {
         }
 
         // Pass 2: `events` is dropped, so we can freely mutate/read `self`.
+        //
+        // **A press is held until something says where it happened.** `ToolEvent::Down` carries no
+        // position -- the position arrives in the `Pose` that follows it -- so emitting the press
+        // straight away sent it to wherever the pen was last seen, and at the start of a session
+        // that is (0,0). The whole stroke was then refused for being outside the canvas, which
+        // reads as the brush not working at all. A pen that hovers before it touches happened to
+        // hide this; one that taps straight down did not.
+        let mut pressing = false;
         for action in actions {
             match action {
                 Action::Pose {
@@ -230,7 +238,13 @@ impl InputBackend for PenBackend {
                             pos.0, pos.1, pressure, tilt.0, tilt.1, self.down
                         );
                     }
-                    if self.down {
+                    // **A press waiting for somewhere to be.** `ToolEvent::Down` carries no
+                    // position, so the press is held until this pose says where it happened.
+                    if pressing {
+                        pressing = false;
+                        println!("pen: DOWN at ({:.1},{:.1})", pos.0, pos.1);
+                        out.push(PenEvent::Down(self.sample()));
+                    } else if self.down {
                         out.push(PenEvent::Move(vec![self.sample()]));
                     } else {
                         out.push(PenEvent::Hover(self.sample()));
@@ -240,13 +254,21 @@ impl InputBackend for PenBackend {
                     self.down = true;
                     // Fresh logging budget per stroke — see `logged_poses`.
                     self.logged_poses = 0;
-                    println!(
-                        "pen: DOWN at ({:.1},{:.1})",
-                        self.last_pos.0, self.last_pos.1
-                    );
-                    out.push(PenEvent::Down(self.sample()));
+                    // Not emitted yet: see `pressing`.
+                    pressing = true;
                 }
                 Action::Up => {
+                    // A press and a release with no pose between them is a tap with no position,
+                    // and the fallback below has not run yet. Put the press out first so the
+                    // release has a stroke to end.
+                    if pressing {
+                        pressing = false;
+                        println!(
+                            "pen: DOWN at ({:.1},{:.1}) [no pose; where it last was]",
+                            self.last_pos.0, self.last_pos.1
+                        );
+                        out.push(PenEvent::Down(self.sample()));
+                    }
                     if self.down {
                         self.down = false;
                         println!("pen: UP");
