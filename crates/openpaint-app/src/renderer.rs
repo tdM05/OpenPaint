@@ -47,6 +47,14 @@ pub enum HistoryChange {
     LayerRestored { index: usize, layer: Layer },
     /// A restored layer was deleted again.
     LayerDeleted { index: usize },
+    /// A layer put back where it was in the stack. Metadata: the caller moves it, since the stack
+    /// is the document's and the pixels do not care what order they composite in.
+    LayerMoved { from: usize, to: usize },
+    /// A page put back in the running order.
+    PageMoved { from: usize, to: usize },
+    /// A page has to be taken away, and whoever does it must hand back what it held so that a redo
+    /// can put it there again. The page itself lives in the document, which is the caller's.
+    PageTaken { index: usize },
     /// A deleted page came back, and the document must put it at `index` again.
     PageRestored {
         index: usize,
@@ -631,6 +639,55 @@ impl Renderer {
         });
     }
 
+    /// Record a layer that was just made, so Ctrl+Z can unmake it.
+    ///
+    /// Takes no tiles: a fresh layer has none, and a duplicate's are on the canvas where they
+    /// belong. What the reverse needs is gathered when the reverse happens -- see `Op::AddLayer`.
+    pub fn record_layer_addition(&mut self, index: usize, layer: Layer) {
+        self.history.push(Op::AddLayer {
+            index,
+            layer,
+            tiles: Vec::new(),
+        });
+    }
+
+    /// Record a layer that was moved up or down the stack.
+    pub fn record_layer_move(&mut self, from: usize, to: usize) {
+        self.history.push(Op::MoveLayer { from, to });
+    }
+
+    /// Record a page that was just made, so Ctrl+Z can unmake it.
+    pub fn record_page_addition(&mut self, index: usize) {
+        self.history.push(Op::AddPage {
+            index,
+            page: None,
+            tiles: Vec::new(),
+        });
+    }
+
+    /// Record a page that was moved in the running order.
+    pub fn record_page_move(&mut self, from: usize, to: usize) {
+        self.history.push(Op::MovePage { from, to });
+    }
+
+    /// Hand back what a page held, after an undo took it out of the document.
+    ///
+    /// **Separate from the undo itself, because the page belongs to the document and the tiles
+    /// belong here.** Undoing an addition has to take both, and neither side can reach the other's
+    /// half -- so the renderer says "take that page away", the caller does it, and gives back what
+    /// it removed for the redo to use.
+    pub fn keep_page(&mut self, page: openpaint_core::Page, tiles: Vec<(TileKey, Slot)>) {
+        if let Some(Op::AddPage {
+            page: slot,
+            tiles: held,
+            ..
+        }) = self.history.newest_redo_mut()
+        {
+            *slot = Some(page);
+            *held = tiles;
+        }
+    }
+
     /// Save the document and every tile it holds to `path`.
     ///
     /// Stalls to read the resident tiles back, which is fine for an explicit save; the drawing
@@ -1054,10 +1111,14 @@ impl Renderer {
     /// onto the page in the editor, since the page's dimensions live there and the
     /// pixels live here.
     pub fn undo(&mut self) -> HistoryChange {
-        let Some(op) = self.history.pop_undo() else {
+        // **Mutable, because undoing an addition has to take the pixels with it.** Every other op
+        // arrives holding everything its reverse needs; `AddLayer` is the one that learns what it
+        // is holding at the moment it is undone, because that is the moment the layer stops
+        // existing. See `Op::AddLayer`.
+        let Some(mut op) = self.history.pop_undo() else {
             return HistoryChange::None;
         };
-        let change = match &op {
+        let change = match &mut op {
             // Undoing a move is undoing paint: restore every tile it touched, at the source and
             // at the destination alike. What differs is only what the caller is told afterwards.
             Op::Paint { layer, before, .. } | Op::Move { layer, before, .. } => {
@@ -1119,6 +1180,34 @@ impl Renderer {
                     page: page.clone(),
                 }
             }
+            // Undoing "a layer was made" is deleting it, and a deletion keeps what it deleted.
+            // The tiles are taken into the op here so that a redo can put back a duplicate with
+            // its pixels rather than an empty layer wearing its name.
+            Op::AddLayer {
+                index,
+                layer,
+                tiles,
+            } => {
+                let index = *index;
+                let id = LayerId(layer.id());
+                // A refusal to adopt means the pool is full. The layer still goes -- the artist
+                // asked for that -- and what is lost is only the ability to redo it with its
+                // pixels, which is the same trade `adopt_layer` makes for a deletion.
+                *tiles = self.adopt_layer(id).unwrap_or_default();
+                self.canvas_renderer.discard_layer(id);
+                HistoryChange::LayerDeleted { index }
+            }
+            Op::MoveLayer { from, to } => HistoryChange::LayerMoved {
+                from: *to,
+                to: *from,
+            },
+            // Undoing "a page was made" is deleting it. What it held is collected by the caller,
+            // which owns the document, and handed back through `keep_page`.
+            Op::AddPage { index, .. } => HistoryChange::PageTaken { index: *index },
+            Op::MovePage { from, to } => HistoryChange::PageMoved {
+                from: *to,
+                to: *from,
+            },
         };
         self.history.finish_undo(op);
         change
@@ -1251,6 +1340,35 @@ impl Renderer {
                 }
                 HistoryChange::PageDeleted { index: *index }
             }
+            // Making it again, pixels and all: the same shape as undoing a deletion, because it
+            // is the same thing.
+            Op::AddLayer {
+                index,
+                layer,
+                tiles,
+            } => {
+                self.restore_tiles(tiles);
+                HistoryChange::LayerRestored {
+                    index: *index,
+                    layer: layer.clone(),
+                }
+            }
+            Op::MoveLayer { from, to } => HistoryChange::LayerMoved {
+                from: *from,
+                to: *to,
+            },
+            Op::AddPage { index, page, tiles } => {
+                self.restore_tiles(tiles);
+                page.clone()
+                    .map_or(HistoryChange::None, |page| HistoryChange::PageRestored {
+                        index: *index,
+                        page,
+                    })
+            }
+            Op::MovePage { from, to } => HistoryChange::PageMoved {
+                from: *from,
+                to: *to,
+            },
         };
         self.history.finish_redo(op);
         change

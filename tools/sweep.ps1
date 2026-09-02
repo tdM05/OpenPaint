@@ -49,8 +49,15 @@ foreach ($scene in $scenes) {
         }
         $extra['PlantRecovery'] = $doc
     }
-    $out = & (Join-Path $PSScriptRoot 'drive.ps1') -Shot $name -Width $Width -Height $Height `
-        -Script $scene.FullName @extra 2>&1
+    # Caught, so one scenario that fails does not take the rest of the suite with it -- the point
+    # of a suite is the whole table at the end, not the first thing that broke.
+    $out = @()
+    try {
+        $out = & (Join-Path $PSScriptRoot 'drive.ps1') -Shot $name -Width $Width -Height $Height `
+            -Script $scene.FullName @extra 2>&1
+    } catch {
+        $out = @($_)
+    }
     $checks = Join-Path $root "target\drive\$name.checks"
     $lines = if (Test-Path $checks) { @(Get-Content -LiteralPath $checks) } else { @() }
     $ok = @($lines | Where-Object { $_ -match '^\s+ok' }).Count

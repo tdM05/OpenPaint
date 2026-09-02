@@ -3,17 +3,39 @@ expect layers 1
 expect layer-names Layer 1
 expect active.name Layer 1
 
+# **Making a layer is undoable, like unmaking one.** Deleting was in the stack and adding was not,
+# so Ctrl+Z after Add did nothing at all -- which reads as undo being broken rather than as this
+# operation being outside it.
 press Layers:Add
 expect layers 2
 expect active.name Layer 2
+expect undo 1
 shot layers-added
+key ctrl+z
+expect layers 1
+expect undo 0
+expect redo 1
+key ctrl+y
+expect layers 2
 
 press Duplicate
 expect layers 3
 expect layer-names Layer 1, Layer 2, Layer 2 copy
+expect undo 2
+key ctrl+z
+expect layers 2
+expect layer-names Layer 1, Layer 2
+key ctrl+y
+expect layers 3
+expect layer-names Layer 1, Layer 2, Layer 2 copy
 
 # Reorder. Up moves the active layer towards the top of the stack.
+# Reordering is a change to the document too, and goes in the same stack.
 press Down
+expect layer-names Layer 1, Layer 2 copy, Layer 2
+key ctrl+z
+expect layer-names Layer 1, Layer 2, Layer 2 copy
+key ctrl+y
 expect layer-names Layer 1, Layer 2 copy, Layer 2
 press Up
 expect layer-names Layer 1, Layer 2, Layer 2 copy

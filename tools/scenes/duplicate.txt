@@ -1,0 +1,37 @@
+# A duplicated layer's pixels survive being undone and redone.
+#
+# This is the case `Op::AddLayer` carries tiles for at all. Undoing an addition is a deletion, and
+# a deletion that dropped the pixels would let a redo put back an empty layer wearing the right
+# name -- which every other assertion about layer counts and names would happily call a pass.
+
+# Something to copy.
+expect layers 1
+ink 850 550 1000 700 0
+drag 700 450 1150 850
+ink 850 550 1000 700 20
+expect undo 1
+
+press Layers:Duplicate
+expect layers 2
+expect layer-names Layer 1, Layer 1 copy
+expect undo 2
+shot duplicate-made
+
+# Away and back again.
+key ctrl+z
+expect layers 1
+key ctrl+y
+expect layers 2
+expect layer-names Layer 1, Layer 1 copy
+shot duplicate-redone
+
+# Now throw away the layer that was copied *from*. What is left is the copy, and the marks still on
+# the page are the ones it carried through the undo and the redo. An empty copy would leave a blank
+# page here, and nothing else in this file could tell the difference.
+press layers:0
+expect active.name Layer 1
+press Layers:Delete
+expect layers 1
+expect layer-names Layer 1 copy
+ink 850 550 1000 700 20
+shot duplicate-survived

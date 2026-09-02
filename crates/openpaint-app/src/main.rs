@@ -2055,6 +2055,36 @@ impl OpenPaint {
                 self.editor.document_mut().active_mut().remove_layer(index);
                 self.request_redraw();
             }
+            renderer::HistoryChange::LayerMoved { from, to } => {
+                self.editor.document_mut().active_mut().move_layer(from, to);
+                self.request_redraw();
+            }
+            renderer::HistoryChange::PageMoved { from, to } => {
+                self.editor.document_mut().move_page(from, to);
+                self.follow_active_page();
+                self.request_redraw();
+            }
+            // Undoing "a page was made". The renderer cannot do it alone: the page belongs to the
+            // document and its tiles belong to the renderer, so this takes the page out, hands
+            // both halves back for the redo, and only then lets go.
+            renderer::HistoryChange::PageTaken { index } => {
+                let Some(page) = self.editor.document().page(index).cloned() else {
+                    return;
+                };
+                let Some(renderer) = self.renderer.as_mut() else {
+                    return;
+                };
+                // A refusal to adopt costs the redo its pixels, not the undo its correctness --
+                // the same trade a deletion makes.
+                let tiles = renderer.adopt_page(&page).unwrap_or_default();
+                if self.editor.document_mut().remove_page(index).is_some() {
+                    if let Some(r) = self.renderer.as_mut() {
+                        r.keep_page(page, tiles);
+                    }
+                    self.follow_active_page();
+                }
+                self.request_redraw();
+            }
             renderer::HistoryChange::PageRestored { index, page } => {
                 self.editor.document_mut().restore_page(index, page);
                 self.follow_active_page();
@@ -2142,12 +2172,21 @@ impl OpenPaint {
             ui::PageAction::Add => {
                 self.editor.stroke_end();
                 let index = self.editor.document_mut().add_page_like_active();
+                // In the stack, like the deletion that reverses it.
+                if let Some(r) = self.renderer.as_mut() {
+                    r.record_page_addition(index);
+                }
                 self.follow_active_page();
+                self.mark_dirty();
                 self.status_message = Some(format!("Added page {}", index + 1));
             }
             ui::PageAction::Delete(index) => self.delete_page(index),
             ui::PageAction::Move { from, to } => {
                 self.editor.document_mut().move_page(from, to);
+                if let Some(r) = self.renderer.as_mut() {
+                    r.record_page_move(from, to);
+                }
+                self.mark_dirty();
             }
         }
         self.request_redraw();
@@ -2214,6 +2253,16 @@ impl OpenPaint {
             ui::LayerAction::Add => {
                 self.editor.stroke_end();
                 let index = self.editor.document_mut().add_layer();
+                // Recorded, like the deletion that reverses it. Making a layer and unmaking one
+                // are the same kind of change to the document, and only one of them being in the
+                // stack made Ctrl+Z look broken rather than inapplicable.
+                if let Some((r, layer)) = self
+                    .renderer
+                    .as_mut()
+                    .zip(self.editor.layers().get(index).cloned())
+                {
+                    r.record_layer_addition(index, layer);
+                }
                 self.status_message = Some(format!("Added layer {}", index + 1));
             }
             ui::LayerAction::Delete(index) => self.delete_layer(index),
@@ -2221,6 +2270,10 @@ impl OpenPaint {
             ui::LayerAction::MergeDown(index) => self.merge_layer_down(index),
             ui::LayerAction::Move { from, to } => {
                 self.editor.document_mut().active_mut().move_layer(from, to);
+                if let Some(r) = self.renderer.as_mut() {
+                    r.record_layer_move(from, to);
+                }
+                self.mark_dirty();
             }
             ui::LayerAction::SetVisible { index, visible } => {
                 if let Some(l) = self.editor.document_mut().active_mut().layer_mut(index) {
@@ -2288,6 +2341,15 @@ impl OpenPaint {
             .active()
             .layer(at)
             .map_or_else(String::new, |l| l.name.clone());
+        // Recorded after the pixels are copied, so undoing it takes the copy with it. A duplicate
+        // is the case that makes `Op::AddLayer` carry tiles at all.
+        if let Some((r, layer)) = self
+            .renderer
+            .as_mut()
+            .zip(self.editor.layers().get(at).cloned())
+        {
+            r.record_layer_addition(at, layer);
+        }
         self.status_message = Some(format!("Duplicated as \"{name}\""));
         self.mark_dirty();
         self.request_redraw();

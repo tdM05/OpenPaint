@@ -15,7 +15,8 @@ expect file -
 drag 700 450 1150 850
 press Layers:Add
 expect layers 2
-expect undo 1
+# Two steps: the stroke, and the layer -- making a layer is recorded like unmaking one.
+expect undo 2
 expect dirty true
 
 # Save As, and type where. The dialog is native and runs on its own thread, and it needs a good

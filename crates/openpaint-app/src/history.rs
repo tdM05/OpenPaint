@@ -189,6 +189,39 @@ pub enum Op {
         layer: Layer,
         tiles: Vec<(TileKey, Slot)>,
     },
+    /// A layer that was made: by Add, or by Duplicate, which is Add with pixels in it.
+    ///
+    /// **The mirror of [`Op::DeleteLayer`], and it had to exist for the same reason that one
+    /// does.** Deleting a layer was undoable and making one was not, so Ctrl+Z after Add did
+    /// nothing at all -- which reads as undo being broken rather than as this operation being
+    /// outside it. Every change to the shape of the document belongs in one stack; a stack you
+    /// have to know the contents of before you can predict what Ctrl+Z does is not one.
+    ///
+    /// `tiles` is empty when this is pushed and filled when it is *undone*: undoing an addition is
+    /// a deletion, and a deletion has to take the pixels with it or a redo would put back an empty
+    /// layer. A duplicate is the case that makes this matter.
+    AddLayer {
+        index: usize,
+        layer: Layer,
+        tiles: Vec<(TileKey, Slot)>,
+    },
+    /// A layer moved up or down the stack. Metadata only: nothing is drawn differently, the
+    /// composite order changes, and there are no pixels to keep.
+    MoveLayer { from: usize, to: usize },
+    /// A page that was made. The mirror of [`Op::DeletePage`], for the same reason
+    /// [`Op::AddLayer`] mirrors [`Op::DeleteLayer`]: a document with pages has two ways to change
+    /// its shape and both belong in one stack.
+    ///
+    /// `page` and `tiles` are filled when it is undone -- a new page is made empty, but the
+    /// undo has to keep whatever was drawn on it before Ctrl+Z was pressed, or a redo would hand
+    /// back a blank one.
+    AddPage {
+        index: usize,
+        page: Option<openpaint_core::Page>,
+        tiles: Vec<(TileKey, Slot)>,
+    },
+    /// A page moved in the running order. Metadata only, like [`Op::MoveLayer`].
+    MovePage { from: usize, to: usize },
 }
 
 impl Op {
@@ -209,7 +242,11 @@ impl Op {
             Self::Resize { .. } | Self::Content { .. } => Vec::new(),
             Self::Trim { tiles }
             | Self::DeleteLayer { tiles, .. }
+            | Self::AddLayer { tiles, .. }
             | Self::DeletePage { tiles, .. } => tiles.into_iter().map(|(_, slot)| slot).collect(),
+            Self::AddPage { tiles, .. } => tiles.into_iter().map(|(_, slot)| slot).collect(),
+            // Nothing but two indices.
+            Self::MoveLayer { .. } | Self::MovePage { .. } => Vec::new(),
             // Both halves: a merge holds the layer it consumed *and* the before-image of the layer
             // it was folded into. Releasing one and forgetting the other leaks the pool until the
             // app restarts, which is exactly the shape of bug this function exists to prevent.
@@ -445,6 +482,15 @@ impl History {
 
     /// A reverted operation becomes redoable, keeping whatever it stored — that data is
     /// exactly what a later undo of the redone operation needs again.
+    /// The op the next redo will take, so a caller can finish filling it in.
+    ///
+    /// Only ever used by an undo that had to be completed by somebody else -- see
+    /// `Renderer::keep_page`, where the page belongs to the document and the tiles belong to the
+    /// renderer, and neither can reach the other's half.
+    pub fn newest_redo_mut(&mut self) -> Option<&mut Op> {
+        self.redo.last_mut()
+    }
+
     pub fn finish_undo(&mut self, op: Op) {
         self.redo.push(op);
     }
