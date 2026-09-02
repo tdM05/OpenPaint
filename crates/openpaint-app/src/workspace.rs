@@ -1467,7 +1467,27 @@ impl Workspace {
                 egui::Id::new("floating-marks"),
             ))
         };
-        if let Some(Preview::Waiting { progress, on }) = &preview {
+        // **What you have hold of stays lit until you let go.**
+        //
+        // The mark below fades in while a press is waiting out the hold, and it used to be the
+        // only thing that drew it -- so the instant the gesture armed and began to move, the tint
+        // vanished. Press, watch it light up, move a pixel, watch it go out: a flick, reported as
+        // one, and it reads as the application having lost the thing you are still holding.
+        //
+        // So the same mark is drawn at full strength for the whole of a gesture that is under way.
+        // `Waiting` carries how far the hold has got; everything else is arrived, and full.
+        let lit: Option<(f32, Held)> = match &preview {
+            Some(Preview::Waiting { progress, on }) => Some((*progress, on.clone())),
+            // Carrying a panel out of a window moves the window, so the window is what is held.
+            Some(Preview::MovingWindow | Preview::ResizingWindow { .. }) => {
+                Some((1.0, Held::Frame))
+            }
+            Some(Preview::Carrying { .. }) if working != Surface::Docked => {
+                Some((1.0, Held::Frame))
+            }
+            _ => None,
+        };
+        if let Some((progress, on)) = &lit {
             let alpha = (140.0 * progress).clamp(0.0, 140.0) as u8;
             let tint = egui::Color32::from_rgba_unmultiplied(
                 p.state.0[0],
@@ -1927,7 +1947,8 @@ impl Workspace {
         }
         self.remember_for_undo();
         self.layout.remove(panel);
-        let at = first_float(self.screen, self.floating.len(), &self.theme.metrics);
+        let taken: Vec<Rect> = self.floating.iter().map(|f| f.rect).collect();
+        let at = first_float(self.screen, &taken, &self.theme.metrics);
         let id = self.take_float_id();
         self.floating.push(Floating {
             id,
@@ -3301,19 +3322,50 @@ fn draw_tab(
     );
 }
 
-/// Where a floating panel goes when it is first lifted out.
-///
-/// Offset from the top-left rather than centred, so several lifted in a row do not land exactly on
-/// top of one another with no way to tell there is more than one.
+/// Whether two rectangles share any pixel.
 #[must_use]
-fn first_float(screen: Rect, already: usize, m: &Metrics) -> Rect {
-    let step = m.header * f32::from(u8::try_from(already % 6).unwrap_or(0));
+fn overlaps(a: Rect, b: Rect) -> bool {
+    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+}
+
+/// Where a floating panel goes when it is first lifted out: somewhere there is room for it.
+///
+/// **Clear of every window already out**, and that is not fussiness. This used to offset each new
+/// window from the last by one header -- twenty-eight units on a window of three hundred and
+/// twenty by four hundred and twenty, so two of them overlapped by better than nine tenths and
+/// read as one. The comment here said they were offset "so several lifted in a row do not land
+/// exactly on top of one another with no way to tell there is more than one", which is exactly
+/// what they did.
+///
+/// What it cost was not only that they looked like one. Dragging the top one's tab even a little
+/// dropped it *inside* the one underneath, which is the merge gesture -- so the artist moved a
+/// window, let go, and found the two had become one, with the tab under their pointer now
+/// belonging to the other panel. Reported as dragging one tab and picking up another.
+///
+/// Left to right, then down, taking the first free place. When there is nowhere left, the old
+/// cascade is the fallback: a window that overlaps is worse than one that does not and better
+/// than one placed off screen.
+#[must_use]
+fn first_float(screen: Rect, taken: &[Rect], m: &Metrics) -> Rect {
     let (w, h) = ((screen.w * 0.22).min(320.0), (screen.h * 0.35).min(420.0));
-    hold_on_screen(
-        Rect::new(screen.x + 60.0 + step, screen.y + 60.0 + step, w, h),
-        screen,
-        m,
-    )
+    // A gap wide enough to be a gap: two windows edge to edge read as one window with a line down
+    // it, and the drop zones either side of that line are a coin toss.
+    let gap = m.gutter * 4.0;
+    let (left, top) = (screen.x + 60.0, screen.y + 60.0);
+    let mut y = top;
+    while y + h <= screen.y + screen.h {
+        let mut x = left;
+        while x + w <= screen.x + screen.w {
+            let here = Rect::new(x, y, w, h);
+            if !taken.iter().any(|r| overlaps(grown(*r, gap), here)) {
+                return hold_on_screen(here, screen, m);
+            }
+            x += w + gap;
+        }
+        y += h + gap;
+    }
+    let step = m.header * f32::from(u8::try_from(taken.len() % 6).unwrap_or(0));
+    hold_on_screen(Rect::new(left + step, top + step, w, h), screen, m)
 }
 
 /// The smallest a floating window may be, on either axis.
@@ -4187,6 +4239,55 @@ mod tests {
             ws.floating[0].rect, was,
             "a window has to be movable by its own chrome, or its tabs are the only handle"
         );
+    }
+
+    /// Dragging the same window's tab twice moves the same window twice.
+    ///
+    /// **Reported by the artist**: with two panels floating, dragging one's tab worked, and
+    /// dragging the same tab again picked up the other window instead. Two windows and one
+    /// gesture, and the second one went to the wrong one of them.
+    #[test]
+    fn the_same_tab_dragged_twice_moves_the_same_window() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.set_screen(screen);
+        ws.float(PAGES);
+        ws.float(HISTORY);
+        let (pages, history) = (ws.floating[0].id, ws.floating[1].id);
+
+        // **Left where floating put them**, which is the whole point: windows land offset by one
+        // header each, so two of them sit almost exactly on top of one another. Moving them apart
+        // first would test a tidier arrangement than any artist ever sees.
+        let history_was = ws.floating[1].rect;
+
+        for round in 1..=2 {
+            let before = {
+                let mut hand = Hand::new(&mut ws, screen);
+                let grab = hand.tab_of(pages);
+                let was = hand.rect_of(pages);
+                hand.drag(grab, (grab.0 + 40.0, grab.1 + 30.0));
+                was
+            };
+            let now = ws
+                .floating
+                .iter()
+                .find(|f| f.id == pages)
+                .expect("the pages window")
+                .rect;
+            assert_ne!(
+                now, before,
+                "round {round}: dragging the Pages tab did not move the Pages window"
+            );
+            assert_eq!(
+                ws.floating
+                    .iter()
+                    .find(|f| f.id == history)
+                    .expect("the history window")
+                    .rect,
+                history_was,
+                "round {round}: dragging the Pages tab moved the *History* window"
+            );
+        }
     }
 
     /// Holding a window's frame asks about the panel it is showing.
@@ -6941,18 +7042,32 @@ mod tests {
         }
     }
 
-    /// Two panels lifted in a row do not land exactly on top of one another.
+    /// Panels lifted in a row do not overlap at all.
+    ///
+    /// **This test used to pass while the bug was there**, which is the part worth keeping. It
+    /// asked whether the second window was offset from the first by at least one header, and it
+    /// was -- by exactly one header, on a window fifteen times that wide, so the two overlapped by
+    /// better than nine tenths and read as a single window. The letter of the intent held and the
+    /// intent did not.
+    ///
+    /// What that cost: dragging the top one's tab even a little dropped it inside the one beneath,
+    /// which is the merge gesture, so an artist moved a window, let go, and found the two had
+    /// become one with the tab under the pointer now belonging to the other panel.
     #[test]
     fn floating_panels_do_not_hide_behind_each_other() {
         let m = crate::theme::Theme::default().metrics;
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
-        let a = first_float(screen, 0, &m);
-        let b = first_float(screen, 1, &m);
-        assert_ne!(a, b, "the second one landed exactly on the first");
-        assert!(
-            (a.x - b.x).abs() >= m.header - 0.001 || (a.y - b.y).abs() >= m.header - 0.001,
-            "and it should be offset by enough to see"
-        );
+        let mut out: Vec<Rect> = Vec::new();
+        for n in 0..4 {
+            let next = first_float(screen, &out, &m);
+            for (i, before) in out.iter().enumerate() {
+                assert!(
+                    !overlaps(*before, next),
+                    "window {n} at {next:?} overlaps window {i} at {before:?}"
+                );
+            }
+            out.push(next);
+        }
     }
 
     /// A floating panel survives being saved, under its name like everything else.
