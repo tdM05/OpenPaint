@@ -3188,7 +3188,8 @@ impl OpenPaint {
     /// Bindings follow Photoshop/CSP habits (DECISIONS section 1a):
     ///   - space + drag, or middle-drag, pans
     ///   - wheel zooms about the cursor
-    ///   - Ctrl+0 fits the canvas, Ctrl+1 goes to 100%
+    ///   - `0` fits the canvas, `1` goes to 100% -- bare, not with Ctrl, which the arm below
+    ///     excludes on purpose so Ctrl+S and friends are not eaten here
     ///   - `[` / `]` resize the brush, Shift+`[` / Shift+`]` rotate about the cursor
     ///   - `b` / `e` choose brush or eraser
     fn handle_navigation(&mut self, event: &WindowEvent) -> bool {
@@ -3330,7 +3331,7 @@ impl OpenPaint {
                         // rather than leaving the artwork half off the edge of its new panel.
                         self.view.request_fit();
                         self.status_message = Some(if self.workspace_mode {
-                            "Panel workspace. Hold a panel's header to move it; Ctrl+Shift+Z resets the layout."
+                            "Panel workspace. Hold a panel's header to move it; F3 takes a layout change back and Ctrl+F3 resets it."
                                 .to_owned()
                         } else {
                             "Back to the old panel.".to_owned()

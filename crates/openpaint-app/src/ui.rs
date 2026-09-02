@@ -716,10 +716,13 @@ fn workspace_panel(
 }
 
 /// What a workspace panel asked for.
+///
+/// Every variant has a producer now. This carried an `expect(dead_code)` while the panels were
+/// being written across, worded so that it would stop compiling the moment the last one landed
+/// rather than sit there forgiving whatever was left behind. It stopped compiling; the port is
+/// finished, and `Picked::TextChanged` -- which never had a producer and never would -- went with
+/// it, since a caption's edit arrives as `TextSet` carrying the caption.
 #[derive(Clone, Debug, PartialEq)]
-// The panels that produce the last dozen of these are being written; `expect` rather than `allow`
-// so this stops compiling the moment the last one lands and cannot be left behind.
-#[expect(dead_code, reason = "the panels that produce them are being ported")]
 pub(crate) enum Picked {
     Paint(Tool),
     Select(SelectTool),
@@ -762,8 +765,6 @@ pub(crate) enum Picked {
     Trim,
     /// A text command: add a layer, convert it, load a font.
     Text(TextAction),
-    /// The text of the layer being edited changed, so its pixels have to be derived again.
-    TextChanged,
     /// The caption as the artist has set it: the words, the face, the size, where it sits.
     ///
     /// Carried whole for the same reason `TransformSet` is: a caption is one thing being adjusted,
@@ -1231,7 +1232,6 @@ impl Ui {
                             Picked::ExtendBy(by) => extend_amount = by,
                             Picked::Trim => trim = true,
                             Picked::Text(a) => text_action = Some(a),
-                            Picked::TextChanged => text_changed = true,
                             Picked::TextSet(block) => {
                                 if let Some(held) = text.as_deref_mut() {
                                     *held = block;

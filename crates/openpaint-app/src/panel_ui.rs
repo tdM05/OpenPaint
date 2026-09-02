@@ -309,6 +309,20 @@ pub fn place<'a>(
             "a label with a run of spaces in it: {:?}",
             text_of_control(control)
         );
+        // **And the same sentence twice, one under the other.** The font-substitution warning was
+        // pushed by the panel and again by the caption editor, so a page lettered in a face nobody
+        // asked for said so twice. Two identical *sentences* in a row are never the intent, and
+        // both halves looked correct in isolation -- which is why the question is asked here,
+        // where the list is whole. Buttons are exempt: a rail of them may legitimately share a
+        // name, and a label is the only kind of control whose whole purpose is what it says.
+        debug_assert!(
+            !matches!(control, Control::Label { .. })
+                || out.last().is_none_or(|p: &Placed<'_>| {
+                    !matches!(p.control, Control::Label { text } if text == text_of_control(control))
+                }),
+            "the same sentence twice in a row: {:?}",
+            text_of_control(control)
+        );
         let rect = if across {
             // Everything in a row is one row tall, including the labels and the rules, or the
             // strip has no baseline to read along.
@@ -422,14 +436,6 @@ pub enum Change {
     Toggled(ControlId, bool),
     /// A row was chosen.
     Chose(ControlId),
-    /// Option `n` of a [`Control::Pick`] was chosen, counting from the list the panel offered.
-    ///
-    /// By position rather than by name, because the panel that offered the list is the one being
-    /// told, and it has the list in front of it. A name would have to survive being spelled twice.
-    // Nothing produces it yet -- the dropdown's round trip is the next thing to be written.
-    // `expect` rather than `allow` so it stops compiling the moment something does.
-    #[expect(dead_code, reason = "the dropdown's round trip is being written")]
-    Picked(ControlId, usize),
     /// A [`Control::Text`] took the caret. Nothing has changed yet.
     ///
     /// Reported so the panel can tell that a field is being edited -- to stop a shortcut eating

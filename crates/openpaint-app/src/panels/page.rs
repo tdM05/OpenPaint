@@ -37,12 +37,11 @@ pub(crate) fn show(
     let mut picked: Option<Picked> = None;
     let _ = (&mut *brush, &mut *color_srgb, place);
 
-    // **A blocker, and a stand-in until it is lifted.** How much an extend adds is a panel
-    // setting, held in `ui::Ui::extend_amount` and applied there from `Picked::ExtendBy` -- but
-    // `Status` does not carry it, so this panel cannot read back what it last asked for. Until
-    // `Status` gains a field, the slider shows the default every frame and the buttons extend by
-    // it, which stops being true the moment the slider is dragged. It answers `ExtendBy` anyway,
-    // so the shell already records the value and this becomes right by deleting one line.
+    // How much an extend adds is a panel setting rather than document state, so it arrives on
+    // `Painting` rather than on `Status`: the shell holds it, this panel shows it and answers
+    // `ExtendBy` when it moves, and the buttons below extend by whatever it currently says. It
+    // used to be unreadable from here -- the slider showed the default every frame and stopped
+    // agreeing with the buttons the moment it was dragged -- and this comment used to say so.
     let extend_by = paint.extend_by;
 
     let controls = controls(state.page_size, state.crop_rect, extend_by);

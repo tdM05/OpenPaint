@@ -217,7 +217,7 @@ mod tests {
                 spilled: 0,
                 traffic: (0, 0),
                 layers: &layers,
-                active_layer: 2,
+                active_layer: 3,
                 pages: (3, 0),
                 tool: crate::editor::Tool::Brush,
                 confirm: None,

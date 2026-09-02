@@ -84,7 +84,6 @@ pub(crate) fn show(
                 | Picked::ExtendBy(_)
                 | Picked::Trim
                 | Picked::Text(_)
-                | Picked::TextChanged
                 | Picked::TextSet(_)
                 | Picked::Brush(_)
                 | Picked::PresetName(_)

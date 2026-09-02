@@ -205,11 +205,16 @@ pub(crate) fn menu_items(which: u32, active_layer: usize, layers: usize) -> Vec<
             named("Invert", Picked::Selection(SelectAction::Invert)),
             named("Clear", Picked::Selection(SelectAction::Clear)),
         ],
-        _ => vec![
+        4 => vec![
             named("Fit", Picked::Command(Command::ZoomFit)),
             named("Actual size", Picked::Command(Command::ZoomActual)),
             named("Settings", Picked::Settings),
         ],
+        // **Nothing, rather than the View menu.** This was the `_` arm, so any id that was not one
+        // of the five drew View's items under some other menu's name -- a menu that lies about
+        // what it is, and silently. An id nobody put in the bar has no items, and an empty popup
+        // is at least honestly empty.
+        _ => Vec::new(),
     }
 }
 

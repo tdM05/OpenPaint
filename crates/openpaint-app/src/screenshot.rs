@@ -164,7 +164,7 @@ pub(crate) fn sample_document() -> (
     Vec<openpaint_core::BrushPreset>,
     Vec<String>,
 ) {
-    let layers: Vec<openpaint_core::Layer> = ["Paper", "Flats", "Ink"]
+    let mut layers: Vec<openpaint_core::Layer> = ["Paper", "Flats", "Ink"]
         .iter()
         .enumerate()
         .map(|(i, name)| {
@@ -179,6 +179,26 @@ pub(crate) fn sample_document() -> (
             )
         })
         .collect();
+    // **And one of them is lettering**, because a fixture with no text layer cannot draw the
+    // caption editor -- and a fixture that cannot draw a thing cannot fail on it. That is not
+    // hypothetical: the font-substitution warning was emitted twice, the check for it went in,
+    // the fault was put back on purpose, and every test stayed green because none of them had a
+    // text layer to reach the second copy with.
+    layers.push(
+        openpaint_core::Layer::restored(
+            3,
+            "Caption",
+            1.0,
+            openpaint_core::Blend::Normal,
+            true,
+            false,
+            false,
+        )
+        .with_text(openpaint_core::TextBlock {
+            text: "Be here".to_owned(),
+            ..openpaint_core::TextBlock::default()
+        }),
+    );
     let palette = vec![
         [232, 196, 168],
         [186, 132, 102],

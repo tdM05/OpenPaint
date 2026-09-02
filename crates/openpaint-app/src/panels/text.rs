@@ -2,17 +2,17 @@
 //!
 //! One module per panel, exporting one function. See [`super`] for why.
 //!
-//! # What is drawn, and what is waiting
+//! # What is drawn
 //!
-//! The three commands -- add a text layer, convert one to raster, load a font file -- are here and
-//! work, along with the substitution warning and the explanation of what a text layer is.
+//! The three commands -- add a text layer, convert one to raster, load a font file -- along with
+//! the substitution warning, and the caption editor itself: the words, the family, the size, the
+//! weight and slant, wrapping and its width, alignment, colour, spacing and position.
 //!
-//! The caption editor is written and proved in [`editor`] and **not drawn yet**. The block itself
-//! is perfectly readable from here -- it is `state.layers[state.active_layer].text()` -- but a
-//! panel may not edit the document in place (see [`super`]), and no [`Picked`] carries an edited
-//! block back, so every control below the buttons would move and change nothing. A slider that
-//! lies is worse than a slider that is missing, so they are missing. [`editor`] says exactly what
-//! closes the gap.
+//! The caption editor is written and proved in [`editor`]. A panel may not edit the document in
+//! place (see [`super`]), so it edits a copy of the block and hands it back as `Picked::TextSet`;
+//! the shell writes it through, records the undo step and derives the pixels again. That is what
+//! keeps the undo record where it belongs, and it is why the editor is pure enough to prove
+//! without a GPU, a font stack or a document.
 
 use super::{Painting, Picked};
 use crate::panel_ui::{Change, Control};
@@ -76,13 +76,11 @@ pub(crate) fn show(
         return None;
     }
 
+    // **The substitution warning is `controls_for`'s, and only its.** It was pushed here as well,
+    // so a page lettered in a face nobody asked for said so twice, one line under the other. It is
+    // a statement about a particular block's requested family, and `controls_for` is the thing
+    // that has the block -- there is nothing for it to be about when no text layer is active.
     let mut controls = Vec::new();
-    if let Some(actual) = state.font_substituted {
-        // Loud, and first: the alternative is shipping a page lettered in the wrong face.
-        controls.push(Control::Label {
-            text: editor::substitution_warning(block.and_then(editor::requested_family), actual),
-        });
-    }
 
     if let Some(block) = block {
         controls.extend(editor::controls_for(block, state.font_substituted));
