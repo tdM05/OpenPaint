@@ -1688,9 +1688,20 @@ impl Workspace {
                 // The panel draws its own popup. Nothing here knows what is in it, which is what
                 // keeps menus out of the workspace and the workspace out of menus.
                 PopupKind::Panel(panel) => {
+                    // Named, like the arrangement's panels, so what a popup draws can be told
+                    // apart from what the panel behind it draws. Without this a popup's controls
+                    // were filed under whichever panel happened to report last, and the Select
+                    // menu's Clear and the Select panel's Clear became one indistinguishable name.
+                    crate::panel_draw::report_panel(name_of(panel));
                     contents(panel, &mut ui, Direction::Column, Place::Popup);
                 }
                 kind => {
+                    crate::panel_draw::report_panel(match kind {
+                        PopupKind::Panels => "popup-panels",
+                        PopupKind::Workspace => "popup-workspace",
+                        PopupKind::Settings(p) => name_of(p),
+                        PopupKind::Panel(_) => "popup",
+                    });
                     let controls = self.popup_controls(kind);
                     let changes = crate::panel_draw::show(
                         &mut ui,

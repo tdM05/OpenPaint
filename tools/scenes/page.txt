@@ -1,0 +1,177 @@
+# Every control in the Page panel: the size readout, the four extends and the amount they use, the
+# crop tool, and trim.
+#
+# **Two of the steps here are drags on the canvas, so this scene is written for the window
+# `sweep.ps1` opens -- 2200 x 1450, whose client area is 2178 x 1394.** At that size a fresh
+# 2048 x 2048 page, fitted with the 0.94 margin `View::fit` uses, lands on screen at x 359..1570,
+# y 142..1353: the crop box starts covering exactly that, so its right edge is at x 1570 and its
+# vertical middle at y 747. `grab_tolerance` is ten screen pixels whatever the zoom, so a press has
+# to be within ten of the edge it means, which is why those two numbers are measured from the fit
+# rather than aimed at by eye. Nothing between here and the last crop re-fits the view -- a resize
+# deliberately keeps the artist's zoom -- so the same two numbers hold all the way down.
+#
+# The `{w} x {h} px` readout at the top of the panel is a Label: it has no id, so it is not in the
+# atlas and cannot be pressed. It is checked through `page-size`, which is the same number.
+expect page-size 2048	2048
+expect crop false
+expect undo 0
+expect dirty false
+tab Page
+shot page-start
+
+# The four extends, each growing the side it is named after by the amount the slider holds, which
+# starts at `DEFAULT_EXTEND` = 512. Four buttons and four sides: a swapped pair would read
+# perfectly and grow the page the wrong way, so each is asserted on its own.
+press page:Extend down
+expect page-size 2048	2560
+expect undo 1
+expect dirty true
+press page:up
+expect page-size 2048	3072
+expect undo 2
+press page:left
+expect page-size 2560	3072
+expect undo 3
+press page:right
+expect page-size 3072	3072
+expect undo 4
+shot page-extended
+
+# Every one of them went through `apply_page_rect`, so every one is a recorded Resize and comes
+# back one at a time in the order it was made.
+key ctrl+z
+expect page-size 2560	3072
+key ctrl+z
+expect page-size 2048	3072
+key ctrl+z
+expect page-size 2048	2560
+key ctrl+z
+expect page-size 2048	2048
+expect undo 0
+expect redo 4
+
+# The crop box starts covering the whole page, and starting one swaps this panel's
+# "Crop / resize by dragging" for Apply and Cancel -- the two are never both offered, because a
+# second Start in the middle of a crop could only refuse.
+press page:Crop / resize by dragging
+expect crop true
+expect page-size 2048	2048
+expect undo 0
+shot page-crop-started
+
+# Cancel puts the box away and leaves the page exactly as it was: no resize, nothing recorded.
+press page:Cancel
+expect crop false
+expect status Crop cancelled
+expect page-size 2048	2048
+expect undo 0
+
+# Escape does what the panel's own instruction says it does.
+press page:Crop / resize by dragging
+expect crop true
+key escape
+expect crop false
+expect status Crop cancelled
+expect undo 0
+
+# Applying a box nobody moved is a crop to the rectangle the page already has, and `crop_action`
+# says so rather than pushing a resize that changes nothing.
+press page:Crop / resize by dragging
+expect crop true
+press page:Apply
+expect crop false
+expect status Crop unchanged
+expect page-size 2048	2048
+expect undo 0
+
+# **And now one that moves.** The press at x 1570 is on the box's right edge; dragging it 300
+# screen pixels left pulls the page in by about 507 of its own, and applying resizes the page to
+# it. The exact width the drag lands on is not asserted -- it is whatever 300 pixels comes to at
+# this zoom -- but the two things that matter are exact: a recorded op only exists if the size
+# actually changed (`clamp_page_size` answers None when it did not, and nothing is pushed), and
+# undoing it puts 2048 x 2048 back.
+press page:Crop / resize by dragging
+expect crop true
+drag 1570 747 1270 747
+expect crop true
+press page:Apply
+expect crop false
+expect undo 1
+expect dirty true
+shot page-cropped
+key ctrl+z
+expect page-size 2048	2048
+expect undo 0
+expect redo 1
+
+# Trim with nothing outside the page discards nothing and records nothing. `trim_to_page` returns
+# early on an empty list, so a run that asserted only "the button was pressed" would pass here
+# whether or not trimming worked at all.
+press page:Trim to canvas
+expect status Nothing outside the page to trim
+expect undo 0
+
+# So give it something to throw away: a stroke down the right of the page, then a crop that leaves
+# that stroke outside the new page, then the trim that discards its tiles -- undoably, which is the
+# third op on the stack.
+drag 1450 400 1450 1100
+expect undo 1
+expect dirty true
+press page:Crop / resize by dragging
+expect crop true
+drag 1570 747 1270 747
+press page:Apply
+expect crop false
+expect undo 2
+press page:Trim to canvas
+expect undo 3
+shot page-trimmed
+key ctrl+z
+expect undo 2
+expect redo 1
+
+# **The Extend by slider, and why it is proved this way.** The amount is a panel setting held in
+# `Ui::extend_amount`; `report_state` does not carry it, and a log slider dragged by a pointer
+# lands where the pointer lands, so the number itself can be neither read back nor predicted to the
+# pixel. What *can* be asserted exactly is where the four buttons stop. Dragged to its far end the
+# slider is worth something close to its 4096 maximum, so twenty presses of Extend down run the
+# page into `MAX_PAGE_DIMENSION` and it clamps at 65536 -- which twenty presses of the 512 the
+# buttons used above could never reach (they would come to 12288). Reaching the clamp is therefore
+# the proof that the slider moved the amount, and it exercises the clamp itself, which nothing else
+# here does.
+key ctrl+z
+expect undo 1
+key ctrl+z
+expect undo 0
+expect page-size 2048	2048
+slide page:0 1
+press page:Extend down
+expect undo 1
+expect dirty true
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+press page:Extend down
+expect page-size 2048	65536
+shot page-extend-by
+
+# And once it is there, an extend that cannot grow the page is refused out loud rather than
+# recorded as a resize to the size it already is.
+press page:Extend down
+expect page-size 2048	65536
+expect status Page is already 2048x65536

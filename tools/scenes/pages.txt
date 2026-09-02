@@ -1,0 +1,136 @@
+# Every control in the Pages panel, and what each is supposed to move.
+#
+# The evidence for a page command is `layer-names`, not `pages`. A count only says how many pages
+# there are; a stack of layers says *which* page is being drawn on, because every page carries its
+# own. So page 1 is given a second layer before anything else happens, and from then on
+# "Layer 1, Layer 2" means one particular page and "Layer 1" means the other -- which is what makes
+# a reorder assertable at all. A run that only counted pages would call a Move that did nothing a
+# pass.
+expect pages 1
+expect page 0
+expect layers 1
+expect layer-names Layer 1
+expect undo 0
+expect dirty false
+
+# The second layer that tells the two pages apart. Adding a layer is not recorded in history, so
+# the undo stack is still empty when the page commands below are asked about it.
+press Layers:Add
+expect layers 2
+expect layer-names Layer 1, Layer 2
+expect undo 0
+
+# Add page puts an empty page of the same size *after* the active one and makes it active, so the
+# stack the panel reports is the new page's one layer rather than page 1's two.
+tab Pages
+press pages:Add page
+expect pages 2
+expect page 1
+expect status Added page 2
+expect layers 1
+expect layer-names Layer 1
+expect dirty true
+shot pages-added
+
+# **Adding a page is not undoable, and the code says so by never recording it.** `apply_page_action`
+# marks the document dirty and calls `add_page_like_active`; nothing is pushed onto history. So the
+# undo depth is still zero, and Ctrl+Z here has nothing to take back -- the page stays. Asserted
+# because it is a real edit with no way back, not because it is what one would want.
+expect undo 0
+key ctrl+z
+expect pages 2
+expect page 1
+expect layers 1
+expect undo 0
+
+# A row selects the page it names, and the whole layer stack follows the page.
+press pages:Page 1
+expect page 0
+expect layers 2
+expect layer-names Layer 1, Layer 2
+press pages:Page 2
+expect page 1
+expect layers 1
+expect layer-names Layer 1
+shot pages-selected
+
+# Reorder. Up moves the *active* page one place earlier and the active index follows it, so the
+# proof that the order changed is what the other row now holds: page 2 is the two-layer page.
+press pages:Up
+expect page 0
+expect layers 1
+expect layer-names Layer 1
+press pages:Page 2
+expect page 1
+expect layer-names Layer 1, Layer 2
+shot pages-reordered
+
+# **Down on the last page is refused, not hidden.** The button is drawn in every case so the three
+# commands keep their places whatever page is active; `picked` answers None and says why on stderr.
+# Nothing may move.
+press pages:Down
+expect pages 2
+expect page 1
+expect layer-names Layer 1, Layer 2
+
+# Back up, which puts the two-layer page first again.
+press pages:Up
+expect page 0
+expect layer-names Layer 1, Layer 2
+
+# And Up on the first page is refused the same way: there is nothing above it to move above.
+press pages:Up
+expect pages 2
+expect page 0
+expect layer-names Layer 1, Layer 2
+
+# Down moves it back, and the active index follows it down, so again the other row is the witness.
+press pages:Down
+expect page 1
+expect layer-names Layer 1, Layer 2
+press pages:Page 1
+expect page 0
+expect layers 1
+expect layer-names Layer 1
+
+# Delete takes the active page away, and unlike Add that one IS recorded: `delete_page` adopts the
+# page's tiles first and pushes an op, which is the undo depth rising. The page left behind is the
+# two-layer one, so the list did not merely shorten -- the right page went.
+press pages:Delete
+expect pages 1
+expect page 0
+expect layers 2
+expect layer-names Layer 1, Layer 2
+expect undo 1
+expect status Deleted page 1 (Ctrl+Z to bring it back)
+shot pages-deleted
+
+# **Delete on the only page is refused**: a document needs somewhere to draw. Nothing changes, and
+# the status message is still the one the previous delete left, which is the plainest evidence that
+# this press did nothing at all.
+press pages:Delete
+expect pages 1
+expect page 0
+expect layers 2
+expect undo 1
+expect status Deleted page 1 (Ctrl+Z to bring it back)
+
+# And the deletion comes back. `restore_page` puts it at the index it came from and makes it
+# active, so the one-layer page is in front again.
+key ctrl+z
+expect pages 2
+expect page 0
+expect layers 1
+expect layer-names Layer 1
+expect undo 0
+expect redo 1
+shot pages-restored
+
+# Redo takes it away again, by the same recorded op.
+key ctrl+y
+expect pages 1
+expect page 0
+expect layers 2
+expect layer-names Layer 1, Layer 2
+expect undo 1
+expect redo 0

@@ -61,3 +61,32 @@ expect response.size Pressure	3
 shot brush-curve
 rpress brush:1049088
 expect response.size Pressure	2
+
+# Naming and saving a brush. The letters of a name are letters, not shortcuts: typing "beeper"
+# here used to select the eraser, step the size twice and refit the view, because every
+# unmodified key was read as a tool key as well.
+tab Brush
+expect presets 
+expect tool Brush
+press brush:1048585
+type beeper
+expect tool Brush
+expect brush.size 8.000
+key enter
+slide brush:1048577 0.6
+press Save brush
+expect presets beeper
+shot brush-saved
+
+# A saved brush comes back when its row is pressed, whatever the sliders have been moved to since.
+slide brush:1048577 0.2
+press Reset to defaults
+expect brush.size 8.000
+press brush:0
+about brush.size 30 25
+shot brush-applied
+
+# And Forget takes it away again.
+press Forget beeper
+expect presets 
+shot brush-forgotten

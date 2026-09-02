@@ -1,0 +1,197 @@
+# The whole selection story: the four tools, a selection made by dragging on the canvas, the
+# wand's three settings, the two commands that need a live selection, and the Select menu.
+#
+# **Where the canvas points come from.** In a 2200x1450 window the canvas viewport is about
+# x 330..1450 by y 130..1250 -- a square of roughly 1120 -- and `View::fit` takes the smaller of
+# viewport/page and keeps 6% as margin, so a 2048-square page rests at about 1120/2048 * 0.94 =
+# 0.51. That is asserted below rather than assumed. At that scale the page covers 890+-526 by
+# 690+-526, which is x 364..1416 by y 164..1216, so every point this scene touches -- nothing
+# outside 660..1120 by 460..920 -- is well inside the page and well clear of the tool rail on the
+# left and the panel column on the right.
+expect tool Brush
+expect select-tool -
+expect selection false
+expect undo 0
+expect redo 0
+expect dirty false
+expect layers 1
+expect page-size 2048	2048
+about zoom 0.51 0.04
+
+tab Select
+
+# The four tools. The panel and the rail read one field, so `select-tool` is the evidence for both.
+# Named `Select:...` throughout because the rail offers the same four words and the harness refuses
+# a name that fits two controls -- which is the whole point of it.
+#
+# **The asymmetry, asserted as it is rather than as it ought to be.** `SelectAction::Use` treats a
+# second press on the tool already up as "put it away" for the Lasso and the Rect only; for the
+# Wand and the Move it falls through and rebuilds the tool, so the tool stays up. Two of the four
+# toggle and two do not, and nothing in the panel says which. Written down here so the behaviour is
+# visible to whoever decides whether it is a bug.
+press Select:Lasso
+expect select-tool lasso
+expect tool Brush
+press Select:Lasso
+expect select-tool -
+press Select:Rect
+expect select-tool rect
+press Select:Rect
+expect select-tool -
+press Select:Wand
+expect select-tool wand
+press Select:Wand
+expect select-tool wand
+press Select:Move
+expect select-tool move
+press Select:Move
+expect select-tool move
+shot select-tools
+
+# A real selection, made the way an artist makes one: a rectangle dragged across the canvas.
+# A straight drag is a shape for the Rect and not for the Lasso -- see the lasso block below.
+press Select:Rect
+expect select-tool rect
+drag 660 460 1120 920
+expect selection true
+expect status Selected
+expect undo 0
+shot select-rect
+
+# Fill and Clear exist only while there is something to act on: with no selection the panel says
+# "Fill and Clear need a selection." instead, so the selection above had to come first. Both change
+# pixels, so both are answerable in the undo depth.
+press Select:Fill with brush colour
+expect selection true
+expect status Filled the selection
+expect undo 1
+expect dirty true
+shot select-filled
+press Select:Clear
+expect selection true
+expect status Cleared the selection
+expect undo 2
+shot select-cleared
+key ctrl+z
+expect undo 1
+expect redo 1
+
+# The Select menu: All, Invert and Deselect. Driven from the menu rather than from a panel because
+# that is the only place they live. Clear is in this menu too and is deliberately left alone: while
+# the drop-down is open its Clear and the Select panel's Clear are two controls with one name, and
+# the harness is right to refuse that.
+#
+# Inverting everything leaves nothing, and `set_selection` is given `None` rather than an empty
+# mask -- so a full selection inverted reads as no selection at all. Inverting *that* selects
+# everything again, which is what the code does when there is nothing to invert.
+press Menu:Select
+shot select-menu
+press All
+expect selection true
+expect status Selected all
+press Menu:Select
+press Invert
+expect selection false
+expect status Inverted the selection
+press Menu:Select
+press Invert
+expect selection true
+expect status Inverted the selection
+press Menu:Select
+press Deselect
+expect selection false
+expect status Deselected
+shot select-deselected
+
+# The wand, and its three settings -- which the panel offers only while the wand is the tool up,
+# so the wand has to be chosen before they can be touched at all.
+#
+# Something to aim at first: the filled rectangle from the block above is still on the layer, so a
+# rectangle over it gives the wand a region with an edge in it.
+press Select:Rect
+drag 700 500 1080 880
+expect selection true
+expect status Selected
+press Select:Wand
+expect select-tool wand
+
+# Dragging a slider inside a panel must not reach the canvas. It once did: a release that began on
+# a control still counted as a tap, and a tap deselects -- so setting a tolerance threw away the
+# selection it was for. `selection true` after each drag is that bug's assertion.
+#
+# The two numbers themselves have no key in `report_state`, so what is proved here is that they are
+# reachable, that they belong to the wand, and that the wand still works after them -- not that the
+# knob landed on 32. That gap is worth closing in `report_state`, not here.
+slide Select:Tolerance 0.25
+expect selection true
+expect select-tool wand
+slide Select:Expand 0.5
+expect selection true
+expect select-tool wand
+shot select-wand-settings
+
+# With Fill off a wand click leaves a selection.
+click 890 690
+expect selection true
+expect status Selected
+expect undo 1
+shot select-wand-picked
+
+# With Fill on it is a bucket instead: the region is filled with the brush colour, undoably, and
+# the mask the artist had is put back rather than replaced -- so `selection` is still true
+# afterwards and the status names the fill, not a selection.
+press Select:Fill on click (bucket)
+expect selection true
+click 890 690
+expect status Filled the region
+expect undo 2
+expect selection true
+expect dirty true
+shot select-wand-bucket
+press Select:Fill on click (bucket)
+expect selection true
+
+# The lasso, and the one thing the harness cannot do to it. `drag` walks a straight line, and a
+# straight line is a polygon of no area, so `Selection::from_polygon` answers empty and the release
+# reads as a tap -- which deselects. That is the code behaving correctly on a degenerate gesture,
+# and it is asserted as such; a lasso that actually encloses something needs a path with a corner
+# in it, which the step vocabulary has no way to send.
+press Select:Lasso
+expect select-tool lasso
+expect selection true
+drag 700 500 1000 800
+expect selection false
+expect status Deselected
+shot select-lasso-line
+
+# The move tool. It needs a selection with pixels under it, so the rectangle is made again over the
+# filled area; the drag lifts them, floats them and puts them down on release as one undo step.
+press Select:Rect
+drag 700 500 1080 880
+expect selection true
+press Select:Move
+expect select-tool move
+expect selection true
+drag 850 650 950 750
+expect selection true
+expect status Applied the transform
+expect undo 3
+expect dirty true
+shot select-moved
+
+# And undoing a move brings the outline back with the pixels, not just the pixels.
+key ctrl+z
+expect undo 2
+expect redo 1
+expect selection true
+expect status Moved the selection back
+shot select-move-undone
+
+# Putting a paint tool up stows the selection *tool* and keeps the selection *mask* -- two
+# different things that a single "deselect" would confuse.
+press Tools:Brush
+expect tool Brush
+expect select-tool -
+expect selection true
+expect page-size 2048	2048
+shot select-stowed

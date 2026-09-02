@@ -1,0 +1,252 @@
+# The transform story. The panel is one of three shapes and the document alone decides which, so
+# this scene is mostly about creating state: with no selection it offers a sentence and a filter,
+# with a selection it offers one button, and only with a transform in the air does it offer the
+# sliders, the lock, the flips and the two commands that end it. A scene that never lifts anything
+# never sees eleven of its controls.
+#
+# **Where the canvas points come from.** In a 2200x1450 window the canvas viewport is about
+# x 330..1450 by y 130..1250 -- a square of roughly 1120 -- and `View::fit` takes the smaller of
+# viewport/page and keeps 6% as margin, so a 2048-square page rests at about 1120/2048 * 0.94 =
+# 0.51, which is asserted below rather than assumed. At that scale the page covers 890+-526 by
+# 690+-526, that is x 364..1416 by y 164..1216. Everything here happens inside 660..1120 by
+# 460..920, well within the page and clear of the rail and the panel column.
+#
+# **And the handle box is that rectangle.** `begin_transform` builds the box from the selection
+# mask's `content_bounds`, so a rectangle dragged from (660,460) to (1120,920) puts its corner
+# handles at exactly those screen points, to within the pixel the page round-trip costs. That is
+# how the corner drag below knows where to grab, and `GRAB_PX` gives it ten screen pixels of slack.
+expect tool Brush
+expect select-tool -
+expect selection false
+expect dragging false
+expect undo 0
+expect redo 0
+expect dirty false
+expect page-size 2048	2048
+about zoom 0.51 0.04
+
+tab Transform
+shot transform-empty
+
+# Shape three: nothing selected. The only interactive control is the resampling filter, which is
+# offered whether or not there is anything to transform because it is the filter the *next* one
+# will use. Choosing one with nothing in flight hangs it on the identity, and that guard is worth
+# driving: it must not conjure a transform nobody started, must not touch the document, and must
+# not make an undo step. There is no `kernel` key in `report_state`, so the picture is the evidence
+# that the pick's value text changed, and these four lines are the evidence that nothing else did.
+press Resampling
+shot transform-kernels
+press Fast (bilinear)
+expect dragging false
+expect selection false
+expect undo 0
+expect dirty false
+
+# Something to transform. Pixels first: lifting reads the layer through the mask, and a mask over
+# blank canvas lifts nothing at all -- `begin_transform` answers "Nothing to transform: the
+# selection is empty" and the panel never changes shape. So a stroke, then a rectangle around it.
+drag 700 500 1080 880
+expect undo 1
+expect dirty true
+shot transform-stroke
+
+press Tools:Rect
+expect select-tool rect
+drag 660 460 1120 920
+expect selection true
+expect status Selected
+expect undo 1
+
+# The tool goes away and the mask stays, so every drag from here on belongs to the transform and
+# not to a rectangle still armed underneath it.
+press Tools:Brush
+expect select-tool -
+expect selection true
+shot transform-ready
+
+# Shape two: a selection and no transform, which is the only state in which "Transform selection"
+# exists. Beginning lifts the pixels and holds them in the air; nothing is recorded yet, because
+# nothing has landed.
+press Transform selection
+expect dragging true
+expect selection true
+expect undo 1
+expect status Transforming. Drag inside to move, a handle to scale, just outside to rotate. Enter applies, Esc cancels.
+shot transform-in-flight
+
+# Cancel puts them back and records nothing: the layer has been untouched since the lift, so an
+# abandoned transform is not an edit to undo but an edit that never happened.
+press Transform:Cancel
+expect dragging false
+expect selection true
+expect undo 1
+expect redo 0
+expect status Transform cancelled
+shot transform-cancelled
+
+# From here every block is the same shape: begin, move one control, apply, undo. Undoing an
+# `Op::Move` brings the outline back with the pixels, so each block starts from the same document
+# and the same handle box as the last -- which is what lets one set of coordinates serve them all.
+#
+# **What Apply's status proves.** `commit_transform` only announces "Applied the transform" when
+# the transform is not the identity; an untouched one lands silently. So that one line is the
+# assertion that the control under test actually moved the transform, and it is the only one
+# available: scale, rotation, lock and kernel have no key in `report_state`. The pictures carry
+# the rest.
+
+# Scale X. The track is logarithmic with 100% dead centre, so 0.60 is about 160%.
+press Transform selection
+expect dragging true
+slide Transform:Scale X 0.60
+expect dragging true
+shot transform-scaled-x
+press Transform:Apply
+expect dragging false
+expect status Applied the transform
+expect selection true
+expect undo 2
+expect dirty true
+key ctrl+z
+expect undo 1
+expect redo 1
+expect selection true
+expect status Moved the selection back
+
+# Lock, then Scale Y. Turning the lock on snaps Y to X there and then rather than at the next drag,
+# and afterwards one slider moves both. Neither is in the state dump, so the toggle is asserted by
+# what it must not do -- end the transform -- and shown by the picture beside it.
+press Transform selection
+expect dragging true
+press Transform:Lock
+expect dragging true
+shot transform-locked
+slide Transform:Scale Y 0.45
+expect dragging true
+shot transform-scaled-y
+press Transform:Apply
+expect dragging false
+expect status Applied the transform
+expect undo 2
+key ctrl+z
+expect undo 1
+expect selection true
+expect status Moved the selection back
+
+# Rotation. Degrees in the panel, radians in the document; 0.60 of -180..180 is about 36 degrees.
+press Transform selection
+expect dragging true
+slide Transform:Rotation 0.60
+expect dragging true
+shot transform-rotated
+press Transform:Apply
+expect dragging false
+expect status Applied the transform
+expect undo 2
+key ctrl+z
+expect undo 1
+expect selection true
+expect status Moved the selection back
+
+# The two flips, one per block, so each one's status is its own evidence. A flip is a negative
+# scale, so it leaves the Scale sliders where they are -- they carry magnitude -- and the only way
+# to tell from the state that it did anything is that the transform is no longer the identity.
+press Transform selection
+press Transform:Flip horizontally
+expect dragging true
+shot transform-flipped-h
+press Transform:Apply
+expect status Applied the transform
+expect undo 2
+key ctrl+z
+expect undo 1
+expect selection true
+
+press Transform selection
+press Transform:Flip vertically
+expect dragging true
+shot transform-flipped-v
+press Transform:Apply
+expect status Applied the transform
+expect undo 2
+key ctrl+z
+expect undo 1
+expect selection true
+
+# The canvas is the instrument. A press inside the box grabs its interior and drags the floating
+# pixels; a press on a corner grabs that handle and scales. Both go through `apply_grab`, and both
+# are proved the same way: if the grab missed, the transform is still the identity and Apply lands
+# without a word.
+press Transform selection
+expect dragging true
+drag 890 690 990 790
+expect dragging true
+shot transform-moved
+press Transform:Apply
+expect status Applied the transform
+expect undo 2
+key ctrl+z
+expect undo 1
+expect selection true
+expect status Moved the selection back
+
+# The bottom-right corner of the handle box, which the note at the top of this file works out is at
+# (1120,920) -- the corner of the rectangle that was dragged to make the selection.
+press Transform selection
+expect dragging true
+drag 1120 920 1230 1030
+expect dragging true
+shot transform-handle
+press Transform:Apply
+expect status Applied the transform
+expect undo 2
+key ctrl+z
+expect undo 1
+expect selection true
+expect status Moved the selection back
+
+# The resampling filter again, this time with a transform in the air, where it also redraws the
+# floating pixels. Choosing it must not end the transform, and the transform must still apply.
+press Transform selection
+expect dragging true
+press Resampling
+shot transform-kernels-live
+press Sharp (Catmull-Rom)
+expect dragging true
+expect selection true
+slide Transform:Scale X 0.58
+press Transform:Apply
+expect status Applied the transform
+expect undo 2
+key ctrl+z
+expect undo 1
+expect selection true
+
+# Esc puts it back and Enter applies it, the two keys the panel's own first line promises. They are
+# claimed only while a transform is in the air, which is why they are driven last: everything above
+# has already proved the state they depend on.
+press Transform selection
+expect dragging true
+key escape
+expect dragging false
+expect status Transform cancelled
+expect undo 1
+expect redo 1
+
+press Transform selection
+expect dragging true
+drag 890 690 960 760
+key enter
+expect dragging false
+expect status Applied the transform
+expect undo 2
+expect dirty true
+shot transform-entered
+key ctrl+z
+expect undo 1
+expect selection true
+expect status Moved the selection back
+
+# A transform moves pixels inside the page; it never resizes it.
+expect page-size 2048	2048
+expect layers 1
+shot transform-done

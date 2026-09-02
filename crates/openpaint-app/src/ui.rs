@@ -1039,6 +1039,18 @@ impl Ui {
         self.canvas_viewport
     }
 
+    /// Whether a text field somewhere has the caret.
+    ///
+    /// **Because a key a field is taking is not a shortcut.** Naming a brush "beeper" selected the
+    /// eraser, resized the brush twice and refitted the view, because every letter typed into the
+    /// box was also read as a tool key as well. Every text editor in the world answers this
+    /// question the same way, and the shell has to be able to ask it: the field lives in the panel
+    /// layer and the shortcuts live in the shell, so one of them must know about the other.
+    #[must_use]
+    pub fn typing(&self) -> bool {
+        self.panel_input.values().any(|i| i.editing.is_some())
+    }
+
     /// Whether a point in physical window pixels lies over the old side panel.
     ///
     /// Used to keep pen strokes from painting underneath the UI. egui's own pointer handling

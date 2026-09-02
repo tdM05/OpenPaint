@@ -3303,7 +3303,10 @@ impl OpenPaint {
                         self.request_redraw();
                         true
                     }
-                    Key::Named(NamedKey::Space) => {
+                    // A space in a name is a space in a name, not a pan.
+                    Key::Named(NamedKey::Space)
+                        if !self.ui.as_ref().is_some_and(ui::Ui::typing) =>
+                    {
                         self.nav.space_held = pressed;
                         if !pressed {
                             self.nav.panning_from = None;
@@ -3315,7 +3318,19 @@ impl OpenPaint {
                     // The way back from any arrangement at all, including one with no menu bar
                     // left to reach a command from.
                     //
-                    Key::Character(c) if pressed && !self.nav.modifiers.control_key() => {
+                    // **Not while a text field has the caret.** These are the unmodified keys, so
+                    // they are the letters a name is made of: typing "beeper" into the brush's
+                    // name box picked the eraser, stepped the size twice and refitted the view.
+                    // A key a field is taking is not a shortcut, and the field is the only thing
+                    // that knows it has the caret -- so the shell asks (`Ui::typing`) rather than
+                    // guessing from where the last press landed. The Ctrl chords above are
+                    // deliberately not gated: Ctrl+S saves while you are naming a brush, as it
+                    // does in every application that has both.
+                    Key::Character(c)
+                        if pressed
+                            && !self.nav.modifiers.control_key()
+                            && !self.ui.as_ref().is_some_and(ui::Ui::typing) =>
+                    {
                         match c.as_str() {
                             "0" => {
                                 self.view.request_fit();
@@ -3451,6 +3466,34 @@ impl OpenPaint {
             }
         );
         let _ = writeln!(o, "palette\t{}", doc.palette().len());
+        let _ = writeln!(
+            o,
+            "presets\t{}",
+            self.brushes
+                .presets()
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        // The magic wand's settings, which are the shell's rather than the document's -- and were
+        // the only panel controls a scenario could reach but not check.
+        let _ = writeln!(o, "wand.tolerance\t{}", self.wand.tolerance);
+        let _ = writeln!(o, "wand.expand\t{}", self.wand.expand);
+        let _ = writeln!(o, "wand.fill\t{}", self.wand.fill_on_click);
+        let _ = writeln!(o, "kernel\t{:?}", self.kernel);
+        // A transform in the air: how the lifted pixels are currently placed. Nothing else can say
+        // whether the panel's scale and rotation reached the pixels, because the pixels are the
+        // only place the answer lives until it is committed.
+        if let Some(d) = self.dragging.as_ref() {
+            let t = &d.transform;
+            let _ = writeln!(o, "transform.scale\t{:.4}\t{:.4}", t.scale.0, t.scale.1);
+            let _ = writeln!(o, "transform.rotation\t{:.4}", t.rotation);
+            let _ = writeln!(o, "transform.offset\t{:.1}\t{:.1}", t.offset.0, t.offset.1);
+            let _ = writeln!(o, "transform.lock\t{}", d.lock_aspect);
+            let _ = writeln!(o, "transform.kernel\t{:?}", d.kernel);
+            let _ = writeln!(o, "transform.persistent\t{}", d.persistent);
+        }
         let _ = writeln!(o, "selection\t{}", self.selection.is_some());
         let _ = writeln!(
             o,
@@ -3941,7 +3984,13 @@ impl OpenPaint {
 
         // Delete clears the selection, the binding every art app uses. Handled before the crop
         // tool's own keys because a selection and a crop cannot both be up.
-        if self.selection.is_some() && self.crop.is_none() {
+        // And not while a text field has the caret: Backspace in a name is a backspace, and a
+        // Delete that quietly erased the selected pixels of the drawing instead would be the worst
+        // of the lot. Same rule as the tool keys below; see `Ui::typing`.
+        if self.selection.is_some()
+            && self.crop.is_none()
+            && !self.ui.as_ref().is_some_and(ui::Ui::typing)
+        {
             if let WindowEvent::KeyboardInput { event: key, .. } = &event {
                 use winit::event::ElementState;
                 use winit::keyboard::{Key, NamedKey};

@@ -1,0 +1,178 @@
+# The Text panel's caption editor, and the two doors either side of it.
+#
+# Fourteen of this panel's controls exist only while the active layer is a text layer -- the
+# editor and the "not a text layer" label are mutually exclusive -- so nothing here can be
+# pressed until "Add text layer" has made one. That button is the whole scene's precondition.
+#
+# What the state dump can see of a caption is `text`, and the layer name that follows it, and
+# `active.kind`. It cannot see a size, a weight or a colour. So everything else is proved
+# through the undo stack: an edit the panel accepted is one entry, an edit it refused is none.
+# Text edits within 700 ms of each other coalesce into one entry (History::TEXT_COALESCE_MS),
+# which is why every edit below is preceded by `wait 900` -- that is what makes each one its own
+# step, and the count below it a statement about that control and no other.
+tab Text
+expect layers 1
+expect active.kind raster
+expect undo 0
+expect dirty false
+
+# A text layer keeps the words rather than the pixels. It is named after its own caption, and
+# with no caption yet that name is "Text".
+press Add text layer
+expect layers 2
+expect active.kind text
+expect active.name Text
+expect dirty true
+expect undo 0
+shot text-added
+
+# The caption. A press puts the caret in the field with the value selected, Enter gives the
+# words up -- one write for the whole edit, not one per keystroke -- and the layer renames
+# itself to match. No `b`, `e`, `0`, `1`, `[` or `]` in the words on purpose: those keys also
+# reach the tool and view shortcuts while a field is being typed into.
+wait 900
+press text:Caption
+type A caption
+key enter
+expect text A caption
+expect active.name A caption
+expect undo 1
+shot text-typed
+
+# The font picker. Pressing it opens the list of installed families with "(default)" at its
+# head; a step that named something not on screen would stop the run, so reaching "(default)"
+# is the proof that the list opened. Choosing the entry the block already has is not an edit,
+# and the undo stack is where that shows: no new step.
+wait 900
+press text:Font
+shot text-font-list
+press (default)
+expect text A caption
+expect active.kind text
+expect undo 1
+
+# Bold and Italic. Each is one press, one accepted edit, one step.
+wait 900
+press text:Bold
+expect undo 2
+wait 900
+press text:Italic
+expect undo 3
+shot text-weight
+
+# The three metric sliders. A drag lands wherever the track puts it, and all of one drag's
+# samples fall inside the coalescing window, so each slider is one step and not twelve.
+wait 900
+slide text:Size 0.75
+expect undo 4
+wait 900
+slide text:Line height 0.8
+expect undo 5
+wait 900
+slide text:Letter spacing 0.6
+expect undo 6
+expect text A caption
+shot text-metrics
+
+# Alignment. Start/Center/End rather than Left/Right, so they stay true for a right-to-left
+# script. The block starts at Start, so Center is a change and a second Center is not -- which
+# is the editor's own rule that a value set to what it already was costs no undo step.
+wait 900
+press text:Center
+expect undo 7
+wait 900
+press text:Center
+expect undo 7
+wait 900
+press text:Start
+expect undo 8
+shot text-align
+
+# Colour, as three or six hex digits. A good one is an edit; anything else is refused, the
+# block keeps the colour it had, and the field springs back on the next frame. The refusal is
+# the interesting half, and an undo stack that did not move is what proves it was a refusal
+# rather than an edit to something invisible.
+wait 900
+press text:Colour
+type #3A7F5C
+key enter
+expect undo 9
+wait 900
+press text:Colour
+type zzz
+key enter
+expect undo 9
+expect text A caption
+expect active.kind text
+shot text-colour
+
+# Wrap, and the Width slider that only exists while it is on. Before this the list has no
+# Width at all; pressing Wrap is what puts it there, and sliding it is what proves it arrived.
+# Turning Wrap off again forgets the width -- a third edit, and only undo brings it back.
+wait 900
+press text:Wrap
+expect undo 10
+wait 900
+slide text:Width 0.25
+expect undo 11
+shot text-wrapped
+wait 900
+press text:Wrap
+expect undo 12
+
+# Position. Typed, not dragged: a caption can sit anywhere on a page of any size, so there is
+# no range to give a slider. A number is an edit; anything that is not a number is refused the
+# same way a bad colour is.
+wait 900
+press text:X
+type 543
+key enter
+expect undo 13
+wait 900
+press text:Y
+type 377
+key enter
+expect undo 14
+wait 900
+press text:X
+type xyz
+key enter
+expect undo 14
+shot text-placed
+
+# Retyping the caption. The field arrives selected, so the first keystroke replaces the lot --
+# and the layer's name follows the new words, not the old ones.
+wait 900
+press text:Caption
+type Not that caption
+key enter
+expect text Not that caption
+expect active.name Not that caption
+expect undo 15
+
+# Convert to raster: the pixels stay and the words stop existing. One way, and undo is the only
+# way back -- which is exactly what the line under the button says, so it is what is checked.
+wait 900
+press Convert to raster layer
+expect active.kind raster
+expect layers 2
+expect undo 16
+shot text-raster
+key ctrl+z
+expect active.kind text
+expect text Not that caption
+expect undo 15
+expect redo 1
+shot text-undone
+
+# Load font file, last of all, because it hands the machine a native file dialog that this
+# harness cannot answer. It is driven only as far as "the request was made" and then dismissed
+# with Escape: the dialog runs on its own thread and nothing in the application reads Escape
+# while it is up, so the key reaches the dialog and cancels it. Pressed by id because the
+# button's label ends in a U+2026 ellipsis, and a scene file has no business carrying one.
+press text:514
+expect dialog true
+key escape
+expect dialog false
+expect active.kind text
+shot text-font-dialog
