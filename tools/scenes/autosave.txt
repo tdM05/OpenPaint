@@ -21,7 +21,7 @@ shot autosave-dirty
 # depends on where the stroke fell, so what is asserted is that something was written at all --
 # "none yet" would mean the timer never fired or the guard never let it.
 wait 66000
-expect autosave 1 tiles in 1 ms
+expect autosave written
 shot autosave-written
 
 # --- Closing the window with unsaved work ---

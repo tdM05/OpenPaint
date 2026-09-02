@@ -119,6 +119,15 @@ const MAX_BRUSH_RADIUS: f32 = 512.0;
 /// with real latency numbers in step 6.
 const POLL_INTERVAL: Duration = Duration::from_millis(4);
 
+/// The soonest the loop will wake itself while there is nothing to draw.
+///
+/// Only ever a floor under the autosave deadline, which is a minute away in every ordinary case.
+/// It exists for the one path that can leave that deadline in the past -- a write refused before
+/// the interval is pushed forward -- so that the worst outcome is a second of waiting rather than
+/// a loop spinning as fast as the scheduler allows. `POLL_INTERVAL` is four milliseconds and is
+/// what a stroke needs; nothing idle should ask for that.
+const IDLE_FLOOR: Duration = Duration::from_secs(1);
+
 /// The application shell: it owns the pieces and wires them together, and holds
 /// no engine logic of its own.
 ///
@@ -3651,7 +3660,10 @@ impl OpenPaint {
                         "unavailable".to_owned()
                     }
                 },
-                |(_, took, tiles)| format!("{tiles} tiles in {} ms", took.as_millis().max(1)),
+                // Coarse on purpose: whether a copy exists is the fact a test can state, and how
+                // many tiles it held depends on where the stroke fell. The panel shows the detail
+                // for a person; this is the part that can be asserted without guessing.
+                |_| "written".to_owned(),
             )
         );
         let _ = writeln!(
@@ -4377,6 +4389,24 @@ impl ApplicationHandler for OpenPaint {
         if !converging && !awaiting_dialog && !self.input.wants_continuous_poll() {
             // Event-driven backends (mouse) with nothing in flight stay idle until a real window
             // event, keeping the app at 0% CPU when nothing is happening.
+            //
+            // **Except that the autosave has to happen anyway.** `maybe_autosave` is called just
+            // above and then this returned without arranging to be woken again, so with nothing
+            // in flight the loop slept until somebody touched something -- and a recovery copy was
+            // written only while the artist was already at the machine. The hour they walk away
+            // with unsaved work is the hour it is for. So: sleep until it falls due rather than
+            // sleeping until an event.
+            //
+            // A deadline, not a redraw. Requesting one here would leave a `WM_PAINT` permanently
+            // pending, which is what a nested pump dispatches back into us -- the hazard this
+            // whole file is arranged around.
+            if self.dirty && self.autosave.available() {
+                // Never sooner than the ordinary poll: a deadline already in the past would spin
+                // the loop at whatever rate the scheduler allows, and there is one path that can
+                // leave it there -- a write refused before `record` or `postpone` is reached.
+                let due = self.autosave.due_at().max(Instant::now() + IDLE_FLOOR);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+            }
             return;
         }
 

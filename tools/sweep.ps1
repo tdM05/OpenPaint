@@ -37,6 +37,28 @@ if (-not (Test-Path $exe)) {
 Get-ChildItem -Path $root -Filter 'openpaint-*.png' -File -ErrorAction SilentlyContinue |
     Remove-Item -Force -ErrorAction SilentlyContinue
 
+# The bitmap-tip scenario loads a PNG through the application's own file dialog, so one has to
+# exist at a known path. Drawn here rather than kept in the repository: it is a fixture of the
+# suite, not an asset of the application, and a few lines of arithmetic are clearer than a blob.
+$tip = Join-Path $root 'target\drive	ip.png'
+if (-not (Test-Path $tip)) {
+    Add-Type -AssemblyName System.Drawing
+    $n = 96
+    $bmp = New-Object System.Drawing.Bitmap $n, $n
+    for ($y = 0; $y -lt $n; $y++) {
+        for ($x = 0; $x -lt $n; $x++) {
+            $dx = ($x - $n / 2) / ($n / 2)
+            $dy = ($y - $n / 2) / ($n / 2) * 2.2
+            $r = [Math]::Sqrt($dx * $dx + $dy * $dy)
+            $a = [Math]::Max(0.0, 1.0 - $r)
+            $v = [int](255 * [Math]::Pow($a, 0.7))
+            $bmp.SetPixel($x, $y, [System.Drawing.Color]::FromArgb($v, 0, 0, 0))
+        }
+    }
+    $bmp.Save($tip, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+}
+
 $results = @()
 foreach ($scene in $scenes) {
     $name = $scene.BaseName

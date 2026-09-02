@@ -1,0 +1,34 @@
+# Loading a bitmap brush tip, which is a whole branch of the brush panel nothing had ever entered.
+#
+# With a stamp loaded the panel says what it loaded, offers a way back to a round tip, and takes
+# away the edge-profile curve -- because a bitmap carries its own edge and a profile over it would
+# be a control that does nothing. All of that had never been on screen in a driven run: the tip
+# arrives through a native file dialog, and until the harness learned to type a path into one there
+# was no way in.
+#
+# The image is written by the sweep before it runs, so the path is known.
+tab Brush
+expect brush-tip round
+press brush:1048590
+absent Back to a round tip
+
+# The dialog is native and runs on its own thread; it needs a good while to appear and take the
+# keyboard, and a path typed before it has goes into the application instead.
+press Load brush tip
+wait 3000
+expect dialog true
+type C:\Users\taddm\code\OpenPaint\target\drive\tip.png
+wait 1000
+key enter
+wait 2500
+expect dialog false
+expect brush-tip bitmap
+shot tip-loaded
+
+# The edge profile is gone, and the way back is offered in its place.
+absent brush:1048590
+press Back to a round tip
+expect brush-tip round
+press brush:1048590
+absent Back to a round tip
+shot tip-round-again

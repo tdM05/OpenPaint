@@ -23,9 +23,17 @@ Everything lands in `target/drive/`: `name.png` (the client area), `name.log` (s
 ## Steps
 
 Positional, in client-area pixels:
-`move X Y`, `click X Y`, `right X Y`, `drag X1 Y1 X2 Y2`, `wheel X Y N`, `key NAME`, `type TEXT`,
-`wait MS`, and `pressat NAME DX DY` / `rpressat NAME DX DY` for a press at an offset inside one
-control — the palette is a grid of chips in a box far wider than the chips.
+`move X Y`, `click X Y`, `right X Y`, `drag X1 Y1 X2 Y2`, `middle X1 Y1 X2 Y2`, `wheel X Y N`,
+`key NAME`, `type TEXT`, `wait MS`, and `pressat NAME DX DY` / `rpressat NAME DX DY` for a press at
+an offset inside one control — the palette is a grid of chips in a box far wider than the chips.
+
+`path X1 Y1 X2 Y2 …` presses, walks through every point in turn, and releases. That is what a
+freehand lasso is: `drag` walks a straight line, which is a polygon with no area, so every lasso
+this suite drew before the step existed was a test of the code that copes with a tap.
+
+`holding KEY STEP` holds space, alt, ctrl or shift down, does one step inside it, and lets go —
+what space-to-pan and alt-click-to-pick both are, and what `key` cannot say, since it sends a whole
+keystroke and is over before the drag begins.
 
 For rearranging the workspace: `drag` moves a panel, and `hold X1 Y1 X2 Y2` does not. A tab is
 grabbed the instant it is pressed; the hold is what turns a *stationary* press into a question —
@@ -45,6 +53,13 @@ By name, resolved from the atlas the app writes each frame:
 Assertions, against the state the app writes each frame:
 `expect KEY VALUE`, `about KEY VALUE [TOLERANCE]` (for a number that came off a drag),
 `state NAME` (print the lot).
+
+`absent NAME` asserts that a control is **not** on screen. There was no negative assertion at all
+for a long time, so every rule about hiding a command that would be refused was enforced by unit
+tests and by nothing that had ever looked at the running application — one scenario narrated an
+item disappearing and then did not check it. Note that it passes trivially when the panel holding
+the control is not showing either, so open the menu first and check something that *is* there
+alongside what is not.
 
 A name may be a label (`Add`), a control id, or `Panel:label` when two panels share a word
 (`Layers:Opacity`). A step that names something not on screen **stops the run** and lists what is —
@@ -89,13 +104,22 @@ the list was already scrolled", and the log only says what input arrived, never 
 
 ## Rules that are not negotiable
 
-- **Never answer the recovery prompt.** Its two answers are Recover and Discard, and Discard
-  destroys unsaved work that is not ours to destroy. `drive.ps1` moves
-  `%LOCALAPPDATA%\OpenPaint\recovery` aside before each run and puts it back in `finally`.
+- **Never answer the artist's recovery prompt.** Its two answers are Recover and Discard, and
+  Discard destroys unsaved work that is not ours to destroy. `drive.ps1` moves their recovery
+  folder aside before each run and puts it back in `finally`. The recovery scenario answers a
+  copy the harness *planted*, which is a different thing entirely.
+- **A stash that is already there means the last run was killed**, and it is put back before
+  anything is set aside again. The `finally` cannot run when the run is killed from outside,
+  which is what interrupting a sweep does -- and the artist's workspace, brushes, theme and
+  recovery copies then sit in a `.driving` stash with the live ones missing, which is precisely
+  the harm the stashing exists to prevent. Nothing but this script writes those names, so a
+  stash is never evidence of anything else.
 - **Never kill the artist's running OpenPaint** to free the build lock. Build to
   `target/drive-build`, which is why that flag is in every command above.
-- `workspace.json` is stashed the same way, so a run tests the code and not whatever was saved
-  last. `-KeepWorkspace` is for the one case that wants the opposite.
+- `workspace.json`, `brushes.json` and `theme.json` are stashed the same way, so a run tests the
+  code and not whatever the last one left. `-KeepWorkspace` is for the one case that wants the
+  opposite. The brush library is on that list because a run can create and delete brushes, and a
+  harness that mis-resolved one name once wiped the lot.
 
 ## Two traps already paid for
 

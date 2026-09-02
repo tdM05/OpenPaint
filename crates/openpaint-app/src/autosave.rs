@@ -116,6 +116,17 @@ impl Autosave {
         }
     }
 
+    /// When the next copy falls due.
+    ///
+    /// Asked by the event loop so it can arrange to be awake for it. Painting here is
+    /// demand-driven and the loop otherwise sleeps until a window event, which is fine for
+    /// drawing and wrong for this: the moment an autosave matters most is the one where nobody
+    /// has touched the machine for an hour.
+    #[must_use]
+    pub fn due_at(&self) -> Instant {
+        self.due_at
+    }
+
     /// Whether it is time to write, given whether there is anything to protect.
     ///
     /// `drawing` is taken because a save reads tiles back off the GPU, which mid-stroke would both
