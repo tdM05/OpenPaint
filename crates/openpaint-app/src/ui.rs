@@ -1132,7 +1132,16 @@ impl Ui {
                 // Read once, before the closure borrows what they came from.
                 let preset_name_now = preset_name.clone();
                 let mut show_panel_list = false;
-                let mut menu_request: Option<(crate::layout::Rect, (f32, f32), Anchor)> = None;
+                // **Which panel asked, as well as where.** A popup belongs to the panel that
+                // opened it, because the panel is what draws the inside of it: the workspace
+                // paints the frame and calls `contents(panel, .., Place::Popup)`. This used to
+                // name `MENU` unconditionally, so every dropdown in the application -- blend mode,
+                // font family, alignment, every response source -- opened a popup owned by the
+                // menu bar, which had nothing to draw in it. An empty box, and no way to choose a
+                // blend mode at all. Hardcoding one panel's identity into shared machinery is the
+                // §1c mistake in a different costume, and this is the shape that cannot make it.
+                let mut menu_request: Option<(crate::layout::PanelId, crate::layout::Rect, (f32, f32), Anchor)> =
+                    None;
                 let mut close_menu = false;
                 let mut show_settings = false;
                 // Copied out because `ws` is borrowed for the whole of `show`, and the panel that
@@ -1178,7 +1187,7 @@ impl Ui {
                             // borrowed for the whole of `show`, and this is asked for from inside
                             // it.
                             Picked::OpenMenu { at, size, side } => {
-                                menu_request = Some((at, size, side));
+                                menu_request = Some((panel, at, size, side));
                             }
                             Picked::CloseMenu => close_menu = true,
                             Picked::Settings => show_settings = true,
@@ -1218,8 +1227,8 @@ impl Ui {
                 if show_settings {
                     ws.open_settings();
                 }
-                if let Some((at, size, side)) = menu_request {
-                    ws.open_popup_for(crate::workspace::MENU, at, size, side, area);
+                if let Some((panel, at, size, side)) = menu_request {
+                    ws.open_popup_for(panel, at, size, side, area);
                 }
                 // A menu whose popup has been dismissed some other way -- a press elsewhere,
                 // Escape -- must not leave its button lit claiming to be open.

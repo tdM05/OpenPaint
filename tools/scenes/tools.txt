@@ -1,0 +1,17 @@
+# The six tools, and what each one sets.
+expect tool Brush
+expect select-tool -
+press Eraser
+expect tool Eraser
+press Lasso
+expect select-tool lasso
+press Rect
+expect select-tool rect
+press Wand
+expect select-tool wand
+press Move
+expect select-tool move
+press Brush
+expect tool Brush
+expect select-tool -
+shot tools-brush

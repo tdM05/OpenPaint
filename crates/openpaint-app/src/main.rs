@@ -3384,6 +3384,35 @@ impl OpenPaint {
                 if l.text().is_some() { "text" } else { "raster" }
             );
         }
+        // The active layer's properties, each under its own name. Most controls act on the
+        // active layer, and an assertion that has to compare a whole tab-separated row against a
+        // string is an assertion nobody will write correctly twice.
+        if let Some(l) = self.editor.layers().get(self.editor.active_layer_index()) {
+            let _ = writeln!(o, "active.name	{}", l.name);
+            let _ = writeln!(o, "active.opacity	{:.3}", l.opacity);
+            let _ = writeln!(o, "active.blend	{:?}", l.blend);
+            let _ = writeln!(o, "active.visible	{}", l.visible);
+            let _ = writeln!(o, "active.lock-alpha	{}", l.lock_alpha);
+            let _ = writeln!(o, "active.clip-below	{}", l.clip_below);
+            let _ = writeln!(
+                o,
+                "active.kind	{}",
+                if l.text().is_some() { "text" } else { "raster" }
+            );
+        }
+        // The stack in order, so a reorder can be asserted as a whole rather than one index at a
+        // time -- "Up moved this layer" is a statement about the order, not about one row.
+        let _ = writeln!(
+            o,
+            "layer-names	{}",
+            self.editor
+                .layers()
+                .iter()
+                .map(|l| l.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
         let b = self.editor.brush();
         let c = b.color_srgb8();
         let _ = writeln!(o, "colour\t{:02x}{:02x}{:02x}", c[0], c[1], c[2]);

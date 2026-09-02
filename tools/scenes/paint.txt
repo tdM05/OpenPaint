@@ -1,0 +1,23 @@
+# The core loop: a stroke lands, undo takes it back, redo puts it there again, the eraser is
+# its own operation. Undo depth is the evidence -- a paint op reaches history only if dabs did.
+expect undo 0
+expect dirty false
+drag 500 300 900 700
+shot paint-stroke
+expect undo 1
+expect dirty true
+key ctrl+z
+expect undo 0
+expect redo 1
+shot paint-undone
+key ctrl+y
+expect undo 1
+expect redo 0
+shot paint-redone
+press Eraser
+drag 520 620 880 380
+expect undo 2
+expect tool Eraser
+shot paint-erased
+key ctrl+z
+expect undo 1

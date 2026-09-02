@@ -1,0 +1,66 @@
+# Every control in the Layers panel, and what each is supposed to move.
+expect layers 1
+expect layer-names Layer 1
+expect active.name Layer 1
+
+press Layers:Add
+expect layers 2
+expect active.name Layer 2
+shot layers-added
+
+press Duplicate
+expect layers 3
+expect layer-names Layer 1, Layer 2, Layer 2 copy
+
+# Reorder. Up moves the active layer towards the top of the stack.
+press Down
+expect layer-names Layer 1, Layer 2 copy, Layer 2
+press Up
+expect layer-names Layer 1, Layer 2, Layer 2 copy
+
+# Properties of the active layer.
+slide Layers:Opacity 0.5
+about active.opacity 0.5
+press Lock alpha
+expect active.lock-alpha true
+press Lock alpha
+expect active.lock-alpha false
+press Clip to the layer below
+expect active.clip-below true
+press Clip to the layer below
+expect active.clip-below false
+shot layers-props
+
+# Merge down folds the active layer into the one beneath it.
+press Merge down
+expect layers 2
+shot layers-merged
+
+# Delete takes the active layer away, and that one IS undoable.
+press Layers:Delete
+expect layers 1
+key ctrl+z
+expect layers 2
+shot layers-deleted
+
+# The blend picker: pressing it opens a list, and choosing from that list changes the layer.
+press Blend
+shot layers-blend-open
+press Multiply
+expect active.blend Multiply
+press Blend
+press Normal
+expect active.blend Normal
+
+# The eye on a layer row. 524288 is the first row's visibility toggle (1 << 19).
+# The eye on a row. Rows read top-of-stack-first but carry the document index, so 524288 is
+# layer 0's eye whichever row it is drawn on. Select that layer first, so the assertion is about
+# the layer the eye belongs to.
+press layers:0
+expect active.name Layer 1
+expect active.visible true
+press 524288
+expect active.visible false
+press 524288
+expect active.visible true
+shot layers-eye

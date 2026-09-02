@@ -203,8 +203,18 @@ try {
         $tabs = @{}
         $panel = ''
         $view = $null
-        if (-not (Test-Path $atlas)) { return @($found, $tabs) }
-        foreach ($line in (Get-Content -LiteralPath $atlas -ErrorAction SilentlyContinue)) {
+        # The app truncates this at the top of every frame and fills it as the panels draw, so a
+        # read can land on the empty moment in between. An empty atlas is a timing accident, not a
+        # blank screen, and reporting it as one sends you hunting a bug in the app.
+        $lines = @()
+        for ($i = 0; $i -lt 30; $i++) {
+            if (Test-Path $atlas) {
+                $lines = @(Get-Content -LiteralPath $atlas -ErrorAction SilentlyContinue)
+            }
+            if ($lines.Count) { break }
+            Start-Sleep -Milliseconds 60
+        }
+        foreach ($line in $lines) {
             if ($line.StartsWith('# ')) { $panel = $line.Substring(2).Trim(); $view = $null; continue }
             if ($line.StartsWith('@ ')) {
                 $f = $line.Substring(2) -split "`t"
@@ -283,8 +293,13 @@ try {
         $near = @($table.Keys | Where-Object { $_.StartsWith($k + ' ') -or $_.StartsWith($k + ':') })
         if ($near.Count -eq 1) { return $table[$near[0]] }
         $what = if ($Tab) { 'tab' } else { 'control' }
-        $have = ($table.Keys | Sort-Object) -join ', '
         if ($near.Count -gt 1) { throw "'$name' names $($near.Count) ${what}s: $($near -join ', ')" }
+        # Only the qualified names, and only from the panel the step probably meant. The full list
+        # is two hundred entries and burying the answer in it is how a clear failure reads as noise.
+        $prefix = if ($name -match '^([^:]+):') { $Matches[1].ToLower() } else { '' }
+        $keys = @($table.Keys | Where-Object { $_ -like '*:*' } | Sort-Object)
+        if ($prefix) { $keys = @($keys | Where-Object { $_.StartsWith("${prefix}:") }) }
+        $have = ($keys | Select-Object -First 60) -join ', '
         throw "no $what called '$name'. On screen: $have"
     }
 
@@ -333,6 +348,24 @@ try {
     # it did not crash.
     $checks = New-Object System.Collections.ArrayList
 
+    # `about KEY VALUE` -- the same check for a number that came off a drag. A slider set by
+    # dragging a pointer across a panel lands on 0.501, not 0.500, and a harness that calls that a
+    # failure trains whoever reads it to ignore failures.
+    function Expect-Near([string]$key, [double]$want, [double]$tol = 0.02) {
+        $got = $null
+        for ($i = 0; $i -lt 20; $i++) {
+            $got = (Read-State)[$key]
+            if ($null -ne $got -and [Math]::Abs([double]$got - $want) -le $tol) { break }
+            Start-Sleep -Milliseconds 100
+        }
+        if ($null -ne $got -and [Math]::Abs([double]$got - $want) -le $tol) {
+            [void]$checks.Add("  ok    $key = $got (wanted about $want)")
+        } else {
+            [void]$checks.Add("  FAIL  ${key}: wanted about $want, got '$got'")
+            $script:failed = $true
+        }
+    }
+
     function Expect-State([string]$key, [string]$want) {
         # Given a frame or two: a press is answered on the next paint, not on the release.
         $got = $null
@@ -360,6 +393,9 @@ try {
 
     foreach ($step in $steps) {
         $a = $step.Trim() -split '\s+'
+        # A control's name has spaces in it -- "Merge down", "Clip to the layer below" -- so the
+        # name is everything after the verb, not the next token.
+        $rest = $step.Trim().Substring($a[0].Length).Trim()
         switch ($a[0].ToLower()) {
             'move'  { Point-At $a[1] $a[2] }
             'click' {
@@ -392,19 +428,31 @@ try {
                 Start-Sleep -Milliseconds 350
             }
             'key'   {
-                $k = switch ($a[1].ToLower()) {
-                    'escape'       { '{ESC}' }
-                    'enter'        { '{ENTER}' }
-                    'delete'       { '{DEL}' }
-                    'f2'           { '{F2}' }
-                    'f3'           { '{F3}' }
-                    'ctrl+z'       { '^z' }
-                    'ctrl+shift+z' { '^+z' }
-                    'ctrl+e'       { '^e' }
-                    'ctrl+a'       { '^a' }
-                    'ctrl+d'       { '^d' }
-                    default        { $a[1] }
+                # Modifiers are peeled off by name, not looked up in a table of chords. The
+                # table was the bug: `ctrl+y` was not in it, so the fallback typed the seven
+                # letters c-t-r-l-plus-y into the app and the run reported redo as broken.
+                $parts = $a[1].ToLower() -split '\+'
+                $key = $parts[-1]
+                $mods = ''
+                foreach ($m in $parts[0..($parts.Count - 2)]) {
+                    switch ($m) {
+                        'ctrl'  { $mods += '^' }
+                        'shift' { $mods += '+' }
+                        'alt'   { $mods += '%' }
+                        default { throw "no such modifier: $m" }
+                    }
                 }
+                $named = @{
+                    'escape' = '{ESC}'; 'enter' = '{ENTER}'; 'delete' = '{DEL}'
+                    'tab' = '{TAB}'; 'space' = ' '; 'backspace' = '{BS}'
+                    'left' = '{LEFT}'; 'right' = '{RIGHT}'; 'up' = '{UP}'; 'down' = '{DOWN}'
+                    'home' = '{HOME}'; 'end' = '{END}'
+                }
+                $body = if ($named.ContainsKey($key)) { $named[$key] }
+                        elseif ($key -match '^f([1-9]|1[0-2])$') { "{$($key.ToUpper())}" }
+                        elseif ($key.Length -eq 1) { $key }
+                        else { throw "no such key: $key" }
+                $k = $mods + $body
                 [System.Windows.Forms.SendKeys]::SendWait($k)
                 Start-Sleep -Milliseconds 250
             }
@@ -423,6 +471,11 @@ try {
                 $k, $v = $rest -split '\s+', 2
                 Expect-State $k $v
             }
+            'about' {
+                $rest = $step.Trim().Substring(5).Trim()
+                $k, $v = $rest -split '\s+', 2
+                Expect-Near $k ([double]$v)
+            }
             'state' {
                 # Print the whole of it, for a step that is exploring rather than asserting.
                 Write-Output "--- state: $($a[1]) ---"
@@ -430,16 +483,16 @@ try {
             }
             'shot'  { Save-Shot $a[1] }
             'tab'   {
-                $r = Rect-Of $a[1] -Tab
+                $r = Rect-Of $rest -Tab
                 Click-At ($r.X + [int]($r.W / 2)) ($r.Y + [int]($r.H / 2))
                 Start-Sleep -Milliseconds 200
             }
             'press' {
-                $r = Bring-Into-View $a[1]
+                $r = Bring-Into-View $rest
                 Click-At ($r.X + [int]($r.W / 2)) ($r.Y + [int]($r.H / 2))
             }
             'rpress' {
-                $r = Bring-Into-View $a[1]
+                $r = Bring-Into-View $rest
                 Click-At ($r.X + [int]($r.W / 2)) ($r.Y + [int]($r.H / 2)) -Right
             }
             'wheel' {
@@ -449,12 +502,12 @@ try {
             'slide' {
                 # A slider is dragged, not clicked: a press sets the value under the pointer and a
                 # drag is what a hand does, and only one of the two exercises the tracking code.
-                $r = Bring-Into-View $a[1]
+                $r = Bring-Into-View ($rest -replace '\s+\S+$', '')
                 $y = $r.Y + [int]($r.H / 2)
                 $pad = 8
                 $x0 = $r.X + $pad
                 $x1 = $r.X + $r.W - $pad
-                $to = [int]($x0 + ($x1 - $x0) * [double]$a[2])
+                $to = [int]($x0 + ($x1 - $x0) * [double]$a[-1])
                 Point-At ($x0 + [int](($x1 - $x0) / 2)) $y
                 [Win]::mouse_event([Win]::LDOWN, 0, 0, 0, [IntPtr]::Zero)
                 Start-Sleep -Milliseconds 60

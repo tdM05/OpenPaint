@@ -248,7 +248,7 @@ pub fn show(
             input.custom.push((*id, p.rect));
         }
     }
-    report_controls(&placed, content, input.scroll, tall, ui.ctx());
+    report_controls(&placed, m, content, input.scroll, tall, ui.ctx());
     input.pointer = resp.hover_pos().or(pointer).map(|q| (q.x, q.y));
     input.pressed = down;
     // Only while this panel has the pointer: a click anywhere on the window is not a click on
@@ -763,6 +763,7 @@ pub fn report_tab(name: &str, rect: crate::layout::Rect, ppp: f32) {
 /// asked, and asking costs one environment lookup per panel per frame.
 fn report_controls(
     placed: &[crate::panel_ui::Placed<'_>],
+    m: &crate::theme::Metrics,
     content: Rect,
     scroll: f32,
     tall: f32,
@@ -810,6 +811,24 @@ fn report_controls(
             p.rect.w * ppp,
             p.rect.h * ppp
         );
+        // A row's switch is its own thing to press -- the eye on a layer -- and it is not a
+        // control of its own, so it needs saying separately or nothing driving the application
+        // can reach it. The same rectangle `change_at` hit-tests against.
+        if let Control::Row {
+            mark: Some(mark), ..
+        } = p.control
+        {
+            let r = crate::panel_ui::mark_rect(p.rect, m);
+            let _ = writeln!(
+                out,
+                "{}	{:.0}	{:.0}	{:.0}	{:.0}	{name} mark",
+                mark.id,
+                r.x * ppp,
+                r.y * ppp,
+                r.w * ppp,
+                r.h * ppp
+            );
+        }
     }
     // Appended, because every panel reports its own and the harness reads the lot. Truncated by
     // whoever starts the run.
