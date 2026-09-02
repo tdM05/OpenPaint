@@ -875,9 +875,17 @@ try {
                 $x0 = $r.X + $pad
                 $x1 = $r.X + $r.W - $pad
                 $to = [int]($x0 + ($x1 - $x0) * [double]$a[-1])
+                # **Let a frame happen before pressing, as well as before letting go.** A press is
+                # attributed to the control the application believes is under the pointer, and it
+                # learns that from a frame. Painting here is demand-driven, so straight after
+                # `Bring-Into-View` has scrolled the panel the frame that settles the new positions
+                # may not have happened yet -- and the press then lands on where the control used
+                # to be. It showed up as a slider that moved on its own and not inside a scenario
+                # that had scrolled to reach it.
                 Point-At ($x0 + [int](($x1 - $x0) / 2)) $y
+                Start-Sleep -Milliseconds 200
                 [Win]::mouse_event([Win]::LDOWN, 0, 0, 0, [IntPtr]::Zero)
-                Start-Sleep -Milliseconds 60
+                Start-Sleep -Milliseconds 90
                 for ($i = 1; $i -le 12; $i++) {
                     $t = $i / 12.0
                     Point-At ([int]($x0 + ($x1 - $x0) / 2 + ($to - ($x0 + ($x1 - $x0) / 2)) * $t)) $y
