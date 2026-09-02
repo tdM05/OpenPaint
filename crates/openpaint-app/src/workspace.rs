@@ -1425,6 +1425,7 @@ impl Workspace {
             }
             // The direction is worked out here and handed over, because the panel that wants it
             // runs inside a borrow of the workspace that holds the setting.
+            crate::panel_draw::report_panel(name_of(showing));
             contents(showing, &mut ui, self.direction_of(showing), Place::Panel);
         }
 
@@ -1642,6 +1643,7 @@ impl Workspace {
                 if was_picking {
                     ui.disable();
                 }
+                crate::panel_draw::report_panel(name_of(showing));
                 contents(showing, &mut ui, self.direction_of(showing), Place::Panel);
             }
         }
@@ -3018,6 +3020,11 @@ fn draw_tab(
     p: &crate::theme::Palette,
     hovered: bool,
 ) {
+    // Where this tab is, for whatever is driving the application. Same reason as
+    // `panel_draw::report_controls`: a test presses "Layers", not a pixel.
+    if let Some(&panel) = slot.tabs.get(tab.index) {
+        crate::panel_draw::report_tab(name_of(panel), tab.rect, painter.ctx().pixels_per_point());
+    }
     // **Every tab is drawn as its own button**, docked or floating, by this one routine. There
     // were two, and they did not agree: a floating panel had no button-looking thing to press, and
     // a docked one filled its whole bar when you held it. "Which of these is a handle" has to look

@@ -3346,7 +3346,116 @@ impl OpenPaint {
     }
 
     /// Draw one frame: canvas first, then the UI on top of it.
+    /// Describe the application in one page of text, for whoever is driving it.
+    ///
+    /// **Because a picture cannot say what changed.** The panels were driven for a day with
+    /// screenshots as the only evidence, and a screenshot cannot tell "Add made a layer" from
+    /// "Add did nothing and the list was already scrolled". Nor can the log: it says what input
+    /// arrived, never what became of it. So the application answers the question directly --
+    /// every piece of state a control is supposed to move, named, one per line -- and a test
+    /// asserts on the difference instead of on a hunch.
+    ///
+    /// Written only when `OPENPAINT_STATE` names a file, and it is the whole state each time
+    /// rather than a diff, so a run can be read from any single frame.
+    fn report_state(&self) {
+        use std::fmt::Write as _;
+        let Some(path) = std::env::var_os("OPENPAINT_STATE") else {
+            return;
+        };
+        let mut o = String::new();
+        let doc = self.editor.document();
+        let page = self.editor.page_rect();
+        let _ = writeln!(o, "tool\t{:?}", self.editor.tool());
+        let _ = writeln!(o, "pages\t{}", doc.page_count());
+        let _ = writeln!(o, "page\t{}", doc.active_index());
+        let _ = writeln!(o, "page-size\t{}\t{}", page.w, page.h);
+        let _ = writeln!(o, "layers\t{}", self.editor.layers().len());
+        let _ = writeln!(o, "layer\t{}", self.editor.active_layer_index());
+        for (i, l) in self.editor.layers().iter().enumerate() {
+            let _ = writeln!(
+                o,
+                "layer.{i}\t{}\t{:.3}\t{:?}\t{}\t{}\t{}\t{}",
+                l.name,
+                l.opacity,
+                l.blend,
+                l.visible,
+                l.lock_alpha,
+                l.clip_below,
+                if l.text().is_some() { "text" } else { "raster" }
+            );
+        }
+        let b = self.editor.brush();
+        let c = b.color_srgb8();
+        let _ = writeln!(o, "colour\t{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+        let _ = writeln!(
+            o,
+            "brush\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}",
+            b.radius, b.hardness, b.spacing, b.roundness, b.angle, b.flow, b.opacity
+        );
+        let _ = writeln!(o, "brush-tip\t{}", match b.tip {
+                openpaint_core::dab::Tip::Stamp(_) => "bitmap",
+                openpaint_core::dab::Tip::Round(_) => "round",
+            });
+        let _ = writeln!(o, "palette\t{}", doc.palette().len());
+        let _ = writeln!(o, "selection\t{}", self.selection.is_some());
+        let _ = writeln!(
+            o,
+            "select-tool\t{}",
+            match &self.select {
+                Some(Select::Lasso { .. }) => "lasso",
+                Some(Select::Rect { .. }) => "rect",
+                Some(Select::Wand { .. }) => "wand",
+                Some(Select::Move { .. }) => "move",
+                None => "-",
+            }
+        );
+        let _ = writeln!(o, "crop\t{}", self.crop.is_some());
+        let _ = writeln!(o, "dragging\t{}", self.dragging.is_some());
+        let (undo, redo) = self
+            .renderer
+            .as_ref()
+            .map_or((0, 0), crate::renderer::Renderer::history_depth);
+        let _ = writeln!(o, "undo\t{undo}");
+        let _ = writeln!(o, "redo\t{redo}");
+        let _ = writeln!(o, "dirty\t{}", self.dirty);
+        let _ = writeln!(
+            o,
+            "file\t{}",
+            self.document_path
+                .as_deref()
+                .and_then(std::path::Path::file_name)
+                .map_or_else(|| "-".to_owned(), |n| n.to_string_lossy().into_owned())
+        );
+        let _ = writeln!(o, "zoom\t{:.4}", self.view.scale());
+        let _ = writeln!(o, "rotation\t{:.4}", self.view.rotation());
+        let _ = writeln!(o, "confirm\t{}", self.pending_confirm.is_some());
+        let _ = writeln!(o, "recovery\t{}", self.recovery.is_some());
+        let _ = writeln!(o, "dialog\t{}", self.file_dialog.is_some());
+        let _ = writeln!(o, "workspace-mode\t{}", self.workspace_mode);
+        let _ = writeln!(
+            o,
+            "status\t{}",
+            self.status_message.as_deref().unwrap_or("-")
+        );
+        let _ = writeln!(
+            o,
+            "text\t{}",
+            self.editor
+                .active_text()
+                .map_or_else(|| "-".to_owned(), |t| t.text.replace(['\n', '\t'], " "))
+        );
+        let _ = std::fs::write(path, o.as_bytes());
+    }
+
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        // Start the frame's record of where the controls are, if anybody asked for one. Emptied
+        // here rather than appended forever so that what a harness reads is this frame's layout
+        // and not a heap of every frame since launch. See `panel_draw::report_controls`.
+        if let Some(path) = std::env::var_os("OPENPAINT_CONTROLS") {
+            let _ = std::fs::write(path, b"");
+        }
+        // And what the frame is about to draw, for the same reader.
+        self.report_state();
         // Before anything reads the canvas: the floating pixels of a transform are produced per
         // frame rather than per pointer sample, so this is where they catch up.
         self.refresh_float();

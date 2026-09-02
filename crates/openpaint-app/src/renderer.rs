@@ -127,6 +127,14 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// How many steps back and forward the artwork's history can walk.
+    ///
+    /// Exposed so the application can say so when asked to describe itself: "undo did something"
+    /// is not a thing a screenshot can show, and a test that cannot tell is not a test.
+    pub fn history_depth(&self) -> (usize, usize) {
+        (self.history.undo_depth(), self.history.redo_depth())
+    }
+
     /// Create the GPU context for a window. Blocks on async setup via pollster.
     pub fn new(window: Arc<Window>, page: PageRect) -> Result<Self, String> {
         let size = window.inner_size();

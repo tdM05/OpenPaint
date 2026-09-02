@@ -248,6 +248,7 @@ pub fn show(
             input.custom.push((*id, p.rect));
         }
     }
+    report_controls(&placed, content, input.scroll, tall, ui.ctx());
     input.pointer = resp.hover_pos().or(pointer).map(|q| (q.x, q.y));
     input.pressed = down;
     // Only while this panel has the pointer: a click anywhere on the window is not a click on
@@ -716,6 +717,106 @@ pub fn text_well(r: Rect, m: &crate::theme::Metrics, left: f32) -> Rect {
         (r.x + r.w - m.padding * 0.5 - left).max(m.row),
         (r.h - m.padding * 0.5).max(m.row * 0.6),
     )
+}
+
+/// Say which panel the controls that follow belong to.
+///
+/// Called by whoever knows -- the workspace, which decides what is drawn where. `panel_draw` is
+/// handed a rectangle and a list and has no idea whose they are, which is the whole point of it.
+pub fn report_panel(name: &str) {
+    let Some(path) = std::env::var_os("OPENPAINT_CONTROLS") else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
+        use std::io::Write as _;
+        let _ = writeln!(f, "# {name}");
+    }
+}
+
+/// Where a panel's tab landed, so a harness can bring that panel to the front by name.
+pub fn report_tab(name: &str, rect: crate::layout::Rect, ppp: f32) {
+    let Some(path) = std::env::var_os("OPENPAINT_CONTROLS") else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
+        use std::io::Write as _;
+        let _ = writeln!(
+            f,
+            "@ {name}	{:.0}	{:.0}	{:.0}	{:.0}",
+            rect.x * ppp,
+            rect.y * ppp,
+            rect.w * ppp,
+            rect.h * ppp
+        );
+    }
+}
+
+/// Write down where every control just landed, for whatever is driving the application.
+///
+/// **So a test can say "press Blend" instead of guessing a pixel.** Driving the real application
+/// is the only way to find out whether it works -- tests of the pieces passed for a day while the
+/// brush painted nothing -- but a script full of hand-measured coordinates is a script that breaks
+/// on a different window size and lies about which control it pressed. This is the layout the
+/// engine actually used, in the units the pointer speaks, written where a harness can read it.
+///
+/// One line per control: `panel-id control-id x y w h label`. Nothing is written unless somebody
+/// asked, and asking costs one environment lookup per panel per frame.
+fn report_controls(
+    placed: &[crate::panel_ui::Placed<'_>],
+    content: Rect,
+    scroll: f32,
+    tall: f32,
+    ctx: &egui::Context,
+) {
+    use std::fmt::Write as _;
+    let Some(path) = std::env::var_os("OPENPAINT_CONTROLS") else {
+        return;
+    };
+    // The scale the pointer is in: the harness clicks in physical pixels and `place` works in
+    // points, and a factor of 1.5 between them is a click a control's width away from where it
+    // was meant to go.
+    let ppp = ctx.pixels_per_point();
+    let mut out = String::new();
+    // The window onto the list, and how far down it we are. Without this a harness can read that
+    // a control is at y=674 and has no way to know the panel stops at 420 -- so it clicks a
+    // confident nowhere and calls it a pass.
+    let _ = writeln!(
+        out,
+        "$	{:.0}	{:.0}	{:.0}	{:.0}	{:.0}	{:.0}",
+        content.x * ppp,
+        content.y * ppp,
+        content.w * ppp,
+        content.h * ppp,
+        scroll * ppp,
+        tall * ppp
+    );
+    for p in placed {
+        let Some(id) = p.control.id() else { continue };
+        let name = match p.control {
+            Control::Button { text, .. }
+            | Control::Slider { text, .. }
+            | Control::Toggle { text, .. }
+            | Control::Choice { text, .. }
+            | Control::Pick { text, .. }
+            | Control::Text { text, .. }
+            | Control::Row { text, .. } => text.as_str(),
+            _ => "",
+        };
+        let _ = writeln!(
+            out,
+            "{id}\t{:.0}\t{:.0}\t{:.0}\t{:.0}\t{name}",
+            p.rect.x * ppp,
+            p.rect.y * ppp,
+            p.rect.w * ppp,
+            p.rect.h * ppp
+        );
+    }
+    // Appended, because every panel reports its own and the harness reads the lot. Truncated by
+    // whoever starts the run.
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
+        use std::io::Write as _;
+        let _ = f.write_all(out.as_bytes());
+    }
 }
 
 /// How tall a label's words are once wrapped to `width`, or zero for anything that is not one.
