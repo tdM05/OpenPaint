@@ -121,6 +121,31 @@ the list was already scrolled", and the log only says what input arrived, never 
   opposite. The brush library is on that list because a run can create and delete brushes, and a
   harness that mis-resolved one name once wiped the lot.
 
+## What makes a scenario lie to you
+
+Four things have caused an assertion to pass or fail for a reason that had nothing to do with the
+application. Each cost an hour, and each is fixed in the harness rather than worked around in a
+scenario — but they are the shapes to suspect first when a run disagrees with itself.
+
+- **A name that fits two controls.** The brush panel has a Size slider and a Size picker, and six
+  more pairs besides. First-wins resolved them silently, so a run meaning to drag a slider opened a
+  dropdown and went on pressing at coordinates underneath it. A name that fits more than one
+  control is refused now; say which by id.
+- **A drag that lets go before it lands.** A slider follows the pointer while it is latched, so
+  releasing in the same breath as the final move let the release be processed first and the value
+  stopped wherever the previous sample reached. The same fraction gave 75 on one run and 132 on the
+  next — and two assertions had been rewritten to match the under-drag before anyone noticed.
+- **A wheel turned before a frame has happened.** Only the panel under the pointer takes the wheel,
+  and egui decides which that is from the last frame. Painting is demand-driven, so straight after
+  a click the frame that learns where the pointer went may not have happened yet and the notch is
+  simply lost. It read as panels that scrolled sometimes.
+- **A key sent at a native modal before it has the keyboard.** It lands on the application instead
+  and leaves the dialog standing. Every dialog block in a scenario carries two generous waits for
+  this reason, and they are not politeness.
+
+The rule behind all four: an assertion that changes between runs is worse than no assertion,
+because the way it gets silenced is by writing down whatever it happened to say.
+
 ## Two traps already paid for
 
 - **PowerShell must be DPI-aware.** Without `SetProcessDpiAwarenessContext(PER_MONITOR_V2)` it
