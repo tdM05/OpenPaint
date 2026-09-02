@@ -1,0 +1,102 @@
+# Every key the application answers, driven at the keyboard rather than through a panel. The two
+# routes in must not become two behaviours, which is the whole reason `history_step` is shared.
+
+# Tools.
+expect tool Brush
+key e
+expect tool Eraser
+expect status Eraser
+key b
+expect tool Brush
+expect status Brush
+
+# Brush size steps by a ratio, so two presses one way and two back land where they started.
+expect brush.size 8.000
+key ]
+key ]
+about brush.size 10.58 0.2
+key [
+key [
+about brush.size 8 0.1
+
+# The view. Bare 0 is fit and bare 1 is actual size -- deliberately not Ctrl+0, whatever the
+# doc comment above `handle_navigation` says.
+key 1
+about zoom 1 0.001
+key 0
+about zoom 0.59 0.05
+shot kb-fit
+
+# Rotation, about the cursor, fifteen degrees a press. Four one way is a sixth of a turn.
+move 900 700
+expect rotation 0.0000
+key shift+]
+about rotation 0.2618 0.01
+key shift+[
+about rotation 0 0.001
+
+# Undo and redo, both spellings of redo.
+drag 700 400 1100 800
+expect undo 1
+key ctrl+z
+expect undo 0
+expect redo 1
+key ctrl+shift+z
+expect undo 1
+key ctrl+z
+key ctrl+y
+expect undo 1
+expect redo 0
+
+# Selection from the keyboard. Select all, then deselect.
+key ctrl+a
+expect selection true
+key ctrl+d
+expect selection false
+
+# Invert has to be tried on part of the page, not all of it: the opposite of everything is
+# nothing, and a selection of nothing is correctly not a selection at all. So take a rectangle
+# first, and then the inverse of that is still a selection.
+press Rect
+drag 600 350 1000 700
+expect selection true
+key ctrl+shift+i
+expect selection true
+key ctrl+d
+expect selection false
+press Brush
+
+# And the degenerate case said out loud, because it is a decision rather than an accident:
+# inverting the whole page leaves nothing selected.
+key ctrl+a
+expect selection true
+key ctrl+shift+i
+expect selection false
+
+# Fill paints the selection with the brush colour, and that is an edit, so history grows.
+key ctrl+a
+expect selection true
+key ctrl+f
+expect undo 2
+shot kb-filled
+key ctrl+z
+expect undo 1
+
+# Delete clears the selected pixels -- only with a selection up, which there is.
+key ctrl+a
+key delete
+expect undo 2
+key ctrl+z
+expect undo 1
+key ctrl+d
+
+# F4 cycles the theme; F2 swaps the whole UI for the old side panel and back.
+key f4
+shot kb-theme
+key f4
+key f2
+shot kb-old-panel
+expect workspace-mode false
+key f2
+expect workspace-mode true
+shot kb-workspace

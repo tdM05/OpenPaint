@@ -84,6 +84,11 @@ public class Win {
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint x, uint y, uint d, IntPtr e);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint from, uint to, bool attach);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int t, bool repaint);
@@ -186,7 +191,45 @@ try {
     if ($h -eq [IntPtr]::Zero) { throw 'the app window never appeared' }
     # A known size and place, so a coordinate in a script means the same thing every run.
     [void][Win]::MoveWindow($h, 60, 60, $Width, $Height, $true)
-    [void][Win]::SetForegroundWindow($h)
+
+    # **The window has to actually be in front, and the run must stop if it is not.**
+    # `SetForegroundWindow` is refused when the calling process does not already own the
+    # foreground, and it fails quietly. Keys then go wherever the focus happens to be -- another
+    # application, this console -- and the run reports the application as ignoring every shortcut
+    # while typing into something else. Which is both a false result and a way to do real damage.
+    [void][Win]::ShowWindow($h, 9)   # SW_RESTORE
+    $mine = [Win]::GetCurrentThreadId()
+    $owner = [uint32]0
+    $theirs = [Win]::GetWindowThreadProcessId($h, [ref]$owner)
+    for ($i = 0; $i -lt 8; $i++) {
+        # Attaching to the window's input queue is what lifts the refusal: two threads sharing an
+        # input state may hand the foreground to each other.
+        [void][Win]::AttachThreadInput($mine, $theirs, $true)
+        [void][Win]::BringWindowToTop($h)
+        [void][Win]::SetForegroundWindow($h)
+        [void][Win]::AttachThreadInput($mine, $theirs, $false)
+        if ([Win]::GetForegroundWindow() -eq $h) { break }
+        # The call is refused outright when the terminal this runs from owns the foreground, and
+        # it fails silently. A press does what the call may not: Windows always gives the
+        # foreground to the window you actually clicked. So click the title bar -- which belongs
+        # to Windows, not to the application, so nothing in the application is pressed by it.
+        $t = New-Object Win+POINT
+        [void][Win]::ClientToScreen($h, [ref]$t)
+        $bar = [int]((60 + $t.Y) / 2)
+        [Win]::MoveTo($t.X + 120, $bar)
+        Start-Sleep -Milliseconds 60
+        [Win]::mouse_event([Win]::LDOWN, 0, 0, 0, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 60
+        [Win]::mouse_event([Win]::LUP, 0, 0, 0, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 250
+    }
+    if ([Win]::GetForegroundWindow() -ne $h) {
+        $fg = [Win]::GetForegroundWindow()
+        $sb = New-Object System.Text.StringBuilder 256
+        [void][Win]::GetClassName($fg, $sb, $sb.Capacity)
+        throw ("the app window would not come to the front (the front one is $fg, class " +
+               "$($sb.ToString()); the app's is $h) -- keys would go somewhere else")
+    }
     Start-Sleep -Milliseconds 800
 
     # Steps are in the *client* area's coordinates, so they mean the same thing whatever the title
@@ -508,7 +551,10 @@ try {
                 $parts = $a[1].ToLower() -split '\+'
                 $key = $parts[-1]
                 $mods = ''
-                foreach ($m in $parts[0..($parts.Count - 2)]) {
+                # `$parts[0..-1]` is the whole array in PowerShell, not an empty one, so a key with
+                # no modifiers read its own name as a modifier.
+                $before = if ($parts.Count -gt 1) { $parts[0..($parts.Count - 2)] } else { @() }
+                foreach ($m in $before) {
                     switch ($m) {
                         'ctrl'  { $mods += '^' }
                         'shift' { $mods += '+' }
@@ -521,6 +567,8 @@ try {
                     'tab' = '{TAB}'; 'space' = ' '; 'backspace' = '{BS}'
                     'left' = '{LEFT}'; 'right' = '{RIGHT}'; 'up' = '{UP}'; 'down' = '{DOWN}'
                     'home' = '{HOME}'; 'end' = '{END}'
+                    # SendKeys reserves the brackets, so the literal ones are written in braces.
+                    '[' = '{[}'; ']' = '{]}'
                 }
                 $body = if ($named.ContainsKey($key)) { $named[$key] }
                         elseif ($key -match '^f([1-9]|1[0-2])$') { "{$($key.ToUpper())}" }
