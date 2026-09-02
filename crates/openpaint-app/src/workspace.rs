@@ -557,17 +557,36 @@ pub struct PanelOptions {
     pub direction: Option<Direction>,
 }
 
-impl Default for Workspace {
-    fn default() -> Self {
-        // The arrangement and the settings come out of the same file together, because a setting
-        // belongs to a panel and the panels are the arrangement: loading one without the other
-        // would open a workspace half of which was somebody's and half of which was the default's.
-        let (layout, options, floating) =
-            load_layout().unwrap_or_else(|| (default_layout(), <_>::default(), Vec::new()));
+impl Workspace {
+    /// Assemble a workspace from the pieces a file resolved to.
+    ///
+    /// **One place, so a test can reach the same assembly the application does.** The constructor
+    /// used to build the struct inline and the tests built their own beside it, which is two
+    /// definitions of "a workspace that has just started" -- and the one the tests could see was
+    /// not the one that had the bug in it.
+    fn from_parts(
+        layout: Layout,
+        options: std::collections::HashMap<u32, PanelOptions>,
+        floating: Vec<Floating>,
+        theme: crate::theme::Theme,
+    ) -> Self {
+        // **Past every name already in use.** Windows restored from the file are named by their
+        // position in it, and this counter used to start at zero regardless -- so the first panel
+        // floated after start-up was given the name of a window that already existed. Two windows,
+        // one name, and every lookup is `find(|f| f.id == id)`, which answers with the first of
+        // them: press one window's tab and a different window moves. Reported exactly so.
+        //
+        // A name is a name for as long as the thing it names exists, and this is the only place
+        // two of them could ever have met.
+        let next_float = floating
+            .iter()
+            .map(|f| f.id.0.wrapping_add(1))
+            .max()
+            .unwrap_or(0);
         Self {
             layout,
             history: crate::layout::History::default(),
-            theme: load_theme().unwrap_or_default(),
+            theme,
             drag: PanelDrag::default(),
             canvas_rect: None,
             popup: None,
@@ -576,7 +595,7 @@ impl Default for Workspace {
             options,
             floating,
             grab_surface: Surface::Docked,
-            next_float: 0,
+            next_float,
             grip: (0.0, 0.0),
             grip_rect: Rect::new(0.0, 0.0, 0.0, 0.0),
             grip_at: (0.0, 0.0),
@@ -584,6 +603,17 @@ impl Default for Workspace {
             placing: None,
             screen: Rect::new(0.0, 0.0, 1280.0, 800.0),
         }
+    }
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        // The arrangement and the settings come out of the same file together, because a setting
+        // belongs to a panel and the panels are the arrangement: loading one without the other
+        // would open a workspace half of which was somebody's and half of which was the default's.
+        let (layout, options, floating) =
+            load_layout().unwrap_or_else(|| (default_layout(), <_>::default(), Vec::new()));
+        Self::from_parts(layout, options, floating, load_theme().unwrap_or_default())
     }
 }
 
@@ -3090,7 +3120,25 @@ impl Workspace {
                 let mut drag = std::mem::take(&mut self.drag);
                 let outcome = match self.layout_of_mut(self.grab_surface) {
                     Some(layout) => drag.release(layout, area, x, y),
-                    None => Outcome::Nothing,
+                    // **A release always takes the grab apart, arrangement or no arrangement.**
+                    //
+                    // This used to answer `Outcome::Nothing` and leave the grab standing, which
+                    // strands it for the rest of the session: `active()` stays true, and
+                    // `working_surface` therefore keeps handing back the surface that press chose
+                    // instead of the one under the pointer. From then on *every* drag rearranges
+                    // whatever window that was, wherever you press.
+                    //
+                    // The window it named is gone by then, and that is not rare: dropping a tab
+                    // into another window merges the two and the one it came from ceases to exist
+                    // -- which is precisely the gesture that gets here. Reported as dragging one
+                    // panel's tab and picking up another's, and it was permanent until restart.
+                    //
+                    // Nothing to apply, so nothing is applied; what matters is that the hand is
+                    // opened. `Pulse::Lost` and the no-pointer path already do this.
+                    None => {
+                        drag.let_go();
+                        Outcome::Nothing
+                    }
                 };
                 self.drag = drag;
                 if saves(&outcome) {
@@ -3708,26 +3756,22 @@ mod tests {
     /// Built directly rather than through `Workspace::new`, which would read whatever the machine
     /// running the tests happens to have saved.
     fn bare() -> Workspace {
-        Workspace {
-            layout: default_layout(),
-            history: crate::layout::History::default(),
-            theme: crate::theme::Theme::default(),
-            drag: crate::panel_drag::PanelDrag::default(),
-            canvas_rect: None,
-            popup: None,
-            popup_input: crate::panel_draw::PanelInput::default(),
-            popup_wanted: None,
-            options: std::collections::HashMap::new(),
-            floating: Vec::new(),
-            grab_surface: Surface::Docked,
-            next_float: 0,
-            grip: (0.0, 0.0),
-            grip_rect: Rect::new(0.0, 0.0, 0.0, 0.0),
-            grip_at: (0.0, 0.0),
-            pending: None,
-            placing: None,
-            screen: Rect::new(0.0, 0.0, 1280.0, 800.0),
-        }
+        Workspace::from_parts(
+            default_layout(),
+            std::collections::HashMap::new(),
+            Vec::new(),
+            crate::theme::Theme::default(),
+        )
+    }
+
+    /// A workspace as it comes up from a file that had windows in it.
+    fn restored(floating: Vec<Floating>) -> Workspace {
+        Workspace::from_parts(
+            default_layout(),
+            std::collections::HashMap::new(),
+            floating,
+            crate::theme::Theme::default(),
+        )
     }
 
     /// A press inside the open list belongs to the list: it must not also close it, and it must
@@ -4286,6 +4330,157 @@ mod tests {
                     .rect,
                 history_was,
                 "round {round}: dragging the Pages tab moved the *History* window"
+            );
+        }
+    }
+
+    /// A release lets go, even when the window it was holding has ceased to exist.
+    ///
+    /// **This is the bug behind "I drag one panel's tab and it picks up another's".** Dropping a
+    /// tab into another window merges the two, and the window it came from is gone by the time the
+    /// release is handled -- so `layout_of_mut(grab_surface)` answered `None`, `release` was never
+    /// called, and the grab was left standing. `active()` stays true after that, and
+    /// `working_surface` therefore keeps handing back the surface *that* press chose rather than
+    /// the one under the pointer: from then on every drag anywhere rearranges that one window.
+    /// Permanent until the application is restarted.
+    ///
+    /// The merge is the ordinary way in, but the claim is about the release, so this arranges the
+    /// disappearance directly: hold a window's tab, take the window away, let go, and then check
+    /// that the next gesture goes where it is aimed.
+    #[test]
+    fn a_release_lets_go_of_a_window_that_has_gone() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.set_screen(screen);
+        ws.float(PAGES);
+        ws.float(HISTORY);
+        let (pages, history) = (ws.floating[0].id, ws.floating[1].id);
+        let history_was = ws.floating[1].rect;
+
+        // Pressed and not moved. A press that *has* moved is carrying the window, and a carry is
+        // let go of by an earlier branch -- so a moved gesture never reaches the arm this is about.
+        {
+            let mut hand = Hand::new(&mut ws, screen);
+            let grab = hand.tab_of(pages);
+            hand.press(grab);
+        }
+        // Gone, exactly as a merge would leave it, while the hand is still closed on it.
+        ws.floating.retain(|f| f.id != pages);
+        {
+            let mut hand = Hand::new(&mut ws, screen);
+            hand.release((260.0, 200.0));
+        }
+        assert!(
+            !ws.drag.active(),
+            "the release left the workspace still holding a window that no longer exists"
+        );
+
+        // And the next drag goes where it is aimed rather than to whatever the stale grab named.
+        let before = ws
+            .floating
+            .iter()
+            .find(|f| f.id == history)
+            .expect("history")
+            .rect;
+        assert_eq!(before, history_was, "nothing should have moved History yet");
+        {
+            let mut hand = Hand::new(&mut ws, screen);
+            let grab = hand.tab_of(history);
+            hand.drag(grab, (grab.0 + 60.0, grab.1 + 45.0));
+        }
+        let now = ws
+            .floating
+            .iter()
+            .find(|f| f.id == history)
+            .expect("history")
+            .rect;
+        assert_ne!(
+            now, before,
+            "dragging History's own tab did not move History"
+        );
+    }
+
+    /// A window floated after start-up never takes the name of one restored from the file.
+    ///
+    /// **This is the bug behind "I drag one panel's tab and another panel moves".** Windows
+    /// restored from a saved workspace are named by their position in the file -- 0, 1, 2 -- while
+    /// the counter that names new ones started at zero regardless. So the first panel floated
+    /// after start-up was handed a name that already belonged to something, and every lookup is
+    /// `find(|f| f.id == id)`, which answers with the first of the two. Press the tab of the one
+    /// you can see, and the other one moves.
+    ///
+    /// It needed a saved workspace to happen at all, which is why nothing driven from a fresh
+    /// start ever met it, and why it looked intermittent: whether it bit depended on which of the
+    /// two windows came first in the list.
+    #[test]
+    fn a_new_window_never_takes_a_restored_window_s_name() {
+        let restored_windows = vec![
+            Floating {
+                id: FloatId(0),
+                rect: Rect::new(60.0, 60.0, 300.0, 300.0),
+                layout: Layout::single(HISTORY),
+            },
+            Floating {
+                id: FloatId(1),
+                rect: Rect::new(700.0, 60.0, 300.0, 300.0),
+                layout: Layout::single(COLOUR),
+            },
+        ];
+        let mut ws = restored(restored_windows);
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.set_screen(screen);
+        ws.float(PAGE);
+
+        let names: Vec<u32> = ws.floating.iter().map(|f| f.id.0).collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "two windows share a name: {names:?}"
+        );
+
+        // And the consequence, which is the thing that was actually reported: the window you take
+        // hold of is the window that moves.
+        let page = ws
+            .floating
+            .iter()
+            .find(|f| f.layout.find(PAGE).is_some())
+            .expect("the page window")
+            .id;
+        let others: Vec<(FloatId, Rect)> = ws
+            .floating
+            .iter()
+            .filter(|f| f.id != page)
+            .map(|f| (f.id, f.rect))
+            .collect();
+        let before = ws
+            .floating
+            .iter()
+            .find(|f| f.id == page)
+            .expect("the page window")
+            .rect;
+        {
+            let mut hand = Hand::new(&mut ws, screen);
+            let grab = hand.tab_of(page);
+            hand.drag(grab, (grab.0 + 70.0, grab.1 + 50.0));
+        }
+        let now = ws
+            .floating
+            .iter()
+            .find(|f| f.id == page)
+            .expect("the page window")
+            .rect;
+        assert_ne!(
+            now, before,
+            "dragging the Page window's tab did not move it"
+        );
+        for (id, was) in others {
+            assert_eq!(
+                ws.floating.iter().find(|f| f.id == id).map(|f| f.rect),
+                Some(was),
+                "dragging Page's tab moved window {id:?} as well"
             );
         }
     }
