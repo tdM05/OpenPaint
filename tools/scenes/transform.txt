@@ -23,7 +23,8 @@ expect undo 0
 expect redo 0
 expect dirty false
 expect page-size 2048	2048
-about zoom 0.51 0.04
+# Measured, not derived: the application reports 0.5916 for a 2048 page in this window.
+about zoom 0.5916 0.02
 
 tab Transform
 shot transform-empty

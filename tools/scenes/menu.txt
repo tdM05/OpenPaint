@@ -4,6 +4,12 @@
 # the atlas like any other -- which means a `press` that resolves at all is already proof that
 # the menu opened, because a step naming something not on screen stops the run.
 #
+# Every press below says `Menu:` first. A drop-down is drawn by the panel that owns it, so the
+# menu bar and its lists are all filed under Menu -- and half these words belong to a panel as
+# well. The Layer menu's Add and the Layers panel's Add are one name; so are the Select menu's
+# Clear and the Select panel's Clear, and Undo and Redo and Fill selection. The atlas refuses a
+# name that fits two controls, deliberately, and saying which panel is meant is the answer.
+#
 # Three of these items hand the machine a native file dialog, and this harness cannot answer
 # one: it blocks on its own thread and no control of ours is on screen while it is up. Those
 # are driven only as far as "the request was made" -- `dialog true` -- and then dismissed with
@@ -19,8 +25,8 @@ expect dialog false
 
 # File > New, from a clean document: nothing to lose, so no question is asked, and what comes
 # back is one empty layer with an empty history.
-press File
-press New
+press Menu:File
+press Menu:New
 expect status New document
 expect confirm false
 expect layers 1
@@ -32,16 +38,16 @@ shot menu-new
 
 # The bar button lights while its list is down, and pressing it again puts the list away.
 # Closing a menu is not a command: nothing about the document may have moved.
-press File
-press File
+press Menu:File
+press Menu:File
 expect layers 1
 expect dirty false
 expect status New document
 
 # File > Open. Driven while the document is still clean, so the unsaved-changes question does
 # not stand between the press and the dialog. Cancelling must leave the document untouched.
-press File
-press Open
+press Menu:File
+press Menu:Open
 expect dialog true
 key escape
 expect dialog false
@@ -52,8 +58,8 @@ shot menu-open
 
 # File > Save on a document with no file of its own falls through to Save As, so it is a
 # dialog too -- and a cancelled save must not invent a path.
-press File
-press Save
+press Menu:File
+press Menu:Save
 expect dialog true
 key escape
 expect dialog false
@@ -61,8 +67,8 @@ expect file -
 expect dirty false
 
 # File > Save As always shows the picker, whether or not the document has a file.
-press File
-press Save As
+press Menu:File
+press Menu:Save As
 expect dialog true
 key escape
 expect dialog false
@@ -71,16 +77,16 @@ expect dirty false
 shot menu-saveas
 
 # View > Actual size is exactly one document pixel per screen pixel, whatever the window.
-press View
-press Actual size
+press Menu:View
+press Menu:Actual size
 expect zoom 1.0000
 shot menu-actual
 
 # View > Fit puts the whole 2048-square page inside the canvas, so the scale it lands on is
 # whatever this window makes it -- a number no scene can name. The band is wide on purpose:
 # its one job is to say that Fit is a real scale and that it is not 1:1.
-press View
-press Fit
+press Menu:View
+press Menu:Fit
 about zoom 0.5 0.49
 shot menu-fit
 
@@ -91,91 +97,88 @@ expect undo 1
 expect dirty true
 
 # Edit > Undo and Edit > Redo, which are the same two steps the History panel offers.
-press Edit
-press Undo
+press Menu:Edit
+press Menu:Undo
 expect undo 0
 expect redo 1
 shot menu-undone
-press Edit
-press Redo
+press Menu:Edit
+press Menu:Redo
 expect undo 1
 expect redo 0
 shot menu-redone
 
 # Select > All, and the mask it leaves behind.
-press Select
-press All
+press Menu:Select
+press Menu:All
 expect selection true
 expect status Selected all
 shot menu-selected
 
 # Select > Invert twice. Inverting everything leaves nothing, and an empty result is recorded
 # as no selection at all; inverting nothing selects everything. The pair is the proof.
-press Select
-press Invert
+press Menu:Select
+press Menu:Invert
 expect selection false
 expect status Inverted the selection
-press Select
-press Invert
+press Menu:Select
+press Menu:Invert
 expect selection true
 expect status Inverted the selection
 
 # Select > Deselect drops the mask.
-press Select
-press Deselect
+press Menu:Select
+press Menu:Deselect
 expect selection false
 expect status Deselected
 
 # Edit > Fill selection needs something selected, so the mask goes back first. The status only
 # reads "Filled the selection" when the fill was recorded, which is what makes it the check:
 # an unrecordable fill says so instead.
-press Select
-press All
+press Menu:Select
+press Menu:All
 expect selection true
-press Edit
-press Fill selection
+press Menu:Edit
+press Menu:Fill selection
 expect status Filled the selection
 expect dirty true
 shot menu-filled
 
 # Select > Clear is the other half of fill: the pixels inside the mask come off the active
 # layer, and that is recorded the same way.
-press Select
-press Clear
+press Menu:Select
+press Menu:Clear
 expect status Cleared the selection
 expect dirty true
 shot menu-cleared
-press Select
-press Deselect
+press Menu:Select
+press Menu:Deselect
 expect selection false
 
-# The Layer menu. Its four items carry the same words as the Layers panel's four buttons, and
-# the atlas refuses a name that fits two controls -- deliberately -- so these are pressed by
-# id. A menu item's id is FIRST_ITEM (1 << 21) plus its position in the list, and the Select
-# panel, which is the only other thing numbering from 1 << 21, is behind a tab and not drawn.
-press Layer
-press 2097152
+# The Layer menu, whose four items are word for word the Layers panel's four buttons.
+press Menu:Layer
+press Menu:Add
 expect layers 2
 expect active.name Layer 2
 expect status Added layer 2
 shot menu-layer-added
 
-press Layer
-press 2097153
+press Menu:Layer
+press Menu:Duplicate
 expect layers 3
 expect layer-names Layer 1, Layer 2, Layer 2 copy
 expect active.name Layer 2 copy
 
-press Layer
-press 2097154
+press Menu:Layer
+press Menu:Merge down
 expect layers 2
 expect layer-names Layer 1, Layer 2
 expect active.name Layer 2
 
 # Delete is the fourth item, and it is only built at all while there is more than one layer.
 # Unlike Add and Duplicate it is undoable, and that is the half worth driving.
-press Layer
-press 2097155
+press Menu:Layer
+press Menu:Delete
 expect layers 1
 expect layer-names Layer 1
 key ctrl+z
@@ -188,8 +191,8 @@ shot menu-layer-deleted
 # quotes that unpredictable absolute path, so what is asserted here is the rest of it -- that
 # it asked for no dialog, and left the document exactly as it found it. The picture beside
 # this scene and the "exported <path>" line in the run's log are the other half of the proof.
-press File
-press Export PNG
+press Menu:File
+press Menu:Export PNG
 expect dialog false
 expect layers 2
 expect dirty true
@@ -199,8 +202,8 @@ shot menu-exported
 # work away -- so it is last, and it is only ever cancelled. Escape answers the unsaved-changes
 # question with Cancel, and Cancel is the answer that keeps everything.
 expect dirty true
-press File
-press New
+press Menu:File
+press Menu:New
 expect confirm true
 shot menu-confirm
 key escape
@@ -211,11 +214,12 @@ expect dirty true
 shot menu-cancelled
 
 # View > Settings, right at the end, because what it opens is the workspace's own popup and it
-# stays up. Reaching "Words" inside it is the proof it opened; choosing a look is a setting,
-# not an edit, so the document must be exactly where the block above left it.
-press View
-press Settings
-press Words
+# stays up under a name of its own. Reaching "Words" inside it is the proof it opened, and
+# choosing a look is a setting rather than an edit -- so the document must be exactly where the
+# block above left it.
+press Menu:View
+press Menu:Settings
+press popup-workspace:Words
 expect layers 2
 expect layer-names Layer 1, Layer 2
 expect dirty true

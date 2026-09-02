@@ -353,14 +353,19 @@ try {
             $r = Rect-Of $name
             $v = $r.View
             if (-not $v) { return $r }
-            if ($r.Y -ge $v.Y -and ($r.Y + $r.H) -le ($v.Y + $v.H)) { return $r }
+            # **The centre is what a press aims at**, so the centre is what has to be inside.
+            # Insisting on the whole box refused controls a hand can hit perfectly well: a menu
+            # popup's last item overhangs its own box by two thirds of a point, which nobody can
+            # see and which stopped the run dead.
+            $mid = $r.Y + [int]($r.H / 2)
+            if ($mid -gt $v.Y -and $mid -lt ($v.Y + $v.H)) { return $r }
             $mx = $v.X + [int]($v.W / 2)
             $my = $v.Y + [int]($v.H / 2)
             # How far short, in pixels, and which way.
-            $short = if (($r.Y + $r.H) -gt ($v.Y + $v.H)) {
-                ($r.Y + $r.H) - ($v.Y + $v.H - 4)
+            $short = if ($mid -ge ($v.Y + $v.H)) {
+                $mid - ($v.Y + $v.H - 4)
             } else {
-                $r.Y - ($v.Y + 4)
+                $mid - ($v.Y + 4)
             }
             if ($per -le 0) {
                 # Measure one notch before spending any.

@@ -10,6 +10,10 @@
 # Text edits within 700 ms of each other coalesce into one entry (History::TEXT_COALESCE_MS),
 # which is why every edit below is preceded by `wait 900` -- that is what makes each one its own
 # step, and the count below it a statement about that control and no other.
+#
+# Every press says `text:` first. Half these words -- Size, Colour, Width, Font -- belong to
+# another panel as well, and the atlas refuses a name that fits two controls; the panel's own
+# drop-down is filed under the panel too, so the font list is reached the same way.
 tab Text
 expect layers 1
 expect active.kind raster
@@ -18,7 +22,7 @@ expect dirty false
 
 # A text layer keeps the words rather than the pixels. It is named after its own caption, and
 # with no caption yet that name is "Text".
-press Add text layer
+press text:Add text layer
 expect layers 2
 expect active.kind text
 expect active.name Text
@@ -28,15 +32,17 @@ shot text-added
 
 # The caption. A press puts the caret in the field with the value selected, Enter gives the
 # words up -- one write for the whole edit, not one per keystroke -- and the layer renames
-# itself to match. No `b`, `e`, `0`, `1`, `[` or `]` in the words on purpose: those keys also
-# reach the tool and view shortcuts while a field is being typed into.
+# itself to match. The words are chosen for their letters: `b` and `e` are the two tool keys and
+# the space arms the pan, and a field with the caret is supposed to keep all three to itself --
+# so the tool afterwards is still the brush, and that is checked.
 wait 900
 press text:Caption
-type A caption
+type Be here
 key enter
-expect text A caption
-expect active.name A caption
+expect text Be here
+expect active.name Be here
 expect undo 1
+expect tool Brush
 shot text-typed
 
 # The font picker. Pressing it opens the list of installed families with "(default)" at its
@@ -46,8 +52,8 @@ shot text-typed
 wait 900
 press text:Font
 shot text-font-list
-press (default)
-expect text A caption
+press text:(default)
+expect text Be here
 expect active.kind text
 expect undo 1
 
@@ -71,7 +77,7 @@ expect undo 5
 wait 900
 slide text:Letter spacing 0.6
 expect undo 6
-expect text A caption
+expect text Be here
 shot text-metrics
 
 # Alignment. Start/Center/End rather than Left/Right, so they stay true for a right-to-left
@@ -102,7 +108,7 @@ press text:Colour
 type zzz
 key enter
 expect undo 9
-expect text A caption
+expect text Be here
 expect active.kind text
 shot text-colour
 
@@ -153,7 +159,7 @@ expect undo 15
 # Convert to raster: the pixels stay and the words stop existing. One way, and undo is the only
 # way back -- which is exactly what the line under the button says, so it is what is checked.
 wait 900
-press Convert to raster layer
+press text:Convert to raster layer
 expect active.kind raster
 expect layers 2
 expect undo 16
@@ -171,8 +177,12 @@ shot text-undone
 # while it is up, so the key reaches the dialog and cancels it. Pressed by id because the
 # button's label ends in a U+2026 ellipsis, and a scene file has no business carrying one.
 press text:514
+wait 1200
 expect dialog true
+# A native modal takes a moment to appear and take the keyboard; an Escape sent before it has
+# lands on the application instead and leaves the dialog standing.
 key escape
+wait 800
 expect dialog false
 expect active.kind text
 shot text-font-dialog

@@ -3495,6 +3495,20 @@ impl OpenPaint {
             let _ = writeln!(o, "transform.persistent\t{}", d.persistent);
         }
         let _ = writeln!(o, "selection\t{}", self.selection.is_some());
+        // What is actually in it. "There is a selection" and "the selection has pixels in it" are
+        // different claims, and only the second lets anything be painted -- a mask that covers
+        // nothing blocks the whole page while showing no marching ants to explain why.
+        let _ = writeln!(
+            o,
+            "selection.bounds\t{}",
+            self.selection.as_ref().map_or_else(
+                || "-".to_owned(),
+                |s| s.mask.content_bounds().map_or_else(
+                    || "empty".to_owned(),
+                    |(x0, y0, x1, y1)| format!("{x0} {y0} {x1} {y1}"),
+                ),
+            )
+        );
         let _ = writeln!(
             o,
             "select-tool\t{}",
