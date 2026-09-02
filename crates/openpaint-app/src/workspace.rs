@@ -2295,6 +2295,35 @@ impl Workspace {
         // The window's own rectangle, read before the closure below borrows the workspace. Its
         // edges resize it; the arrangement inside knows nothing about them.
         let border = self.rect_of(working);
+        // **And the rectangles the panels draw their controls into**, which are theirs and not the
+        // window's. A press inside a floating window that was not a tab used to move the window --
+        // *any* press, including one on the colour wheel, so dragging a hue dragged the window
+        // instead. A window still needs somewhere to be picked up that is not one of its tabs;
+        // that somewhere is its chrome, which is what is left once the contents are taken out.
+        //
+        // The same rule as the secondary press (`contents_under`): what a panel draws in is the
+        // panel's. That one was fixed and this one was not, which is what having two places decide
+        // the same thing costs.
+        let contents: Vec<Rect> = if frame_of {
+            here.iter()
+                .filter_map(|slot| {
+                    let showing = showing_of(slot);
+                    if showing == CANVAS {
+                        return None;
+                    }
+                    let c = chrome::panel(
+                        slot,
+                        &m,
+                        style_of(slot),
+                        along_of(slot, direction_for(slot)),
+                        |i| measure(slot.tabs.get(i).copied()),
+                    );
+                    Some(c.controls.rect())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let preview = if on_popup == PopupPress::Consume {
             // The list owns this press. A drag already in flight still gets its release, which is
@@ -2335,7 +2364,10 @@ impl Workspace {
                             return crate::panel_drag::Target::Edge { pull };
                         }
                     }
-                    window_target(target, frame_of)
+                    window_target(
+                        target,
+                        frame_of && !contents.iter().any(|r| r.contains(x, y)),
+                    )
                 },
             )
         };
@@ -3498,9 +3530,13 @@ fn working_surface(in_flight: bool, over: Surface, current: Surface) -> Surface 
 fn window_target(target: crate::panel_drag::Target, in_window: bool) -> crate::panel_drag::Target {
     use crate::panel_drag::Target;
     match target {
-        // A window's own body, or the strip beside its tabs: both are the window itself.
-        // A window's own body has no leaf to name, so it stands for the first one -- which is the
-        // only leaf a window with one has.
+        // The window's chrome -- the ground around its contents, and the strip beside its tabs.
+        // Not the contents themselves: `in_window` is answered false for a point inside a panel's
+        // controls, because those belong to the panel. Without that, dragging anywhere in a
+        // floating panel moved the window, so the colour wheel could not be used at all.
+        //
+        // Chrome has no leaf to name, so it stands for the first one -- which is the only leaf a
+        // window with one has.
         Target::Elsewhere if in_window => Target::Frame { path: Vec::new() },
         Target::Strip { path } if in_window => Target::Frame { path },
         // In the arrangement the strip does nothing yet. It is the natural home for "float
@@ -4097,6 +4133,59 @@ mod tests {
         assert!(
             !ws.contents_under(&placed, label, r.x + r.w / 2.0, r.y + r.h / 2.0),
             "the canvas draws no controls, so it has no use for the other button"
+        );
+    }
+
+    /// A floating panel's controls are the panel's, not a handle for the window.
+    ///
+    /// **Reported by the artist**, and it made a floated panel unusable: dragging across the
+    /// colour wheel moved the whole window instead of choosing a hue. Any press inside a window
+    /// that was not a tab, a divider or an edge became a grab on the window's frame -- and "not a
+    /// tab" included every control in it.
+    ///
+    /// A window does still need somewhere to be picked up that is not one of its tabs, or dragging
+    /// it would always threaten to pull a panel out of it. That somewhere is its chrome, which is
+    /// what is left once the contents are taken out; both halves are checked here, because a fix
+    /// that stopped the window moving and left it unmovable would pass one of them.
+    #[test]
+    fn a_floating_panels_controls_are_not_a_handle_for_its_window() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.set_screen(screen);
+        ws.float(COLOUR);
+        let was = ws.floating[0].rect;
+
+        // Where that window draws its controls, worked out the way the workspace does.
+        let m = ws.theme.metrics;
+        let slot = ws.floating[0]
+            .layout
+            .resolve(inset(was, m.gutter))
+            .first()
+            .cloned()
+            .expect("the window has a leaf");
+        let c = chrome::panel(&slot, &m, style_of(&slot), Along::Down, |_| 46.0);
+        let body = c.controls.rect();
+        let inside = (body.x + body.w / 2.0, body.y + body.h / 2.0);
+
+        let mut hand = Hand::new(&mut ws, screen);
+        hand.press(inside);
+        hand.move_to((inside.0 + 120.0, inside.1 + 90.0));
+        hand.release((inside.0 + 120.0, inside.1 + 90.0));
+        assert_eq!(
+            ws.floating[0].rect, was,
+            "dragging inside a panel's controls moved the window it is in"
+        );
+
+        // And the strip beside the tabs still carries it, which is the whole reason the rule that
+        // broke this exists.
+        let grab = (c.header.x + c.header.w - 6.0, c.header.y + c.header.h / 2.0);
+        let mut hand = Hand::new(&mut ws, screen);
+        hand.press(grab);
+        hand.move_to((grab.0 + 80.0, grab.1 + 60.0));
+        hand.release((grab.0 + 80.0, grab.1 + 60.0));
+        assert_ne!(
+            ws.floating[0].rect, was,
+            "a window has to be movable by its own chrome, or its tabs are the only handle"
         );
     }
 

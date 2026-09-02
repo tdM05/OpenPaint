@@ -1,0 +1,69 @@
+# **A floating panel's contents belong to the panel, not to the window.**
+#
+# Reported, and rightly: with Colour floated, dragging across the colour wheel moved the whole
+# window instead of choosing a hue -- so the panel could not be used at all. Any press inside a
+# floating window that was not a tab was turned into a grab on the window's frame, and "not a tab"
+# included every control in it.
+#
+# This is the same rule the secondary press already follows: what a panel draws in is the panel's.
+# That one was fixed and this one was not, which is what having two places decide the same
+# question costs.
+#
+# Colour is floated from its own settings rather than by dragging its tab out: a tab let go over
+# the canvas docks into the canvas slot, which is what `PanelDrag::release` does with `Floated`.
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / *Brush,Transform,Select,Text / *Colour
+holdat 1816 1043
+press Float
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / *Brush,Transform,Select,Text | Colour
+shot window-floated
+
+# Where the window is now, so any movement of it would show.
+expect windows 60,60 319x325
+
+# **Dragging across the wheel picks a colour and does not move the window.** Both halves matter: a
+# fix that merely stopped the window moving, and left the wheel dead, would pass one of them.
+# The offset is the middle of the wheel control as the *floating* window sizes it -- 446 by 285,
+# so its centre is (223, 142). A floating panel is not the same width as a docked one, and an
+# offset carried over from the docked scenario lands outside the ring where a press means nothing.
+expect colour 141418
+pressat colour:0 223 142
+expect colour 414181
+expect windows 60,60 319x325
+slide colour:0 0.75
+expect colour 000081
+expect windows 60,60 319x325
+shot window-wheel
+
+# Nor do the ordinary controls under it move it.
+press Keep this colour
+expect palette 1
+expect windows 60,60 319x325
+press Triangle
+expect wheel-shape Triangle
+expect windows 60,60 319x325
+shot window-controls
+
+# And the window still moves when it is taken by its chrome, which is the whole reason that rule
+# exists -- a window with nowhere to pick it up but its tabs could not be moved without threatening
+# to pull the panel out of it every time.
+drag 200 75 400 300
+shot window-moved
+
+# --- And it is not a fact about the Colour panel ---
+#
+# The rule is "what a panel draws in is the panel's", so it has to hold for every panel that can be
+# floated. Brush is the other extreme: a list far taller than any window, so its controls have to
+# be scrolled to as well as pressed, and both are presses inside a floating window.
+# The Brush tab has moved since the start of this scene -- Colour leaving the right-hand column
+# resized what is left -- so the point comes from the atlas beside the last screenshot, not from
+# the arrangement this file opened with.
+holdat 1813 861
+press Float
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / *Transform,Select,Text | Colour / Brush
+expect brush.size 8.000
+slide brush:1048577 0.6
+about brush.size 25 12
+shot window-brush-slider
+press Reset to defaults
+expect brush.size 8.000
+shot window-brush
