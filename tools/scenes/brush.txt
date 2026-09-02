@@ -90,3 +90,88 @@ shot brush-applied
 press Forget beeper
 expect presets 
 shot brush-forgotten
+
+# **All six response pickers and all six curves.** Only the first of each had ever been touched, so
+# a picker wired to the wrong response, or a curve editor pointed at its neighbour, would have gone
+# unnoticed five times over. Each one is given a different source, and then all six are read back
+# at once -- so two of them crossed would show as two wrong answers rather than none.
+tab Brush
+press Reset to defaults
+
+press brush:1048832
+press Tilt
+expect response.size Tilt	2
+press brush:1048833
+press Velocity
+expect response.flow Velocity	2
+press brush:1048834
+press Direction
+expect response.hardness Direction	2
+press brush:1048835
+press Random
+expect response.spacing Random	2
+press brush:1048836
+press Pressure
+expect response.roundness Pressure	2
+press brush:1048837
+press Tilt
+expect response.angle Tilt	2
+shot brush-sources
+
+# And the curve under each picker: a press on empty track adds a point to that response and to no
+# other. Adding one to each in turn and reading all six back is the check that they are six
+# editors and not one drawn six times.
+press brush:1049088
+expect response.size Tilt	3
+press brush:1049089
+expect response.flow Velocity	3
+press brush:1049090
+expect response.hardness Direction	3
+press brush:1049091
+expect response.spacing Random	3
+press brush:1049092
+expect response.roundness Pressure	3
+press brush:1049093
+expect response.angle Tilt	3
+shot brush-curves
+
+# Right-clicking a point takes it away again, from the same curve it was added to.
+rpress brush:1049088
+expect response.size Tilt	2
+rpress brush:1049089
+expect response.flow Velocity	2
+rpress brush:1049090
+expect response.hardness Direction	2
+rpress brush:1049091
+expect response.spacing Random	2
+rpress brush:1049092
+expect response.roundness Pressure	2
+rpress brush:1049093
+expect response.angle Tilt	2
+
+# The edge profile is a seventh curve, and not a response: its axis is distance within the dab
+# rather than an input, which is why nothing drives it. It is only reachable while the tip is a
+# procedural one, which it is until a bitmap is loaded.
+press brush:1048590
+shot brush-edge
+rpress brush:1048590
+press Reset to defaults
+expect brush-tip round
+
+# **Editing inside a field, rather than replacing it.** Every other `type` in this suite lands in a
+# field that arrives selected, so the first keystroke replaces the lot and the caret is never
+# actually moved. Here the caret is walked about and the text mended in place, which is the only
+# way to find out whether the field is a text field or a box that accepts one word.
+press brush:1048585
+type inkr
+key left
+type e
+key home
+type f
+key end
+type s
+key enter
+press Save brush
+expect presets finkers
+press Forget finkers
+expect presets

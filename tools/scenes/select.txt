@@ -161,16 +161,29 @@ expect selection true
 # reads as a tap -- which deselects. That is the code behaving correctly on a degenerate gesture,
 # and it is asserted as such; a lasso that actually encloses something needs a path with a corner
 # in it, which the step vocabulary has no way to send.
+# **A real freehand shape, with corners in it.** Until the harness learned to walk a path, every
+# lasso this suite drew was a straight line -- which is a polygon with no area, and therefore a
+# test of the code that copes with a tap rather than of the lasso. The square below is drawn as
+# four sides and the marching ants trace exactly it.
 press Select:Lasso
 expect select-tool lasso
-expect selection true
-drag 700 500 1000 800
+path 700 500 1050 500 1050 850 700 850
 expect selection true
 expect status Selected
-# It encloses an area rather than nothing, which is not what a straight there-and-back path should
-# give under any even-odd rule -- so the shape the lasso actually receives is not the straight line
-# the harness drew. Worth a look; recorded in DRIVE_LOG.md rather than guessed at here.
-expect selection.bounds 611 639 1032 1061
+expect selection.bounds 576 604 1169 1197
+shot select-lasso-square
+
+# And the straight line, which encloses nothing and must therefore leave nothing selected.
+#
+# It used to leave a selection that could not be seen. An injected pointer reports whole pixels, so
+# a "straight" drag is really a staircase wandering half a pixel either side of the line it meant
+# to be; closing that back to the start encloses a row of slivers. Far below the half coverage the
+# outline counts as inside -- so no marching ants -- and comfortably above zero, so there was a
+# mask, and every stroke afterwards fell outside it and was refused with nothing on screen to say
+# why. That is the worst state this application has had, and this is the assertion for it.
+drag 700 500 1000 800
+expect selection false
+expect status That shape has no area, so nothing is selected
 shot select-lasso-line
 
 # The move tool. It needs a selection with pixels under it, so the rectangle is made again over the

@@ -826,7 +826,7 @@ pub fn report_widget(name: &str, rect: egui::Rect, ppp: f32) {
         let _ = writeln!(
             f,
             "# prompt
-0	{:.0}	{:.0}	{:.0}	{:.0}	{name}",
+0\t{:.0}\t{:.0}\t{:.0}\t{:.0}\t{name}",
             rect.min.x * ppp,
             rect.min.y * ppp,
             rect.width() * ppp,
@@ -848,7 +848,7 @@ pub fn report_tab(name: &str, rect: crate::layout::Rect, ppp: f32) {
         use std::io::Write as _;
         let _ = writeln!(
             f,
-            "@ {name}	{:.0}	{:.0}	{:.0}	{:.0}",
+            "@ {name}\t{:.0}\t{:.0}\t{:.0}\t{:.0}",
             rect.x * ppp,
             rect.y * ppp,
             rect.w * ppp,
@@ -890,7 +890,7 @@ fn report_controls(
     // confident nowhere and calls it a pass.
     let _ = writeln!(
         out,
-        "$	{:.0}	{:.0}	{:.0}	{:.0}	{:.0}	{:.0}	{}	{:.1}",
+        "$\t{:.0}\t{:.0}\t{:.0}\t{:.0}\t{:.0}\t{:.0}\t{}\t{:.1}",
         content.x * ppp,
         content.y * ppp,
         content.w * ppp,
@@ -930,7 +930,7 @@ fn report_controls(
             let r = crate::panel_ui::mark_rect(p.rect, m);
             let _ = writeln!(
                 out,
-                "{}	{:.0}	{:.0}	{:.0}	{:.0}	{name} mark",
+                "{}\t{:.0}\t{:.0}\t{:.0}\t{:.0}\t{name} mark",
                 mark.id,
                 r.x * ppp,
                 r.y * ppp,

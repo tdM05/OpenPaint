@@ -1,0 +1,107 @@
+# The crop box's eight handles, one at a time, and Enter as the way to apply.
+#
+# Seven of the eight had never been touched: `page.txt` drags the right edge and nothing else, so a
+# handle wired to the wrong side would have gone unnoticed everywhere but there. Each block below
+# moves one handle and checks that the side it belongs to moved and the other did not.
+#
+# The page is 2048 square and fitted at a zoom the application reports as 0.5916, so it occupies
+# x 359..1570 by y 142..1353 on screen and 300 screen pixels are about 507 page pixels. A drag of
+# 300 inwards should leave about 1541 on that axis. The tolerance is generous on purpose: what is
+# being proved is which side moved, not the arithmetic of the zoom.
+tab Page
+expect page.w 2048
+expect page.h 2048
+about zoom 0.5916 0.02
+
+# The right edge.
+press page:Crop / resize by dragging
+drag 1570 747 1270 747
+press page:Apply
+about page.w 1541 60
+expect page.h 2048
+key ctrl+z
+expect page.w 2048
+
+# The left edge. Moving it inwards takes the same amount off the other side.
+press page:Crop / resize by dragging
+drag 359 747 659 747
+press page:Apply
+about page.w 1541 60
+expect page.h 2048
+key ctrl+z
+expect page.w 2048
+
+# The top edge, which must move the height and leave the width alone.
+press page:Crop / resize by dragging
+drag 964 142 964 442
+press page:Apply
+expect page.w 2048
+about page.h 1541 60
+key ctrl+z
+expect page.h 2048
+
+# And the bottom.
+press page:Crop / resize by dragging
+drag 964 1353 964 1053
+press page:Apply
+expect page.w 2048
+about page.h 1541 60
+key ctrl+z
+expect page.h 2048
+
+# The four corners, each of which must move both sides at once.
+press page:Crop / resize by dragging
+drag 359 142 659 442
+press page:Apply
+about page.w 1541 60
+about page.h 1541 60
+key ctrl+z
+expect page.w 2048
+expect page.h 2048
+
+press page:Crop / resize by dragging
+drag 1570 142 1270 442
+press page:Apply
+about page.w 1541 60
+about page.h 1541 60
+key ctrl+z
+
+press page:Crop / resize by dragging
+drag 359 1353 659 1053
+press page:Apply
+about page.w 1541 60
+about page.h 1541 60
+key ctrl+z
+
+press page:Crop / resize by dragging
+drag 1570 1353 1270 1053
+press page:Apply
+about page.w 1541 60
+about page.h 1541 60
+shot crop-corner
+key ctrl+z
+expect page.w 2048
+expect page.h 2048
+
+# The interior moves the whole box rather than one side. A box that already covers the whole page
+# has nowhere to move to, so this changes neither side -- and the application says why in the
+# plainest terms it has: the page is already that size.
+press page:Crop / resize by dragging
+drag 964 747 1064 847
+press page:Apply
+expect page.w 2048
+expect page.h 2048
+expect status Page is already 2048x2048
+
+# **Enter applies the crop**, which is what the panel's own instruction says and which nothing had
+# ever pressed.
+press page:Crop / resize by dragging
+expect crop true
+drag 1570 747 1270 747
+key enter
+expect crop false
+about page.w 1541 60
+expect undo 1
+shot crop-entered
+key ctrl+z
+expect page.w 2048

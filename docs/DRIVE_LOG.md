@@ -27,7 +27,7 @@ now driven and correct.
 | 15 | **Two of the four selection tools would not put themselves away.** Pressing the tool already up toggles it off — but only Lasso and Rect were named in the check, so a lit Wand or Move was silently rebuilt instead. The same press on the same-looking button doing two different things, with nothing in the panel to say which. Now asked of the tool rather than of a list, so a fifth tool cannot be left out of it. | `main.rs` `SelectAction::Use` | fixed |
 | 16 | **The menu offered three things it would refuse**: Merge down on the bottom layer, Fill selection with nothing selected, and Deselect/Invert/Clear likewise. `menu.rs`'s own header says a menu never does that, and there was a test for it — which only covered Delete. | `panels/menu.rs` | fixed, with a test |
 | 14 | Stale module docs: `text.rs` said the caption editor was "not drawn yet" — it is fully wired, and a reader trusting the header would skip fourteen live controls — and `page.rs` described a blocker that had been lifted. | `panels/text.rs`, `panels/page.rs` | fixed |
-| 6 | A straight-line lasso drag encloses an area rather than nothing, which no even-odd rule should give for a there-and-back path. The shape the lasso receives is therefore not the line the harness drew. Asserted as it is, in `select.txt`; worth understanding. | `main.rs` lasso path | open |
+| 6 | **A lasso with no area left a selection that could not be seen.** An injected pointer reports whole pixels, so a "straight" drag is a staircase wandering half a pixel either side of the line it meant to be; closing that back to the start encloses a row of slivers. Far below the half coverage `Selection::outline` counts as inside — so no marching ants — and comfortably above zero, so `is_empty` said there *was* a selection. Every stroke afterwards fell outside it and was refused, with nothing on screen to say why: the worst state this application has had, arrived at by a second route. `set_selection` now tests the outline rather than the mask, so what constrains the brush is what is drawn on the page. | `main.rs::set_selection` | fixed, with a test |
 
 ## Panels
 
@@ -56,6 +56,10 @@ are assertions against the application's own reported state, not steps.
 | Launch into the workspace | every one | ok |
 | Brush stroke, eraser, undo, redo | `paint.txt` | ok |
 | Every keyboard shortcut | `keyboard.txt` | ok |
+| Zoom by wheel, pan by middle-drag and by space-drag, alt+click to pick a colour | `navigate.txt` | ok |
+| Ctrl+S over an existing path, and all three answers to the unsaved-changes question | `saving.txt` | ok |
+| The eight crop handles, one at a time, and Enter to apply | `crop.txt` | ok |
+| What the menus and panels do **not** offer | `absences.txt` | ok |
 | New, and its unsaved-changes prompt | `menu.txt` | ok |
 | Open / Save / Save As — the request and its cancellation | `menu.txt` | ok |
 | Export PNG | `menu.txt` | ok |
@@ -72,7 +76,7 @@ are assertions against the application's own reported state, not steps.
 | Resize a floating window's edges and corners | -- | |
 | Pick-a-destination mode | -- | |
 | Settings popup, remove this panel | -- | |
-| Wheel scrolls the panel under the pointer only | ok | proven by `press` scrolling a control into view |
+| Wheel scrolls the panel under the pointer only | ok | `navigate.txt` — and the wheel over the artwork zooms, which is a different code path and was for a long time wrongly claimed as covered by this one |
 | Panel list, and toggling a panel off and on | ok | `gestures.txt` |
 | Layout undo, redo and reset (F3, Shift+F3, Ctrl+F3) | ok | `gestures.txt` |
 | Float, dock, move a tab between slots, settings popup, remove a panel, resize a window | ok | `gestures.txt` |

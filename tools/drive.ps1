@@ -41,6 +41,9 @@
     key NAME            a key by name: b, e, f2, f3, ctrl+z, escape, enter
     type TEXT           the text, as typing
     wait MS             let the app catch up
+    path X1 Y1 X2 Y2 ...  a press, a walk through every point in turn, and a release -- what a
+                        freehand lasso is. `drag` walks a straight line, which is a polygon with
+                        no area and therefore not a test of the lasso at all.
     middle X1 Y1 X2 Y2  a middle-button drag, which is how the canvas is panned
     holding KEY STEP    hold space, alt, ctrl or shift down and do one step inside it -- what
                         space-to-pan and alt-click-to-pick need, and what `key` cannot say
@@ -762,6 +765,34 @@ try {
                     [void]$checks.Add("  FAIL  '$rest' is on screen and should not be")
                     $script:failed = $true
                 }
+            }
+            'path' {
+                # `path X1 Y1 X2 Y2 X3 Y3 ...` -- a press, a walk through every point in turn, and
+                # a release. **A `drag` is a straight line**, so a lasso drawn with it is a
+                # degenerate polygon and every freehand selection this suite made was of a shape
+                # with no area. A corner is the whole difference between testing the lasso and
+                # testing the code that copes with somebody tapping.
+                $n = ($a.Count - 1) / 2
+                if ($a.Count -lt 7 -or (($a.Count - 1) % 2) -ne 0) {
+                    throw 'path wants at least three x,y pairs'
+                }
+                Point-At ([int]$a[1]) ([int]$a[2])
+                Start-Sleep -Milliseconds 80
+                [Win]::mouse_event([Win]::LDOWN, 0, 0, 0, [IntPtr]::Zero)
+                Start-Sleep -Milliseconds 60
+                for ($k = 1; $k -lt $n; $k++) {
+                    $fx = [int]$a[($k * 2) - 1]
+                    $fy = [int]$a[$k * 2]
+                    $tx = [int]$a[($k * 2) + 1]
+                    $ty = [int]$a[($k * 2) + 2]
+                    for ($i = 1; $i -le 14; $i++) {
+                        $t = $i / 14
+                        Point-At ([int]($fx + ($tx - $fx) * $t)) ([int]($fy + ($ty - $fy) * $t))
+                    }
+                }
+                Start-Sleep -Milliseconds 120
+                [Win]::mouse_event([Win]::LUP, 0, 0, 0, [IntPtr]::Zero)
+                Start-Sleep -Milliseconds 350
             }
             'middle' {
                 # `middle X1 Y1 X2 Y2` -- a middle-button drag, which is how the canvas is panned

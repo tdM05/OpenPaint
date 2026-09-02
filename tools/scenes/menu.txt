@@ -254,3 +254,13 @@ press Menu:Edit
 absent Menu:Fill selection
 press Menu:Undo
 shot menu-absences
+
+# The Panels button in the bar is the other way to the workspace's list of panels -- the one that
+# is discoverable, as against the secondary press that is not. It had never been pressed.
+press Menu:Panels
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / *Brush,Transform,Select,Text / *Colour
+press popup-panels:History
+expect layout *Menu / *Tools / *Canvas / *Layers,Pages,Page / *Brush,Transform,Select,Text / *Colour
+shot menu-panel-list
+key f3
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / *Brush,Transform,Select,Text / *Colour

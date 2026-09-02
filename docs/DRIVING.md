@@ -61,13 +61,20 @@ brush panel's list is four times taller than the window, and `place` gives every
 whether or not it is on screen.
 
 **The state dump.** `OPENPAINT_STATE` names a file; the app rewrites it at the end of every frame
-with the state a control is supposed to move — tool, pages, layers and every layer's properties,
-what is actually inside a selection, the wand's settings, a transform's placement, colour, every
-brush parameter and response, the saved brushes, undo/redo depth, dirty, zoom, which prompts are
-up, and the whole arrangement of panels in one line (`OpenPaint::report_state`,
-`Workspace::describe`). At the end of the frame, not the start: painting is demand-driven, so the
-last frame after an action is the last word, and reported from the top it described the state
-*before* that frame's presses were applied. A screenshot cannot tell "Add made a layer" from "Add did nothing and
+with the state a control is supposed to move. Read `OpenPaint::report_state` for the list, which is
+the only authority — but in outline: the tool and the selection tool; pages, the active page, and
+the page's size as a pair and as `page.w` / `page.h` on their own; the layer stack, its names in
+order, and every property of the active layer; what is actually inside a selection, not merely
+that there is one; the wand's settings; a transform's placement while one is in the air; the
+caption's ten fields when a text layer is active; the colour, every brush parameter, every
+response and its curve, the saved brushes; undo and redo depth; dirty and the file's name; the
+zoom, the rotation and where the view is looking; which prompts and dialogs are up; and the whole
+arrangement of panels in one line, with the direction each runs in beside it
+(`Workspace::describe`, `Workspace::directions`).
+
+At the end of the frame, not the start: painting is demand-driven, so the last frame after an
+action is the last word, and reported from the top it described the state *before* that frame's
+presses were applied. A screenshot cannot tell "Add made a layer" from "Add did nothing and
 the list was already scrolled", and the log only says what input arrived, never what became of it.
 
 ## What it reaches, and what it does not

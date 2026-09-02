@@ -15,6 +15,26 @@
 # mask's `content_bounds`, so a rectangle dragged from (660,460) to (1120,920) puts its corner
 # handles at exactly those screen points, to within the pixel the page round-trip costs. That is
 # how the corner drag below knows where to grab, and `GRAB_PX` gives it ten screen pixels of slack.
+#
+# **What each control is answerable to.** `report_state` now describes a transform while it is in
+# the air -- `transform.scale`, `transform.rotation`, `transform.offset`, `transform.lock`,
+# `transform.kernel`, `transform.persistent` -- and reports the application's own filter, `kernel`,
+# whether or not anything is in flight. Before that, seven controls shared the one assertion
+# `status Applied the transform`, which says only that the transform was not the identity: true of
+# any control that did anything at all, and just as true with Scale X wired to Scale Y. Each block
+# below checks the number its own control is supposed to move, and checks that the numbers beside
+# it did not move.
+#
+# **How a scale is asserted, and why it is asserted as a pair.** `transform.scale` is two numbers
+# on one line, and `about` reads one number, so it cannot serve here at all -- `expect`, and an
+# exact pair, is the only assertion available. A slider dragged to the middle of its track lands
+# near its target and not on it, which is no use to an exact assertion, so each scale block drives
+# its slider *past* the end of the track instead: `from_fraction` is the one place a slider's range
+# is enforced, `panel_draw` keeps a latched slider following the pointer wherever it has got to,
+# and together those pin the value at exactly `SCALE_MIN` -- 10%, a scale of 0.1000. The axis under
+# test then reads 0.1000 and the axis beside it has to still read 1.0000, so swapping the two ids
+# fails both blocks. The fraction is negative because the low end of the track is to the left, over
+# the canvas; a drag off the right-hand end of the panel would be a drag off the screen.
 expect tool Brush
 expect select-tool -
 expect selection false
@@ -25,19 +45,27 @@ expect dirty false
 expect page-size 2048	2048
 # Measured, not derived: the application reports 0.5916 for a 2048 page in this window.
 about zoom 0.5916 0.02
+# The filter the next transform will use, before anybody has touched it: `Kernel::default`.
+expect kernel Mitchell
 
 tab Transform
 shot transform-empty
 
-# Shape three: nothing selected. The only interactive control is the resampling filter, which is
+# Shape three: nothing selected. There is one interactive control and it is the resampling filter,
 # offered whether or not there is anything to transform because it is the filter the *next* one
-# will use. Choosing one with nothing in flight hangs it on the identity, and that guard is worth
-# driving: it must not conjure a transform nobody started, must not touch the document, and must
-# not make an undo step. There is no `kernel` key in `report_state`, so the picture is the evidence
-# that the pick's value text changed, and these four lines are the evidence that nothing else did.
+# will use. What belongs to a transform in flight is not merely dead here, it is gone.
+absent Transform selection
+absent Transform:Scale X
+absent Transform:Lock
+absent Transform:Apply
+# Choosing one with nothing in flight hangs it on the identity, and that guard is worth driving: it
+# must not conjure a transform nobody started, must not touch the document, and must not make an
+# undo step. `kernel` is the witness that the pick reached the application at all; the four lines
+# after it are the witnesses that nothing else moved with it.
 press Resampling
 shot transform-kernels
 press Fast (bilinear)
+expect kernel Bilinear
 expect dragging false
 expect selection false
 expect undo 0
@@ -66,13 +94,26 @@ expect selection true
 shot transform-ready
 
 # Shape two: a selection and no transform, which is the only state in which "Transform selection"
-# exists. Beginning lifts the pixels and holds them in the air; nothing is recorded yet, because
-# nothing has landed.
+# exists -- and still no sliders. Beginning lifts the pixels and holds them in the air; nothing is
+# recorded yet, because nothing has landed.
+absent Transform:Scale X
+absent Transform:Apply
 press Transform selection
 expect dragging true
 expect selection true
 expect undo 1
 expect status Transforming. Drag inside to move, a handle to scale, just outside to rotate. Enter applies, Esc cancels.
+# A transform that has just been lifted is the identity, hung on the filter that was chosen with
+# nothing in flight, and it is *persistent*: it stays up until Apply, Cancel, Enter or Esc ends it.
+# The `false` a quick move-drag reports cannot be seen from here at all -- it exists only between a
+# press and a release, and the harness reads the state between steps.
+expect transform.scale 1.0000	1.0000
+expect transform.rotation 0.0000
+expect transform.offset 0.0	0.0
+expect transform.lock false
+expect transform.kernel Bilinear
+expect transform.persistent true
+absent Transform selection
 shot transform-in-flight
 
 # Cancel puts them back and records nothing: the layer has been untouched since the lift, so an
@@ -88,18 +129,21 @@ shot transform-cancelled
 # From here every block is the same shape: begin, move one control, apply, undo. Undoing an
 # `Op::Move` brings the outline back with the pixels, so each block starts from the same document
 # and the same handle box as the last -- which is what lets one set of coordinates serve them all.
-#
-# **What Apply's status proves.** `commit_transform` only announces "Applied the transform" when
-# the transform is not the identity; an untouched one lands silently. So that one line is the
-# assertion that the control under test actually moved the transform, and it is the only one
-# available: scale, rotation, lock and kernel have no key in `report_state`. The pictures carry
-# the rest.
+# `status Applied the transform` stays in every block, because `commit_transform` says it only when
+# the transform is not the identity and that is still worth knowing; it is no longer the only thing
+# a block proves.
 
-# Scale X. The track is logarithmic with 100% dead centre, so 0.60 is about 160%.
+# Scale X, driven off the low end of its track and pinned there. The first number is 0.1000 and the
+# second is untouched, which is the whole point: a Scale X wired to `scale.1` fails this line.
 press Transform selection
 expect dragging true
-slide Transform:Scale X 0.60
+expect transform.lock false
+slide Transform:Scale X -0.40
 expect dragging true
+expect transform.scale 0.1000	1.0000
+# And a scale is not a rotation and not a move.
+expect transform.rotation 0.0000
+expect transform.offset 0.0	0.0
 shot transform-scaled-x
 press Transform:Apply
 expect dragging false
@@ -113,16 +157,13 @@ expect redo 1
 expect selection true
 expect status Moved the selection back
 
-# Lock, then Scale Y. Turning the lock on snaps Y to X there and then rather than at the next drag,
-# and afterwards one slider moves both. Neither is in the state dump, so the toggle is asserted by
-# what it must not do -- end the transform -- and shown by the picture beside it.
+# Scale Y, the same drag on the other slider, and the pair comes out the other way round.
 press Transform selection
 expect dragging true
-press Transform:Lock
+slide Transform:Scale Y -0.40
 expect dragging true
-shot transform-locked
-slide Transform:Scale Y 0.45
-expect dragging true
+expect transform.scale 1.0000	0.1000
+expect transform.rotation 0.0000
 shot transform-scaled-y
 press Transform:Apply
 expect dragging false
@@ -133,11 +174,105 @@ expect undo 1
 expect selection true
 expect status Moved the selection back
 
-# Rotation. Degrees in the panel, radians in the document; 0.60 of -180..180 is about 36 degrees.
+# The lock, as a flag and as a snap. Turning it on evens the axes there and then rather than at the
+# next drag -- a lock that only bit later is a lock you cannot tell you have set -- so the axes are
+# made to differ first and the toggle is what brings them back together.
+press Transform selection
+expect transform.lock false
+slide Transform:Scale X -0.40
+expect transform.scale 0.1000	1.0000
+press Transform:Lock
+expect dragging true
+expect transform.lock true
+expect transform.scale 0.1000	0.1000
+shot transform-locked
+press Transform:Apply
+expect dragging false
+expect status Applied the transform
+expect undo 2
+key ctrl+z
+expect undo 1
+expect selection true
+expect status Moved the selection back
+
+# And what the lock does to a slider: with it on, one slider moves both axes. This is the same
+# gesture as the Scale Y block above, on the same slider, and the answer is different -- there it
+# left the first number at 1.0000, here it drags that number down with the second.
+press Transform selection
+press Transform:Lock
+expect transform.lock true
+expect transform.scale 1.0000	1.0000
+slide Transform:Scale Y -0.40
+expect transform.scale 0.1000	0.1000
+shot transform-locked-slider
+press Transform:Apply
+expect status Applied the transform
+expect undo 2
+key ctrl+z
+expect undo 1
+expect selection true
+
+# And what it does to a *corner*, which is the gesture the lock exists for and a different piece of
+# code from the sliders: `transform_box::scale` projects the drag onto the diagonal instead of
+# reading the two axes off it separately. Two numbers that came off a pointer cannot be asserted --
+# `expect` wants them exact and `about` cannot read a two-number line -- so what is asserted here is
+# what the pixels do, which is the difference the lock makes and has nothing to do with the panel.
+#
+# **The one thing this scene still cannot say** is "those two numbers are equal", which is what the
+# projection actually promises. It would take either two single-valued keys, `transform.scale-x`
+# and `transform.scale-y`, which `about` could then check to a tolerance apiece, or a step that
+# compares two keys. Until then the equality is covered by `transform_box`'s own tests and the
+# scene checks the consequence instead.
+#
+# The bottom-right handle is at (1120,920) and it is dragged straight down to (1120,1180). Unlocked
+# that stretches the height alone: the content still ends at x 1120, so the box out to its right
+# stays as clean as it was before the drag. Locked, the same drag takes the width with it --
+# k = (460 + 720) / (2 * 460) = 1.283, so the content reaches x 660 + 460*1.283 = 1250 and the far
+# end of the stroke lands at (1199,999), crossing the box that was empty a moment ago. Apply's
+# status is in both halves because an `ink ... 0` alone would also pass if the grab had missed.
+press Transform selection
+expect transform.lock false
+ink 1135 900 1235 1010 0
+drag 1120 920 1120 1180
+expect dragging true
+ink 1135 900 1235 1010 0
+shot transform-corner-unlocked
+press Transform:Apply
+expect status Applied the transform
+expect undo 2
+key ctrl+z
+expect undo 1
+expect selection true
+
+press Transform selection
+press Transform:Lock
+expect transform.lock true
+drag 1120 920 1120 1180
+expect dragging true
+expect transform.lock true
+ink 1135 900 1235 1010 20
+shot transform-corner-locked
+press Transform:Apply
+expect status Applied the transform
+expect undo 2
+key ctrl+z
+expect undo 1
+expect selection true
+expect status Moved the selection back
+
+# Rotation. Degrees in the panel, radians in the document, and one number -- so this is the one
+# slider that can be driven to the middle of its track and read back: 0.60 of -180..180 is 36
+# degrees, which is 0.6283 radians, and the drag lands a little short of the fraction it is given
+# because `slide` keeps eight pixels of padding at each end of the row. Hence `about`.
 press Transform selection
 expect dragging true
 slide Transform:Rotation 0.60
 expect dragging true
+about transform.rotation 0.60 0.05
+# A rotation is not a scale: the sliders carry size and this one carries angle, and neither reaches
+# into the other.
+expect transform.scale 1.0000	1.0000
+expect transform.offset 0.0	0.0
 shot transform-rotated
 press Transform:Apply
 expect dragging false
@@ -148,13 +283,19 @@ expect undo 1
 expect selection true
 expect status Moved the selection back
 
-# The two flips, one per block, so each one's status is its own evidence. A flip is a negative
-# scale, so it leaves the Scale sliders where they are -- they carry magnitude -- and the only way
-# to tell from the state that it did anything is that the transform is no longer the identity.
+# The two flips, one per block. A flip is a negative scale, so each one is answerable in the sign of
+# its own number and in nothing else -- the sliders carry magnitude and do not move.
 press Transform selection
 press Transform:Flip horizontally
 expect dragging true
+expect transform.scale -1.0000	1.0000
 shot transform-flipped-h
+# **And the slider carries how big, not which way round.** Driving Scale X down the track on a
+# flipped axis leaves it flipped: `resize` puts the magnitude back on the axis it found, sign and
+# all, so a touch of the slider cannot quietly unflip a selection.
+slide Transform:Scale X -0.40
+expect transform.scale -0.1000	1.0000
+shot transform-flipped-scaled
 press Transform:Apply
 expect status Applied the transform
 expect undo 2
@@ -165,6 +306,7 @@ expect selection true
 press Transform selection
 press Transform:Flip vertically
 expect dragging true
+expect transform.scale 1.0000	-1.0000
 shot transform-flipped-v
 press Transform:Apply
 expect status Applied the transform
@@ -173,14 +315,21 @@ key ctrl+z
 expect undo 1
 expect selection true
 
-# The canvas is the instrument. A press inside the box grabs its interior and drags the floating
-# pixels; a press on a corner grabs that handle and scales. Both go through `apply_grab`, and both
-# are proved the same way: if the grab missed, the transform is still the identity and Apply lands
-# without a word.
+# The canvas is the instrument, and the interior of the box is the plainest gesture on it: a press
+# inside grabs the interior and the floating pixels follow the pointer. `Handle::Inside` rounds the
+# total to whole page pixels so a move still takes the lossless copy path, and 100 screen pixels at
+# the 0.5916 this window reports is 169.03 page pixels, which rounds to 169. That is the number to
+# re-derive if the window size or the fit ever changes; nothing else here leans on the zoom to more
+# than a handle's width.
 press Transform selection
 expect dragging true
+expect transform.offset 0.0	0.0
 drag 890 690 990 790
 expect dragging true
+expect transform.offset 169.0	169.0
+# A move is not a scale and not a rotation.
+expect transform.scale 1.0000	1.0000
+expect transform.rotation 0.0000
 shot transform-moved
 press Transform:Apply
 expect status Applied the transform
@@ -190,13 +339,20 @@ expect undo 1
 expect selection true
 expect status Moved the selection back
 
-# The bottom-right corner of the handle box, which the note at the top of this file works out is at
-# (1120,920) -- the corner of the rectangle that was dragged to make the selection.
+# Just outside the box is the rotation ring, the third thing a press on the canvas can mean. It
+# reaches `ROTATE_BAND` times the ten screen pixels of `GRAB_PX`, so twenty pixels clear of the
+# right-hand edge is inside the ring and clear of the edge handle, which wants ten. The box turns
+# about its own centre, which is (890,690): the press is due right of it at zero degrees and the
+# release is down and to the right at forty-five, so the transform turns by 0.7854 radians. Off a
+# pointer, so `about` -- and rotation is one number, which is what lets `about` serve at all.
 press Transform selection
 expect dragging true
-drag 1120 920 1230 1030
+drag 1140 690 1067 867
 expect dragging true
-shot transform-handle
+about transform.rotation 0.7854 0.05
+expect transform.scale 1.0000	1.0000
+expect transform.offset 0.0	0.0
+shot transform-ring
 press Transform:Apply
 expect status Applied the transform
 expect undo 2
@@ -206,15 +362,24 @@ expect selection true
 expect status Moved the selection back
 
 # The resampling filter again, this time with a transform in the air, where it also redraws the
-# floating pixels. Choosing it must not end the transform, and the transform must still apply.
+# floating pixels. Choosing it must not end the transform, it must reach the transform that is up --
+# `transform.kernel` -- and it must also become the application's own preference for the next one,
+# which is why `set_transform` writes both and why both are checked.
 press Transform selection
 expect dragging true
+expect transform.kernel Bilinear
 press Resampling
 shot transform-kernels-live
 press Sharp (Catmull-Rom)
 expect dragging true
 expect selection true
-slide Transform:Scale X 0.58
+expect transform.kernel CatmullRom
+expect kernel CatmullRom
+# A filter is not a placement: choosing one leaves the transform where it was, so the pixels have
+# to be moved before Apply has anything to announce.
+expect transform.scale 1.0000	1.0000
+slide Transform:Scale X -0.40
+expect transform.scale 0.1000	1.0000
 press Transform:Apply
 expect status Applied the transform
 expect undo 2
@@ -235,7 +400,8 @@ expect redo 1
 
 press Transform selection
 expect dragging true
-drag 890 690 960 760
+drag 890 690 990 790
+expect transform.offset 169.0	169.0
 key enter
 expect dragging false
 expect status Applied the transform

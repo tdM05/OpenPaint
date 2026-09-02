@@ -2782,6 +2782,26 @@ impl Workspace {
         }
     }
 
+    /// Where each floating window is and how big, for whoever is driving the application.
+    ///
+    /// Separate from [`Self::describe`], which says what is *in* each window: a resize changes
+    /// neither the arrangement nor the document, so without this a window dragged by its edge had
+    /// no witness at all and the only evidence was that it left one entry on the layout stack --
+    /// true of any change, and silent about the size.
+    #[must_use]
+    pub fn window_rects(&self) -> String {
+        self.floating
+            .iter()
+            .map(|f| {
+                format!(
+                    "{:.0},{:.0} {:.0}x{:.0}",
+                    f.rect.x, f.rect.y, f.rect.w, f.rect.h
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" / ")
+    }
+
     /// Which way each panel's controls run, for whoever is driving the application.
     ///
     /// Separate from [`Self::describe`] because it is a different question about the same

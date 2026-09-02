@@ -124,7 +124,6 @@ impl View {
         Self::default()
     }
 
-    #[must_use]
     /// The page point the viewport is looking at.
     ///
     /// Exposed so the application can say where the view is when asked to describe itself: panning

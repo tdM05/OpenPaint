@@ -137,8 +137,13 @@ expect redo 0
 
 # --- Resizing a floating window by its edge and by its corner ---
 #
-# **There is no state key for a window's size, so what is asserted is the undo step the resize
-# leaves behind.** The Page window is the second one lifted, so it sits at 88,88 by 319x325 points
+# **A window's size is now something the application will say**, so a resize is asserted as a
+# resize rather than only as a step on the layout stack -- which is true of any change and silent
+# about the size. `windows` gives each floating window as `x,y wxh` in points, in the order they
+# were lifted. The undo-step reasoning below is kept as well: between them they say that the drag
+# changed the size, and that it recorded exactly one change and not two.
+#
+# The Page window is the second one lifted, so it sits at 88,88 by 319x325 points
 # -- 132,132 by 479x488 pixels -- and its right edge is at x 611, its bottom at y 620. The grab
 # band straddles each edge by half of the 26-point splitter reach, so 617,450 is the right edge and
 # 617,626 is the bottom-right corner. `hold` is right here where it is wrong on a tab: an edge is
@@ -151,14 +156,21 @@ expect redo 0
 # The presses that begin on the border lie over the canvas, and the artwork's undo depth says
 # neither of them painted.
 shot gestures-window-before
+expect windows 60,60 319x325 / 88,88 319x325
 hold 617 450 797 450
+# 180 screen pixels wider is 120 points wider, and only the width moves.
+expect windows 60,60 319x325 / 88,88 439x325
 shot gestures-window-wider
 key f3
+expect windows 60,60 319x325 / 88,88 319x325
 expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Select / *Brush,Transform / *Colour | Text / Page
 expect undo 1
 hold 617 626 767 746
+# A corner takes both: 150 screen pixels across and 120 down, which is 100 and 80 in points.
+expect windows 60,60 319x325 / 88,88 419x405
 shot gestures-window-corner
 key f3
+expect windows 60,60 319x325 / 88,88 319x325
 expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Select / *Brush,Transform / *Colour | Text / Page
 expect undo 1
 expect dirty true

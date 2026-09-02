@@ -32,6 +32,11 @@ if (-not (Test-Path $exe)) {
     throw "no binary at $exe -- cargo build --release --target-dir target/drive-build -p openpaint-app"
 }
 
+# Export drops a timestamped PNG beside wherever the application started, and the keyboard
+# scenario presses Ctrl+E every run. Cleared first so they do not pile up one per sweep.
+Get-ChildItem -Path $root -Filter 'openpaint-*.png' -File -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+
 $results = @()
 foreach ($scene in $scenes) {
     $name = $scene.BaseName

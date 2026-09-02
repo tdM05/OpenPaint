@@ -1673,14 +1673,38 @@ impl OpenPaint {
     /// The single place the selection changes, so the outline can never be stale: it is derived
     /// from the mask, and deriving it anywhere else would let the two drift.
     fn set_selection(&mut self, selection: Option<openpaint_core::Selection>, what: &str) {
-        self.selection = selection.map(|mask| {
+        // **A selection you cannot see is not a selection**, and that rule belongs here rather
+        // than at each of the five places a selection arrives from -- invert remembered to check
+        // for an empty one and the lasso did not.
+        //
+        // The test is the outline, not `Selection::is_empty`, and the difference is the whole bug.
+        // A lasso drawn as a straight line encloses no area, but rasterising it still leaves a
+        // sliver of partial coverage along the path: not empty, so `is_empty` said there was a
+        // selection, while `outline` -- which counts a pixel as inside only at half coverage --
+        // traced nothing. What was left was a mask with no marching ants that every later stroke
+        // fell outside of: nothing on screen, and the brush refusing to paint, with no way to find
+        // out why. That is the exact shape of the worst bug this application has had.
+        //
+        // Tying the two together means they cannot disagree again: what constrains the brush is
+        // what is drawn on the page.
+        let answered = selection.map(|mask| {
             let outline = mask.outline();
             ActiveSelection { mask, outline }
         });
+        let nothing_in_it = answered.as_ref().is_some_and(|s| s.outline.is_empty());
+        self.selection = answered.filter(|s| !s.outline.is_empty());
+
         // Named rather than a bare "selected". An outline at the page border looks the same
         // whether it arrived from select-all or from inverting a lasso, so the message is the only
         // thing that distinguishes them until the panel grows a proper indicator.
-        self.status_message = Some(what.to_owned());
+        //
+        // Except when the answer was nothing: saying "Selected" over an empty page is the same lie
+        // in words that the missing outline was in pixels.
+        self.status_message = Some(if nothing_in_it {
+            "That shape has no area, so nothing is selected".to_owned()
+        } else {
+            what.to_owned()
+        });
         self.request_redraw();
     }
 
@@ -3457,6 +3481,10 @@ impl OpenPaint {
         let _ = writeln!(o, "pages\t{}", doc.page_count());
         let _ = writeln!(o, "page\t{}", doc.active_index());
         let _ = writeln!(o, "page-size\t{}\t{}", page.w, page.h);
+        // Each side on its own, so a crop handle can be shown to move the side it belongs to and
+        // not merely to change the page somehow. The pair above cannot be compared loosely.
+        let _ = writeln!(o, "page.w\t{}", page.w);
+        let _ = writeln!(o, "page.h\t{}", page.h);
         let _ = writeln!(o, "layers\t{}", self.editor.layers().len());
         let _ = writeln!(o, "layer\t{}", self.editor.active_layer_index());
         for (i, l) in self.editor.layers().iter().enumerate() {
@@ -3476,15 +3504,15 @@ impl OpenPaint {
         // active layer, and an assertion that has to compare a whole tab-separated row against a
         // string is an assertion nobody will write correctly twice.
         if let Some(l) = self.editor.layers().get(self.editor.active_layer_index()) {
-            let _ = writeln!(o, "active.name	{}", l.name);
-            let _ = writeln!(o, "active.opacity	{:.3}", l.opacity);
-            let _ = writeln!(o, "active.blend	{:?}", l.blend);
-            let _ = writeln!(o, "active.visible	{}", l.visible);
-            let _ = writeln!(o, "active.lock-alpha	{}", l.lock_alpha);
-            let _ = writeln!(o, "active.clip-below	{}", l.clip_below);
+            let _ = writeln!(o, "active.name\t{}", l.name);
+            let _ = writeln!(o, "active.opacity\t{:.3}", l.opacity);
+            let _ = writeln!(o, "active.blend\t{:?}", l.blend);
+            let _ = writeln!(o, "active.visible\t{}", l.visible);
+            let _ = writeln!(o, "active.lock-alpha\t{}", l.lock_alpha);
+            let _ = writeln!(o, "active.clip-below\t{}", l.clip_below);
             let _ = writeln!(
                 o,
-                "active.kind	{}",
+                "active.kind\t{}",
                 if l.text().is_some() { "text" } else { "raster" }
             );
         }
@@ -3492,7 +3520,7 @@ impl OpenPaint {
         // time -- "Up moved this layer" is a statement about the order, not about one row.
         let _ = writeln!(
             o,
-            "layer-names	{}",
+            "layer-names\t{}",
             self.editor
                 .layers()
                 .iter()
@@ -3561,6 +3589,12 @@ impl OpenPaint {
         if let Some(d) = self.dragging.as_ref() {
             let t = &d.transform;
             let _ = writeln!(o, "transform.scale\t{:.4}\t{:.4}", t.scale.0, t.scale.1);
+            // Each axis on its own as well as the pair. The pair is what a reader wants; the
+            // singles are what an approximate check needs, because `about` compares one number
+            // and a scale that came off a pointer drag cannot be predicted to four places.
+            // Without them "the aspect lock made these two equal" had no assertion at all.
+            let _ = writeln!(o, "transform.scale-x\t{:.4}", t.scale.0);
+            let _ = writeln!(o, "transform.scale-y\t{:.4}", t.scale.1);
             let _ = writeln!(o, "transform.rotation\t{:.4}", t.rotation);
             let _ = writeln!(o, "transform.offset\t{:.1}\t{:.1}", t.offset.0, t.offset.1);
             let _ = writeln!(o, "transform.lock\t{}", d.lock_aspect);
@@ -3615,7 +3649,7 @@ impl OpenPaint {
         // without it space-drag and a middle-drag are two gestures with no consequence to check.
         let _ = writeln!(
             o,
-            "pan	{:.0}	{:.0}",
+            "pan\t{:.0}\t{:.0}",
             self.view.center().0,
             self.view.center().1
         );
@@ -3625,8 +3659,9 @@ impl OpenPaint {
         let _ = writeln!(o, "dialog\t{}", self.file_dialog.is_some());
         let _ = writeln!(o, "workspace-mode\t{}", self.workspace_mode);
         // The arrangement itself, which is the only witness a panel gesture has.
-        let _ = writeln!(o, "layout	{}", self.workspace.describe());
-        let _ = writeln!(o, "directions	{}", self.workspace.directions());
+        let _ = writeln!(o, "layout\t{}", self.workspace.describe());
+        let _ = writeln!(o, "directions\t{}", self.workspace.directions());
+        let _ = writeln!(o, "windows\t{}", self.workspace.window_rects());
         let _ = writeln!(
             o,
             "status\t{}",
@@ -3639,6 +3674,37 @@ impl OpenPaint {
                 .active_text()
                 .map_or_else(|| "-".to_owned(), |t| t.text.replace(['\n', '\t'], " "))
         );
+        // **The caption itself, field by field.** `text` alone says what the words are, and eleven
+        // controls in that panel change something else -- the face, the size, the weight, the
+        // wrapping, where it sits. Every one of them was asserted as "the undo depth went up by
+        // one", which is true of any recorded edit and says nothing about which edit. Swapping two
+        // of those controls would have left every assertion passing.
+        if let Some(t) = self.editor.active_text() {
+            let _ = writeln!(
+                o,
+                "text.font\t{}",
+                if t.font.family.is_empty() {
+                    "-"
+                } else {
+                    t.font.family.as_str()
+                }
+            );
+            let _ = writeln!(o, "text.weight\t{}", t.font.weight);
+            let _ = writeln!(o, "text.italic\t{}", t.font.italic);
+            let _ = writeln!(o, "text.size\t{:.2}", t.size);
+            let _ = writeln!(o, "text.line-height\t{:.3}", t.line_height);
+            let _ = writeln!(o, "text.letter-spacing\t{:.2}", t.letter_spacing);
+            let _ = writeln!(o, "text.align\t{:?}", t.align);
+            let _ = writeln!(
+                o,
+                "text.wrap\t{}",
+                t.wrap_width
+                    .map_or_else(|| "-".to_owned(), |w| format!("{w:.0}"))
+            );
+            let _ = writeln!(o, "text.at\t{:.0}\t{:.0}", t.x, t.y);
+            let c = t.color_srgb8;
+            let _ = writeln!(o, "text.colour\t{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+        }
         let _ = std::fs::write(path, o.as_bytes());
     }
 
@@ -4814,6 +4880,74 @@ mod tests {
             app.editor.pending_stroke().1.len(),
             before,
             "a stroke on a text layer put dabs in the queue"
+        );
+    }
+
+    /// A selection nobody can see is no selection at all.
+    ///
+    /// **The worst state this application can be in is something invisible that refuses input**,
+    /// and this is one of the two ways it got there. A lasso drawn as a straight line encloses no
+    /// area, but rasterising it leaves a sliver of partial coverage along the path: not empty by
+    /// `Selection::is_empty`, so there was a selection, and below the half-coverage the outline
+    /// counts as inside, so there were no marching ants. Every stroke afterwards fell outside "the
+    /// selection" and was refused, with nothing on screen to say why.
+    ///
+    /// The rule is now that what constrains the brush is what is drawn on the page, and this is
+    /// the test that the two cannot come apart again.
+    #[test]
+    fn a_selection_with_no_outline_is_not_a_selection() {
+        let mut app = OpenPaint::default();
+        let page = app.editor.page_rect();
+
+        // A real shape: something with an inside.
+        let square = openpaint_core::Selection::from_polygon(
+            &[
+                (200.0, 200.0),
+                (400.0, 200.0),
+                (400.0, 400.0),
+                (200.0, 400.0),
+            ],
+            page,
+        );
+        app.set_selection(Some(square), "Selected");
+        assert!(
+            app.selection.is_some(),
+            "a square encloses an area and is a selection"
+        );
+
+        // And a stroke that meant to be a straight line.
+        //
+        // Not two points: a polygon of two points really is empty, and a test built from one would
+        // pass for the wrong reason. What a hand -- or an injected pointer, which reports whole
+        // pixels -- actually draws is a staircase that wanders half a pixel either side of the
+        // line it meant to be. Closing that back to the start encloses a row of slivers: far below
+        // the half coverage the outline counts as inside, and comfortably above zero.
+        let wobbly: Vec<(f32, f32)> = (0..30)
+            .map(|i| {
+                let t = i as f32 * 20.0;
+                let wobble = if i % 2 == 0 { 0.05 } else { -0.05 };
+                (200.0 + t, 200.0 + t + wobble)
+            })
+            .collect();
+        let line = openpaint_core::Selection::from_polygon(&wobbly, page);
+        assert!(
+            !line.is_empty(),
+            "the sliver of coverage is exactly why `is_empty` was the wrong test; \
+             if this ever becomes true the bug is gone by another route and this test is stale"
+        );
+        assert!(
+            line.outline().is_empty(),
+            "and nothing above half coverage, which is why it drew no marching ants"
+        );
+        app.set_selection(Some(line), "Selected");
+        assert!(
+            app.selection.is_none(),
+            "a shape with no area left a selection that could not be seen and still refused paint"
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("That shape has no area, so nothing is selected"),
+            "and it has to say so, or the brush simply stops working for no stated reason"
         );
     }
 

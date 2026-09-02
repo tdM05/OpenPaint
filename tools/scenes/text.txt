@@ -3,10 +3,22 @@
 # Fourteen of this panel's controls exist only while the active layer is a text layer -- the
 # editor and the "not a text layer" label are mutually exclusive -- so nothing here can be
 # pressed until "Add text layer" has made one. That button is the whole scene's precondition.
+# Which of those controls are on screen when is `absences.txt`'s subject and not this one's.
 #
-# What the state dump can see of a caption is `text`, and the layer name that follows it, and
-# `active.kind`. It cannot see a size, a weight or a colour. So everything else is proved
-# through the undo stack: an edit the panel accepted is one entry, an edit it refused is none.
+# **Every control here is now checked against the field it is supposed to move.** It was not.
+# Eleven of them were asserted as "the undo depth went up by one", which is true of any recorded
+# edit and says nothing about which edit: Bold wired to the italic flag, Line height wired to
+# the letter spacing, X wired to Y -- every assertion in this file would still have passed.
+# `report_state` now writes the caption field by field, `text.font` through `text.colour`, so a
+# press is followed by the value it was supposed to write **and by a neighbouring value it was
+# not**. Two switches side by side are what a mis-wiring swaps, so each of a pair is asked
+# about the other.
+#
+# The undo depth stays where it proves something no value can: that a redundant edit -- the
+# font already chosen, an alignment already set -- costs no step, and that a refused one -- a
+# colour that is not hex, an X that is not a number -- costs none either. Both of those look
+# exactly like doing nothing in the fields, which is why the depth is still being counted.
+#
 # Text edits within 700 ms of each other coalesce into one entry (History::TEXT_COALESCE_MS),
 # which is why every edit below is preceded by `wait 900` -- that is what makes each one its own
 # step, and the count below it a statement about that control and no other.
@@ -28,13 +40,31 @@ expect active.kind text
 expect active.name Text
 expect dirty true
 expect undo 0
+
+# **The block every assertion below is a change from.** These are `TextBlock::default`, and
+# writing them down is what turns a later number into evidence: a size near 110 proves the Size
+# slider only because the size was 32.00 before anyone touched it, and an unset family reads as
+# "-" rather than as a blank. The placement is the panel's own arithmetic -- a quarter across
+# and two fifths down a 2048-square page -- because a caption at the page's origin would sit
+# half off its top-left corner and read as a bug.
+expect text.font -
+expect text.weight 400
+expect text.italic false
+expect text.size 32.00
+expect text.line-height 1.200
+expect text.letter-spacing 0.00
+expect text.align Start
+expect text.wrap -
+expect text.colour 141418
+expect text.at 512	819
 shot text-added
 
 # The caption. A press puts the caret in the field with the value selected, Enter gives the
 # words up -- one write for the whole edit, not one per keystroke -- and the layer renames
 # itself to match. The words are chosen for their letters: `b` and `e` are the two tool keys and
 # the space arms the pan, and a field with the caret is supposed to keep all three to itself --
-# so the tool afterwards is still the brush, and that is checked.
+# so the tool afterwards is still the brush, and that is checked. The words and only the words:
+# typing a caption is not a change of face or of size.
 wait 900
 press text:Caption
 type Be here
@@ -43,130 +73,200 @@ expect text Be here
 expect active.name Be here
 expect undo 1
 expect tool Brush
+expect text.font -
+expect text.size 32.00
 shot text-typed
 
 # The font picker. Pressing it opens the list of installed families with "(default)" at its
 # head; a step that named something not on screen would stop the run, so reaching "(default)"
-# is the proof that the list opened. Choosing the entry the block already has is not an edit,
-# and the undo stack is where that shows: no new step.
+# is the proof that the list opened. Choosing the entry the block already has is not an edit:
+# the family stays unset, and the undo stack is where that shows.
+#
+# **This is the one control in the file without a positive assertion**, and the reason is that
+# no family name is guaranteed to be installed on the machine running this. Naming one that is
+# missing would stop the run rather than fail a check, so the scene will not name one. What is
+# proved instead is that the pick left the family where it was and wrote into nothing else: the
+# three fields a mis-wired pick would land in are checked, and so is the depth.
 wait 900
 press text:Font
 shot text-font-list
 press text:(default)
+expect text.font -
+expect text.weight 400
+expect text.size 32.00
+expect text.colour 141418
+expect undo 1
 expect text Be here
 expect active.kind text
-expect undo 1
 
-# Bold and Italic. Each is one press, one accepted edit, one step.
+# Bold and Italic. Bold is a threshold on a continuous axis rather than a flag, so what it
+# writes is a number -- 700, up from the regular 400 -- and Italic writes a boolean beside it.
+# Each is asked about the other's field as well: two switches one under the next are the pair
+# most easily crossed, and crossed they would each still cost their one undo step.
 wait 900
 press text:Bold
+expect text.weight 700
+expect text.italic false
 expect undo 2
 wait 900
 press text:Italic
+expect text.italic true
+expect text.weight 700
 expect undo 3
 shot text-weight
 
-# The three metric sliders. A drag lands wherever the track puts it, and all of one drag's
-# samples fall inside the coalescing window, so each slider is one step and not twelve.
+# The three metric sliders. A drag lands wherever the track puts it -- `about`, not `expect` --
+# and all of one drag's samples fall inside the coalescing window, so each slider is one step
+# and not twelve. Size is logarithmic over 6..300 px, so three quarters along the track is near
+# 110 and not near 230; Line height is linear over 0.5..3 and Letter spacing linear over
+# -10..40 px. Each drag is followed by the other two fields, still at the defaults above:
+# three sliders in a column are three chances to write into the row above or below.
 wait 900
 slide text:Size 0.75
+about text.size 110 25
+expect text.line-height 1.200
+expect text.letter-spacing 0.00
 expect undo 4
 wait 900
 slide text:Line height 0.8
+about text.line-height 2.5 0.2
+expect text.letter-spacing 0.00
 expect undo 5
 wait 900
 slide text:Letter spacing 0.6
+about text.letter-spacing 20 3
+about text.line-height 2.5 0.2
+about text.size 110 25
 expect undo 6
 expect text Be here
 shot text-metrics
 
 # Alignment. Start/Center/End rather than Left/Right, so they stay true for a right-to-left
 # script. The block starts at Start, so Center is a change and a second Center is not -- which
-# is the editor's own rule that a value set to what it already was costs no undo step.
+# is the editor's own rule that a value set to what it already was costs no undo step. The
+# value cannot tell those two presses apart, both leaving Center behind: the depth can.
 wait 900
 press text:Center
+expect text.align Center
 expect undo 7
 wait 900
 press text:Center
+expect text.align Center
 expect undo 7
 wait 900
 press text:Start
+expect text.align Start
 expect undo 8
 shot text-align
 
-# Colour, as three or six hex digits. A good one is an edit; anything else is refused, the
-# block keeps the colour it had, and the field springs back on the next frame. The refusal is
-# the interesting half, and an undo stack that did not move is what proves it was a refusal
-# rather than an edit to something invisible.
+# Colour, typed as three or six hex digits and reported back as the six the block holds. A good
+# one is an edit; anything else is refused, the block keeps the colour it had, and the field
+# springs back on the next frame. The refusal is the interesting half: the colour that stayed
+# put says the typing reached the right field, and the depth that stayed put says it was a
+# refusal rather than an edit to something invisible.
 wait 900
 press text:Colour
 type #3A7F5C
 key enter
+expect text.colour 3a7f5c
 expect undo 9
 wait 900
 press text:Colour
 type zzz
 key enter
+expect text.colour 3a7f5c
 expect undo 9
 expect text Be here
 expect active.kind text
 shot text-colour
 
-# Wrap, and the Width slider that only exists while it is on. Before this the list has no
-# Width at all; pressing Wrap is what puts it there, and sliding it is what proves it arrived.
-# Turning Wrap off again forgets the width -- a third edit, and only undo brings it back.
+# Wrap, and the Width slider that only exists while it is on. Turning wrapping on gives the
+# block the 400 px the editor keeps as its default width -- not zero, which would collapse the
+# caption to a glyph a line -- and that number is what proves the toggle wrote a width and not
+# merely a flag. Sliding Width replaces it, linearly over 40..4000. Turning Wrap off forgets it
+# altogether, which is what `-` says, and only undo brings it back. That the Width control
+# itself comes and goes with the toggle is `absences.txt`'s check rather than this one's.
 wait 900
 press text:Wrap
+expect text.wrap 400
 expect undo 10
 wait 900
 slide text:Width 0.25
+about text.wrap 1075 200
 expect undo 11
 shot text-wrapped
 wait 900
 press text:Wrap
+expect text.wrap -
 expect undo 12
 
 # Position. Typed, not dragged: a caption can sit anywhere on a page of any size, so there is
-# no range to give a slider. A number is an edit; anything that is not a number is refused the
-# same way a bad colour is.
+# no range to give a slider. `text.at` carries both coordinates at once, which is what makes
+# the two fields separable -- X is proved by the 543 that arrived *and* by the 819 the layer
+# was placed at still sitting beside it, and Y by the 543 still sitting beside the 377. A
+# number is an edit; anything that is not a number is refused the way a bad colour is, and a
+# position that did not move under a depth that did not move is what a refusal looks like.
 wait 900
 press text:X
 type 543
 key enter
+expect text.at 543	819
 expect undo 13
 wait 900
 press text:Y
 type 377
 key enter
+expect text.at 543	377
 expect undo 14
 wait 900
 press text:X
 type xyz
 key enter
+expect text.at 543	377
 expect undo 14
 shot text-placed
 
 # Retyping the caption. The field arrives selected, so the first keystroke replaces the lot --
-# and the layer's name follows the new words, not the old ones.
+# and the layer's name follows the new words, not the old ones. Nothing else the caption was
+# set to moves with them: retyping is not a reset.
 wait 900
 press text:Caption
 type Not that caption
 key enter
 expect text Not that caption
 expect active.name Not that caption
+expect text.weight 700
+expect text.italic true
+expect text.align Start
+expect text.colour 3a7f5c
+expect text.at 543	377
 expect undo 15
 
-# Convert to raster: the pixels stay and the words stop existing. One way, and undo is the only
-# way back -- which is exactly what the line under the button says, so it is what is checked.
+# Convert to raster: the pixels stay and the words stop existing, which is what `text -` says --
+# there is no block left to report, and the ten fields under it go with it. One way, and undo is
+# the only way back, so undo is asked for the whole block and not merely for the words: the
+# weight, the slant, the alignment, the colour, the metrics and the placement all have to come
+# back with them, or what came back is a different caption wearing the same words.
 wait 900
 press text:Convert to raster layer
 expect active.kind raster
+expect text -
 expect layers 2
 expect undo 16
 shot text-raster
 key ctrl+z
 expect active.kind text
 expect text Not that caption
+expect text.font -
+expect text.weight 700
+expect text.italic true
+expect text.align Start
+expect text.colour 3a7f5c
+expect text.wrap -
+expect text.at 543	377
+about text.size 110 25
+about text.line-height 2.5 0.2
+about text.letter-spacing 20 3
 expect undo 15
 expect redo 1
 shot text-undone

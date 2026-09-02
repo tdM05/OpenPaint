@@ -100,3 +100,25 @@ expect workspace-mode false
 key f2
 expect workspace-mode true
 shot kb-workspace
+
+# Export writes a PNG beside wherever the application was started, with a timestamp in its name so
+# it can never land on something that was already there. The status names the file it wrote; what
+# is asserted here is that it asked for no dialog and left the document alone, because the path in
+# that message contains a timestamp nothing can predict.
+expect dirty true
+key ctrl+e
+wait 1500
+expect dialog false
+expect dirty true
+shot kb-exported
+
+# Backspace clears the selected pixels, exactly as Delete does -- two keys, one behaviour, and only
+# one of them had ever been pressed.
+key ctrl+a
+expect selection true
+ink 600 400 800 600 20
+key backspace
+ink 600 400 800 600 0
+key ctrl+z
+ink 600 400 800 600 20
+key ctrl+d
