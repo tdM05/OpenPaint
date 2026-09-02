@@ -2,17 +2,22 @@
 # its own operation. Undo depth is the evidence -- a paint op reaches history only if dabs did.
 expect undo 0
 expect dirty false
+# A box well inside the page, around the middle of where the stroke goes.
+ink 600 400 800 600 0
 drag 500 300 900 700
 shot paint-stroke
 expect undo 1
+ink 600 400 800 600 20
 expect dirty true
 key ctrl+z
 expect undo 0
 expect redo 1
+ink 600 400 800 600 0
 shot paint-undone
 key ctrl+y
 expect undo 1
 expect redo 0
+ink 600 400 800 600 20
 shot paint-redone
 press Eraser
 drag 520 620 880 380

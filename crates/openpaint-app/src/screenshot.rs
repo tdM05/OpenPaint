@@ -158,7 +158,7 @@ pub fn press_controls(
 /// second, quieter answer to all of it. Written out here, once, with enough in it that the panels
 /// have something to show: layers with names, a palette, a page, a font that was substituted.
 #[must_use]
-fn sample_document() -> (
+pub(crate) fn sample_document() -> (
     Vec<openpaint_core::Layer>,
     Vec<[u8; 3]>,
     Vec<openpaint_core::BrushPreset>,

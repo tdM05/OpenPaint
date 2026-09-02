@@ -174,3 +174,112 @@ pub(crate) fn pick_popup(
     }
     answer
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Painting, Place};
+    use crate::workspace as ws;
+
+    /// Every panel, laid out, so the assertions in `panel_ui::place` are actually asked.
+    ///
+    /// **A test that cannot express the bug proves nothing.** A dozen labels shipped carrying runs
+    /// of twenty-odd spaces mid-sentence -- the recovery prompt read "pointed at the original
+    /// [twenty spaces] file, so" -- and the check for it was added to `place`, which every
+    /// on-screen string passes through. Then the same defect was put back on purpose and the whole
+    /// suite stayed green, because nothing in it had ever built these panels' controls and laid
+    /// them out. This is the missing half.
+    ///
+    /// No GPU: `place` and the label measurement are egui's text layout and arithmetic, and the
+    /// picture is not what is being checked. Both surfaces, because a popup's half of a panel is
+    /// a different list of controls from its panel's half.
+    #[test]
+    fn every_panel_lays_its_controls_out() {
+        let (layers, palette, presets, fonts) = crate::screenshot::sample_document();
+        let theme = crate::theme::Theme::default();
+        let mut brush = openpaint_core::Brush::default();
+        let mut colour = brush.color_srgb8();
+        let mut panel_input: std::collections::HashMap<u32, crate::panel_draw::PanelInput> =
+            std::collections::HashMap::new();
+        let mut menu: Option<u32> = None;
+        let mut pick: Option<crate::panel_ui::ControlId> = None;
+        let mut wheel_shape = crate::colour_wheel::Shape::default();
+        let mut wheel_hold: Option<crate::colour_wheel::Region> = None;
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |c| {
+            let status = crate::ui::Status {
+                history: (3, 1, 2 * 1024 * 1024),
+                message: Some("something happened"),
+                page_size: (1200, 1600),
+                crop: None,
+                crop_rect: None,
+                residency: (0, 0),
+                spilled: 0,
+                traffic: (0, 0),
+                layers: &layers,
+                active_layer: 2,
+                pages: (3, 0),
+                tool: crate::editor::Tool::Brush,
+                confirm: None,
+                brush_cursor: None,
+                perf: crate::perf::PerfSnapshot::default(),
+                recovery: None,
+                palette: &palette,
+                presets: &presets,
+                preset_trouble: Some("the brush library could not be written"),
+                font_families: &fonts,
+                font_substituted: Some("Some Missing Face"),
+                transform: None,
+                transform_box: None,
+                kernel: openpaint_core::Kernel::default(),
+                autosave: "saved a moment ago",
+                selection: &[],
+                select_tool: Some(crate::ui::SelectTool::Wand),
+                has_selection: true,
+                wand: crate::ui::WandSettings::default(),
+            };
+            egui::CentralPanel::default().show(c, |ui| {
+                for panel in [
+                    ws::MENU,
+                    ws::TOOLS,
+                    ws::BRUSH,
+                    ws::LAYERS,
+                    ws::COLOUR,
+                    ws::HISTORY,
+                    ws::TRANSFORM,
+                    ws::PAGES,
+                    ws::PAGE,
+                    ws::TEXT,
+                    ws::SELECT,
+                ] {
+                    for place in [Place::Panel, Place::Popup] {
+                        // A popup only draws when its own pick is the one open, so ask for each in
+                        // turn rather than leaving that half of every panel undrawn.
+                        pick = Some(0);
+                        let mut paint = Painting {
+                            theme: &theme,
+                            direction: crate::panel_ui::Direction::Column,
+                            input: panel_input.entry(panel.0).or_default(),
+                            menu: &mut menu,
+                            pick: &mut pick,
+                            extend_by: 512,
+                            preset_name: "a name",
+                            ctx: c,
+                            wheel_shape: &mut wheel_shape,
+                            wheel_hold: &mut wheel_hold,
+                        };
+                        super::show(
+                            panel,
+                            ui,
+                            &mut brush,
+                            &mut colour,
+                            &status,
+                            &mut paint,
+                            place,
+                        );
+                    }
+                }
+            });
+        });
+    }
+}

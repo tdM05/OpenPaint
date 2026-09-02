@@ -1145,6 +1145,11 @@ impl Workspace {
     pub fn reset(&mut self) {
         self.remember_for_undo();
         self.layout = default_layout();
+        // **The windows too.** A floating panel is part of the arrangement, and the arrangement
+        // being restored has none -- so leaving them standing put a second copy of every floated
+        // panel on screen, one in its default slot and one still in the air. "Everything back
+        // where it started" cannot leave half the workspace where it was.
+        self.floating.clear();
         self.remember();
     }
 
@@ -2720,6 +2725,84 @@ impl Workspace {
             );
             c.controls.rect().contains(x, y)
         })
+    }
+
+    /// The arrangement in one line, for whoever is driving the application.
+    ///
+    /// **Because a rearrangement has no other witness.** A panel dragged to a new slot, floated,
+    /// docked, or closed changes nothing a document state can show and nothing a screenshot can be
+    /// asserted about; only the arrangement itself says whether the gesture did what it looked
+    /// like. Slots in the order they resolve, each a slash-separated list of its tabs with the
+    /// one on show marked `*`, then the floating windows.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let m = self.theme.metrics;
+        let slots: Vec<String> = self
+            .layout
+            .resolve(inset(self.screen, m.gutter))
+            .iter()
+            .map(|slot| {
+                slot.tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        if i == slot.active {
+                            format!("*{}", name_of(*p))
+                        } else {
+                            name_of(*p).to_owned()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect();
+        let windows: Vec<String> = self
+            .floating
+            .iter()
+            .map(|f| {
+                f.layout
+                    .resolve(inset(f.rect, m.gutter))
+                    .iter()
+                    .map(|slot| {
+                        slot.tabs
+                            .iter()
+                            .map(|p| name_of(*p))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .collect();
+        let docked = slots.join(" / ");
+        if windows.is_empty() {
+            docked
+        } else {
+            format!("{docked} | {}", windows.join(" / "))
+        }
+    }
+
+    /// Which way each panel's controls run, for whoever is driving the application.
+    ///
+    /// Separate from [`Self::describe`] because it is a different question about the same
+    /// workspace, and folding it in would make every assertion about the *arrangement* also an
+    /// assertion about the settings. "Controls run" has no other witness: a panel turned on its
+    /// side is a picture and nothing else.
+    #[must_use]
+    pub fn directions(&self) -> String {
+        PANELS
+            .iter()
+            .map(|p| {
+                let how = match self.direction_of(p.id) {
+                    Direction::Row => "across",
+                    Direction::Column => "down",
+                    Direction::Wrap => "wrapped",
+                    Direction::Auto => "fits",
+                };
+                format!("{}={how}", p.name)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     pub fn open_panel_list(&mut self) {

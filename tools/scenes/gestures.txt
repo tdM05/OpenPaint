@@ -1,0 +1,305 @@
+# Every panel gesture the workspace offers, and what each one does to the arrangement.
+#
+# **Run this at 2200 by 1450.** Every coordinate below was read off `target/drive/layers.controls`,
+# which is a 2200x1450 run: the client area is 2178 by 1394 physical pixels at 1.5 pixels per
+# point, so a 28-point header is 42 pixels and a 22-point row is 33. Tab positions come from the
+# `@` lines of that atlas and slot rectangles from the `$` lines plus the 8-point padding a panel
+# insets its contents by. At any other size the numbers are wrong and the run will stop on a press
+# that lands nowhere, which is the right way for it to fail.
+#
+# **The arrangement is the only witness.** A panel moved, floated, docked or closed changes no
+# document state and a screenshot cannot be asserted on, so every gesture here is proved through
+# the `layout` key -- slots in the order they resolve, each a comma-separated list of its tabs with
+# the one on show marked `*`, then ` | ` and the floating windows.
+#
+# **Why a window is floated before anything else is asserted.** `Workspace::describe` writes
+# `"{slots} | {windows}"`, so an arrangement with no floating windows ends in a space, and the
+# harness trims both the scene line and the value it compares -- which makes an `expect layout` for
+# a floating-free arrangement impossible to satisfy. Everything below therefore keeps at least one
+# window out, and the two states this scene cannot assert (the arrangement it starts from and the
+# one it restores) are marked where they occur. Trimming `$got` in `Expect-State`, or dropping the
+# trailing space from `describe`, would close that gap.
+#
+# **`hold` does not arm a drag, and `drag` does not need it to.** `docs/DRIVING.md` says nothing
+# rearranges the workspace until the pointer has been held for `panel_drag::HOLD_MS`; the code says
+# the opposite and has since "Grab at once, hold to ask". `Grab::moved` gates only whether anything
+# *has* moved, a tab is taken the instant it is pressed, and holding one still for 320 ms drops the
+# grab and asks the panel for its settings instead. So a panel is moved with `drag`, and `hold` on
+# a tab is what opens a settings popup -- which is asserted below rather than assumed. `hold` is
+# still the right step for a window's edge, which asks nothing on a hold and goes on resizing.
+
+# --- What we start from, and a stroke to prove the layout stack never touches the artwork ---
+#
+# The arrangement here is the built-in one and cannot be written as an `expect layout` for the
+# reason in the header; it is `*Menu / *Tools / *Canvas / *Layers,History,Pages,Page /
+# *Brush,Transform,Select,Text / *Colour` with nothing floating.
+expect workspace-mode true
+expect undo 0
+expect redo 0
+expect dirty false
+ink 600 400 800 600 0
+drag 500 300 900 700
+expect undo 1
+expect dirty true
+ink 600 400 800 600 20
+shot gestures-start
+
+# --- Holding a tab asks that panel what it offers, and Float lifts it out of the arrangement ---
+#
+# The Text tab is the last one in the Brush group, so taking it out leaves every other tab and
+# every slot exactly where the atlas says it is -- which is what the rest of this scene relies on.
+# Pressing Float proves the popup was really open: a name the application is not drawing stops the
+# run rather than clicking nowhere.
+holdat 2088 643
+shot gestures-text-settings
+press Float
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / *Brush,Transform,Select / *Colour | Text
+expect undo 1
+expect redo 0
+
+# --- Bringing each tab of a stacked slot to the front ---
+#
+# Two stacked slots, seven tabs, every one of them asserted through the `*`. A tap on a tab is
+# deliberately not a change to the arrangement, which the undo block below is what actually proves;
+# here it is only that the right panel came forward.
+tab History
+expect layout *Menu / *Tools / *Canvas / Layers,*History,Pages,Page / *Brush,Transform,Select / *Colour | Text
+tab Pages
+expect layout *Menu / *Tools / *Canvas / Layers,History,*Pages,Page / *Brush,Transform,Select / *Colour | Text
+tab Page
+expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Page / *Brush,Transform,Select / *Colour | Text
+tab Layers
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / *Brush,Transform,Select / *Colour | Text
+tab Transform
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / Brush,*Transform,Select / *Colour | Text
+tab Select
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / Brush,Transform,*Select / *Colour | Text
+tab Brush
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / *Brush,Transform,Select / *Colour | Text
+shot gestures-tabs
+
+# --- A second window, so a docked drag can be watched while one is out ---
+#
+# Page is the last tab of the Layers group and comes out the same way Text did. Two windows now
+# stand behind the bar: Text was floated first and Page second, and `describe` lists them in the
+# order they were lifted.
+holdat 2074 83
+press Float
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages / *Brush,Transform,Select / *Colour | Text / Page
+
+# --- Holding a tab and then dragging it moves nothing, because the hold already took the grab ---
+#
+# The same press and the same path as the move in the next block, with `hold` instead of `drag`.
+# The arrangement is unchanged, and the Select panel's settings are open over the middle of the
+# window -- which the Remove that follows could not reach otherwise. Removing a panel from its own
+# settings is the same act as switching it off in the panel list, and it is undoable like any
+# other change to the arrangement.
+hold 2010 643 1970 335
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages / *Brush,Transform,Select / *Colour | Text / Page
+shot gestures-select-settings
+press Remove this panel
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages / *Brush,Transform / *Colour | Text / Page
+key f3
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages / *Brush,Transform,Select / *Colour | Text / Page
+
+# --- Dragging a tab into another slot moves the panel ---
+#
+# The Select tab, from the Brush group into the middle of the Layers group. The middle of a leaf is
+# its centre zone, so Select arrives as another tab there and is the one shown; the group it left
+# keeps Brush in front. The drop point is the centre of the Layers slot, which runs 1775..2176 by
+# 62..619, and the centre zone is the middle half of both.
+drag 2010 643 1970 335
+expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Select / *Brush,Transform / *Colour | Text / Page
+shot gestures-moved
+
+# --- Layout undo, redo and the tab tap that leaves no trace ---
+#
+# Switching tab between the move and the undo is the point of this block: if a tap were recorded,
+# the first F3 would take back the tab switch and stop there. It goes straight back past it to the
+# arrangement as it stood before the drag, tab selection and all, which is one entry for one
+# gesture and none for a tap. The artwork's own stack is untouched throughout.
+tab Layers
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Select / *Brush,Transform / *Colour | Text / Page
+key f3
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages / *Brush,Transform,Select / *Colour | Text / Page
+expect undo 1
+expect redo 0
+expect dirty true
+# Redo puts back the arrangement as it stood at the moment of the undo, and at that moment the tab
+# tap above had already changed which one was showing. So Select comes back to the Layers group
+# with Layers still in front -- not because the tap was recorded, but because it was never undone.
+# The two claims sit together consistently: undo walks arrangements and skips taps; redo restores
+# what you actually had.
+key shift+f3
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Select / *Brush,Transform / *Colour | Text / Page
+expect undo 1
+expect redo 0
+
+# --- Resizing a floating window by its edge and by its corner ---
+#
+# **There is no state key for a window's size, so what is asserted is the undo step the resize
+# leaves behind.** The Page window is the second one lifted, so it sits at 88,88 by 319x325 points
+# -- 132,132 by 479x488 pixels -- and its right edge is at x 611, its bottom at y 620. The grab
+# band straddles each edge by half of the 26-point splitter reach, so 617,450 is the right edge and
+# 617,626 is the bottom-right corner. `hold` is right here where it is wrong on a tab: an edge is
+# grabbed the instant it is touched and asks nothing when it is held still.
+#
+# The arrangement is still the one the move above left, so a resize that recorded nothing would
+# send the F3 after it back past the move instead; a resize that recorded two would need two. One
+# F3, and the arrangement is unchanged: exactly one step, and it also puts the window back to the
+# size and place it started at, which is what makes the corner grab below land where it is aimed.
+# The presses that begin on the border lie over the canvas, and the artwork's undo depth says
+# neither of them painted.
+shot gestures-window-before
+hold 617 450 797 450
+shot gestures-window-wider
+key f3
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Select / *Brush,Transform / *Colour | Text / Page
+expect undo 1
+hold 617 626 767 746
+shot gestures-window-corner
+key f3
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Select / *Brush,Transform / *Colour | Text / Page
+expect undo 1
+expect dirty true
+key f3
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages / *Brush,Transform,Select / *Colour | Text / Page
+
+# --- A docked tab dragged out over the canvas stays docked ---
+#
+# `docs/PANEL_GESTURES.md` is explicit that dragging never crosses between docked and floating, and
+# this is what that means in practice: the Colour tab let go in the middle of the canvas becomes a
+# tab of the *canvas* slot rather than a window, and because Colour was the only tab in its slot,
+# that slot goes away and the right-hand column collapses from three to two. Colour is the panel on
+# show there, so the artwork is behind it -- which is why there is no ink assertion here.
+#
+# The pointer crosses the whole canvas with the button down and the undo depth does not move, which
+# is the assertion that a panel gesture owns the pointer and no stroke was painted under it.
+drag 1816 1043 958 720
+expect layout *Menu / *Tools / Canvas,*Colour / *Layers,History,Pages / *Brush,Transform,Select | Text / Page
+expect undo 1
+shot gestures-onto-canvas
+key f3
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages / *Brush,Transform,Select / *Colour | Text / Page
+
+# --- A floating window dragged over a slot stays floating ---
+#
+# The other half of the same rule. The Page window is taken by its tab at 171,156 and let go in the
+# middle of the Layers slot, which is where the block above dropped a docked panel and where the
+# pick below will drop this one. It lands nowhere: the window has been carried and that is all,
+# and the arrangement is untouched. The carry is still one entry on the layout stack, and taking it
+# back is also what puts the window back at 132,132 for the hold that follows.
+drag 171 156 1970 335
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages / *Brush,Transform,Select / *Colour | Text / Page
+shot gestures-window-carried
+key f3
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages / *Brush,Transform,Select / *Colour | Text / Page
+
+# --- Put back into: the way across from floating to docked ---
+#
+# Holding the window's tab asks the panel it is showing, and a floating panel is offered "Put back
+# into..." where a docked one is offered "Float". It names no destination: the window stops
+# floating and the next press says where it goes, so the click on the middle of the Layers slot is
+# the answer to a question rather than a drop. Page arrives as a tab there and is the one shown.
+#
+# The state between the two -- Page in neither tree while the pick waits -- has no floating window
+# and so cannot be written as an `expect layout`.
+holdat 171 156
+shot gestures-window-settings
+press Put back into...
+click 1970 335
+expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Page / *Brush,Transform,Select / *Colour | Text
+shot gestures-docked-again
+
+# --- The panel list, from a secondary press on the workspace's own ground ---
+#
+# The canvas draws no contents of its own, so the other button there means the workspace rather
+# than the panel: this is the route that survives an arrangement with everything closed. Switching
+# History off takes it out and leaves the list up, so putting it back is the next press in the same
+# list; switching it on starts the same pick that "Put back into..." does, and the click says
+# where. Both halves are one entry on the layout stack each, which the two F3s prove.
+#
+# The switch is named `popup-panels:History` rather than `History` because the list carries a
+# switch for every panel the build knows about, and several of those words -- Brush, Select,
+# Colour -- are also the names of controls inside panels that are on screen at the time.
+right 958 720
+shot gestures-panel-list
+press popup-panels:History
+expect layout *Menu / *Tools / *Canvas / Layers,Pages,*Page / *Brush,Transform,Select / *Colour | Text
+press popup-panels:History
+click 1970 335
+expect layout *Menu / *Tools / *Canvas / Layers,Pages,Page,*History / *Brush,Transform,Select / *Colour | Text
+key f3
+expect layout *Menu / *Tools / *Canvas / Layers,Pages,*Page / *Brush,Transform,Select / *Colour | Text
+key f3
+expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Page / *Brush,Transform,Select / *Colour | Text
+
+# --- Remove this panel, from a docked panel's own settings ---
+#
+# Colour is the only tab in its slot, so removing it takes the slot with it and the right-hand
+# column collapses to two. It is the same function the panel list's switch calls, and undo takes
+# it back the same way.
+holdat 1816 1043
+shot gestures-colour-settings
+press Remove this panel
+expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Page / *Brush,Transform,Select | Text
+key f3
+expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Page / *Brush,Transform,Select / *Colour | Text
+
+# --- Controls run, and the one consequence that is not visible in the arrangement ---
+#
+# **This block cannot assert what it changes.** Which way a panel's controls run is not part of
+# `describe` and has no key of its own in the state dump, so what is proved here is that the
+# choices are offered, that pressing one reaches the workspace, and that it disturbs nothing in the
+# arrangement -- the pictures either side are the only record of the panel turning. Worth closing
+# by reporting the panel's direction in `report_state`.
+#
+# The Menu is asked with the other button rather than by holding it. A compact panel is all panel
+# strip, and `window_target` turns a docked strip into `Elsewhere`, so holding one asks nothing at
+# all -- which the table in `docs/PANEL_GESTURES.md` says should give that panel's settings. The
+# secondary press does reach it, through `header_under`, which is what this uses. Across and
+# Whichever fits both put a wide panel's handle down its left-hand side, so the bar stays where it
+# is and the settings stay reachable at the same point.
+right 14 30
+shot gestures-menu-settings
+press Menu:Across
+expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Page / *Brush,Transform,Select / *Colour | Text
+shot gestures-menu-across
+press Menu:Whichever fits
+expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Page / *Brush,Transform,Select / *Colour | Text
+key escape
+
+# --- Layout reset, and the one thing it does not reset ---
+#
+# Ctrl+F3 puts the arrangement back to the built-in one, which is asserted here in full: every slot
+# and every tab in the order the workspace resolves them, and no floating windows -- the built-in
+# arrangement has none, and a panel left out in the air while its default slot was restored was in
+# the workspace twice. "Everything back where it started" cannot leave half of it where it was.
+#
+# The reset goes on the layout stack like every other change, so F3 takes it back whole.
+key ctrl+f3
+expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / *Brush,Transform,Select,Text / *Colour
+shot gestures-reset
+key f3
+expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Page / *Brush,Transform,Select / *Colour | Text
+expect undo 1
+expect redo 0
+
+# --- Leaving the workspace as it was found ---
+#
+# Text goes back into the Brush group the way Page did, and Ctrl+F3 puts every tab back in its
+# built-in order and every slot back to its built-in weight. Neither of those two states has a
+# floating window in it, so neither can be written as an `expect layout`; what is asserted instead
+# is that the artwork came through all of it untouched -- one stroke, one undo step, still on the
+# page and still on screen -- and the picture beside this shot carries the arrangement for anyone
+# reading the run afterwards.
+holdat 127 114
+press Put back into...
+click 1970 820
+key ctrl+f3
+expect undo 1
+expect redo 0
+expect dirty true
+expect layers 1
+ink 600 400 800 600 20
+shot gestures-restored

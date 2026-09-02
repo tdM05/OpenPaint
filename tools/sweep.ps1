@@ -36,8 +36,21 @@ $results = @()
 foreach ($scene in $scenes) {
     $name = $scene.BaseName
     Write-Output "--- $name"
+    # The recovery scenario needs a document to offer as an abandoned copy, and `file.txt` --
+    # which sorts before it -- has just written one. A real crash is the only other way to make
+    # one, and crashing the application on purpose is not a thing a suite should do.
+    $extra = @{}
+    if ($name -eq 'recovery') {
+        $doc = Join-Path $root 'target\drive\driven.openpaint'
+        if (-not (Test-Path $doc)) {
+            Write-Output "  SKIPPED no $doc -- the file scenario has to run first"
+            $results += [pscustomobject]@{ Scene = $name; Ok = 0; Failed = 0; Stopped = 'skipped' }
+            continue
+        }
+        $extra['PlantRecovery'] = $doc
+    }
     $out = & (Join-Path $PSScriptRoot 'drive.ps1') -Shot $name -Width $Width -Height $Height `
-        -Script $scene.FullName 2>&1
+        -Script $scene.FullName @extra 2>&1
     $checks = Join-Path $root "target\drive\$name.checks"
     $lines = if (Test-Path $checks) { @(Get-Content -LiteralPath $checks) } else { @() }
     $ok = @($lines | Where-Object { $_ -match '^\s+ok' }).Count

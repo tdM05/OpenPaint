@@ -16,6 +16,9 @@ now driven and correct.
 | 3 | **A secondary press anywhere opened the panel list**, including inside a panel that has its own use for the button — so right-clicking a swatch to forget it forgot it *and* threw the list over the panel. | `workspace.rs` | fixed, with a test |
 | 4 | **Unmodified keys fired while a text field had the caret.** Naming a brush "beeper" selected the eraser, stepped the size twice and refitted the view; Backspace and Delete erased the drawing. | `main.rs`, `ui.rs::typing` | fixed |
 | 5 | A menu popup's last item overhangs its own box by about two thirds of a point. A hand can still hit it; nothing is visibly wrong. Cosmetic, unfixed. | `panels/mod.rs::list_size` | open |
+| 7 | **A dozen on-screen labels carried runs of twenty-odd spaces mid-sentence.** The recovery prompt read "pointed at the original⎵⎵⎵…⎵file, so". Mended, and `panel_ui::place` now refuses a label with four or more spaces in a row — with a test that lays out every panel, because the first version of that check passed a deliberate sabotage: nothing in the suite had ever built these panels' controls. | `ui.rs`, `panels/*`, `panel_ui::place` | fixed, with a test |
+| 8 | **Ctrl+F3 left floating windows standing** while restoring the built-in arrangement, so a floated panel ended up in the workspace twice. | `workspace.rs::reset` | fixed |
+| 9 | `docs/PANEL_GESTURES.md` promised that holding a docked compact panel's strip opens its settings; `window_target` has never done that. The doc now says what the code does. | docs | fixed |
 | 6 | A straight-line lasso drag encloses an area rather than nothing, which no even-odd rule should give for a there-and-back path. The shape the lasso receives is therefore not the line the harness drew. Asserted as it is, in `select.txt`; worth understanding. | `main.rs` lasso path | open |
 
 ## Panels
@@ -36,6 +39,7 @@ are assertions against the application's own reported state, not steps.
 | Transform | `transform.txt` | 104 | ok |
 | Text | `text.txt` | 48 | ok |
 | Menu | `menu.txt` | 76 | ok |
+| — panel gestures | `gestures.txt` | 60 | ok |
 
 ## Core loop
 
@@ -47,8 +51,8 @@ are assertions against the application's own reported state, not steps.
 | New, and its unsaved-changes prompt | `menu.txt` | ok |
 | Open / Save / Save As — the request and its cancellation | `menu.txt` | ok |
 | Export PNG | `menu.txt` | ok |
-| A document actually written and read back | -- | not yet: needs a filename typed into a native dialog |
-| Autosave and recovery | -- | not yet; never answer the artist's prompt, see DRIVING.md |
+| A document written and read back, marks and all | `file.txt` | ok |
+| The recovered-work prompt: visible, blocking, answerable | `recovery.txt` | ok |
 
 ## Panel gestures
 
@@ -61,5 +65,6 @@ are assertions against the application's own reported state, not steps.
 | Pick-a-destination mode | -- | |
 | Settings popup, remove this panel | -- | |
 | Wheel scrolls the panel under the pointer only | ok | proven by `press` scrolling a control into view |
-| Panel list, and toggling a panel off and on | -- | |
-| Layout undo, redo and reset (F3, Shift+F3, Ctrl+F3) | -- | |
+| Panel list, and toggling a panel off and on | ok | `gestures.txt` |
+| Layout undo, redo and reset (F3, Shift+F3, Ctrl+F3) | ok | `gestures.txt` |
+| Float, dock, move a tab between slots, settings popup, remove a panel, resize a window | ok | `gestures.txt` |

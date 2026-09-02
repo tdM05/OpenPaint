@@ -121,7 +121,7 @@ fn controls(
             // row tall whatever it said and a long line was drawn clipped at the panel's edge --
             // which read as three paragraphs and came undone at any other width. Labels wrap now.
             controls.push(Control::Label {
-                text: "Tolerance is how far up an anti-aliased edge still counts as the                        region; Expand tucks the result under the ink so no pale fringe is                        left. With Fill off the wand leaves a selection instead."
+                text: "Tolerance is how far up an anti-aliased edge still counts as the region; Expand tucks the result under the ink so no pale fringe is left. With Fill off the wand leaves a selection instead."
                     .to_owned(),
             });
         }

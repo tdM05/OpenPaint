@@ -24,14 +24,27 @@ Everything lands in `target/drive/`: `name.png` (the client area), `name.log` (s
 
 Positional, in client-area pixels:
 `move X Y`, `click X Y`, `right X Y`, `drag X1 Y1 X2 Y2`, `wheel X Y N`, `key NAME`, `type TEXT`,
-`wait MS`.
+`wait MS`, and `pressat NAME DX DY` / `rpressat NAME DX DY` for a press at an offset inside one
+control — the palette is a grid of chips in a box far wider than the chips.
+
+For rearranging the workspace: `drag` moves a panel, and `hold X1 Y1 X2 Y2` does not. A tab is
+grabbed the instant it is pressed; the hold is what turns a *stationary* press into a question —
+after `panel_drag::HOLD_MS` a still tab opens that panel's settings and the grab is dropped. So
+`hold` on a tab asks and moves nothing, which is what it is for here; `hold` on a window's edge
+resizes, because an edge asks nothing when held. `holdat X Y` presses and holds in one place, which
+is how a panel is asked for its settings.
+
+**Pixel proof**: `ink X1 Y1 X2 Y2 N` counts dark pixels in a box of the page and asserts at least
+N of them, or exactly none when N is 0. Undo depth says an operation was *recorded*; only this says
+the brush put anything on the page, and those two came apart once already.
 
 By name, resolved from the atlas the app writes each frame:
 `tab NAME` (bring a panel forward), `press NAME`, `rpress NAME` (right button),
 `slide NAME FRACTION`, `shot NAME` (a picture mid-run).
 
 Assertions, against the state the app writes each frame:
-`expect KEY VALUE`, `state NAME` (print the lot).
+`expect KEY VALUE`, `about KEY VALUE [TOLERANCE]` (for a number that came off a drag),
+`state NAME` (print the lot).
 
 A name may be a label (`Add`), a control id, or `Panel:label` when two panels share a word
 (`Layers:Opacity`). A step that names something not on screen **stops the run** and lists what is —
@@ -47,10 +60,14 @@ viewport is there too — `press` can scroll a control into view before clicking
 brush panel's list is four times taller than the window, and `place` gives every control a position
 whether or not it is on screen.
 
-**The state dump.** `OPENPAINT_STATE` names a file; the app rewrites it every frame with the state
-a control is supposed to move — tool, pages, layers and every layer's properties, colour, brush
-parameters, selection, crop, undo/redo depth, dirty, zoom, which prompts are up
-(`OpenPaint::report_state`). A screenshot cannot tell "Add made a layer" from "Add did nothing and
+**The state dump.** `OPENPAINT_STATE` names a file; the app rewrites it at the end of every frame
+with the state a control is supposed to move — tool, pages, layers and every layer's properties,
+what is actually inside a selection, the wand's settings, a transform's placement, colour, every
+brush parameter and response, the saved brushes, undo/redo depth, dirty, zoom, which prompts are
+up, and the whole arrangement of panels in one line (`OpenPaint::report_state`,
+`Workspace::describe`). At the end of the frame, not the start: painting is demand-driven, so the
+last frame after an action is the last word, and reported from the top it described the state
+*before* that frame's presses were applied. A screenshot cannot tell "Add made a layer" from "Add did nothing and
 the list was already scrolled", and the log only says what input arrived, never what became of it.
 
 ## What it reaches, and what it does not

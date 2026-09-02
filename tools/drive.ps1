@@ -35,9 +35,13 @@
     click X Y           press and release there
     right X Y           the other button
     drag X1 Y1 X2 Y2    press, move along the path in steps, release -- what a stroke is
+    hold X1 Y1 X2 Y2    press, wait for the workspace to arm, then move and release -- what
+                        rearranging a panel is; `drag` moves too soon to ever arm one
+    holdat X Y          press and hold in one place, which asks a panel for its settings
     key NAME            a key by name: b, e, f2, f3, ctrl+z, escape, enter
     type TEXT           the text, as typing
     wait MS             let the app catch up
+    ink X1 Y1 X2 Y2 N   at least N dark pixels in that box of the page (N=0 means none at all)
 
     tab NAME            bring that panel's tab to the front
     press NAME          press the control whose label matches, anywhere on screen
@@ -62,7 +66,8 @@ param(
     [int]$Height = 820,
     [int]$Settle = 3000,
     [switch]$Keep,
-    [switch]$KeepWorkspace
+    [switch]$KeepWorkspace,
+    [string]$PlantRecovery = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -172,6 +177,28 @@ if (Test-Path $brushes) { Move-Item $brushes $brushStash -Force }
 $rec = Join-Path $env:LOCALAPPDATA 'OpenPaint' | Join-Path -ChildPath 'recovery'
 $recStash = "$rec-driving"
 if (Test-Path $rec) { Move-Item $rec $recStash -Force }
+
+# **A recovery copy of our own, when a run is about to test the prompt.**
+# The artist's is safely aside by now, so what the application finds here is a file this run put
+# there and is free to answer either way. A recovery copy is an ordinary document with one extra
+# row in its `meta` table (`autosave::IS_RECOVERY`) -- see the module header, which says so on
+# purpose so that the recovery path is the same code as loading anything else.
+if ($PlantRecovery) {
+    if (-not (Test-Path $PlantRecovery)) { throw "no document at $PlantRecovery to plant" }
+    New-Item -ItemType Directory -Force -Path $rec | Out-Null
+    $planted = Join-Path $rec 'planted.openpaint'
+    Copy-Item -LiteralPath $PlantRecovery -Destination $planted -Force
+    # The marker goes in through the same library the application reads it with, rather than
+    # through an sqlite3.exe no Windows box is guaranteed to have.
+    $marker = Join-Path $root 'target' | Join-Path -ChildPath 'drive-build' |
+        Join-Path -ChildPath 'release' | Join-Path -ChildPath 'examples' |
+        Join-Path -ChildPath 'mark-recovery.exe'
+    if (-not (Test-Path $marker)) {
+        throw "no $marker -- cargo build --release --target-dir target/drive-build -p openpaint-file --example mark-recovery"
+    }
+    & $marker $planted
+    if ($LASTEXITCODE -ne 0) { throw 'could not mark the planted copy as a recovery' }
+}
 
 # The app writes where every control landed, once per frame, and the name-based steps read it.
 $atlas = Join-Path $outDir "$Shot.atlas"
@@ -489,6 +516,7 @@ try {
         $got = $null
         for ($i = 0; $i -lt 20; $i++) {
             $got = (Read-State)[$key]
+            if ($null -ne $got) { $got = $got.Trim() }
             if ($got -eq $want) { break }
             Start-Sleep -Milliseconds 100
         }
@@ -498,6 +526,30 @@ try {
             [void]$checks.Add("  FAIL  ${key}: wanted '$want', got '$got'")
             $script:failed = $true
         }
+    }
+
+    # **Whether there is actually ink there.**
+    # Undo depth says an operation was recorded; it does not say the brush put anything on the
+    # page. The two came apart once already -- nine hundred tests passed while the brush painted
+    # nothing -- so a scenario that claims a stroke happened should be able to look. Counts the
+    # pixels in a box that are darker than the page, sampling every third one because this is
+    # `GetPixel` in PowerShell and the whole point is that it stays cheap enough to use.
+    function Count-Ink([int]$x0, [int]$y0, [int]$x1, [int]$y1) {
+        Start-Sleep -Milliseconds 300
+        $b = New-Object System.Drawing.Bitmap ($x1 - $x0), ($y1 - $y0)
+        $gg = [System.Drawing.Graphics]::FromImage($b)
+        $gg.CopyFromScreen(($ox + $x0), ($oy + $y0), 0, 0, $b.Size)
+        $n = 0
+        for ($yy = 0; $yy -lt $b.Height; $yy += 3) {
+            for ($xx = 0; $xx -lt $b.Width; $xx += 3) {
+                $c = $b.GetPixel($xx, $yy)
+                # The page is very nearly white and every mark made here is very nearly black, so
+                # one threshold in the middle separates them without needing to know either.
+                if (([int]$c.R + [int]$c.G + [int]$c.B) -lt 380) { $n++ }
+            }
+        }
+        $gg.Dispose(); $b.Dispose()
+        return $n
     }
 
     function Click-At([int]$x, [int]$y, [switch]$Right) {
@@ -533,6 +585,36 @@ try {
                 Start-Sleep -Milliseconds 80
                 [Win]::mouse_event([Win]::RUP, 0, 0, 0, [IntPtr]::Zero)
                 Start-Sleep -Milliseconds 250
+            }
+            'hold'  {
+                # `hold X1 Y1 X2 Y2` -- press, wait for the workspace to arm, then move and let go.
+                # Nothing rearranges the workspace until the pointer has been held still on it for
+                # `panel_drag::HOLD_MS` (320 ms), which is the whole point: a press that has only
+                # been waiting has taken nothing, so a stroke that begins on a panel is not a
+                # rearrangement. `drag` moves at once and therefore can never arm one.
+                Point-At $a[1] $a[2]
+                Start-Sleep -Milliseconds 120
+                [Win]::mouse_event([Win]::LDOWN, 0, 0, 0, [IntPtr]::Zero)
+                Start-Sleep -Milliseconds 600
+                $steps = 24
+                for ($i = 1; $i -le $steps; $i++) {
+                    $t = $i / $steps
+                    Point-At ([int]([int]$a[1] + ([int]$a[3] - [int]$a[1]) * $t)) `
+                             ([int]([int]$a[2] + ([int]$a[4] - [int]$a[2]) * $t))
+                }
+                Start-Sleep -Milliseconds 250
+                [Win]::mouse_event([Win]::LUP, 0, 0, 0, [IntPtr]::Zero)
+                Start-Sleep -Milliseconds 500
+            }
+            'holdat' {
+                # `holdat X Y` -- press and hold in one place, which is what asks a panel for its
+                # settings, and let go.
+                Point-At $a[1] $a[2]
+                Start-Sleep -Milliseconds 120
+                [Win]::mouse_event([Win]::LDOWN, 0, 0, 0, [IntPtr]::Zero)
+                Start-Sleep -Milliseconds 700
+                [Win]::mouse_event([Win]::LUP, 0, 0, 0, [IntPtr]::Zero)
+                Start-Sleep -Milliseconds 400
             }
             'drag'  {
                 # Along the path in steps, because one jump is a pointer teleporting and a stroke
@@ -638,6 +720,18 @@ try {
             'rpressat' {
                 $r = Bring-Into-View ($rest -replace '\s+\S+\s+\S+$', '')
                 Click-At ($r.X + [int]$a[-2]) ($r.Y + [int]$a[-1]) -Right
+            }
+            'ink' {
+                # `ink X1 Y1 X2 Y2 MIN` -- at least MIN dark pixels in that box of the page.
+                # `ink X1 Y1 X2 Y2 0` asserts the opposite: that the box is clean.
+                $want = [int]$a[5]
+                $got = Count-Ink ([int]$a[1]) ([int]$a[2]) ([int]$a[3]) ([int]$a[4])
+                if (($want -eq 0 -and $got -eq 0) -or ($want -gt 0 -and $got -ge $want)) {
+                    [void]$checks.Add("  ok    ink in $($a[1]),$($a[2])..$($a[3]),$($a[4]) = $got")
+                } else {
+                    [void]$checks.Add("  FAIL  ink in $($a[1]),$($a[2])..$($a[3]),$($a[4]): wanted $want, got $got")
+                    $script:failed = $true
+                }
             }
             'wheel' {
                 # `wheel X Y N` -- N notches at a point, for testing the wheel itself.

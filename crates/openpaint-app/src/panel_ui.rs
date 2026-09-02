@@ -295,6 +295,20 @@ pub fn place<'a>(
     let mut out = Vec::with_capacity(controls.len());
     let (mut x, mut y) = (content.x, content.y);
     for control in controls {
+        // **A hole in the middle of a sentence.** Every string on screen passes through here, so
+        // this is where the question can be asked once. A dozen labels carried runs of twenty-odd
+        // spaces mid-sentence -- the recovery prompt read "pointed at the original            file,
+        // so" -- because a literal reflowed across source lines was joined back up with the
+        // indentation still in it. Nothing measured it, because a label is measured by its width
+        // and a wide label is exactly what it looked like.
+        //
+        // Four, not two: the History panel spaces its readout's columns with three on purpose, and
+        // a rule that forbade that would be a rule people turn off.
+        debug_assert!(
+            !text_of_control(control).contains("    "),
+            "a label with a run of spaces in it: {:?}",
+            text_of_control(control)
+        );
         let rect = if across {
             // Everything in a row is one row tall, including the labels and the rules, or the
             // strip has no baseline to read along.
@@ -363,6 +377,24 @@ pub fn extent(placed: &[Placed<'_>], origin: Rect) -> (f32, f32) {
             h.max(p.rect.y + p.rect.h - origin.y),
         )
     })
+}
+
+/// The words a control puts on screen, or nothing for one that has none.
+///
+/// Only used to ask whether they read as a sentence; see the assertion in [`place`].
+#[must_use]
+fn text_of_control(control: &Control) -> &str {
+    match control {
+        Control::Button { text, .. }
+        | Control::Slider { text, .. }
+        | Control::Toggle { text, .. }
+        | Control::Choice { text, .. }
+        | Control::Pick { text, .. }
+        | Control::Text { text, .. }
+        | Control::Row { text, .. }
+        | Control::Label { text } => text.as_str(),
+        _ => "",
+    }
 }
 
 /// Where a list may be scrolled to, given how tall it is and how much of it shows.

@@ -795,6 +795,12 @@ fn prompts(
     confirm: Option<&'static str>,
 ) -> (Option<RecoveryChoice>, Option<ConfirmChoice>) {
     let mut answers = (None, None);
+    // A button in a prompt is a thing to press like any other, so it is written down like any
+    // other. See `panel_draw::report_widget`.
+    let ppp = ctx.pixels_per_point();
+    let say = |label: &str, resp: &egui::Response| {
+        crate::panel_draw::report_widget(label, resp.rect, ppp);
+    };
     // Recovered work gets its own window rather than being folded into the unsaved-changes
     // prompt: the question is different (there is nothing to save yet) and so are the
     // answers. If a third prompt ever appears, that is the point at which these should
@@ -812,16 +818,20 @@ fn prompts(
                     ui.horizontal(|ui| {
                         // Recover first and leftmost: it is the answer that loses nothing, and
                         // the one the artist almost always wants.
-                        if ui.button("Recover").clicked() {
+                        let recover = ui.button("Recover");
+                        say("Recover", &recover);
+                        if recover.clicked() {
                             answers.0 = Some(RecoveryChoice::Recover);
                         }
-                        if ui.button("Discard").clicked() {
+                        let discard = ui.button("Discard");
+                        say("Discard recovered work", &discard);
+                        if discard.clicked() {
                             answers.0 = Some(RecoveryChoice::Discard);
                         }
                     });
                     ui.label(
                         egui::RichText::new(
-                            "Recovering opens it as unsaved work pointed at the original                                  file, so nothing is overwritten until you save.",
+                            "Recovering opens it as unsaved work pointed at the original file, so nothing is overwritten until you save.",
                         )
                         .small()
                         .weak(),
@@ -841,13 +851,19 @@ fn prompts(
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     // Save first, and leftmost, because it is the answer that loses nothing.
-                    if ui.button("Save").clicked() {
+                    let save = ui.button("Save");
+                    say("Save first", &save);
+                    if save.clicked() {
                         answers.1 = Some(ConfirmChoice::SaveFirst);
                     }
-                    if ui.button("Discard").clicked() {
+                    let discard = ui.button("Discard");
+                    say("Discard changes", &discard);
+                    if discard.clicked() {
                         answers.1 = Some(ConfirmChoice::Discard);
                     }
-                    if ui.button("Cancel").clicked() {
+                    let cancel = ui.button("Cancel");
+                    say("Cancel", &cancel);
+                    if cancel.clicked() {
                         answers.1 = Some(ConfirmChoice::Cancel);
                     }
                 });
@@ -1502,7 +1518,7 @@ impl Ui {
                             );
                             ui.label(
                                 egui::RichText::new(
-                                    "Alt+click picks the colour under the pointer, sampled from                                      the composited image rather than from one layer.",
+                                    "Alt+click picks the colour under the pointer, sampled from the composited image rather than from one layer.",
                                 )
                                 .small()
                                 .weak(),
@@ -1675,7 +1691,7 @@ impl Ui {
                             ui.add_space(8.0);
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "Spacing is a fraction of diameter (Photoshop ~0.25), so \n                             dabs land every {:.2} px.",
+                                    "Spacing is a fraction of diameter (Photoshop ~0.25), so \n dabs land every {:.2} px.",
                                     brush.radius * 2.0 * brush.spacing
                                 ))
                                 .small()
@@ -1956,7 +1972,7 @@ impl Ui {
                                         if ui
                                             .toggle_value(&mut lock, "α")
                                             .on_hover_text(
-                                                "Lock alpha: paint only where this layer already                                                  has pixels, and never change its transparency.                                                  How colour goes inside line art without a                                                  selection.",
+                                                "Lock alpha: paint only where this layer already has pixels, and never change its transparency. How colour goes inside line art without a selection.",
                                             )
                                             .changed()
                                         {
@@ -1967,7 +1983,7 @@ impl Ui {
                                         if ui
                                             .toggle_value(&mut clip, "⊂")
                                             .on_hover_text(
-                                                "Clip to the layer below: this layer only shows                                                  where the one beneath it has pixels, and stays                                                  separately editable. How shading and highlights                                                  sit over flats.",
+                                                "Clip to the layer below: this layer only shows where the one beneath it has pixels, and stays separately editable. How shading and highlights sit over flats.",
                                             )
                                             .changed()
                                         {
@@ -2037,7 +2053,7 @@ impl Ui {
                                             if ui
                                                 .button("Duplicate")
                                                 .on_hover_text(
-                                                    "Copy this layer, pixels and all, above                                                      itself.",
+                                                    "Copy this layer, pixels and all, above itself.",
                                                 )
                                                 .clicked()
                                             {
@@ -2052,7 +2068,7 @@ impl Ui {
                                                     egui::Button::new("Merge down"),
                                                 )
                                                 .on_hover_text(
-                                                    "Fold this layer into the one below, as it                                                      looks now. Undoable.",
+                                                    "Fold this layer into the one below, as it looks now. Undoable.",
                                                 )
                                                 .on_disabled_hover_text(
                                                     "There is no layer below this one.",

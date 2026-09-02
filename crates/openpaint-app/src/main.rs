@@ -1005,7 +1005,7 @@ impl OpenPaint {
         // and the artist has no way to guess which of two settings is in their way.
         if self.editor.paint_mode().is_none() {
             self.status_message = Some(
-                "This layer's alpha is locked, so the eraser cannot remove anything.                  Unlock it, or paint instead."
+                "This layer's alpha is locked, so the eraser cannot remove anything. Unlock it, or paint instead."
                     .to_owned(),
             );
             self.request_redraw();
@@ -3268,7 +3268,7 @@ impl OpenPaint {
                         // rather than leaving the artwork half off the edge of its new panel.
                         self.view.request_fit();
                         self.status_message = Some(if self.workspace_mode {
-                            "Panel workspace. Hold a panel's header to move it;                              Ctrl+Shift+Z resets the layout."
+                            "Panel workspace. Hold a panel's header to move it; Ctrl+Shift+Z resets the layout."
                                 .to_owned()
                         } else {
                             "Back to the old panel.".to_owned()
@@ -3543,6 +3543,9 @@ impl OpenPaint {
         let _ = writeln!(o, "recovery\t{}", self.recovery.is_some());
         let _ = writeln!(o, "dialog\t{}", self.file_dialog.is_some());
         let _ = writeln!(o, "workspace-mode\t{}", self.workspace_mode);
+        // The arrangement itself, which is the only witness a panel gesture has.
+        let _ = writeln!(o, "layout	{}", self.workspace.describe());
+        let _ = writeln!(o, "directions	{}", self.workspace.directions());
         let _ = writeln!(
             o,
             "status\t{}",
@@ -3630,7 +3633,7 @@ impl OpenPaint {
             // paint stopped landing or undo went quiet.
             if renderer.take_exhausted() {
                 self.status_message = Some(
-                    "Canvas memory is full; part of that stroke was not painted.                      Trim to canvas, or undo."
+                    "Canvas memory is full; part of that stroke was not painted. Trim to canvas, or undo."
                         .to_owned(),
                 );
             } else if renderer.take_unrecordable() {

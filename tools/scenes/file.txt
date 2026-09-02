@@ -1,0 +1,67 @@
+# A document written to disk and read back. Nothing else here proves the file format works from
+# inside the application: the file crate's own tests write and read a Document, and the menu
+# scenario proves only that Save asks for a dialog. This types a path into that dialog and then
+# opens what it wrote.
+#
+# The path is under target/drive with everything else a run produces -- never anywhere the artist
+# keeps work, and never anywhere git will see it. The name is fixed so a rerun overwrites its own
+# file and nothing else. The recovery scenario borrows this document as the copy it plants, which
+# is why this one runs first: `file` sorts before `recovery`.
+
+# Something worth saving: two layers and a stroke, so what comes back can be told from a fresh
+# document by more than its name.
+expect dirty false
+expect file -
+drag 700 450 1150 850
+press Layers:Add
+expect layers 2
+expect undo 1
+expect dirty true
+
+# Save As, and type where. The dialog is native and runs on its own thread, and it needs a good
+# while to appear and take the keyboard -- a path typed before it has goes into the application
+# instead, where the letters are read as tool keys and the file is never written. Everything here
+# that looks like an over-generous wait is that.
+key ctrl+shift+s
+wait 3000
+expect dialog true
+type C:\Users\taddm\code\OpenPaint\target\drive\driven.openpaint
+wait 1000
+key enter
+# Windows asks before replacing a file that is already there, which it will be on every run after
+# the first. Alt+Y is Yes. On the first run there is nothing to replace and this reaches the
+# application instead, where it means nothing.
+wait 900
+key alt+y
+wait 2500
+expect dialog false
+expect file driven.openpaint
+expect dirty false
+shot file-saved
+
+# A new document, which is clean because the work was just saved -- so no question is asked.
+key ctrl+n
+wait 800
+expect confirm false
+expect layers 1
+expect undo 0
+expect file -
+shot file-new
+
+# And open it again. Everything that was saved has to come back: both layers, and the page.
+key ctrl+o
+wait 3000
+expect dialog true
+type C:\Users\taddm\code\OpenPaint\target\drive\driven.openpaint
+wait 1000
+key enter
+wait 3000
+expect dialog false
+expect file driven.openpaint
+expect layers 2
+expect page-size 2048	2048
+expect dirty false
+shot file-opened
+# And the marks themselves came back, not only the layer count. The stroke runs from (700,450) to
+# (1150,850), so a box around its middle must have ink in it.
+ink 850 550 1000 700 20

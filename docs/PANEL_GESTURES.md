@@ -26,9 +26,14 @@ the one written first, and it wins.
 | where | tap | hold | drag |
 |---|---|---|---|
 | tab button | show that tab | that panel's settings | take **that panel** out and move it |
-| panel strip, no tabs | nothing | that panel's settings | move that panel |
 | panel strip, floating | nothing | the settings of the panel **whose strip it is** | move the **whole window** |
 | panel strip, docked | nothing | nothing | **nothing** |
+
+A docked panel with no tab buttons — the menu bar, the tool rail — therefore has no hold that asks
+about it: `window_target` answers `Elsewhere` for a strip that is not in a window, and there is a
+test pinning that. Its settings are reached with a secondary press on the strip instead, which is
+the same gesture that reaches every other panel's. This used to be written here as a row of its own
+promising that a hold would do it, which the code has never done.
 
 Two of those answers need saying in full.
 

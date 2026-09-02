@@ -1,0 +1,30 @@
+# The recovered-work prompt. It is the most dangerous thing in the application: it blocks every pen
+# stroke while it is up, and a version of it that was drawn nowhere but still refused input made
+# the whole application look broken -- reported as "most things do not work, the brush doesn't even
+# work". It has to be visible, it has to be answerable, and the pen has to come back afterwards.
+#
+# The copy it offers is planted by the harness (-PlantRecovery). The artist's own recovery folder
+# is moved aside before every run and put back afterwards, so nothing here can reach their work.
+expect recovery true
+shot recovery-prompt
+
+# While it is up the brush is refused, and that is the point of it -- but the refusal must be
+# visible, which is what the picture above is for. The box is up in the corner of the page: the
+# prompt is a dark window in the middle of the screen, and counting its own pixels as ink would
+# make this pass for the wrong reason.
+ink 420 250 620 400 0
+drag 430 260 610 390
+ink 420 250 620 400 0
+
+# Recovering brings the work back: two layers and the stroke that was in it.
+press Recover
+wait 1500
+expect recovery false
+expect layers 2
+ink 850 550 1000 700 20
+shot recovery-recovered
+
+# And the pen works again the moment the question is answered.
+drag 500 300 700 400
+expect undo 1
+shot recovery-painting

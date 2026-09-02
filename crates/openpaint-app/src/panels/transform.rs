@@ -101,7 +101,7 @@ fn controls(live: Option<TransformState>, has_selection: bool, kernel: Kernel) -
         // the canvas says so; a box with handles is only obvious once somebody has told you.
         //
         controls.push(Control::Label {
-            text: "On the canvas: drag inside to move, a handle to scale, just outside to                    rotate. Enter applies, Esc puts it back."
+            text: "On the canvas: drag inside to move, a handle to scale, just outside to rotate. Enter applies, Esc puts it back."
                 .to_owned(),
         });
         // **Magnitude only.** A flipped axis is a negative scale, and a slider that ran from -1000
