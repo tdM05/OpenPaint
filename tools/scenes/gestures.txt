@@ -258,13 +258,11 @@ expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Page / *Brush,Tra
 key f3
 expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Page / *Brush,Transform,Select / *Colour | Text
 
-# --- Controls run, and the one consequence that is not visible in the arrangement ---
+# --- Controls run ---
 #
-# **This block cannot assert what it changes.** Which way a panel's controls run is not part of
-# `describe` and has no key of its own in the state dump, so what is proved here is that the
-# choices are offered, that pressing one reaches the workspace, and that it disturbs nothing in the
-# arrangement -- the pictures either side are the only record of the panel turning. Worth closing
-# by reporting the panel's direction in `report_state`.
+# Which way a panel's controls run is not part of the arrangement, so it has a key of its own
+# (`directions`, one entry per panel). It used to have neither, and the pictures either side were
+# the whole of the evidence that the panel had turned at all.
 #
 # The Menu is asked with the other button rather than by holding it. A compact panel is all panel
 # strip, and `window_target` turns a docked strip into `Elsewhere`, so holding one asks nothing at
@@ -275,9 +273,12 @@ expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Page / *Brush,Tra
 right 14 30
 shot gestures-menu-settings
 press Menu:Across
+expect directions Menu=across Tools=wrapped Canvas=down Brush=down Layers=down Colour=down History=down Transform=down Pages=down Page=down Text=down Select=down
 expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Page / *Brush,Transform,Select / *Colour | Text
 shot gestures-menu-across
+right 14 30
 press Menu:Whichever fits
+expect directions Menu=fits Tools=wrapped Canvas=down Brush=down Layers=down Colour=down History=down Transform=down Pages=down Page=down Text=down Select=down
 expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Page / *Brush,Transform,Select / *Colour | Text
 key escape
 

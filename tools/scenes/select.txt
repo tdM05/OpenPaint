@@ -61,16 +61,21 @@ shot select-rect
 # Fill and Clear exist only while there is something to act on: with no selection the panel says
 # "Fill and Clear need a selection." instead, so the selection above had to come first. Both change
 # pixels, so both are answerable in the undo depth.
+# The status is written by the same function that would write it after filling zero pixels, so
+# the page is the proof. The selection is the rectangle dragged above.
+ink 700 500 1080 880 0
 press Select:Fill with brush colour
 expect selection true
 expect status Filled the selection
 expect undo 1
 expect dirty true
+ink 700 500 1080 880 5000
 shot select-filled
 press Select:Clear
 expect selection true
 expect status Cleared the selection
 expect undo 2
+ink 700 500 1080 880 0
 shot select-cleared
 key ctrl+z
 expect undo 1

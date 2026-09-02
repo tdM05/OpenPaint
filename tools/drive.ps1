@@ -162,6 +162,26 @@ public class Win {
 
 [void][Win]::SetProcessDpiAwarenessContext([Win]::PER_MONITOR_V2)
 
+# **Put back anything a previous run left aside, before setting anything aside again.**
+#
+# The `finally` at the foot of this script restores the artist's workspace, brushes and recovery
+# copies whatever happens *inside* the run -- but not if the run is killed from outside, which is
+# what happens when a sweep is interrupted. Their files then sit in a `.driving` stash, the live
+# ones are missing, and the next run fails on "cannot create a file when that file already exists"
+# with the artist's work still stranded. Which is exactly the kind of harm this stashing exists to
+# prevent, arrived at from the other direction.
+#
+# So a stash that is already there is treated as evidence of an interrupted run and restored first.
+# It is never evidence of anything else: nothing but this script writes those names.
+function Restore-Stash([string]$live, [string]$stash) {
+    if (-not (Test-Path $stash)) {
+        return
+    }
+    Write-Output "putting back what an interrupted run left aside: $live"
+    if (Test-Path $live) { Remove-Item $live -Recurse -Force }
+    Move-Item $stash $live -Force
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 # Its own build directory, so driving the app never fights the copy the artist has open --
 # Windows locks a running exe, and killing theirs to test mine is not a trade to make.
@@ -174,8 +194,9 @@ New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
 # A fresh workspace every run, so a picture is of the code and not of whatever was saved last.
 # `-KeepWorkspace` is for the one thing that needs the opposite: proving a saved one still loads.
-$saved = Join-Path $env:LOCALAPPDATA 'OpenPaint\workspace.json'
+$saved = Join-Path $env:LOCALAPPDATA 'OpenPaint' | Join-Path -ChildPath 'workspace.json'
 $stash = "$saved.driving"
+Restore-Stash $saved $stash
 if (-not $KeepWorkspace -and (Test-Path $saved)) { Move-Item $saved $stash -Force }
 
 # The saved brushes, set aside for the length of the run. They are an app resource in the same
@@ -184,7 +205,16 @@ if (-not $KeepWorkspace -and (Test-Path $saved)) { Move-Item $saved $stash -Forc
 # Nothing driven here is allowed to cost the artist a brush they made.
 $brushes = Join-Path $env:LOCALAPPDATA 'OpenPaint' | Join-Path -ChildPath 'brushes.json'
 $brushStash = "$brushes.driving"
+Restore-Stash $brushes $brushStash
 if (Test-Path $brushes) { Move-Item $brushes $brushStash -Force }
+
+# The look, for the same reason and with a second one behind it: a run that cycles the theme or
+# picks an icon set writes it here, and the next run then starts in whatever the last one left.
+# One scenario's choice leaked into another's assertion, which is a suite that is not repeatable.
+$look = Join-Path $env:LOCALAPPDATA 'OpenPaint' | Join-Path -ChildPath 'theme.json'
+$lookStash = "$look.driving"
+Restore-Stash $look $lookStash
+if (Test-Path $look) { Move-Item $look $lookStash -Force }
 
 # **And the artist's recovered work is set aside, never answered.** A crashed session leaves a
 # file here and the app opens asking what to do with it. The only two answers are Recover and
@@ -192,6 +222,7 @@ if (Test-Path $brushes) { Move-Item $brushes $brushStash -Force }
 # the question. Put back in `finally`, whatever happens.
 $rec = Join-Path $env:LOCALAPPDATA 'OpenPaint' | Join-Path -ChildPath 'recovery'
 $recStash = "$rec-driving"
+Restore-Stash $rec $recStash
 if (Test-Path $rec) { Move-Item $rec $recStash -Force }
 
 # **A recovery copy of our own, when a run is about to test the prompt.**
@@ -884,6 +915,10 @@ finally {
     if (Test-Path $brushStash) {
         if (Test-Path $brushes) { Remove-Item $brushes -Force }
         Move-Item $brushStash $brushes -Force
+    }
+    if (Test-Path $lookStash) {
+        if (Test-Path $look) { Remove-Item $look -Force }
+        Move-Item $lookStash $look -Force
     }
     if (Test-Path $recStash) {
         if (Test-Path $rec) { Remove-Item $rec -Recurse -Force }

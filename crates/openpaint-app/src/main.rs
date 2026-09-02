@@ -3636,6 +3636,24 @@ impl OpenPaint {
         let _ = writeln!(o, "undo\t{undo}");
         let _ = writeln!(o, "redo\t{redo}");
         let _ = writeln!(o, "dirty\t{}", self.dirty);
+        // Whether a recovery copy has actually been written this session, and what it cost.
+        // The prompt that offers one is driven with a copy the harness plants, because a real
+        // crash is the only other way to make one -- so without this the *writing* of them
+        // had no witness at all, and that is the half that runs every minute of every session.
+        let _ = writeln!(
+            o,
+            "autosave\t{}",
+            self.autosave.last().map_or_else(
+                || {
+                    if self.autosave.available() {
+                        "none yet".to_owned()
+                    } else {
+                        "unavailable".to_owned()
+                    }
+                },
+                |(_, took, tiles)| format!("{tiles} tiles in {} ms", took.as_millis().max(1)),
+            )
+        );
         let _ = writeln!(
             o,
             "file\t{}",
@@ -3661,6 +3679,11 @@ impl OpenPaint {
         // The arrangement itself, which is the only witness a panel gesture has.
         let _ = writeln!(o, "layout\t{}", self.workspace.describe());
         let _ = writeln!(o, "directions\t{}", self.workspace.directions());
+        let _ = writeln!(o, "look\t{}", self.workspace.look());
+        if let Some((shape, extend_by)) = self.ui.as_ref().map(ui::Ui::settings) {
+            let _ = writeln!(o, "wheel-shape\t{shape:?}");
+            let _ = writeln!(o, "extend-by\t{extend_by}");
+        }
         let _ = writeln!(o, "windows\t{}", self.workspace.window_rects());
         let _ = writeln!(
             o,

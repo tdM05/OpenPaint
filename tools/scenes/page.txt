@@ -53,6 +53,14 @@ expect redo 4
 # The crop box starts covering the whole page, and starting one swaps this panel's
 # "Crop / resize by dragging" for Apply and Cancel -- the two are never both offered, because a
 # second Start in the middle of a crop could only refuse.
+# **How much an extend adds**, which is a setting of the shell and had no witness at all: the
+# clamp proof below shows the slider moved a long way and cannot tell three thousand from four.
+expect extend-by 512
+slide page:Extend by (px) 0.5
+# A log slider from 16 to 4096: the middle of it is around 360, not the arithmetic mean.
+about extend-by 363 80
+shot page-extend-by
+
 press page:Crop / resize by dragging
 expect crop true
 expect page-size 2048	2048
@@ -125,15 +133,19 @@ expect crop false
 expect undo 2
 press page:Trim to canvas
 expect undo 3
+# The message names how many tiles went. A trim that recorded an op and discarded nothing would
+# leave the depth exactly as it is here, so the count is the half that says work was done -- and
+# the refusal above ("Nothing outside the page to trim") is the other half.
+expect status Trimmed 6 tiles outside the page (undoable)
 shot page-trimmed
 key ctrl+z
 expect undo 2
 expect redo 1
 
-# **The Extend by slider, and why it is proved this way.** The amount is a panel setting held in
-# `Ui::extend_amount`; `report_state` does not carry it, and a log slider dragged by a pointer
-# lands where the pointer lands, so the number itself can be neither read back nor predicted to the
-# pixel. What *can* be asserted exactly is where the four buttons stop. Dragged to its far end the
+# **The Extend by slider, and why the clamp is still worth proving.** The amount is a panel
+# setting held in `Ui::extend_amount`, and the application now reports it -- see the block near the
+# top of this file, which checks the slider moves it. What that cannot show is where the four
+# buttons stop, and this can. Dragged to its far end the
 # slider is worth something close to its 4096 maximum, so twenty presses of Extend down run the
 # page into `MAX_PAGE_DIMENSION` and it clamps at 65536 -- which twenty presses of the 512 the
 # buttons used above could never reach (they would come to 12288). Reaching the clamp is therefore

@@ -76,24 +76,37 @@ expect selection false
 # Fill paints the selection with the brush colour, and that is an edit, so history grows.
 key ctrl+a
 expect selection true
+# The status is written by the same function that would write it after filling zero pixels, so the
+# proof is the page: a box that was clear before is covered afterwards, and clear again on undo.
+ink 1200 900 1350 1050 0
 key ctrl+f
 expect undo 2
+ink 1200 900 1350 1050 2000
 shot kb-filled
 key ctrl+z
 expect undo 1
+ink 1200 900 1350 1050 0
 
 # Delete clears the selected pixels -- only with a selection up, which there is.
 key ctrl+a
+ink 600 400 800 600 20
 key delete
 expect undo 2
+ink 600 400 800 600 0
 key ctrl+z
 expect undo 1
+ink 600 400 800 600 20
 key ctrl+d
 
-# F4 cycles the theme; F2 swaps the whole UI for the old side panel and back.
+# F4 cycles the theme, and F2 swaps the whole UI for the old side panel and back. The theme is a
+# setting with no other witness -- it changes every colour on screen and nothing a document could
+# show -- so until the application would name it, F4 was proved not to crash and nothing else.
+expect look Studio Line
 key f4
+expect look Paper Line
 shot kb-theme
 key f4
+expect look Studio Line
 key f2
 shot kb-old-panel
 expect workspace-mode false

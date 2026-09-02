@@ -2802,6 +2802,26 @@ impl Workspace {
             .join(" / ")
     }
 
+    /// Which theme is on and which icon set it draws with.
+    ///
+    /// Both are settings with no other witness: cycling the theme changes every colour on screen
+    /// and nothing a document state could show, and choosing an icon set changes what the buttons
+    /// look like and deliberately nothing else. Driven, they were proved not to crash and nothing
+    /// more.
+    #[must_use]
+    pub fn look(&self) -> String {
+        let name = if self.theme.palette == crate::theme::Theme::paper().palette {
+            "Paper"
+        } else {
+            "Studio"
+        };
+        let icons = crate::icons::SETS
+            .iter()
+            .find(|s| s.id == self.theme.icons)
+            .map_or("?", |s| s.name);
+        format!("{name} {icons}")
+    }
+
     /// Which way each panel's controls run, for whoever is driving the application.
     ///
     /// Separate from [`Self::describe`] because it is a different question about the same

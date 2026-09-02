@@ -75,6 +75,21 @@ press Normal
 expect active.blend Normal
 
 # The eye on a layer row. 524288 is the first row's visibility toggle (1 << 19).
+# **The flags have to reach the composite.** Everything above is asserted at the model -- the flag
+# flipped -- and a composite that ignored the eye, or the opacity, would pass all of it. So: put
+# ink on a layer, and watch the page answer.
+press layers:0
+expect active.name Layer 1
+drag 700 450 1150 850
+ink 850 550 1000 700 20
+press 524288
+expect active.visible false
+ink 850 550 1000 700 0
+press 524288
+expect active.visible true
+ink 850 550 1000 700 20
+shot layers-composite
+
 # The eye on a row. Rows read top-of-stack-first but carry the document index, so 524288 is
 # layer 0's eye whichever row it is drawn on. Select that layer first, so the assertion is about
 # the layer the eye belongs to.

@@ -1,0 +1,39 @@
+# Autosave writing a recovery copy, and closing the window with unsaved work.
+#
+# The prompt that *offers* a recovery copy is driven in `recovery.txt` with a copy the harness
+# plants, because a real crash is the only other way to make one. That left the half that runs
+# every minute of every session -- the writing -- with no witness at all.
+#
+# This scenario is slow on purpose: the interval is a minute (`autosave::INTERVAL`) and there is no
+# way to hurry it that would not also be a way for the real thing to behave differently.
+
+# Nothing unsaved, nothing written.
+expect dirty false
+expect autosave none yet
+
+# Now there is something to lose.
+drag 700 450 1150 850
+expect dirty true
+expect autosave none yet
+shot autosave-dirty
+
+# A minute and a little, and a copy exists. The count is the tiles the stroke touched, which
+# depends on where the stroke fell, so what is asserted is that something was written at all --
+# "none yet" would mean the timer never fired or the guard never let it.
+wait 66000
+expect autosave 1 tiles in 1 ms
+shot autosave-written
+
+# --- Closing the window with unsaved work ---
+#
+# Alt+F4 is the ordinary way out, and it must ask rather than throw the drawing away. This is the
+# last unguarded door in the application and nothing had ever tried it.
+key alt+f4
+wait 1200
+expect confirm true
+shot autosave-closing
+press Cancel
+wait 800
+expect confirm false
+expect dirty true
+ink 850 550 1000 700 20

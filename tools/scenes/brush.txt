@@ -173,5 +173,35 @@ type s
 key enter
 press Save brush
 expect presets finkers
+
+# **And the size reaches the dab.** Every slider here is asserted as a number and none of them as
+# ink, which proves the panel wrote to the brush and says nothing about whether the brush uses it.
+# Two strokes down the same line at two sizes: the wide one covers a box the narrow one misses.
+# This matters more than it looks -- Windows Ink gives an injected pointer no pressure, so nothing
+# else in this suite shows that the shape of a dab depends on anything at all.
+press Reset to defaults
+expect brush.size 8.000
+drag 700 450 700 850
+ink 660 600 690 700 0
+key ctrl+z
+slide brush:1048577 0.85
+about brush.size 150 60
+drag 700 450 700 850
+ink 660 600 690 700 20
+shot brush-wide
+key ctrl+z
+press Reset to defaults
+
+# **Saving a brush with no name is refused**, out loud on stderr and silently on screen. The
+# refusal branch had never been taken because every scenario named the brush first.
+press Reset to defaults
 press Forget finkers
+expect presets
+# The field still holds the last name that was typed into it, so it has to be emptied first --
+# otherwise this saves that name again and proves nothing.
+press brush:1048585
+key ctrl+a
+key delete
+key enter
+press Save brush
 expect presets

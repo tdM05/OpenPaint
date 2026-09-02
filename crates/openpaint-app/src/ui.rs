@@ -1056,6 +1056,16 @@ impl Ui {
         self.canvas_viewport
     }
 
+    /// The two settings the UI holds that nothing else can see.
+    ///
+    /// The colour wheel's shape and how much an extend adds are the shell's, not the document's,
+    /// so no document state shows them and a screenshot is the only other evidence. Both were
+    /// driven and neither was checked.
+    #[must_use]
+    pub fn settings(&self) -> (crate::colour_wheel::Shape, u32) {
+        (self.wheel_shape, self.extend_amount)
+    }
+
     /// Whether a text field somewhere has the caret.
     ///
     /// **Because a key a field is taking is not a shortcut.** Naming a brush "beeper" selected the

@@ -219,9 +219,11 @@ shot menu-cancelled
 # stays up under a name of its own. Reaching "Words" inside it is the proof it opened, and
 # choosing a look is a setting rather than an edit -- so the document must be exactly where the
 # block above left it.
+expect look Studio Line
 press Menu:View
 press Menu:Settings
 press popup-workspace:Words
+expect look Studio Words
 expect layers 2
 expect layer-names Layer 1, Layer 2
 expect dirty true
