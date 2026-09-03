@@ -115,7 +115,20 @@ what every comparable application does. The reasoning is in `DECISIONS.md` §5h.
 
 ---
 
-## 4. Deferred features (decided we want them; not now)
+## 4. Contextual panels — designed, agreed, not built
+
+Brush, Select, Transform and Text are four tabs in one strip as though they were four of a kind,
+and they are three different kinds of context: tool options, a layer property, and a task in
+flight. The spec, the prior art, what not to copy from Photoshop, the four things that will go
+wrong and the order to build it in are in **`docs/CONTEXTUAL_PANELS.md`**, which also carries the
+handoff for whoever picks it up.
+
+Start with Properties-for-text: one module, clearest case, and it answers whether contextual
+behaviour feels right before anything is restructured.
+
+---
+
+## 5. Deferred features (decided we want them; not now)
 
 - **Cursor feedback on the transform box** — a scale cursor on the handles, a rotate
   cursor on the ring. Needs a cursor seam that works for pen as well as mouse (Q14).

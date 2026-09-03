@@ -69,6 +69,8 @@ nothing. See [`docs/DRIVING.md`](docs/DRIVING.md).
   with the reason it was made.
 - [`docs/RELEASE_PLAN.md`](docs/RELEASE_PLAN.md) — what a first release needed, and what it did not.
 - [`docs/TODO.md`](docs/TODO.md) — decided but not built.
+- [`docs/CONTEXTUAL_PANELS.md`](docs/CONTEXTUAL_PANELS.md) — where a tool's settings belong, and
+  the handoff for picking that work up.
 - [`docs/OPEN_QUESTIONS.md`](docs/OPEN_QUESTIONS.md) — decisions still open.
 - [`docs/DRIVING.md`](docs/DRIVING.md) — how the application is driven and tested through its UI.
 
