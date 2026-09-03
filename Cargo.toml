@@ -17,7 +17,10 @@ members = [
 debug_assert_with_mut_call = "deny"
 
 [workspace.package]
-version = "0.0.0"
+# **0.1.0: the first release.** Not 1.0, and the number is the honest part -- what is here is a
+# painting application an artist can do a whole job in, and `docs/TODO.md` §4 is the list of what
+# it still cannot do. See CHANGELOG.md.
+version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/tdM05/OpenPaint"

@@ -18,13 +18,22 @@
 [CmdletBinding()]
 param(
     [string[]]$Only = @(),
-    [int]$Width = 2200,
-    [int]$Height = 1450,
+    # **The client area the scenarios were measured in**, not the window size: the frame around a
+    # window is not the same on every display, and six pixels of it is enough to move where a
+    # dragged selection edge lands. 2178x1394 at scale 1.5 is a 1452x929 workspace, which is what
+    # every tab position, window rectangle and canvas coordinate in `scenes/` was written against.
+    [int]$Width = 2178,
+    [int]$Height = 1394,
     # **What the scenes are calibrated against.** The Surface's own screen reports 1.5, which makes
     # the 2200x1450 window a 1452x929 workspace -- the size every tab position, window rectangle
     # and canvas coordinate in `scenes/` was measured on. A run at another scale is refused rather
     # than reported as failures; see the check in `drive.ps1`.
-    [double]$Scale = 1.5
+    [double]$Scale = 1.5,
+    # Where the window goes, in virtual-screen pixels -- which is to say, *which display*. With a
+    # second monitor attached the primary may not be the one the scenes were measured on; put the
+    # window on the one that reports `-Scale` and everything lines up again.
+    [int]$X = 60,
+    [int]$Y = 60
 )
 
 $ErrorActionPreference = 'Continue'
@@ -129,7 +138,7 @@ foreach ($scene in $scenes) {
     $out = @()
     try {
         $out = & (Join-Path $PSScriptRoot 'drive.ps1') -Shot $name -Width $Width -Height $Height `
-            -Scale $Scale `
+            -Scale $Scale -X $X -Y $Y `
             -Script $scene.FullName @extra 2>&1
     } catch {
         $out = @($_)

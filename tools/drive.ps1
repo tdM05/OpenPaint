@@ -76,10 +76,19 @@ param(
     [string]$Shot = 'shot',
     [string]$Do = '',
     [string]$Script = '',
-    [int]$Width = 1280,
-    [int]$Height = 820,
+    # The **client** size, which is what every coordinate in a scenario is measured in. The
+    # window is grown by its frame to reach it; see the convergence below.
+    [int]$Width = 1264,
+    [int]$Height = 781,
     # The display scale the scenarios are calibrated against. See the check after the first frame.
     [double]$Scale = 0,
+    # Where to put the window, in virtual-screen pixels. **Which display this lands on decides the
+    # scale factor**, and the scale factor decides the size of the workspace in the units panels
+    # are laid out in -- so on a machine with two displays of different scales, this is how the run
+    # is put on the one the scenarios were measured on. Negative is normal: a display to the left
+    # of the primary starts at a negative x.
+    [int]$X = 60,
+    [int]$Y = 60,
     [int]$Settle = 3000,
     [switch]$Keep,
     [switch]$KeepWorkspace,
@@ -141,8 +150,16 @@ public class Win {
         int h = GetSystemMetrics(79);   // SM_CYVIRTUALSCREEN
         int vx = GetSystemMetrics(76);  // SM_XVIRTUALSCREEN
         int vy = GetSystemMetrics(77);  // SM_YVIRTUALSCREEN
-        uint nx = (uint)(((double)(x - vx) * 65535.0) / (w - 1));
-        uint ny = (uint)(((double)(y - vy) * 65535.0) / (h - 1));
+        // **The centre of the pixel, rounded, not its corner truncated.**
+        //
+        // The coordinate is normalised across the *virtual desktop*, so its resolution depends on
+        // how many displays are attached: one 2560-wide screen gives 25 steps per pixel, and two
+        // screens 4480 wide give 14. Truncating the corner then lands on the pixel before the one
+        // that was asked for often enough to matter -- `select.txt` came back with a selection
+        // whose right edge was 1168 where it had measured 1169, and nothing about the application
+        // had changed. Half a pixel in, rounded to nearest, hits the pixel that was named.
+        uint nx = (uint)Math.Round(((double)(x - vx) + 0.5) * 65535.0 / w);
+        uint ny = (uint)Math.Round(((double)(y - vy) + 0.5) * 65535.0 / h);
         mouse_event(MOVE | ABSOLUTE | VIRTUALDESK, nx, ny, 0, IntPtr.Zero);
     }
 
@@ -330,7 +347,7 @@ try {
     $h = [Win]::AppWindow($proc.Id)
     if ($h -eq [IntPtr]::Zero) { throw 'the app window never appeared' }
     # A known size and place, so a coordinate in a script means the same thing every run.
-    [void][Win]::MoveWindow($h, 60, 60, $Width, $Height, $true)
+    [void][Win]::MoveWindow($h, $X, $Y, $Width, $Height, $true)
 
     # **The window has to actually be in front, and the run must stop if it is not.**
     # `SetForegroundWindow` is refused when the calling process does not already own the
@@ -381,6 +398,18 @@ try {
     $ox = $o.X
     $oy = $o.Y
 
+    # **The size is the *client* size, and it is converged on rather than asked for.**
+    #
+    # `MoveWindow` sets the outer size, and what a scenario lives in is the client area -- so the
+    # window frame sits between the two, and the frame is not the same on every display or at
+    # every scale. Asking for a 2200x1450 window gave a 2178x1394 client on one display and
+    # 2184x1411 on another, and six pixels of width is enough to move where a dragged selection
+    # edge lands: `select.txt` came back with a right edge of 1168 where it had measured 1169.
+    #
+    # So: measure the client, move the outer edge by the difference, and repeat. Three passes is
+    # plenty -- the frame is constant for a given window, so the first correction is usually
+    # exact.
+    #
     # **The size has to stick, and the run must stop if it does not.**
     #
     # Every coordinate in every scenario is in this client area, so a window that came out a
@@ -398,20 +427,28 @@ try {
     # `MoveWindow` counts and `GetClientRect` does not -- a correctly placed 2200x1450 window has
     # a client area of about 2184x1411 here. Anything further out is a different window from the
     # one the scenes were written against.
-    $frame = 80
-    for ($try = 0; $try -lt 3; $try++) {
+    $outerW = $Width
+    $outerH = $Height
+    for ($try = 0; $try -lt 4; $try++) {
         [void][Win]::GetClientRect($h, [ref]$c)
-        if ($Width - $c.Right -le $frame -and $Height - $c.Bottom -le $frame) { break }
-        [void][Win]::MoveWindow($h, 60, 60, $Width, $Height, $true)
+        if ($c.Right -eq $Width -and $c.Bottom -eq $Height) { break }
+        $outerW += $Width - $c.Right
+        $outerH += $Height - $c.Bottom
+        [void][Win]::MoveWindow($h, $X, $Y, $outerW, $outerH, $true)
         Start-Sleep -Milliseconds 400
     }
     [void][Win]::GetClientRect($h, [ref]$c)
-    if ($Width - $c.Right -gt $frame -or $Height - $c.Bottom -gt $frame) {
-        throw ("the window will not stay at ${Width}x${Height}: its client area is " +
+    # **Exactly, and in both directions.** A client larger than asked for is as wrong as one
+    # smaller, and larger is the case that actually happened: moved onto a 150% display, winit
+    # kept the *logical* size and the client became 3276x2117. An earlier one-sided check waved
+    # that through, and eighteen scenarios then described a workspace half again the size of the
+    # one they were measured on.
+    if ($c.Right -ne $Width -or $c.Bottom -ne $Height) {
+        throw ("the client area will not settle at ${Width}x${Height}: it is " +
                "$($c.Right)x$($c.Bottom). Every coordinate in a scenario is in that area, so " +
-               'nothing below would mean what it says. This happens when displays of different ' +
-               'scale factors are attached and the window is restored to its own default size; ' +
-               'run on a single display, or pass -Width and -Height that stick.')
+               'nothing below would mean what it says. This happens when a display of a ' +
+               'different scale is attached and the window is restored to its own size; run on ' +
+               'the display the suite was calibrated on, or pass -Width and -Height that settle.')
     }
     # **A fresh point.** `ClientToScreen` converts in place, and the one above already holds
     # screen coordinates -- converting it twice adds the window's origin twice, which puts every
@@ -673,6 +710,43 @@ try {
         }
     }
 
+    # `about KEY a b c d [TOL]` -- every number of a multi-field state value, each within TOL.
+    #
+    # **Because a bound taken from where a pointer landed is exact to a pixel and no further.**
+    # The pointer is injected in coordinates normalised across the whole virtual desktop, so its
+    # resolution depends on how many displays are attached -- 25 steps per pixel on one screen,
+    # 14 on two. A lasso's right edge came back as 1168 where it had been measured at 1169, on an
+    # application that had not changed and a client area of exactly the calibrated size. Asserting
+    # such a number exactly is asserting the harness's aim, not the selection.
+    #
+    # Numbers that are *not* pointer-derived stay on `expect`, which is exact: a page size, a
+    # layer count and an undo depth have no business being approximate.
+    function Expect-Near-Many([string]$key, [double[]]$want, [double]$tol = 1) {
+        $got = $null
+        $ok = $false
+        for ($i = 0; $i -lt 20; $i++) {
+            $got = (Read-State)[$key]
+            if ($null -ne $got) {
+                $nums = @($got.Trim() -split '\s+' | ForEach-Object { [double]$_ })
+                if ($nums.Count -eq $want.Count) {
+                    $ok = $true
+                    for ($j = 0; $j -lt $want.Count; $j++) {
+                        if ([Math]::Abs($nums[$j] - $want[$j]) -gt $tol) { $ok = $false }
+                    }
+                }
+            }
+            if ($ok) { break }
+            Start-Sleep -Milliseconds 100
+        }
+        $wanted = $want -join ' '
+        if ($ok) {
+            [void]$checks.Add("  ok    $key = $got (wanted about $wanted)")
+        } else {
+            [void]$checks.Add("  FAIL  ${key}: wanted about $wanted, got '$got'")
+            $script:failed = $true
+        }
+    }
+
     function Expect-State([string]$key, [string]$want) {
         # Given a frame or two: a press is answered on the next paint, not on the release.
         $got = $null
@@ -920,7 +994,13 @@ try {
             'about' {
                 # `about KEY VALUE [TOLERANCE]`. A log slider set by fraction lands where the
                 # curve puts it, so the scene says how close is close enough.
-                if ($a.Count -ge 4) {
+                #
+                # `about KEY a b c d` -- a state value of several numbers, each within a pixel.
+                # See `Expect-Near-Many`: a bound derived from where the pointer landed is exact
+                # to a pixel and no further.
+                if ($a.Count -gt 4) {
+                    Expect-Near-Many $a[1] ([double[]]($a[2..($a.Count - 1)]))
+                } elseif ($a.Count -eq 4) {
                     Expect-Near $a[1] ([double]$a[2]) ([double]$a[3])
                 } else {
                     Expect-Near $a[1] ([double]$a[2])

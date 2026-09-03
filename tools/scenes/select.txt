@@ -175,7 +175,13 @@ expect select-tool lasso
 path 700 500 1050 500 1050 850 700 850
 expect selection true
 expect status Selected
-expect selection.bounds 576 604 1169 1197
+# **About, not exactly.** These four numbers come from where the pointer landed, and the pointer
+# is injected in coordinates normalised across the whole virtual desktop -- so its resolution
+# depends on how many displays are attached, and the last pixel of an edge moves with it. The
+# right edge came back 1168 on a two-monitor desktop and 1169 on one, with nothing about the
+# application different. A pixel of tolerance asserts the selection; asserting the exact number
+# asserts the harness's aim.
+about selection.bounds 576 604 1169 1197
 shot select-lasso-square
 
 # And the straight line, which encloses nothing and must therefore leave nothing selected.
