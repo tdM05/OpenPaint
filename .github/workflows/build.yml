@@ -30,11 +30,14 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # winit needs these system libs to build on Linux CI.
+      # The system libraries a GUI application needs to *build* on Linux CI. winit wants the
+      # first two; `fontconfig` comes in under the text stack, which asks the system which fonts
+      # exist -- there is no such thing as a portable answer to that, which is why it is a system
+      # library and not a crate.
       - name: Install Linux GUI deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libfontconfig1-dev
 
       - name: Formatting
         run: cargo fmt --all -- --check
