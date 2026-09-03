@@ -98,30 +98,30 @@ expect undo 1
 ink 600 400 800 600 20
 key ctrl+d
 
-# F4 cycles the theme, and F2 swaps the whole UI for the old side panel and back. The theme is a
-# setting with no other witness -- it changes every colour on screen and nothing a document could
-# show -- so until the application would name it, F4 was proved not to crash and nothing else.
+# F4 cycles the theme. It is a setting with no other witness -- it changes every colour on screen
+# and nothing a document could show -- so until the application would name it, F4 was proved not to
+# crash and nothing else.
+#
+# F2 used to swap the whole UI for the old side panel and back. There is no old side panel any
+# more, so there is nothing to swap to and no `workspace-mode` to assert; the key is unbound.
 expect look Studio Line
 key f4
 expect look Paper Line
 shot kb-theme
 key f4
 expect look Studio Line
-key f2
-shot kb-old-panel
-expect workspace-mode false
-key f2
-expect workspace-mode true
 shot kb-workspace
 
-# Export writes a PNG beside wherever the application was started, with a timestamp in its name so
-# it can never land on something that was already there. The status names the file it wrote; what
-# is asserted here is that it asked for no dialog and left the document alone, because the path in
-# that message contains a timestamp nothing can predict.
+# Ctrl+E asks where the artwork is going rather than writing a file on the spot. What is asserted
+# here is the shortcut: the question comes up, and Escape puts it away having changed nothing.
+# `export.txt` drives the dialog itself and reads the files off the disk afterwards.
 expect dirty true
 key ctrl+e
-wait 1500
-expect dialog false
+wait 800
+expect exporting true
+shot kb-exporting
+press Not now
+expect exporting false
 expect dirty true
 shot kb-exported
 

@@ -69,19 +69,6 @@ impl From<io::Error> for ExportError {
     }
 }
 
-/// A default filename in the current directory, distinct per second.
-///
-/// No file dialog yet: that arrives with real save/open, where it belongs. Seconds
-/// since the epoch rather than a formatted date to avoid a date-formatting
-/// dependency for a placeholder.
-#[must_use]
-pub fn default_path() -> PathBuf {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    PathBuf::from(format!("openpaint-{stamp}.png"))
-}
-
 /// Largest page a PNG export will attempt, in pixels.
 ///
 /// A PNG is one flat image, so export has to materialise `w * h * 4` bytes on the CPU no
@@ -91,44 +78,316 @@ pub fn default_path() -> PathBuf {
 /// real workflow rather than a theoretical one.
 const MAX_EXPORT_PIXELS: u64 = 512 * 1024 * 1024;
 
-/// Flatten the layer stack and write it as an sRGB PNG.
+/// What an export is about to do.
 ///
-/// Composites on the **CPU**, through `openpaint_core::layer::Blend` — the same functions the
-/// shader mirrors. Two reasons, and neither is convenience:
+/// Held by the shell between frames, like any other half-finished UI state, and shown in a modal
+/// built from the same [`Control`](crate::panel_ui::Control)s every panel is built from.
 ///
-/// 1. Export already stalls on a readback, so there is nothing to gain from doing it on the
-///    GPU, and doing it here needs no render target at all — which matters, because a
-///    page-sized target is exactly the ceiling the tiled canvas removed.
-/// 2. It makes the two compositing implementations comparable. A test that composites the same
-///    stack through both and diffs the pixels is what stops the shader and the reference
-///    drifting apart, the same way the dab tests pin the falloff curve.
-pub fn export_tiles_png(
+/// **Kept after an export, not reset.** Somebody exporting a strip at 50% is going to do it again
+/// in ten minutes, and a dialog that forgets is a dialog you have to set up every time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Choices {
+    pub what: What,
+    /// A percentage of the page's own size, 10 to 100.
+    pub scale: u32,
+}
+
+impl Default for Choices {
+    fn default() -> Self {
+        Self {
+            what: What::ThisPage,
+            scale: FULL_SIZE,
+        }
+    }
+}
+
+/// How much of the document goes out, and in how many files.
+///
+/// **Three choices rather than "everything" plus a switch.** A switch would spell a fourth state
+/// -- this page, as a strip -- which is the same thing as this page and would have to be either
+/// hidden or explained. Three named intents cannot be combined into a meaningless one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum What {
+    /// The page being drawn on.
+    ThisPage,
+    /// Every page, numbered, one file each.
+    EveryPage,
+    /// Every page stacked into one tall image: a webtoon.
+    Strip,
+}
+
+impl What {
+    /// What the artist chooses between, in the order it is offered.
+    pub const ALL: [Self; 3] = [Self::ThisPage, Self::EveryPage, Self::Strip];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ThisPage => "This page",
+            Self::EveryPage => "Every page, one file each",
+            Self::Strip => "Every page, one tall strip",
+        }
+    }
+}
+
+/// Control ids for the export modal.
+///
+/// Past the prompts' own (`crate::prompt`), because both are drawn by the same modal and an id
+/// that meant two things would make the answer depend on which was asked first.
+const WHAT_BASE: crate::panel_ui::ControlId = 100;
+const SCALE: crate::panel_ui::ControlId = 110;
+
+/// The smallest export offered, as a percentage.
+///
+/// Not zero, and not one: below about a tenth the page is a thumbnail, and every step of the
+/// slider below that would be a size nobody asked for.
+const MIN_SCALE: u32 = 10;
+
+/// What the export modal shows, given what is chosen and how many pages there are.
+#[must_use]
+pub fn controls(
+    choices: &Choices,
+    pages: usize,
+    page: (u32, u32),
+) -> Vec<crate::panel_ui::Control> {
+    use crate::panel_ui::Control;
+    let mut controls = Vec::new();
+    for (i, what) in What::ALL.iter().enumerate() {
+        // **A document of one page is not offered three ways to export one page.** Two of them
+        // would do exactly the same thing, and a choice with no consequence is a choice the
+        // artist has to think about for nothing.
+        if pages < 2 && *what != What::ThisPage {
+            continue;
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "three of them")]
+        controls.push(Control::Choice {
+            id: WHAT_BASE + i as u32,
+            text: what.label().to_owned(),
+            selected: choices.what == *what,
+            icon: None,
+        });
+    }
+    controls.push(Control::Slider {
+        id: SCALE,
+        // **Not "Size".** The Brush panel has a Size and so does Text, and the control atlas
+        // refuses a name that fits three controls rather than guessing between them -- which is
+        // the rule that stopped a scenario deleting the artist's saved brushes. A name is only
+        // useful if it is a name.
+        text: "Export size".to_owned(),
+        value: choices.scale as f32,
+        min: MIN_SCALE as f32,
+        max: FULL_SIZE as f32,
+        unit: "%",
+        log: false,
+    });
+    // **The size it will actually be**, because a percentage is not a size and the number that
+    // matters to a webtoon is a pixel width. Worked out by the same function that will do it, so
+    // this cannot promise a size the export does not produce.
+    let (w, h) = scaled_size(page, choices.scale);
+    controls.push(Control::Label {
+        text: match choices.what {
+            What::ThisPage => format!("One file, {w} by {h} pixels."),
+            What::EveryPage => format!("{pages} files, {w} by {h} pixels each."),
+            What::Strip => format!("One file, {w} by {} pixels.", u64::from(h) * pages as u64),
+        },
+    });
+    controls
+}
+
+/// Act on something changed in the export modal. Returns whether anything moved.
+pub fn apply(choices: &mut Choices, change: &crate::panel_ui::Change) -> bool {
+    use crate::panel_ui::Change;
+    match *change {
+        Change::Chose(id) if (WHAT_BASE..WHAT_BASE + What::ALL.len() as u32).contains(&id) => {
+            let what = What::ALL[(id - WHAT_BASE) as usize];
+            let moved = choices.what != what;
+            choices.what = what;
+            moved
+        }
+        Change::Set(SCALE, value) => {
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "clamped to 10..=100 by the slider before it arrives"
+            )]
+            let scale = (value.round() as u32).clamp(MIN_SCALE, FULL_SIZE);
+            let moved = choices.scale != scale;
+            choices.scale = scale;
+            moved
+        }
+        _ => false,
+    }
+}
+
+/// The files an export writes, given the name the artist chose.
+///
+/// One page keeps the name as given. Several are numbered from one, with the number *before* the
+/// extension and zero-padded, so a folder of them sorts the way the document reads -- `page-9`
+/// and `page-10` sort the wrong way round in every file manager there is.
+#[must_use]
+pub fn names(base: &Path, pages: usize) -> Vec<PathBuf> {
+    if pages <= 1 {
+        return vec![base.to_path_buf()];
+    }
+    let extension = base
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "png".to_owned());
+    let stem = base
+        .file_stem()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "page".to_owned());
+    let width = pages.to_string().len();
+    (1..=pages)
+        .map(|n| {
+            let name = format!("{stem}-{n:0width$}.{extension}", width = width);
+            base.with_file_name(name)
+        })
+        .collect()
+}
+
+/// One page, flattened and ready to write: 8-bit sRGB with alpha, row-major.
+///
+/// Named because a strip is several of these stacked, and because the *scaled* size is not the
+/// page's size — so passing the pixels around with their own dimensions is the only way the two
+/// cannot come apart.
+pub struct Sheet {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// A scale of 100%: the page at the size it was drawn.
+pub const FULL_SIZE: u32 = 100;
+
+impl Sheet {
+    /// Write it as an sRGB PNG.
+    ///
+    /// # Errors
+    /// Whatever the encoder or the filesystem said.
+    pub fn write(&self, path: &Path) -> Result<(), ExportError> {
+        write_png(path, self.width, self.height, &self.rgba)
+    }
+
+    /// Stack sheets into one tall image, each centred on the widest.
+    ///
+    /// **This is what a webtoon is.** The format is a single continuous strip a reader scrolls,
+    /// not a folder of numbered files, and stitching one by hand in another program is the step
+    /// that would make this application useless for the thing it was built for.
+    ///
+    /// Centred rather than left-aligned, and padded with paper rather than with transparency: a
+    /// page narrower than its neighbours is a page, not a hole, and a reader scrolling past it
+    /// should see the sheet continue.
+    #[must_use]
+    pub fn stack(sheets: &[Self]) -> Self {
+        let width = sheets.iter().map(|s| s.width).max().unwrap_or(0);
+        let height = sheets.iter().map(|s| s.height).sum();
+        let paper = to_srgb8(&f16x4(Canvas::paper_color()));
+        let mut rgba = Vec::with_capacity((width as usize) * (height as usize) * 4);
+        for sheet in sheets {
+            let left = (width - sheet.width) / 2;
+            for y in 0..sheet.height {
+                for _ in 0..left {
+                    rgba.extend_from_slice(&paper);
+                }
+                let row = (y as usize) * (sheet.width as usize) * 4;
+                rgba.extend_from_slice(&sheet.rgba[row..row + (sheet.width as usize) * 4]);
+                for _ in 0..(width - sheet.width - left) {
+                    rgba.extend_from_slice(&paper);
+                }
+            }
+        }
+        Self {
+            width,
+            height,
+            rgba,
+        }
+    }
+}
+
+/// Flatten one page at a scale, into 8-bit sRGB.
+///
+/// `scale` is a percentage of the page's own size, and 100 is the page as drawn.
+///
+/// **The scale is applied while reading, not to a finished image.** Each output pixel averages
+/// the block of page pixels it covers, straight out of the composited tiles — so exporting a
+/// 2048-pixel page at a quarter size never materialises the full-size image at all, and the
+/// average is taken in *linear* light where averaging means what it says. Downscaling in sRGB is
+/// the classic way to make artwork come out darker than it is.
+///
+/// # Errors
+/// [`ExportError::TooLarge`] when the result would not fit in memory as one image.
+pub fn compose(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     canvas: &CanvasRenderer,
     layers: &[Layer],
-    path: &Path,
-) -> Result<(), ExportError> {
-    let page = canvas.page();
-    let (w, h) = (page.w.max(1), page.h.max(1));
+    page: openpaint_core::PageRect,
+    scale: u32,
+) -> Result<Sheet, ExportError> {
+    let (full_w, full_h) = (page.w.max(1), page.h.max(1));
+    let (w, h) = scaled_size((full_w, full_h), scale);
     if u64::from(w) * u64::from(h) > MAX_EXPORT_PIXELS {
         return Err(ExportError::TooLarge { w, h });
     }
 
-    let flat = flatten(device, queue, canvas, layers);
-    let mut out = Vec::with_capacity((w as usize) * (h as usize) * 4);
+    let flat = flatten(device, queue, canvas, layers, page);
     let paper = Canvas::paper_color();
+    let at = |px: i32, py: i32| {
+        flat.get(&crate::canvas_renderer::tile_of(px, py))
+            .map_or(paper, |tile| tile[local_index(px, py)])
+    };
+    let mut rgba = Vec::with_capacity((w as usize) * (h as usize) * 4);
     for y in 0..h {
+        // The block of source rows this output row stands for. Worked out from the output index
+        // both times, so consecutive rows meet exactly and no source row is used twice or missed.
+        let (y0, y1) = span(y, h, full_h);
         for x in 0..w {
-            let px = page.x + x as i32;
-            let py = page.y + y as i32;
-            let texel = flat
-                .get(&crate::canvas_renderer::tile_of(px, py))
-                .map_or(paper, |tile| tile[local_index(px, py)]);
-            out.extend_from_slice(&to_srgb8(&f16x4(texel)));
+            let (x0, x1) = span(x, w, full_w);
+            let mut sum = [0.0_f32; 4];
+            let mut n = 0.0_f32;
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    let texel = at(page.x + px as i32, page.y + py as i32);
+                    for (acc, v) in sum.iter_mut().zip(texel) {
+                        *acc += v;
+                    }
+                    n += 1.0;
+                }
+            }
+            // Through `f16` at the end, like every other texel that leaves the canvas: the
+            // stored precision is what the screen showed, and an export that was a fraction more
+            // precise than the picture it came from would differ from it for no visible reason.
+            let mean = sum.map(|v| v / n.max(1.0));
+            rgba.extend_from_slice(&to_srgb8(&f16x4(mean)));
         }
     }
-    write_png(path, w, h, &out)
+    Ok(Sheet {
+        width: w,
+        height: h,
+        rgba,
+    })
+}
+
+/// The size a page comes out at, at a scale in percent. Never zero in either direction.
+#[must_use]
+pub fn scaled_size((w, h): (u32, u32), scale: u32) -> (u32, u32) {
+    if scale == FULL_SIZE {
+        return (w.max(1), h.max(1));
+    }
+    let of = |v: u32| {
+        (u64::from(v) * u64::from(scale) / 100)
+            .try_into()
+            .unwrap_or(u32::MAX)
+    };
+    (of(w).max(1), of(h).max(1))
+}
+
+/// Which source pixels output index `i` of `out` covers, given `full` source pixels.
+fn span(i: u32, out: u32, full: u32) -> (u32, u32) {
+    let start = (u64::from(i) * u64::from(full) / u64::from(out.max(1))) as u32;
+    let end = (u64::from(i + 1) * u64::from(full) / u64::from(out.max(1))) as u32;
+    (start, end.max(start + 1).min(full))
 }
 
 /// Index of a page pixel within its tile.
@@ -148,8 +407,8 @@ fn flatten(
     queue: &wgpu::Queue,
     canvas: &CanvasRenderer,
     layers: &[Layer],
+    page: openpaint_core::PageRect,
 ) -> std::collections::HashMap<TileCoord, Vec<[f32; 4]>> {
-    let page = canvas.page();
     let mut out = std::collections::HashMap::new();
     let paper = Canvas::paper_color();
 
@@ -409,6 +668,211 @@ fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), Ex
 }
 
 #[cfg(test)]
+mod choice_tests {
+    use super::*;
+    use crate::panel_ui::{Change, Control};
+
+    fn labels(controls: &[Control]) -> Vec<String> {
+        controls
+            .iter()
+            .filter_map(|c| match c {
+                Control::Choice { text, .. } | Control::Label { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One page is named as the artist named it; several are numbered, and sort in reading order.
+    ///
+    /// **The padding is the point.** `page-9` and `page-10` sort the wrong way round in every file
+    /// manager and in every upload form that takes a folder, which turns a correctly exported
+    /// comic into a shuffled one — and the artist would find out from a reader.
+    #[test]
+    fn several_pages_are_numbered_so_they_sort_in_order() {
+        let base = Path::new("C:/art/chapter.png");
+        assert_eq!(names(base, 1), vec![PathBuf::from("C:/art/chapter.png")]);
+        assert_eq!(
+            names(base, 3),
+            vec![
+                PathBuf::from("C:/art/chapter-1.png"),
+                PathBuf::from("C:/art/chapter-2.png"),
+                PathBuf::from("C:/art/chapter-3.png"),
+            ]
+        );
+        let ten = names(base, 10);
+        assert_eq!(ten.first().unwrap(), Path::new("C:/art/chapter-01.png"));
+        assert_eq!(ten.last().unwrap(), Path::new("C:/art/chapter-10.png"));
+        // Sorted as text, they are still in page order -- which is the whole reason for the zero.
+        let mut sorted: Vec<String> = ten.iter().map(|p| p.display().to_string()).collect();
+        let asked = sorted.clone();
+        sorted.sort();
+        assert_eq!(sorted, asked, "numbered files do not sort into page order");
+    }
+
+    /// A name with no extension still writes PNGs.
+    #[test]
+    fn a_name_without_an_extension_still_gets_one() {
+        assert_eq!(
+            names(Path::new("C:/art/chapter"), 2),
+            vec![
+                PathBuf::from("C:/art/chapter-1.png"),
+                PathBuf::from("C:/art/chapter-2.png"),
+            ]
+        );
+    }
+
+    /// Scaling never produces a zero-pixel side, however small the page or the percentage.
+    ///
+    /// A zero-width PNG is not a small file, it is an invalid one — and the encoder would be the
+    /// thing that reported it, several layers away from the slider that caused it.
+    #[test]
+    fn a_scale_never_shrinks_a_side_to_nothing() {
+        assert_eq!(scaled_size((1200, 1600), FULL_SIZE), (1200, 1600));
+        assert_eq!(scaled_size((1200, 1600), 50), (600, 800));
+        assert_eq!(scaled_size((1200, 1600), 10), (120, 160));
+        assert_eq!(scaled_size((3, 1), 10), (1, 1));
+    }
+
+    /// Every output pixel of a scaled export covers source pixels, and covers each exactly once.
+    ///
+    /// The two ways to get this wrong are a gap — a row of the drawing that reaches no output
+    /// pixel and simply vanishes — and an overlap, which counts the same ink twice and shows up
+    /// as banding. Both are invisible in a thumbnail and obvious in the finished page.
+    #[test]
+    fn the_blocks_a_scale_averages_tile_the_page_exactly() {
+        for (full, out) in [(1600_u32, 800_u32), (1600, 160), (1000, 333), (7, 3)] {
+            let mut covered = vec![0_u32; full as usize];
+            for i in 0..out {
+                let (a, b) = span(i, out, full);
+                assert!(b > a, "output pixel {i} of {out} averages nothing");
+                for p in a..b {
+                    covered[p as usize] += 1;
+                }
+            }
+            assert!(
+                covered.iter().all(|n| *n == 1),
+                "{full} into {out}: some source pixels were used {:?} times",
+                {
+                    let mut seen: Vec<u32> = covered.clone();
+                    seen.sort_unstable();
+                    seen.dedup();
+                    seen
+                }
+            );
+        }
+    }
+
+    /// A document of one page is not offered three ways to export one page.
+    #[test]
+    fn one_page_is_offered_one_way_out() {
+        let choices = Choices::default();
+        let said = labels(&controls(&choices, 1, (1200, 1600)));
+        assert!(
+            said.iter().any(|s| s == What::ThisPage.label()),
+            "the only page cannot be exported: {said:?}"
+        );
+        for hidden in [What::EveryPage, What::Strip] {
+            assert!(
+                !said.iter().any(|s| s == hidden.label()),
+                "a one-page document was offered {said:?}"
+            );
+        }
+    }
+
+    /// With pages to choose between, all three are offered and the size line follows the choice.
+    #[test]
+    fn the_size_line_says_what_will_actually_be_written() {
+        let mut choices = Choices::default();
+        let of = |c: &Choices| {
+            labels(&controls(c, 3, (1200, 1600)))
+                .last()
+                .cloned()
+                .expect("a size line")
+        };
+        assert!(of(&choices).contains("1200 by 1600"), "{}", of(&choices));
+
+        choices.what = What::EveryPage;
+        assert!(of(&choices).contains('3'), "{}", of(&choices));
+
+        // A strip is as tall as its pages put together, and that is the number a webtoon platform
+        // asks for.
+        choices.what = What::Strip;
+        assert!(of(&choices).contains("4800"), "{}", of(&choices));
+
+        // And the scale reaches it.
+        choices.scale = 50;
+        assert!(of(&choices).contains("600 by 2400"), "{}", of(&choices));
+    }
+
+    /// The dialog's controls answer to the dialog, and say when nothing moved.
+    #[test]
+    fn a_change_moves_exactly_what_it_names() {
+        let mut choices = Choices::default();
+        let id = |what: What| {
+            controls(&Choices::default(), 3, (10, 10))
+                .into_iter()
+                .find_map(|c| match c {
+                    Control::Choice { id, text, .. } if text == what.label() => Some(id),
+                    _ => None,
+                })
+                .expect("a choice for every way out")
+        };
+        assert!(apply(&mut choices, &Change::Chose(id(What::Strip))));
+        assert_eq!(choices.what, What::Strip);
+        // The same choice again changes nothing, and says so -- a frame that redraws for a press
+        // that moved nothing is a frame spent for nothing.
+        assert!(!apply(&mut choices, &Change::Chose(id(What::Strip))));
+
+        assert!(apply(&mut choices, &Change::Set(SCALE, 42.4)));
+        assert_eq!(choices.scale, 42);
+        // Out of range is clamped rather than obeyed: a zero-percent export has no pixels in it.
+        assert!(apply(&mut choices, &Change::Set(SCALE, -5.0)));
+        assert_eq!(choices.scale, MIN_SCALE);
+        assert!(apply(&mut choices, &Change::Set(SCALE, 400.0)));
+        assert_eq!(choices.scale, FULL_SIZE);
+
+        // Something from another panel entirely is not this dialog's to act on.
+        let before = choices;
+        assert!(!apply(&mut choices, &Change::Pressed(7)));
+        assert!(!apply(&mut choices, &Change::Toggled(WHAT_BASE, true)));
+        assert_eq!(choices, before);
+    }
+
+    /// A strip is as tall as its pages together, as wide as the widest, and centres the rest.
+    #[test]
+    fn a_strip_stacks_its_pages_and_centres_the_narrow_ones() {
+        let sheet = |w: u32, h: u32, fill: u8| Sheet {
+            width: w,
+            height: h,
+            rgba: vec![fill; (w * h * 4) as usize],
+        };
+        let strip = Sheet::stack(&[sheet(4, 2, 11), sheet(2, 1, 22)]);
+        assert_eq!((strip.width, strip.height), (4, 3));
+        assert_eq!(strip.rgba.len(), (4 * 3 * 4) as usize);
+        // The first page fills its rows.
+        assert!(strip.rgba[..32].iter().all(|b| *b == 11));
+        // The second is two pixels of it with one of paper either side, not four of it and not
+        // two of it flush against the left edge.
+        let paper = to_srgb8(&f16x4(Canvas::paper_color()));
+        let last = &strip.rgba[32..];
+        assert_eq!(
+            &last[0..4],
+            &paper,
+            "a narrow page was not padded on the left"
+        );
+        assert!(
+            last[4..12].iter().all(|b| *b == 22),
+            "the page itself moved"
+        );
+        assert_eq!(
+            &last[12..16],
+            &paper,
+            "a narrow page was not padded on the right"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     /// A layer with `clip_below` set and nothing unclipped beneath it has nothing to clip to.
     ///
@@ -579,14 +1043,6 @@ mod tests {
         assert_eq!([out[0], out[1], out[2]], [255, 255, 255], "got {out:?}");
         assert!((i32::from(out[3]) - 128).abs() <= 1);
     }
-
-    #[test]
-    fn default_path_is_a_png_in_the_current_directory() {
-        let p = default_path();
-        assert_eq!(p.extension().and_then(|e| e.to_str()), Some("png"));
-        assert!(p.parent().is_none_or(|d| d.as_os_str().is_empty()));
-    }
-
     /// End-to-end: paint a known colour into the canvas tiles, export, decode the PNG
     /// back, and check every pixel. Covers tile readback, assembly, unpremultiply, the sRGB
     /// encode, and the PNG writer together.
@@ -617,15 +1073,25 @@ mod tests {
             }
         }
 
-        let stroke = crate::test_gpu::test_stroke_layer(&device);
-        let mut canvas = crate::test_gpu::test_canvas(&device, page, &stroke);
+        let stroke = crate::test_gpu::test_stroke_layer(device);
+        let mut canvas = crate::test_gpu::test_canvas(device, page, &stroke);
         let mut enc = device.create_command_encoder(&Default::default());
-        canvas.upload_dirty(&device, &queue, &mut enc, crate::test_gpu::L0, &mut cpu);
+        canvas.upload_dirty(device, queue, &mut enc, crate::test_gpu::L0, &mut cpu);
         queue.submit(std::iter::once(enc.finish()));
         let doc = openpaint_core::Page::new(page.w, page.h);
 
         let path = std::env::temp_dir().join("openpaint-export-tiles-test.png");
-        export_tiles_png(&device, &queue, &canvas, doc.layers(), &path).expect("export failed");
+        compose(
+            device,
+            queue,
+            &canvas,
+            doc.layers(),
+            canvas.page(),
+            FULL_SIZE,
+        )
+        .expect("compose failed")
+        .write(&path)
+        .expect("export failed");
 
         let file = io::BufReader::new(std::fs::File::open(&path).expect("open png"));
         let decoder = png::Decoder::new(file);
@@ -663,8 +1129,8 @@ mod tests {
         };
 
         let doc = openpaint_core::Page::new(300, 200);
-        let stroke = crate::test_gpu::test_stroke_layer(&device);
-        let canvas = crate::test_gpu::test_canvas(&device, doc.rect(), &stroke);
+        let stroke = crate::test_gpu::test_stroke_layer(device);
+        let canvas = crate::test_gpu::test_canvas(device, doc.rect(), &stroke);
         assert_eq!(
             canvas.occupied_tiles().len(),
             0,
@@ -672,7 +1138,17 @@ mod tests {
         );
 
         let path = std::env::temp_dir().join("openpaint-export-blank-test.png");
-        export_tiles_png(&device, &queue, &canvas, doc.layers(), &path).expect("export failed");
+        compose(
+            device,
+            queue,
+            &canvas,
+            doc.layers(),
+            canvas.page(),
+            FULL_SIZE,
+        )
+        .expect("compose failed")
+        .write(&path)
+        .expect("export failed");
 
         let file = io::BufReader::new(std::fs::File::open(&path).expect("open png"));
         let mut reader = png::Decoder::new(file).read_info().expect("png header");

@@ -36,12 +36,15 @@
 mod autosave;
 mod canvas_renderer;
 mod chrome;
+mod clipboard;
 mod colour_wheel;
 mod crop;
 mod editor;
 mod export;
+mod float_pass;
 mod history;
 mod icons;
+mod import;
 mod input;
 mod input_mouse;
 #[cfg(target_os = "windows")]
@@ -53,6 +56,7 @@ mod panel_ui;
 mod panels;
 mod perf;
 mod presets;
+mod prompt;
 mod renderer;
 #[cfg(test)]
 mod screenshot;
@@ -186,13 +190,23 @@ struct OpenPaint {
     /// that has to happen *after a delay* needs a deadline someone checks. Without this a panel
     /// held under a still pen never arms, because nothing wakes to notice the time passing.
     repaint_at: Option<Instant>,
-    /// The panel workspace, and whether it is the UI on screen.
+    /// The panel workspace: the UI.
     ///
-    /// Both are here while the old side panel still exists. They are two answers to the same
-    /// question, so exactly one is drawn — see `Ui::render`. The old one goes when every section
-    /// has been ported across.
+    /// There is no second one to choose between any more. It answers for its own layout, which
+    /// panels exist, where the canvas is, and which points belong to it rather than to the
+    /// artwork — see [`workspace::Workspace::takes_point`].
     workspace: workspace::Workspace,
-    workspace_mode: bool,
+    /// What the next export will do: which pages, and at what size.
+    ///
+    /// Kept between exports rather than reset with the dialog. Somebody exporting a strip at half
+    /// size is going to do it again in ten minutes, and a dialog that forgets what it was told is
+    /// one the artist has to set up every single time.
+    export_choices: export::Choices,
+    /// Whether the export dialog is up.
+    ///
+    /// Beside the settings rather than wrapping them, because they outlive it: `Option<Choices>`
+    /// would throw the settings away every time the dialog closed, which is the thing above.
+    exporting: bool,
     /// The saved brushes, read once at startup.
     ///
     /// An app resource, not document content (§4p): nothing about a preset reaches a `.openpaint`
@@ -278,19 +292,45 @@ struct FileDialogTask {
 enum FileDialogKind {
     Save,
     Open,
+    /// A picture to bring into the document as a layer.
+    Place,
+    /// Where an export is going.
+    ExportTo,
     /// Font files to make available without installing them system-wide.
     Fonts,
     /// An image to use as the brush's dab shape.
     BrushTip,
 }
 
+/// Every extension `Open` will take: our own documents and the pictures we can read.
+///
+/// Built rather than written out, so adding a decoder to `import` widens the dialog too. A list
+/// typed a second time here is a list that stops matching what the importer can actually read,
+/// and the way that shows up is a file greyed out in the picker for no reason anyone can see.
+fn openable_extensions() -> Vec<&'static str> {
+    std::iter::once(DOCUMENT_EXTENSION)
+        .chain(import::EXTENSIONS.iter().copied())
+        .collect()
+}
+
 impl FileDialogKind {
-    /// The file types this dialog offers, as `(label, extensions)`.
-    fn filter(self) -> (&'static str, &'static [&'static str]) {
+    /// The file types this dialog offers, most useful first.
+    ///
+    /// A list rather than one pair: `Open` takes documents *and* pictures now, and a picker that
+    /// offers only "everything we can read" gives no way to see just the documents in a folder
+    /// full of reference photos.
+    fn filters(self) -> Vec<(&'static str, Vec<&'static str>)> {
         match self {
-            Self::Save | Self::Open => ("OpenPaint document", &[DOCUMENT_EXTENSION]),
-            Self::Fonts => ("Font", &["ttf", "otf", "ttc", "otc"]),
-            Self::BrushTip => ("Image", &["png"]),
+            Self::Save => vec![("OpenPaint document", vec![DOCUMENT_EXTENSION])],
+            Self::Open => vec![
+                ("Anything OpenPaint can open", openable_extensions()),
+                ("OpenPaint document", vec![DOCUMENT_EXTENSION]),
+                ("Image", import::EXTENSIONS.to_vec()),
+            ],
+            Self::Place => vec![("Image", import::EXTENSIONS.to_vec())],
+            Self::ExportTo => vec![("PNG image", vec!["png"])],
+            Self::Fonts => vec![("Font", vec!["ttf", "otf", "ttc", "otc"])],
+            Self::BrushTip => vec![("Image", import::EXTENSIONS.to_vec())],
         }
     }
 }
@@ -319,6 +359,11 @@ enum Dialog {
     Open {
         confirmed: bool,
     },
+    /// Ask for a picture and add it to the document as a layer.
+    ///
+    /// No `confirmed`, unlike the three below it: placing adds to what is open rather than
+    /// replacing it, so there is nothing to lose and nothing to ask about.
+    Place,
     New {
         confirmed: bool,
     },
@@ -707,12 +752,8 @@ impl Default for OpenPaint {
             brush_tip_path: None,
             repaint_at: None,
             workspace: workspace::Workspace::default(),
-            // **The workspace is the UI.** Every section of the old side panel that an artist
-            // reaches for now has a panel, so opening into the old one would be opening into the
-            // scaffolding. F2 still switches, and the old panel still holds the diagnostics --
-            // canvas memory, stroke and frame timings, the autosave line -- which have no home in
-            // the workspace yet and are the only reason it is still here.
-            workspace_mode: true,
+            export_choices: export::Choices::default(),
+            exporting: false,
             brushes: presets::Library::load(),
             font_substituted: None,
             selection: None,
@@ -739,14 +780,36 @@ impl Default for OpenPaint {
 /// Its own function because it is a table, and a table can be checked. Wiring Save As to Save is a
 /// one-character mistake that reads perfectly correctly and silently overwrites somebody's file.
 #[must_use]
+/// Whether a file begins like a picture we can read.
+///
+/// Only the first few bytes, because that is all a format's magic number takes and a document can
+/// be hundreds of megabytes. A file that cannot be opened at all answers `false` and falls through
+/// to the document path, which says why -- one refusal rather than two.
+fn looks_like_a_picture(path: &std::path::Path) -> bool {
+    use std::io::Read as _;
+    let mut head = [0_u8; 16];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(read) = file.read(&mut head) else {
+        return false;
+    };
+    import::sniff(&head[..read])
+}
+
 fn dialog_for(command: ui::Command) -> Option<Dialog> {
     use ui::Command;
     match command {
         Command::New => Some(Dialog::New { confirmed: false }),
         Command::Open => Some(Dialog::Open { confirmed: false }),
+        // No unsaved-changes question: placing adds to the document rather than replacing it.
+        Command::PlaceImage => Some(Dialog::Place),
         Command::Save => Some(Dialog::Save),
         Command::SaveAs => Some(Dialog::SaveAs),
         Command::ExportPng
+        | Command::Copy
+        | Command::Cut
+        | Command::Paste
         | Command::Undo
         | Command::Redo
         | Command::ZoomFit
@@ -893,17 +956,28 @@ impl OpenPaint {
     /// A consequence worth naming: once a stroke has begun, pressing space no longer stops it
     /// mid-line, because the capture was already granted. That is what capture *means*, and it is
     /// the better behaviour — a modifier should not silently truncate a stroke in progress.
+    /// Whether a modal question is on screen.
+    ///
+    /// **One definition, asked by both halves.** The UI asks it to decide that the workspace is
+    /// inert (`workspace::Attention`) and the input path asks it to refuse the pen; those two are
+    /// the same fact, and while they were two lists one of them was missing an entry.
+    fn asking(&self) -> bool {
+        self.pending_confirm.is_some() || self.recovery.is_some() || self.exporting
+    }
+
     fn decide_capture(&mut self, sample: &PenSample) -> Capture {
         let refused = if self.ui_blocks_point(sample.x, sample.y) {
             Some("the UI has that point")
-        } else if self.workspace_mode && self.workspace.busy() {
+        } else if self.workspace.busy() {
             Some("a panel gesture owns the pointer")
         } else if self.nav.is_active() {
             Some("the view is being navigated")
-        } else if self.pending_confirm.is_some() {
-            Some("a prompt is up")
-        } else if self.recovery.is_some() {
-            Some("the recovery prompt is up")
+        } else if self.asking() {
+            // **Every modal, from one answer.** The unsaved-changes question and the recovered-work
+            // offer were listed here one at a time, and the export dialog -- the third of them --
+            // was not, so dragging its size slider painted a stroke on the canvas underneath it.
+            // Found by `export.txt`, which ended a run of exports with an undo depth of ten.
+            Some("a question is up")
         } else {
             None
         };
@@ -957,21 +1031,18 @@ impl OpenPaint {
         let Some(ui) = self.ui.as_ref() else {
             return false;
         };
-        if self.workspace_mode {
-            // **Asked of the workspace, not of a copy kept beside it.** Where the canvas is and
-            // what is drawn over it are one answer, and a cached copy is a second place for it to
-            // be wrong -- which is what it was: it carried the rectangle and not the floating
-            // windows above it, so the wheel zoomed the drawing behind whatever panel was being
-            // scrolled. There is nothing left here to fall out of step.
-            let scale = ui.pixels_per_point();
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "window coordinates, which are far inside f32"
-            )]
-            let (x, y) = (x as f32 / scale, y as f32 / scale);
-            return self.workspace.takes_point(x, y);
-        }
-        ui.blocks_point(x, y)
+        // **Asked of the workspace, not of a copy kept beside it.** Where the canvas is and
+        // what is drawn over it are one answer, and a cached copy is a second place for it to be
+        // wrong -- which is what it was: it carried the rectangle and not the floating windows
+        // above it, so the wheel zoomed the drawing behind whatever panel was being scrolled.
+        // There is nothing left here to fall out of step.
+        let scale = ui.pixels_per_point();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "window coordinates, which are far inside f32"
+        )]
+        let (x, y) = (x as f32 / scale, y as f32 / scale);
+        self.workspace.takes_point(x, y)
     }
 
     /// Remember where the pointer is. Returns whether it moved far enough to be worth a frame.
@@ -1012,12 +1083,8 @@ impl OpenPaint {
         // Say why nothing is going to happen. `Editor::stroke_begin` refuses this case on its own,
         // so the stroke is safe either way -- but a tool that silently does nothing reads as a bug,
         // and the artist has no way to guess which of two settings is in their way.
-        if self.editor.paint_mode().is_none() {
-            self.status_message = Some(
-                "This layer's alpha is locked, so the eraser cannot remove anything. Unlock it, or paint instead."
-                    .to_owned(),
-            );
-            self.request_redraw();
+        if let Some(why) = self.editor.paint_refusal() {
+            self.refuse_paint(why, "painted on");
             return;
         }
         // A selection confines what the stroke may touch, and is fixed at the press for the same
@@ -1373,6 +1440,19 @@ impl OpenPaint {
             }
             // A gesture that enclosed nothing -- a tap, or a lasso of three coincident points --
             // reads as "deselect", which is what a click on empty space means in every art app.
+            //
+            // **Except the wand, which was asked a question and found no answer.** A press with
+            // the wand is not a tap on empty space: it means "the region here", and silently
+            // deselecting instead reads as the tool being broken -- especially at a low tolerance,
+            // where the region genuinely is a single pixel and the number to change is right
+            // there. TODO §1 listed this as unverified; it was silent.
+            None if wand_seed.is_some() => {
+                self.set_selection(None, "Deselected");
+                self.refuse(format!(
+                    "Nothing matched at that point with a tolerance of {}. Raise it, or press                      somewhere with more of the colour you want.",
+                    self.wand.tolerance
+                ));
+            }
             None => self.set_selection(None, "Deselected"),
         }
     }
@@ -1783,7 +1863,12 @@ impl OpenPaint {
     /// Fill the selection with the brush colour, on the active layer.
     fn fill_selection(&mut self) {
         let Some(mode) = self.editor.fill_mode() else {
-            self.refuse_paint_on_derived_layer("filled");
+            self.refuse_paint(
+                self.editor
+                    .paint_refusal()
+                    .unwrap_or(editor::Refusal::Derived),
+                "filled",
+            );
             return;
         };
         // Cloned rather than copied: a brush now owns response curves, so it is no longer Copy.
@@ -1803,16 +1888,15 @@ impl OpenPaint {
     /// is doing anything else.
     fn clear_selection_pixels(&mut self) {
         let Some(mode) = self.editor.clear_mode() else {
-            if self.editor.active_layer_accepts_paint() {
-                self.status_message = Some(
-                    "This layer's alpha is locked, so clearing cannot remove anything. \
-                     Unlock it first."
-                        .to_owned(),
-                );
-                self.request_redraw();
-            } else {
-                self.refuse_paint_on_derived_layer("cleared");
-            }
+            // Clearing removes coverage, so an alpha lock stops it exactly as it stops the
+            // eraser -- which is why the reason comes from the same place the brush's does
+            // rather than from a second guess written here.
+            self.refuse_paint(
+                self.editor
+                    .paint_refusal()
+                    .unwrap_or(editor::Refusal::AlphaLocked),
+                "cleared",
+            );
             return;
         };
         // Colour is irrelevant to an erase — the blend discards the source entirely — but opacity
@@ -1932,12 +2016,34 @@ impl OpenPaint {
     ///
     /// Refusing silently would be the worst of the options — the tool would simply appear broken.
     /// The message names the way out, because there is one: converting the layer to raster.
-    fn refuse_paint_on_derived_layer(&mut self, verb: &str) {
-        self.status_message = Some(format!(
-            "A text layer's pixels come from its text, so it cannot be {verb} — the paint would \
-             disappear the next time the text changed. Convert it to a raster layer first."
-        ));
-        self.request_redraw();
+    fn refuse_paint(&mut self, why: editor::Refusal, verb: &str) {
+        let named = self
+            .editor
+            .document()
+            .active()
+            .layer(self.editor.active_layer_index())
+            .map_or_else(|| "This layer".to_owned(), |l| format!("\"{}\"", l.name));
+        self.refuse(match why {
+            // **Names the layer.** "A layer is locked" is a sentence you have to go and
+            // investigate; the whole cost of the mistake this prevents is not noticing which
+            // layer you are on.
+            editor::Refusal::Locked => {
+                format!("{named} is locked, so it cannot be {verb}. Unlock it in the Layers panel.")
+            }
+            editor::Refusal::Hidden => format!(
+                "{named} is hidden, so you would not see anything {verb} on it. Show it again \
+                 with the eye beside its name."
+            ),
+            editor::Refusal::Derived => format!(
+                "A text layer's pixels come from its text, so {named} cannot be {verb} — the \
+                 paint would disappear the next time the text changed. Convert it to a raster \
+                 layer first."
+            ),
+            editor::Refusal::AlphaLocked => format!(
+                "{named} has its alpha locked, so nothing can be removed from it. Unlock it, or \
+                 paint instead of erasing."
+            ),
+        });
     }
 
     /// Apply paint to the selection on the active layer, undoably.
@@ -2072,6 +2178,12 @@ impl OpenPaint {
             // selection of something that was no longer there.
             renderer::HistoryChange::SelectionRestored { selection } => {
                 self.set_selection(Some(*selection), "Moved the selection back");
+                self.request_redraw();
+            }
+            renderer::HistoryChange::LayerSettingsRestored { index, settings } => {
+                if let Some(layer) = self.editor.document_mut().active_mut().layer_mut(index) {
+                    layer.set_settings(settings);
+                }
                 self.request_redraw();
             }
             renderer::HistoryChange::Geometry { rect } => {
@@ -2246,6 +2358,18 @@ impl OpenPaint {
             r.set_page(rect);
         }
         self.view.request_fit();
+        // **The selection belongs to the page it was drawn on.** A mask is in page coordinates,
+        // so on a different page it describes a region of somebody else's artwork -- and the
+        // marching ants went on being drawn there, over a page that had never been selected on.
+        // `load_from` has said this about opening a document since the beginning; turning to
+        // another page of the same document is the same fact, and was missed.
+        //
+        // Not while a transform is in flight: those pixels are in the air and the mask is what
+        // puts them down. Switching pages mid-transform is its own hazard and this must not make
+        // it worse by taking the selection out from under it.
+        if self.dragging.is_none() && self.selection.is_some() {
+            self.set_selection(None, "Deselected: the selection belonged to the other page");
+        }
     }
 
     /// Delete a page, undoably.
@@ -2318,37 +2442,29 @@ impl OpenPaint {
                 }
                 self.mark_dirty();
             }
+            // **Every setting through one door, and every one of them undoable.** They were
+            // outside history, on the argument that a switch is not artwork. That argument does
+            // not survive the medium: catching the opacity slider on the way past looks exactly
+            // like a mistake, Ctrl+Z is what anyone presses, and what it used to do was take back
+            // the *stroke before it* -- destroying work while fixing something that was not
+            // destroyed. See `history::Op::LayerSettings`.
             ui::LayerAction::SetVisible { index, visible } => {
-                if let Some(l) = self.editor.document_mut().active_mut().layer_mut(index) {
-                    l.visible = visible;
-                }
+                self.set_layer_settings(index, |l| l.visible = visible);
             }
             ui::LayerAction::SetLockAlpha { index, lock } => {
-                // Not undoable, deliberately, and the same call as visibility: it changes no pixels.
-                // Putting a switch in the undo stack would make Ctrl+Z toggle settings instead of
-                // reversing artwork, which is the more surprising behaviour by far.
-                if let Some(l) = self.editor.document_mut().active_mut().layer_mut(index) {
-                    l.lock_alpha = lock;
-                }
-                self.mark_dirty();
+                self.set_layer_settings(index, |l| l.lock_alpha = lock);
             }
             ui::LayerAction::SetClipBelow { index, clip } => {
-                // Not undoable, like visibility and alpha lock: it changes no pixels, and a switch
-                // in the undo stack would make Ctrl+Z toggle settings rather than reverse artwork.
-                if let Some(l) = self.editor.document_mut().active_mut().layer_mut(index) {
-                    l.clip_below = clip;
-                }
-                self.mark_dirty();
+                self.set_layer_settings(index, |l| l.clip_below = clip);
+            }
+            ui::LayerAction::SetLocked { index, locked } => {
+                self.set_layer_settings(index, |l| l.locked = locked);
             }
             ui::LayerAction::SetOpacity { index, opacity } => {
-                if let Some(l) = self.editor.document_mut().active_mut().layer_mut(index) {
-                    l.opacity = opacity;
-                }
+                self.set_layer_settings(index, |l| l.opacity = opacity);
             }
             ui::LayerAction::SetBlend { index, blend } => {
-                if let Some(l) = self.editor.document_mut().active_mut().layer_mut(index) {
-                    l.blend = blend;
-                }
+                self.set_layer_settings(index, |l| l.blend = blend);
             }
         }
         self.request_redraw();
@@ -2361,6 +2477,36 @@ impl OpenPaint {
     /// destroys anything, and the way back is to delete the new layer — which *is* undoable. A
     /// switch or an addition in the undo stack would make Ctrl+Z walk through structure instead of
     /// artwork, which is the more surprising behaviour by far.
+    /// Change one layer's settings, recording the change so it can be taken back.
+    ///
+    /// The closure edits the settings; everything else -- reading them before, writing them
+    /// after, recording the pair, marking the document edited -- happens here once. A caller that
+    /// set a field directly would be a setting outside undo again, and that is precisely how the
+    /// six of them came to be outside it.
+    fn set_layer_settings(
+        &mut self,
+        index: usize,
+        edit: impl FnOnce(&mut openpaint_core::layer::Settings),
+    ) {
+        let Some(layer) = self.editor.document().active().layer(index) else {
+            return;
+        };
+        let before = layer.settings();
+        let mut after = before;
+        edit(&mut after);
+        if before == after {
+            return;
+        }
+        if let Some(l) = self.editor.document_mut().active_mut().layer_mut(index) {
+            l.set_settings(after);
+        }
+        if let Some(r) = self.renderer.as_mut() {
+            r.record_layer_settings(index, before, after);
+        }
+        self.mark_dirty();
+        self.request_redraw();
+    }
+
     fn duplicate_layer(&mut self, index: usize) {
         self.editor.stroke_end();
         let Some(source) = self
@@ -2573,11 +2719,19 @@ impl OpenPaint {
                 self.request_redraw();
             }
             Err(e) => {
-                // Not a status message: autosave is background work the user did not ask for, and
-                // interrupting them about it every minute would be worse than the failure. The
-                // panel shows that it has not run, which is the honest signal.
+                // **Said once, then kept.** Interrupting the artist every minute about background
+                // work would be its own failure, so this speaks on the first failure and on any
+                // *different* one; the History panel's autosave line goes on saying it for as
+                // long as it is true. What it must never be is silent: the whole point of
+                // autosave is a belief that the work is protected, and a belief that is quietly
+                // false is worse than no autosave at all (TODO §1).
                 eprintln!("autosave failed: {e}");
-                self.autosave.postpone();
+                if self.autosave.postpone(e.to_string()) {
+                    self.refuse(format!(
+                        "Autosave is not working, so unsaved work is not being protected: {e}. \
+                         Save the document somewhere you can write to."
+                    ));
+                }
             }
         }
     }
@@ -2648,6 +2802,11 @@ impl OpenPaint {
                 }
             }
             Dialog::SaveAs => self.save_as(),
+            Dialog::Place => {
+                self.spawn_file_dialog(FileDialogKind::Place, |dialog| {
+                    dialog.pick_file().map(|p| vec![p])
+                });
+            }
             Dialog::Open { confirmed } => {
                 if confirmed || !self.dirty {
                     self.open_with_dialog();
@@ -2783,10 +2942,10 @@ impl OpenPaint {
         std::thread::spawn(move || {
             // Owned by our window, so it cannot end up behind it. The `Arc<Window>` moves in
             // with it, which is also what keeps the handle valid for as long as the dialog is up.
-            let (label, extensions) = kind.filter();
-            let dialog = rfd::FileDialog::new()
-                .set_parent(window.as_ref())
-                .add_filter(label, extensions);
+            let mut dialog = rfd::FileDialog::new().set_parent(window.as_ref());
+            for (label, extensions) in kind.filters() {
+                dialog = dialog.add_filter(label, &extensions);
+            }
             // The receiver is gone if the app closed meanwhile; nothing to do about that.
             let _ = tx.send(show(dialog));
         });
@@ -2832,6 +2991,8 @@ impl OpenPaint {
                 self.continue_after_save();
             }
             (FileDialogKind::Open, Some(path)) => self.load_from(&path),
+            (FileDialogKind::Place, Some(path)) => self.place_image(&path),
+            (FileDialogKind::ExportTo, Some(path)) => self.export_to(&path),
             // Cancelled. Anything that was waiting on a save does not happen.
             (_, None) => {
                 self.after_save = None;
@@ -2940,6 +3101,14 @@ impl OpenPaint {
 
     /// Replace the open document with the one in `path`.
     fn load_from(&mut self, path: &std::path::Path) {
+        // **Asked of the bytes, not of the name.** A `.png` that is really a JPEG opens; a
+        // document renamed by someone tidying up still opens as a document. Only the first few
+        // bytes are read for this -- sniffing by loading the whole file would mean reading a
+        // large document twice.
+        if looks_like_a_picture(path) {
+            self.open_picture(path);
+            return;
+        }
         let loaded = match openpaint_file::load(path) {
             Ok(l) => l,
             Err(e) => {
@@ -2970,6 +3139,212 @@ impl OpenPaint {
             if pages == 1 { "" } else { "s" }
         ));
         self.request_redraw();
+    }
+
+    /// Open a picture as a document of its own: one page its size, one layer holding it.
+    ///
+    /// A scanned pencil sketch is the commonest way a comics page starts, and until this existed
+    /// there was no way to get one in at all. The page is the picture's size rather than the
+    /// default page, because the artist chose that size when they scanned it -- and a sketch
+    /// dropped onto a page of a different shape is a sketch that has to be moved before it can be
+    /// drawn on.
+    fn open_picture(&mut self, path: &std::path::Path) {
+        let picture = match import::read(path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status_message = Some(format!("Could not open that picture: {e}"));
+                self.request_redraw();
+                return;
+            }
+        };
+        self.editor.stroke_end();
+        self.crop = None;
+        self.set_selection(None, "Deselected");
+        let (w, h) = (picture.width(), picture.height());
+        self.editor
+            .replace_document(openpaint_core::Document::new(openpaint_core::Page::new(
+                w, h,
+            )));
+        let rect = self.editor.page_rect();
+        let layer = self
+            .editor
+            .document()
+            .active()
+            .layer(0)
+            .map(openpaint_core::Layer::id);
+        if let Some(r) = self.renderer.as_mut() {
+            r.load_document(rect, Vec::new());
+            if let Some(id) = layer {
+                r.place_tiles(tile_store::LayerId(id), picture.tiles((0, 0)));
+            }
+        }
+        self.view.request_fit();
+        // **No path.** This is not a document that was saved and reopened: saving it must ask
+        // where to put a `.openpaint`, not silently write over somebody's photograph.
+        self.document_path = None;
+        self.mark_dirty();
+        self.status_message = Some(format!(
+            "Opened {} as a new document, {w}x{h}. Save it to keep your work.",
+            path.display()
+        ));
+        self.request_redraw();
+    }
+
+    /// Bring a picture into the document as a new layer above the active one.
+    ///
+    /// Centred on the page at its own size. Not scaled to fit: a reference is usually wanted at
+    /// the size it is, and something the artist can see all of is one drag away, while pixels
+    /// thrown away by an automatic resample are gone.
+    fn place_image(&mut self, path: &std::path::Path) {
+        let picture = match import::read(path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status_message = Some(format!("Could not place that picture: {e}"));
+                self.request_redraw();
+                return;
+            }
+        };
+        let named = path
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Placed image".to_owned());
+        let (w, h) = (picture.width(), picture.height());
+        if self.add_picture_layer(&picture, &named) {
+            self.status_message = Some(format!("Placed {named} as a layer, {w}x{h}."));
+            self.request_redraw();
+        }
+    }
+
+    /// Put a picture on a new layer above the active one, centred on the page.
+    ///
+    /// One landing for both ways a picture arrives -- a file placed and a clipboard pasted --
+    /// because "where does it go, what is it called, and how does undo take it back" has one
+    /// right answer and two implementations would eventually give two.
+    ///
+    /// Returns whether it landed.
+    fn add_picture_layer(&mut self, picture: &import::Picture, name: &str) -> bool {
+        self.editor.stroke_end();
+        let page = self.editor.page_rect();
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "both are bounded by MAX_PAGE_DIMENSION"
+        )]
+        let at = (
+            page.x + (page.w as i32 - picture.width() as i32) / 2,
+            page.y + (page.h as i32 - picture.height() as i32) / 2,
+        );
+        let index = self.editor.document_mut().add_layer();
+        let id = {
+            let page = self.editor.document_mut().active_mut();
+            let Some(layer) = page.layer_mut(index) else {
+                return false;
+            };
+            name.clone_into(&mut layer.name);
+            layer.id()
+        };
+        if let Some(r) = self.renderer.as_mut() {
+            r.place_tiles(tile_store::LayerId(id), picture.tiles(at));
+        }
+        // Recorded after the pixels, so undoing it takes them with it -- the same order a
+        // duplicated layer is recorded in, and for the same reason.
+        if let Some((r, layer)) = self
+            .renderer
+            .as_mut()
+            .zip(self.editor.layers().get(index).cloned())
+        {
+            r.record_layer_addition(index, layer);
+        }
+        self.mark_dirty();
+        true
+    }
+
+    /// Say no, out loud.
+    ///
+    /// **One place every refusal goes.** DECISIONS §6b says a refusal must say what happened;
+    /// TODO §1 is the audit of where that is not yet true, and the note under it says why the
+    /// audit keeps going stale: every refusal writes its own string at its own call site, so
+    /// coverage is a list somebody maintains by hand rather than a question the compiler can be
+    /// asked. With this, "which refusals speak" becomes "who calls this", which is greppable.
+    ///
+    /// Deliberately not `&'static str`: half of these want to name the layer, the file or the
+    /// size, and a refusal that cannot say *which* one is half a refusal.
+    fn refuse(&mut self, why: String) {
+        self.status_message = Some(why);
+        self.request_redraw();
+    }
+
+    /// Put the selected pixels on the system clipboard, and take them off the layer if cutting.
+    ///
+    /// **From the active layer, not from the composite.** Copying what you can see would copy
+    /// other people's layers -- the sketch under the inks, the flats under the shading -- and
+    /// pasting the result back would flatten them into one. Every application that has both
+    /// offers "copy merged" separately; this is the one that is not a surprise.
+    fn copy_selection(&mut self, cut: bool) {
+        let verb = if cut { "cut" } else { "copied" };
+        // The mask alone: the outline beside it is for drawing, and cloning a selection's mask is
+        // what every other operation that acts on one does.
+        let Some(selection) = self.selection.as_ref().map(|s| s.mask.clone()) else {
+            self.refuse(format!(
+                "Select something first: there is nothing to be {verb}."
+            ));
+            return;
+        };
+        let layer = self.editor.active_layer_id();
+        let Some(lifted) = self
+            .renderer
+            .as_mut()
+            .and_then(|r| r.read_selection(&selection, tile_store::LayerId(layer)))
+        else {
+            self.refuse(format!(
+                "Nothing on this layer is inside the selection, so there is nothing to be {verb}."
+            ));
+            return;
+        };
+        // The pixels' own bounds, not the selection's: a lasso round a small mark in a big loop
+        // should copy the mark, and a clipboard image of mostly nothing is mostly nothing.
+        let Some((x0, y0, x1, y1)) = lifted.content_bounds() else {
+            self.refuse(format!(
+                "Nothing on this layer is inside the selection, so there is nothing to be {verb}."
+            ));
+            return;
+        };
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "content_bounds is ordered, so the differences are positive"
+        )]
+        let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+        let Some(picture) =
+            import::Picture::from_texels(w, h, (x0, y0), |x, y| lifted.texel_at(x, y))
+        else {
+            self.refuse("That selection is too large to put on the clipboard.".to_owned());
+            return;
+        };
+        if let Err(e) = clipboard::put(&picture) {
+            self.refuse(format!("Nothing was {verb}: {e}."));
+            return;
+        }
+        if cut {
+            // The clear is the existing, undoable one: a cut is a copy and an erase, and the
+            // erase must be exactly the erase Delete does or two things that look identical
+            // would take different numbers of undos to reverse.
+            self.clear_selection_pixels();
+        }
+        self.status_message = Some(format!("{w}x{h} {verb}."));
+        self.request_redraw();
+    }
+
+    /// Put whatever the system clipboard holds onto a new layer.
+    fn paste(&mut self) {
+        match clipboard::take() {
+            Ok(picture) => {
+                let (w, h) = (picture.width(), picture.height());
+                if self.add_picture_layer(&picture, "Pasted") {
+                    self.status_message = Some(format!("Pasted {w}x{h} onto a new layer."));
+                    self.request_redraw();
+                }
+            }
+            Err(e) => self.refuse(format!("Nothing was pasted: {e}.")),
+        }
     }
 
     /// Replace everything with an empty document.
@@ -3088,12 +3463,19 @@ impl OpenPaint {
     fn run_command(&mut self, command: ui::Command) {
         use ui::Command;
         match command {
-            Command::New | Command::Open | Command::Save | Command::SaveAs => {
+            Command::New
+            | Command::Open
+            | Command::PlaceImage
+            | Command::Save
+            | Command::SaveAs => {
                 if let Some(dialog) = dialog_for(command) {
                     self.request_dialog(dialog);
                 }
             }
-            Command::ExportPng => self.export_png(),
+            Command::ExportPng => self.ask_where_to_export(),
+            Command::Copy => self.copy_selection(false),
+            Command::Cut => self.copy_selection(true),
+            Command::Paste => self.paste(),
             Command::Undo => self.history_step(false),
             Command::Redo => self.history_step(true),
             Command::ZoomFit => {
@@ -3162,7 +3544,22 @@ impl OpenPaint {
                         return true;
                     }
                     "e" | "E" => {
-                        self.export_png();
+                        self.ask_where_to_export();
+                        return true;
+                    }
+                    // The three everybody's hands already know. Ctrl+C and Ctrl+X want a
+                    // selection and say so when there is none; Ctrl+V wants a picture on the
+                    // clipboard and says so when there is not one.
+                    "c" | "C" => {
+                        self.copy_selection(false);
+                        return true;
+                    }
+                    "x" | "X" => {
+                        self.copy_selection(true);
+                        return true;
+                    }
+                    "v" | "V" => {
+                        self.paste();
                         return true;
                     }
                     _ => {}
@@ -3200,6 +3597,21 @@ impl OpenPaint {
         } else {
             renderer.undo()
         };
+        // **Said out loud when there was nothing to do.** An undo that does nothing is
+        // indistinguishable from an undo that is broken, and "is Ctrl+Z working?" is a question
+        // an artist should never have to ask about the one command they rely on to be fearless.
+        // TODO §1 had this as "nothing happens".
+        if matches!(change, renderer::HistoryChange::None) {
+            self.refuse(
+                if redo {
+                    "Nothing to redo: this is as far forward as the history goes."
+                } else {
+                    "Nothing to undo: this is as far back as the history goes."
+                }
+                .to_owned(),
+            );
+            return;
+        }
         self.apply_history_change(change);
     }
 
@@ -3207,28 +3619,110 @@ impl OpenPaint {
     ///
     /// Ctrl+E, not Ctrl+S: saving the *document* is what Ctrl+S means now that there is a
     /// document format to save into.
-    fn export_png(&mut self) {
+    /// Put the export dialog up.
+    ///
+    /// **Export used to happen the instant it was asked for**, writing one page under a
+    /// timestamped name into whatever directory the application had been started in. That is a
+    /// debugging convenience: it cannot say where the file goes, cannot export a second page, and
+    /// cannot produce the one delivery format this whole application is aimed at -- a webtoon
+    /// strip. The dialog is the smallest thing that fixes all three.
+    fn ask_where_to_export(&mut self) {
+        self.exporting = true;
+        self.request_redraw();
+    }
+
+    /// Ask for a destination, having been told what to write.
+    fn export_with_dialog(&mut self) {
+        self.exporting = false;
+        // A name to start from: the document's own, or the page's, so the artist is renaming
+        // rather than typing from nothing.
+        let suggested = self
+            .document_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map_or_else(
+                || "artwork".to_owned(),
+                |s| s.to_string_lossy().into_owned(),
+            );
+        let suggested = format!("{suggested}.png");
+        self.spawn_file_dialog(FileDialogKind::ExportTo, move |dialog| {
+            dialog.set_file_name(suggested).save_file().map(|p| vec![p])
+        });
+    }
+
+    /// Write the export the dialog was set to, to the path the artist named.
+    ///
+    /// Every page is composed from *its own* rect and *its own* layers, not from the page that
+    /// happens to be open: the tiles of every page are in the store already, which is why this
+    /// needs no page-switching and leaves the artist looking at the page they were drawing on.
+    fn export_to(&mut self, path: &std::path::Path) {
+        use export::What;
+        let path = if path.extension().is_some() {
+            path.to_path_buf()
+        } else {
+            path.with_extension("png")
+        };
+        let choices = self.export_choices;
+        let document = self.editor.document();
+        let wanted: Vec<usize> = match choices.what {
+            What::ThisPage => vec![document.active_index()],
+            What::EveryPage | What::Strip => (0..document.page_count()).collect(),
+        };
+        let pages: Vec<(openpaint_core::PageRect, Vec<openpaint_core::Layer>)> = wanted
+            .iter()
+            .filter_map(|i| document.page(*i))
+            .map(|p| (p.rect(), p.layers().to_vec()))
+            .collect();
         let Some(renderer) = self.renderer.as_ref() else {
             return;
         };
-        let path = export::default_path();
-        self.status_message = Some(match renderer.export_png(self.editor.layers(), &path) {
-            Ok(()) => {
-                // Absolute, because a bare relative name leaves the user hunting
-                // for the file -- the working directory is not obvious when the app
-                // was launched from a script or an IDE.
-                let shown = std::env::current_dir()
-                    .map_or_else(|_| path.clone(), |dir| dir.join(&path))
-                    .display()
-                    .to_string();
-                println!("exported {shown}");
-                format!("Exported {shown}")
+        let mut sheets = Vec::with_capacity(pages.len());
+        for (rect, layers) in &pages {
+            match renderer.compose_page(layers, *rect, choices.scale) {
+                Ok(sheet) => sheets.push(sheet),
+                Err(e) => {
+                    self.status_message = Some(format!("Export failed: {e}"));
+                    self.request_redraw();
+                    return;
+                }
             }
-            Err(e) => {
-                eprintln!("export failed: {e}");
-                format!("Export failed: {e}")
+        }
+
+        let written = match choices.what {
+            What::Strip => {
+                let strip = export::Sheet::stack(&sheets);
+                let (w, h) = (strip.width, strip.height);
+                match strip.write(&path) {
+                    Ok(()) => format!("Exported {} as one {w} by {h} strip.", path.display()),
+                    Err(e) => format!("Export failed: {e}"),
+                }
             }
-        });
+            What::ThisPage | What::EveryPage => {
+                let names = export::names(&path, sheets.len());
+                let mut trouble = None;
+                for (sheet, name) in sheets.iter().zip(&names) {
+                    if let Err(e) = sheet.write(name) {
+                        trouble = Some(format!("Export failed: {e}"));
+                        break;
+                    }
+                }
+                trouble.unwrap_or_else(|| match names.as_slice() {
+                    [one] => format!("Exported {}.", one.display()),
+                    many => format!(
+                        "Exported {} files, {} to {}.",
+                        many.len(),
+                        many.first()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                        many.last()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default()
+                    ),
+                })
+            }
+        };
+        println!("{written}");
+        self.status_message = Some(written);
         self.request_redraw();
     }
 
@@ -3358,34 +3852,14 @@ impl OpenPaint {
                 match &key.logical_key {
                     // Escape abandons a panel drag before it abandons anything else: it is the
                     // gesture most recently begun, and the one the artist is looking at.
-                    Key::Named(NamedKey::Escape)
-                        if pressed && self.workspace_mode && self.workspace.cancel_drag() =>
-                    {
+                    Key::Named(NamedKey::Escape) if pressed && self.workspace.cancel_drag() => {
                         self.request_redraw();
                         true
                     }
                     // Switch the look. The whole point of the theme being data is that this
                     // changes nine colours and nothing else.
-                    Key::Named(NamedKey::F4) if pressed && self.workspace_mode => {
+                    Key::Named(NamedKey::F4) if pressed => {
                         self.status_message = Some(self.workspace.cycle_theme());
-                        self.request_redraw();
-                        true
-                    }
-                    // Switch between the panel workspace and the old side panel.
-                    //
-                    // Temporary by design, and worth saying so: two UIs is not a feature, it is
-                    // the transition. It goes when the last section has been ported across.
-                    Key::Named(NamedKey::F2) if pressed => {
-                        self.workspace_mode = !self.workspace_mode;
-                        // The canvas viewport is about to change shape completely, so refit
-                        // rather than leaving the artwork half off the edge of its new panel.
-                        self.view.request_fit();
-                        self.status_message = Some(if self.workspace_mode {
-                            "Panel workspace. Hold a panel's header to move it; F3 takes a layout change back and Ctrl+F3 resets it."
-                                .to_owned()
-                        } else {
-                            "Back to the old panel.".to_owned()
-                        });
                         self.request_redraw();
                         true
                     }
@@ -3395,16 +3869,14 @@ impl OpenPaint {
                     // regardless of the modifier, so Ctrl+F3 was silently an undo and the reset it
                     // claims to be was unreachable. A guard that does not exclude the case above it
                     // is not a guard.
-                    Key::Named(NamedKey::F3)
-                        if pressed && self.workspace_mode && self.nav.modifiers.control_key() =>
-                    {
+                    Key::Named(NamedKey::F3) if pressed && self.nav.modifiers.control_key() => {
                         self.workspace.reset();
                         self.status_message =
                             Some("Layout reset. F3 takes that back too.".to_owned());
                         self.request_redraw();
                         true
                     }
-                    Key::Named(NamedKey::F3) if pressed && self.workspace_mode => {
+                    Key::Named(NamedKey::F3) if pressed => {
                         let moved = if self.nav.modifiers.shift_key() {
                             self.workspace.redo()
                         } else {
@@ -3506,13 +3978,14 @@ impl OpenPaint {
         for (i, l) in self.editor.layers().iter().enumerate() {
             let _ = writeln!(
                 o,
-                "layer.{i}\t{}\t{:.3}\t{:?}\t{}\t{}\t{}\t{}",
+                "layer.{i}\t{}\t{:.3}\t{:?}\t{}\t{}\t{}\t{}\t{}",
                 l.name,
                 l.opacity,
                 l.blend,
                 l.visible,
                 l.lock_alpha,
                 l.clip_below,
+                l.locked,
                 if l.text().is_some() { "text" } else { "raster" }
             );
         }
@@ -3526,6 +3999,7 @@ impl OpenPaint {
             let _ = writeln!(o, "active.visible\t{}", l.visible);
             let _ = writeln!(o, "active.lock-alpha\t{}", l.lock_alpha);
             let _ = writeln!(o, "active.clip-below\t{}", l.clip_below);
+            let _ = writeln!(o, "active.locked\t{}", l.locked);
             let _ = writeln!(
                 o,
                 "active.kind\t{}",
@@ -3652,6 +4126,20 @@ impl OpenPaint {
         let _ = writeln!(o, "undo\t{undo}");
         let _ = writeln!(o, "redo\t{redo}");
         let _ = writeln!(o, "dirty\t{}", self.dirty);
+        // Whether the export dialog is up. Its own line rather than folded into `dialog`:
+        // that one is about a *native* window this harness cannot answer, and this one is
+        // ours and can be driven like anything else on screen.
+        let _ = writeln!(o, "exporting\t{}", self.exporting);
+        let _ = writeln!(
+            o,
+            "export-what\t{}",
+            match self.export_choices.what {
+                export::What::ThisPage => "this page",
+                export::What::EveryPage => "every page",
+                export::What::Strip => "strip",
+            }
+        );
+        let _ = writeln!(o, "export-scale\t{}", self.export_choices.scale);
         // Whether a recovery copy has actually been written this session, and what it cost.
         // The prompt that offers one is driven with a copy the harness plants, because a real
         // crash is the only other way to make one -- so without this the *writing* of them
@@ -3681,6 +4169,18 @@ impl OpenPaint {
                 .and_then(std::path::Path::file_name)
                 .map_or_else(|| "-".to_owned(), |n| n.to_string_lossy().into_owned())
         );
+        // The display's scale factor, and with it the size of the workspace in the units
+        // panels are laid out in. **A scenario is calibrated against one of these**: at 1.5
+        // the logical screen is 1452x929 and tabs wrap where the scenes say they do, while
+        // at 1.0 the same window is 2184x1411 and nothing is where it was. Reported so the
+        // harness can refuse rather than drive one display's coordinates into another's.
+        let _ = writeln!(
+            o,
+            "scale\t{:.2}",
+            self.ui
+                .as_ref()
+                .map_or(1.0, crate::ui::Ui::pixels_per_point)
+        );
         let _ = writeln!(o, "zoom\t{:.4}", self.view.scale());
         // Where the view is looking, so panning has a witness -- nothing else moves this, and
         // without it space-drag and a middle-drag are two gestures with no consequence to check.
@@ -3694,7 +4194,6 @@ impl OpenPaint {
         let _ = writeln!(o, "confirm\t{}", self.pending_confirm.is_some());
         let _ = writeln!(o, "recovery\t{}", self.recovery.is_some());
         let _ = writeln!(o, "dialog\t{}", self.file_dialog.is_some());
-        let _ = writeln!(o, "workspace-mode\t{}", self.workspace_mode);
         // The arrangement itself, which is the only witness a panel gesture has.
         let _ = writeln!(o, "layout\t{}", self.workspace.describe());
         let _ = writeln!(o, "directions\t{}", self.workspace.directions());
@@ -3783,15 +4282,21 @@ impl OpenPaint {
         // Built here rather than in the panel so the panel stays a renderer of state. It reports
         // the *cost* as well as the time, because that number is what decides whether the 60 s
         // interval is affordable or whether saving has to become incremental.
-        let autosave_status = match self.autosave.last() {
-            Some((_, took, tiles)) => {
-                format!("Autosave: {tiles} tiles in {} ms", took.as_millis().max(1))
+        // **Failure first, and in those words.** Everything below it describes autosave working;
+        // if it is not working, that is the only thing this line should be saying.
+        let autosave_status = if let Some(why) = self.autosave.trouble() {
+            format!("Autosave is FAILING: {why}")
+        } else {
+            match self.autosave.last() {
+                Some((_, took, tiles)) => {
+                    format!("Autosave: {tiles} tiles in {} ms", took.as_millis().max(1))
+                }
+                None if !self.autosave.available() => {
+                    "Autosave: unavailable (no writable data directory)".to_owned()
+                }
+                None if self.dirty => "Autosave: due within a minute".to_owned(),
+                None => "Autosave: nothing unsaved".to_owned(),
             }
-            None if !self.autosave.available() => {
-                "Autosave: unavailable (no writable data directory)".to_owned()
-            }
-            None if self.dirty => "Autosave: due within a minute".to_owned(),
-            None => "Autosave: nothing unsaved".to_owned(),
         };
 
         // Disjoint field borrows, so the overlay closure can touch the editor and
@@ -3851,6 +4356,7 @@ impl OpenPaint {
         let mut tool_request = None;
         let mut confirm_request = None;
         let mut recovery_request = None;
+        let mut export_request = None;
         let mut select_request = None;
         let mut command_request = None;
         let mut page_request = None;
@@ -3872,10 +4378,6 @@ impl OpenPaint {
         let page_count = editor.document().page_count();
         let active_page = editor.document().active_index();
         let window = renderer.window().clone();
-        // Borrowed, not copied: a copy would mean any future UI control that edits
-        // the view silently writes to a dead value. Disjoint field borrows make
-        // this fine alongside the mutable borrows of `renderer` and `editor`.
-        let view = &self.view;
         // Started here rather than at the top of `redraw`: what this measures is the cost of
         // producing a frame, and the work above it is bookkeeping that happens whether or not a
         // frame follows. `render` presents before it returns, so the interval ends at the present.
@@ -3885,7 +4387,7 @@ impl OpenPaint {
         let mut text_edit = editor.active_text().cloned();
         let font_families = &self.font_families;
         let brushes = &self.brushes;
-        let workspace = self.workspace_mode.then_some(&mut self.workspace);
+        let workspace = &mut self.workspace;
         let brush_trouble = self.brushes.trouble.as_deref();
         let font_substituted = self.font_substituted.clone();
         let mut text_request = None;
@@ -3906,7 +4408,6 @@ impl OpenPaint {
                     gpu,
                     editor.brush_mut(),
                     text_edit.as_mut(),
-                    view,
                     ui::Status {
                         history: history_status,
                         message: status_message.as_deref(),
@@ -3926,6 +4427,7 @@ impl OpenPaint {
                         perf,
                         recovery: recovery_prompt.as_deref(),
                         autosave: &autosave_status,
+                        export: self.exporting.then_some(self.export_choices),
                         selection: &selection_overlay,
                         select_tool,
                         has_selection,
@@ -3950,6 +4452,10 @@ impl OpenPaint {
                 tool_request = out.tool;
                 confirm_request = out.confirm;
                 recovery_request = out.recovery;
+                export_request = out.export;
+                if let Some(set) = out.export_set {
+                    self.export_choices = set;
+                }
                 select_request = out.select;
                 command_request = out.command;
                 self.wand = out.wand;
@@ -4012,6 +4518,15 @@ impl OpenPaint {
 
         if let Some(action) = select_request {
             self.apply_select_action(action);
+        }
+        if let Some(choice) = export_request {
+            match choice {
+                ui::ExportChoice::Go => self.export_with_dialog(),
+                ui::ExportChoice::Stop => {
+                    self.exporting = false;
+                    self.request_redraw();
+                }
+            }
         }
         if let Some(choice) = recovery_request {
             // Taken either way: an offer answered is an offer gone, and leaving it set would put

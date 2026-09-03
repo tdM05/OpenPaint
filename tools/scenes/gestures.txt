@@ -33,7 +33,6 @@
 # The arrangement here is the built-in one and cannot be written as an `expect layout` for the
 # reason in the header; it is `*Menu / *Tools / *Canvas / *Layers,History,Pages,Page /
 # *Brush,Transform,Select,Text / *Colour` with nothing floating.
-expect workspace-mode true
 expect undo 0
 expect redo 0
 expect dirty false
@@ -50,7 +49,11 @@ shot gestures-start
 # every slot exactly where the atlas says it is -- which is what the rest of this scene relies on.
 # Pressing Float proves the popup was really open: a name the application is not drawing stops the
 # run rather than clicking nowhere.
-holdat 2088 643
+#
+# **By name.** Tabs are laid out from measured labels, so any label changing moves the rest -- and
+# a scene holding a raw coordinate then holds whatever ends up there. `windows-apart.txt` was
+# silently floating the wrong panel for exactly this reason.
+holdtab Text
 shot gestures-text-settings
 press Float
 expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / *Brush,Transform,Select / *Colour | Text
@@ -83,7 +86,7 @@ shot gestures-tabs
 # Page is the last tab of the Layers group and comes out the same way Text did. Two windows now
 # stand behind the bar: Text was floated first and Page second, and `describe` lists them in the
 # order they were lifted.
-holdat 2074 83
+holdtab Page
 press Float
 expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages / *Brush,Transform,Select / *Colour | Text / Page
 
@@ -94,7 +97,7 @@ expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages / *Brush,Transfor
 # window -- which the Remove that follows could not reach otherwise. Removing a panel from its own
 # settings is the same act as switching it off in the panel list, and it is undoable like any
 # other change to the arrangement.
-hold 2010 643 1970 335
+holdtab Select -40 -308
 expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages / *Brush,Transform,Select / *Colour | Text / Page
 shot gestures-select-settings
 press Remove this panel
@@ -143,11 +146,16 @@ expect redo 0
 # were lifted. The undo-step reasoning below is kept as well: between them they say that the drag
 # changed the size, and that it recorded exactly one change and not two.
 #
-# The Page window is the second one lifted, so it sits at 88,88 by 319x325 points
-# -- 132,132 by 479x488 pixels -- and its right edge is at x 611, its bottom at y 620. The grab
-# band straddles each edge by half of the 26-point splitter reach, so 617,450 is the right edge and
-# 617,626 is the bottom-right corner. `hold` is right here where it is wrong on a tab: an edge is
-# grabbed the instant it is touched and asks nothing when it is held still.
+# The Page window is the second one lifted, and a second window lands *beside* the first rather
+# than cascading over it -- 387,60 by 319x325 points, which is 580,90 by 479x488 pixels. Its right
+# edge is therefore at x 1059 and its bottom at y 578. The grab band straddles each edge by half of
+# the 26-point splitter reach, so 1066,334 is on the right edge and 1066,584 is the bottom-right
+# corner. `hold` is right here where it is wrong on a tab: an edge is grabbed the instant it is
+# touched and asks nothing when it is held still.
+#
+# **These numbers were 88,88 until the placement changed under them.** The scene went on running,
+# pressing empty canvas where it meant a window's edge, and what came out looked like windows
+# vanishing on their own. A coordinate that names nothing is the most expensive kind of stale.
 #
 # The arrangement is still the one the move above left, so a resize that recorded nothing would
 # send the F3 after it back past the move instead; a resize that recorded two would need two. One
@@ -156,21 +164,21 @@ expect redo 0
 # The presses that begin on the border lie over the canvas, and the artwork's undo depth says
 # neither of them painted.
 shot gestures-window-before
-expect windows 60,60 319x325 / 88,88 319x325
-hold 617 450 797 450
+expect windows 60,60 319x325 / 387,60 319x325
+hold 1066 334 1246 334
 # 180 screen pixels wider is 120 points wider, and only the width moves.
-expect windows 60,60 319x325 / 88,88 439x325
+expect windows 60,60 319x325 / 387,60 439x325
 shot gestures-window-wider
 key f3
-expect windows 60,60 319x325 / 88,88 319x325
+expect windows 60,60 319x325 / 387,60 319x325
 expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Select / *Brush,Transform / *Colour | Text / Page
 expect undo 1
-hold 617 626 767 746
+hold 1066 584 1216 704
 # A corner takes both: 150 screen pixels across and 120 down, which is 100 and 80 in points.
-expect windows 60,60 319x325 / 88,88 419x405
+expect windows 60,60 319x325 / 387,60 419x405
 shot gestures-window-corner
 key f3
-expect windows 60,60 319x325 / 88,88 319x325
+expect windows 60,60 319x325 / 387,60 319x325
 expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Select / *Brush,Transform / *Colour | Text / Page
 expect undo 1
 expect dirty true
@@ -201,7 +209,7 @@ expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages / *Brush,Transfor
 # pick below will drop this one. It lands nowhere: the window has been carried and that is all,
 # and the arrangement is untouched. The carry is still one entry on the layout stack, and taking it
 # back is also what puts the window back at 132,132 for the hold that follows.
-drag 171 156 1970 335
+dragtab Page 1799 179
 expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages / *Brush,Transform,Select / *Colour | Text / Page
 shot gestures-window-carried
 key f3
@@ -216,7 +224,7 @@ expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages / *Brush,Transfor
 #
 # The state between the two -- Page in neither tree while the pick waits -- has no floating window
 # and so cannot be written as an `expect layout`.
-holdat 171 156
+holdtab Page
 shot gestures-window-settings
 press Put back into...
 click 1970 335
@@ -251,7 +259,7 @@ expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Page / *Brush,Tra
 # Colour is the only tab in its slot, so removing it takes the slot with it and the right-hand
 # column collapses to two. It is the same function the panel list's switch calls, and undo takes
 # it back the same way.
-holdat 1816 1043
+holdtab Colour
 shot gestures-colour-settings
 press Remove this panel
 expect layout *Menu / *Tools / *Canvas / Layers,History,Pages,*Page / *Brush,Transform,Select | Text
@@ -306,7 +314,7 @@ expect redo 0
 # is that the artwork came through all of it untouched -- one stroke, one undo step, still on the
 # page and still on screen -- and the picture beside this shot carries the arrangement for anyone
 # reading the run afterwards.
-holdat 127 114
+holdtab Text
 press Put back into...
 click 1970 820
 key ctrl+f3

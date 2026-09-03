@@ -135,6 +135,22 @@ pub fn clamp_page_size(current: (u32, u32), requested: (u32, u32)) -> Option<(u3
     Some((w, h))
 }
 
+/// Why a layer will not take paint.
+///
+/// Three reasons, and they want three different sentences: one is undone by a switch in the
+/// Layers panel, one by converting the layer, and one by picking a different tool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The layer has been set aside. See [`openpaint_core::Layer::is_locked`].
+    Locked,
+    /// The layer is not being shown, so a stroke on it would be invisible.
+    Hidden,
+    /// Its pixels are derived from something else -- a text layer.
+    Derived,
+    /// Its transparency is frozen and the tool in hand is the eraser, which could only remove.
+    AlphaLocked,
+}
+
 /// How a stroke is combined with the layer it lands on.
 ///
 /// An enum rather than two booleans because exactly one applies. "Erase" and "lock alpha" are
@@ -326,6 +342,36 @@ impl Editor {
             (false, true) => Some(PaintMode::LockAlpha),
             (false, false) => Some(PaintMode::Normal),
         }
+    }
+
+    /// Why the active layer will not take paint, or `None` if it will.
+    ///
+    /// **One question, asked once, answered with a reason.** Every place that paints used to
+    /// decide for itself that nothing would happen and then write its own sentence about why --
+    /// and every one of those sentences said "this layer's alpha is locked", including on a text
+    /// layer, where it was simply untrue. The artist would unlock an alpha lock that was not on
+    /// and try again. A refusal has to say what is actually in the way (DECISIONS §6b), and a
+    /// refusal that guesses is worse than one that says nothing, because it sends you somewhere.
+    #[must_use]
+    pub fn paint_refusal(&self) -> Option<Refusal> {
+        let layer = self.document.active().layer(self.active_layer_index());
+        if layer.is_some_and(openpaint_core::Layer::is_locked) {
+            return Some(Refusal::Locked);
+        }
+        // **Refused rather than allowed and invisible.** A stroke on a hidden layer lands
+        // perfectly well and shows nothing, which is the definition of the failure DECISIONS §6b
+        // is about: the artist paints a line, sees no line, and has no way to tell a hidden layer
+        // from a broken brush. TODO §1 had this as "nothing happens at all".
+        if layer.is_some_and(|l| !l.visible) {
+            return Some(Refusal::Hidden);
+        }
+        if !self.active_layer_accepts_paint() {
+            return Some(Refusal::Derived);
+        }
+        if self.tool.erases() && self.active_layer_locks_alpha() {
+            return Some(Refusal::AlphaLocked);
+        }
+        None
     }
 
     /// Whether the active layer's pixels may be painted at all.

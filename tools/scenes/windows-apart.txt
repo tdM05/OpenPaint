@@ -2,35 +2,57 @@
 #
 # **Reported by the artist**: with Pages and History floating, dragging the Pages tab worked, and
 # dragging the same tab again picked up History. The cause was the placement. A new window was
-# offset from the last by one header -- twenty-eight units on a window of three hundred and twenty
-# by three hundred and thirty-eight -- so two of them overlapped by better than nine tenths and
-# read as one. Dragging the top one's tab even a little dropped it *inside* the one beneath, which
-# is the merge gesture: the two became one window, and the tab under the pointer then belonged to
-# the other panel.
+# offset from the last by one header, so two of them overlapped by better than nine tenths and read
+# as one. Dragging the top one's tab even a little dropped it *inside* the one beneath, which is
+# the merge gesture: the two became one window, and the tab under the pointer then belonged to the
+# other panel.
 #
 # There was a test for this and it passed throughout. It asked whether the second window was offset
 # from the first by at least one header. It was -- by exactly one.
+#
+# **Every step here names the tab it means.** This scene used to hold raw screen coordinates, and
+# when the tabs moved -- they are laid out from measured label widths, so any of them changing
+# moves the rest -- `holdat 1900 91` quietly began holding History where the scene said Pages. It
+# went on passing steps that meant something else for a while, which is worse than failing, and
+# then failed in a way that read as a bug in the application. `holdtab` and `dragtab` read the same
+# atlas `tab` does.
 
 tab Pages
-holdat 1900 91
+holdtab Pages
 press Float
-expect layout *Menu / *Tools / *Canvas / *Layers,History,Page / *Brush,Transform,Select,Text / *Colour | Pages
-expect windows 60,60 320x338
+# Floating a tab leaves its *neighbour* showing, not the first tab in the group -- which is
+# what closing a tab does everywhere else.
+expect layout *Menu / *Tools / *Canvas / Layers,History,*Page / *Brush,Transform,Select,Text / *Colour | Pages
+expect windows 60,60 319x325
 
 tab History
-holdat 1900 91
+holdtab History
 press Float
-expect layout *Menu / *Tools / *Canvas / *Layers,Page / *Brush,Transform,Select,Text / *Colour | Pages / History
+expect layout *Menu / *Tools / *Canvas / Layers,*Page / *Brush,Transform,Select,Text / *Colour | Pages / History
 # Side by side with a clear gap, not stacked: the second window's left edge is past the first
-# window's right edge, which is the whole of the fix.
-expect windows 60,60 320x338 / 388,60 320x338
+# window's right edge, which is the whole of the fix. 60 + 319 = 379, and the second starts at 387.
+expect windows 60,60 319x325 / 387,60 319x325
 shot windows-apart
 
 # **The same tab twice.** Each drag moves the window it belongs to, and only that one. The second
 # is the one that used to pick up the neighbour.
-drag 140 91 240 191
-expect windows 160,120 320x338 / 388,60 320x338
+#
+# By the tab rather than by a point, and *also* because a window's tab is its top edge: a point a
+# pixel below that edge used to be the resize border reaching inward, so this step resized the
+# window instead of moving it and left it 259 units tall. The border now stays out of the header
+# -- see `chrome::edge_at` -- but a scene that aims at the middle of the tab is asking for what it
+# means either way.
+# **150 across and down, because the harness works in the window's own pixels and the workspace
+# works in points.** At this display scale that is a hundred points, which is what the numbers
+# below say. A scene that wrote 100 here moved the window 67 and then asserted 100.
+#
+# The windows are listed front to back, and pressing one brings it forward -- so after the first
+# drag Pages is the *second* in the list rather than the first. That is deliberate and is the same
+# rule that makes tapping a tab leave no trace on the layout stack: which window is in front
+# follows the pointer, and is not an arrangement.
+dragtab Pages 150 150
+expect windows 387,60 319x325 / 160,160 319x325
 shot windows-dragged-once
-drag 240 151 340 251
-expect windows 260,180 320x338 / 388,60 320x338
+dragtab Pages 150 150
+expect windows 387,60 319x325 / 260,260 319x325
 shot windows-dragged-twice

@@ -490,6 +490,21 @@ pub enum Place {
     Popup,
 }
 
+/// Whether the pointer is the workspace's this frame.
+///
+/// **Something can be above the workspace.** A prompt that has to be answered is drawn over
+/// everything and owns the pointer while it is up; the workspace reads the pointer out of egui
+/// directly, so nothing about drawing over it would stop a press landing on a panel underneath.
+/// Told rather than inferred, and told per frame, so it cannot be left switched on by a prompt
+/// that has since been answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attention {
+    /// Nothing is over the workspace: presses, drags and the wheel are its own.
+    Workspace,
+    /// Something above it has the pointer. The workspace draws, and touches nothing.
+    Elsewhere,
+}
+
 /// Which way a popup opens from the control it belongs to.
 ///
 /// **Not `Side`**: `openpaint_core::Side` already means an edge of the canvas, and this file has
@@ -941,6 +956,14 @@ mod stack {
     pub const MARKS: egui::Order = egui::Order::Tooltip;
     /// The popup, which is the topmost thing the workspace has.
     pub const POPUP: egui::Order = egui::Order::Debug;
+    /// A prompt the application is waiting on, which is above even that.
+    ///
+    /// The same order as the popup, because egui has six and the workspace uses all six. That is
+    /// safe only because the two are never on screen together: being asked a question puts the
+    /// popup away -- see `Attention::Elsewhere` in `show`, where it is done rather than hoped
+    /// for. Two raw layers of one order paint in map order, so an open menu left under a prompt
+    /// could otherwise paint over it.
+    pub const PROMPT: egui::Order = egui::Order::Debug;
 }
 
 /// The order the canvas's own overlays are drawn in: above the panels, below the windows.
@@ -950,6 +973,15 @@ mod stack {
 #[must_use]
 pub fn artwork_order() -> egui::Order {
     stack::ARTWORK
+}
+
+/// The order a prompt is drawn in: above everything, including the workspace's own popup.
+///
+/// A function for the same reason [`artwork_order`] is one: the stack is described in a single
+/// place, and a caller cannot pick an order that happens to be wrong.
+#[must_use]
+pub fn prompt_order() -> egui::Order {
+    stack::PROMPT
 }
 
 impl Workspace {
@@ -1215,6 +1247,7 @@ impl Workspace {
         &mut self,
         ctx: &egui::Context,
         screen: Rect,
+        attention: Attention,
         mut contents: impl FnMut(PanelId, &mut egui::Ui, Direction, Place),
     ) {
         let painter = ctx.layer_painter(egui::LayerId::new(
@@ -1256,6 +1289,24 @@ impl Workspace {
                 i.time * 1000.0,
             )
         });
+        // **Something above owns the pointer, so the workspace has nothing in progress.** One
+        // rule, said once: no pointer this frame, no popup, and nothing waiting to open. A
+        // gesture in flight is let go by the no-pointer path below, which is the same thing that
+        // happens when the pen leaves the window -- a drag interrupted by a question the artist
+        // must answer is a drag that has been abandoned.
+        //
+        // Putting the popup away is not tidying. The prompt is drawn in the topmost order, which
+        // the popup also uses, and two raw layers of the same order paint in whatever order the
+        // map iterates -- so a menu left open under a prompt could paint *over* it. Empty, it
+        // cannot.
+        let (pointer, pressed, released, down) = match attention {
+            Attention::Workspace => (pointer, pressed, released, down),
+            Attention::Elsewhere => {
+                self.popup = None;
+                self.popup_wanted = None;
+                (None, false, false, false)
+            }
+        };
 
         // Painting is demand-driven, so a hold with the pointer still would never fire: no
         // events, no frames, and the timer never read. Reported as the hold "sometimes" not
@@ -1285,7 +1336,7 @@ impl Workspace {
         // A secondary press asks whatever is under the pointer what it offers: a panel's header
         // offers that panel's settings, anything else offers the workspace's own list of panels.
         // One rule, and the answer depends on what you pressed.
-        if ctx.input(|i| i.pointer.secondary_pressed()) {
+        if attention == Attention::Workspace && ctx.input(|i| i.pointer.secondary_pressed()) {
             // While a pick is waiting, the other button means "no". Opening the panel list on top
             // of the question would be a second question over the first.
             if self.placing.is_some() {
@@ -1332,7 +1383,11 @@ impl Workspace {
         // **Read before the press is acted on.** `input_frame` answers a waiting pick, so by the
         // time the panels below are drawn `self.placing` is already `None` -- and the one frame on
         // which the panels must not answer the pointer is exactly that one.
-        let was_picking = self.placing.is_some();
+        // **Whether anything on the workspace answers at all this frame.** Two reasons and one
+        // rule: a pick is waiting for the artist to say where a panel goes, or something above
+        // the workspace is asking a question. Either way the controls draw greyed and take
+        // nothing, which is how the artist can see that they are being asked rather than ignored.
+        let inert = self.placing.is_some() || attention == Attention::Elsewhere;
         // Everything a press means, in one place: `show` draws, and this decides. Tests drive
         // the *same* entry point rather than a hand-made idea of what the pointer is over -- which
         // is exactly the disagreement that let a real bug pass a green suite.
@@ -1462,17 +1517,17 @@ impl Workspace {
             // Contents are clipped to their own panel, so a list too long for its slot cannot
             // draw over the panel beside it.
             ui.set_clip_rect(content);
-            // **Nothing in a panel answers while a pick is waiting**, and it visibly says so: the
-            // press that lands the panel goes wherever it is pointed, and a control under that
-            // point would otherwise be worked at the same time.
+            // **Nothing in a panel answers while the workspace is inert**, and it visibly says
+            // so: the press that lands a picked panel goes wherever it is pointed, and a control
+            // under that point would otherwise be worked at the same time.
             //
             // Two other things happen to stop that press as well -- the landing rearranges the leaf
             // the control was in, and the drop overlay's layer occludes what is under it -- so no
             // test can tell this line apart from those. It stays because it is the *stated* rule
             // and the only one of the three that is; the other two are accidents of ordering and of
-            // how egui picks a layer. It also greys the workspace, which is how the artist can see
-            // that a question is being asked.
-            if was_picking {
+            // how egui picks a layer. For a prompt it is not an accident at all: this line is the
+            // whole of what stops a button behind a modal question being pressed through it.
+            if inert {
                 ui.disable();
             }
             // The direction is worked out here and handed over, because the panel that wants it
@@ -1712,7 +1767,7 @@ impl Workspace {
                 ui.set_clip_rect(to_egui(c.controls.rect()));
                 // The same rule as the arrangement's panels, and for the same reason: a pick can
                 // land *in* a floating window.
-                if was_picking {
+                if inert {
                     ui.disable();
                 }
                 crate::panel_draw::report_panel(name_of(showing));
@@ -4397,6 +4452,334 @@ mod tests {
         assert_ne!(
             now, before,
             "dragging History's own tab did not move History"
+        );
+    }
+
+    /// One frame of the whole `show` path, with the pointer pressed at a point.
+    ///
+    /// Through `show` rather than `input_frame`, because `attention` is applied in `show` -- a
+    /// test that went straight to `input_frame` would be testing the half that never had the
+    /// question in it, and would pass with the guard deleted.
+    /// Returns whether the panels it drew were live -- see `a_panel_under_a_prompt_is_inert`.
+    fn press_through_show(
+        ws: &mut Workspace,
+        screen: Rect,
+        at: (f32, f32),
+        attention: Attention,
+    ) -> bool {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(screen.x, screen.y),
+                egui::vec2(screen.w, screen.h),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(at.0, at.1)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(at.0, at.1),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut live = None;
+        let _ = ctx.run(input, |c| {
+            ws.show(c, screen, attention, |_, ui, _, _| {
+                // Every panel drawn this frame answers the same way, so the first is the answer.
+                live.get_or_insert(ui.is_enabled());
+            });
+        });
+        live.expect("at least one panel was drawn")
+    }
+
+    /// A question being asked above the workspace takes the pointer away from it.
+    ///
+    /// **The workspace reads the pointer out of egui itself**, so drawing a prompt over it stops
+    /// nothing: the press still reaches a tab, still starts a hold, and the artist answering a
+    /// question about their unsaved work drags a panel across the screen while they do it. It has
+    /// to be told, which is what `Attention` is.
+    ///
+    /// Both halves in one test on purpose. The half that says the press *does* something when
+    /// nothing is above the workspace is what stops this passing for the wrong reason -- a press
+    /// that missed the tab would satisfy the first assertion on its own.
+    #[test]
+    fn a_question_above_the_workspace_takes_the_pointer() {
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let mut ws = Workspace::default();
+        ws.set_screen(screen);
+        ws.float(PAGE);
+        let id = ws.floating.last().expect("the floated window").id;
+        let tab = {
+            let hand = Hand::new(&mut ws, screen);
+            hand.tab_of(id)
+        };
+
+        press_through_show(&mut ws, screen, tab, Attention::Elsewhere);
+        assert!(
+            !ws.busy(),
+            "a press took hold of a window while a prompt was up"
+        );
+
+        press_through_show(&mut ws, screen, tab, Attention::Workspace);
+        assert!(
+            ws.busy(),
+            "the same press took hold of nothing with the workspace's own attention, so the \
+             assertion above proves nothing"
+        );
+    }
+
+    /// Being asked a question puts any open popup away.
+    ///
+    /// Not tidying: the prompt is drawn in the topmost order, which the popup also uses, and two
+    /// raw layers of one order paint in whatever order the map iterates. A menu left open under a
+    /// prompt could paint over the thing that has to be answered.
+    #[test]
+    fn a_question_puts_the_popup_away() {
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let mut ws = Workspace::default();
+        ws.set_screen(screen);
+        ws.open_panel_list();
+        press_through_show(&mut ws, screen, (700.0, 450.0), Attention::Workspace);
+        assert!(ws.popup.is_some(), "the panel list did not open");
+
+        press_through_show(&mut ws, screen, (700.0, 450.0), Attention::Elsewhere);
+        assert!(ws.popup.is_none(), "a popup stayed open under a prompt");
+
+        // And a request made while the question is up does not open one the moment it is put
+        // away either: the press that asked for it was the artist answering something else.
+        ws.open_panel_list();
+        press_through_show(&mut ws, screen, (700.0, 450.0), Attention::Elsewhere);
+        assert!(ws.popup.is_none(), "a popup opened under a prompt");
+    }
+
+    /// Walking the whole layout history back and forward again reproduces every state exactly.
+    ///
+    /// **Windows included.** A floating window is part of the arrangement, and an `Arrangement`
+    /// that recorded only the docked half would undo a *docked* change by restoring a moment when
+    /// the windows did not exist -- taking every window on screen with it. That is what the
+    /// `gestures` scenario found: dragging one docked tab over the canvas, and both floating
+    /// windows vanished with their panels back in the slots they had been floated out of.
+    ///
+    /// A property rather than one case: every step is compared against what the workspace
+    /// actually looked like at the time, so a step that records nothing, records too much, or
+    /// records the state *after* itself all fail here.
+    #[test]
+    fn every_layout_step_undoes_and_redoes_exactly() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.set_screen(screen);
+
+        // Each step is a thing an artist does, and `seen` is what the workspace looked like
+        // before it. Named so a failure says which one.
+        // A thing an artist does to the workspace, and what to call it in a failure. Named
+        // because the tuple is unreadable inline, and borrowing `screen` is why it is not
+        // `'static`.
+        type Step<'a> = (&'static str, Box<dyn Fn(&mut Workspace) + 'a>);
+        let steps: Vec<Step<'_>> = vec![
+            ("float Page", Box::new(|w: &mut Workspace| w.float(PAGE))),
+            ("float Text", Box::new(|w: &mut Workspace| w.float(TEXT))),
+            (
+                "drag the Colour tab onto the canvas",
+                Box::new(move |w: &mut Workspace| {
+                    let m = w.theme.metrics;
+                    let slots = w.layout.resolve(screen);
+                    let from = slots
+                        .iter()
+                        .find(|slot| showing_of(slot) == COLOUR)
+                        .expect("Colour is docked");
+                    let chrome =
+                        crate::chrome::panel(from, &m, style_of(from), Along::Down, |_| 46.0);
+                    let tab = chrome.tabs.first().expect("a tab").rect;
+                    let grab = (tab.x + tab.w / 2.0, tab.y + tab.h / 2.0);
+                    let onto = slots
+                        .iter()
+                        .find(|slot| showing_of(slot) == CANVAS)
+                        .expect("the canvas");
+                    let drop = (
+                        onto.rect.x + onto.rect.w / 2.0,
+                        onto.rect.y + onto.rect.h / 2.0,
+                    );
+                    let mut hand = Hand::new(w, screen);
+                    hand.drag(grab, drop);
+                }),
+            ),
+            (
+                "carry the Page window across the screen",
+                Box::new(|w: &mut Workspace| {
+                    let id = w
+                        .floating
+                        .iter()
+                        .find(|f| f.layout.find(PAGE).is_some())
+                        .expect("the Page window")
+                        .id;
+                    let grab = {
+                        let hand = Hand::new(w, screen);
+                        hand.tab_of(id)
+                    };
+                    let mut hand = Hand::new(w, screen);
+                    hand.drag(grab, (grab.0 + 250.0, grab.1 + 180.0));
+                }),
+            ),
+        ];
+
+        // The arrangement, and the windows **sorted rather than in list order**. Which window is
+        // in front follows the pointer -- pressing one raises it -- and that is deliberately not
+        // an arrangement change, by exactly the rule that makes tapping a tab leave no trace on
+        // the layout stack. Comparing list order would be asserting the opposite of a decision.
+        let state_of = |w: &Workspace| {
+            let docked = w
+                .layout
+                .resolve(inset(w.screen, w.theme.metrics.gutter))
+                .iter()
+                .map(|slot| {
+                    slot.tabs
+                        .iter()
+                        .map(|p| name_of(*p).to_owned())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect::<Vec<_>>()
+                .join(" / ");
+            let mut windows: Vec<String> = w
+                .floating
+                .iter()
+                .map(|f| {
+                    let showing = f
+                        .layout
+                        .resolve(f.rect)
+                        .iter()
+                        .map(|slot| {
+                            slot.tabs
+                                .iter()
+                                .map(|p| name_of(*p).to_owned())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" / ");
+                    format!(
+                        "{showing}@{:.0},{:.0} {:.0}x{:.0}",
+                        f.rect.x, f.rect.y, f.rect.w, f.rect.h
+                    )
+                })
+                .collect();
+            windows.sort();
+            (docked, windows)
+        };
+
+        let mut seen = vec![state_of(&ws)];
+        for (name, step) in &steps {
+            step(&mut ws);
+            let now = state_of(&ws);
+            assert_ne!(
+                &now,
+                seen.last().expect("a previous state"),
+                "\"{name}\" changed nothing, so the steps after it prove less than they look"
+            );
+            seen.push(now);
+        }
+
+        // All the way back.
+        for want in seen.iter().rev().skip(1) {
+            assert!(ws.undo(), "the history ran out before the arrangement did");
+            assert_eq!(
+                &state_of(&ws),
+                want,
+                "undo did not reproduce the earlier state"
+            );
+        }
+        // And all the way forward.
+        for want in seen.iter().skip(1) {
+            assert!(ws.redo(), "the history ran out going forward");
+            assert_eq!(
+                &state_of(&ws),
+                want,
+                "redo did not reproduce the later state"
+            );
+        }
+    }
+
+    /// Dragging a *docked* tab somewhere else leaves the floating windows alone.
+    ///
+    /// **Reported by the suite, not by a person, which is the only reason it was caught.** The
+    /// `gestures` scenario floats two panels, then drags the Colour tab out over the canvas; the
+    /// tab landed correctly and both windows vanished, their panels back in the docked
+    /// arrangement they had been floated out of. Everything an artist had arranged, undone by an
+    /// unrelated gesture.
+    #[test]
+    fn dragging_a_docked_tab_leaves_the_windows_alone() {
+        let mut ws = bare();
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        ws.set_screen(screen);
+        ws.float(PAGE);
+        ws.float(TEXT);
+        let windows_before: Vec<(FloatId, Rect)> =
+            ws.floating.iter().map(|f| (f.id, f.rect)).collect();
+        assert_eq!(windows_before.len(), 2, "two windows were floated");
+
+        // A docked tab, and somewhere else docked to drop it. Found rather than written down:
+        // the built-in arrangement is not this test's to hardcode.
+        let m = ws.theme.metrics;
+        let slots = ws.layout.resolve(screen);
+        let from = slots
+            .iter()
+            .find(|slot| showing_of(slot) == COLOUR)
+            .expect("Colour is docked to start with");
+        let chrome = crate::chrome::panel(from, &m, style_of(from), Along::Down, |_| 46.0);
+        let tab = chrome.tabs.first().expect("a tab").rect;
+        let grab = (tab.x + tab.w / 2.0, tab.y + tab.h / 2.0);
+        let onto = slots
+            .iter()
+            .find(|slot| showing_of(slot) == CANVAS)
+            .expect("the canvas");
+        let drop = (
+            onto.rect.x + onto.rect.w / 2.0,
+            onto.rect.y + onto.rect.h / 2.0,
+        );
+
+        {
+            let mut hand = Hand::new(&mut ws, screen);
+            hand.drag(grab, drop);
+        }
+
+        let windows_now: Vec<(FloatId, Rect)> =
+            ws.floating.iter().map(|f| (f.id, f.rect)).collect();
+        assert_eq!(
+            windows_now, windows_before,
+            "dragging a docked tab changed the floating windows"
+        );
+        // And the drag itself did what it was for, so this is not passing because nothing
+        // happened at all.
+        assert!(
+            ws.layout
+                .resolve(screen)
+                .iter()
+                .any(|slot| slot.tabs.contains(&COLOUR) && slot.tabs.contains(&CANVAS)),
+            "the tab did not land where it was dropped"
+        );
+    }
+
+    /// Nothing inside a panel answers while a question is up.
+    ///
+    /// The other half of the same rule. `Attention` stops the *workspace* reading the pointer,
+    /// but a panel's contents are drawn with egui and interact through it, so a button behind the
+    /// prompt would still light up and fire under a press aimed at the prompt in front of it.
+    /// Disabling them is what stops it, and it is also what makes it visible: the workspace greys
+    /// while it is not listening.
+    #[test]
+    fn a_panel_under_a_prompt_is_inert() {
+        let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let mut ws = Workspace::default();
+        ws.set_screen(screen);
+        assert!(
+            press_through_show(&mut ws, screen, (700.0, 450.0), Attention::Workspace),
+            "the panels were dead with nothing above them"
+        );
+        assert!(
+            !press_through_show(&mut ws, screen, (700.0, 450.0), Attention::Elsewhere),
+            "a panel under a prompt was still live"
         );
     }
 

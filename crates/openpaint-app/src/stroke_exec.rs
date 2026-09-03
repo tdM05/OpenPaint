@@ -256,10 +256,10 @@ mod tests {
         editor.brush_mut().radius = 12.0;
         let page = editor.page_rect();
 
-        let mut layer = test_stroke_layer(&device);
+        let mut layer = test_stroke_layer(device);
 
-        let mut canvas = test_canvas(&device, page, &layer);
-        let mut history = History::new(&device);
+        let mut canvas = test_canvas(device, page, &layer);
+        let mut history = History::new(device);
         let mut recording = Vec::new();
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
@@ -267,8 +267,8 @@ mod tests {
         editor.stroke_begin(openpaint_core::brush::Sample::at(400.0, 400.0, 1.0));
         editor.stroke_to(openpaint_core::brush::Sample::at(600.0, 420.0, 1.0));
         run_frame(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut canvas,
             &mut layer,
             &mut history,
@@ -282,8 +282,8 @@ mod tests {
         editor.stroke_to(openpaint_core::brush::Sample::at(800.0, 500.0, 1.0));
         editor.stroke_end();
         run_frame(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut canvas,
             &mut layer,
             &mut history,
@@ -296,7 +296,7 @@ mod tests {
             canvas.layer_tiles(L0).count() > 0,
             "the bake allocated no canvas tiles"
         );
-        let pixels = readback_page(&device, &queue, &canvas, L0);
+        let pixels = readback_page(device, queue, &canvas, L0);
         assert!(any_paint(&pixels), "the stroke did not reach the canvas");
         assert_eq!(history.undo_depth(), 1, "the stroke was not recorded");
     }
@@ -313,17 +313,17 @@ mod tests {
         let mut editor = Editor::new();
         editor.brush_mut().radius = 20.0;
         let page = editor.page_rect();
-        let mut layer = test_stroke_layer(&device);
-        let mut canvas = test_canvas(&device, page, &layer);
-        let mut history = History::new(&device);
+        let mut layer = test_stroke_layer(device);
+        let mut canvas = test_canvas(device, page, &layer);
+        let mut history = History::new(device);
         let mut recording = Vec::new();
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
         editor.stroke_begin(openpaint_core::brush::Sample::at(500.0, 500.0, 1.0));
         editor.stroke_end();
         run_frame(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut canvas,
             &mut layer,
             &mut history,
@@ -332,7 +332,7 @@ mod tests {
             &mut editor,
         );
 
-        let pixels = readback_page(&device, &queue, &canvas, L0);
+        let pixels = readback_page(device, queue, &canvas, L0);
         assert!(any_paint(&pixels), "a single-frame tap painted nothing");
     }
 
@@ -348,9 +348,9 @@ mod tests {
         let mut editor = Editor::new();
         editor.brush_mut().radius = 15.0;
         let page = editor.page_rect();
-        let mut layer = test_stroke_layer(&device);
-        let mut canvas = test_canvas(&device, page, &layer);
-        let mut history = History::new(&device);
+        let mut layer = test_stroke_layer(device);
+        let mut canvas = test_canvas(device, page, &layer);
+        let mut history = History::new(device);
         let mut recording = Vec::new();
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
@@ -360,8 +360,8 @@ mod tests {
         editor.stroke_begin(openpaint_core::brush::Sample::at(1600.0, 1600.0, 1.0));
         editor.stroke_end();
         run_frame(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut canvas,
             &mut layer,
             &mut history,
@@ -370,7 +370,7 @@ mod tests {
             &mut editor,
         );
 
-        let pixels = readback_page(&device, &queue, &canvas, L0);
+        let pixels = readback_page(device, queue, &canvas, L0);
         let at = |x: u32, y: u32| pixels[(y * page.w + x) as usize];
         let paper = Canvas::paper_color()[0];
         assert!(
@@ -402,15 +402,15 @@ mod tests {
         editor.brush_mut().radius = 30.0;
         let page = editor.page_rect();
         // Room for four tiles, so a stroke across several forces eviction of its own tiles.
-        let mut layer = test_stroke_layer(&device);
+        let mut layer = test_stroke_layer(device);
         let mut canvas = CanvasRenderer::new(
-            &device,
+            device,
             crate::test_gpu::SURFACE,
             page,
             4 * openpaint_core::tile::TILE_BYTES as u64,
             &layer,
         );
-        let mut history = History::new(&device);
+        let mut history = History::new(device);
         let mut recording = Vec::new();
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
@@ -419,8 +419,8 @@ mod tests {
         editor.stroke_to(openpaint_core::brush::Sample::at(150.0, 150.0, 1.0));
         editor.stroke_end();
         run_frame(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut canvas,
             &mut layer,
             &mut history,
@@ -443,8 +443,8 @@ mod tests {
             editor.stroke_to(openpaint_core::brush::Sample::at(x + 40.0, 740.0, 1.0));
             editor.stroke_end();
             run_frame(
-                &device,
-                &queue,
+                device,
+                queue,
                 &mut canvas,
                 &mut layer,
                 &mut history,
@@ -464,7 +464,7 @@ mod tests {
         let mut enc = device.create_command_encoder(&Default::default());
         assert!(
             canvas
-                .make_resident(&device, &queue, &mut enc, L0, (0, 0))
+                .make_resident(device, queue, &mut enc, L0, (0, 0))
                 .is_some(),
             "the spilled tile could not be restored"
         );
@@ -472,7 +472,7 @@ mod tests {
 
         // Just this tile: most of the canvas is spilled on purpose, so a whole-page readback
         // would (correctly) refuse.
-        let tile = crate::test_gpu::readback_tile(&device, &queue, &canvas, L0, (0, 0))
+        let tile = crate::test_gpu::readback_tile(device, queue, &canvas, L0, (0, 0))
             .expect("resident after the restore");
         let texel = tile[125 * openpaint_core::tile::TILE_SIZE + 125];
         assert!(
@@ -498,9 +498,9 @@ mod tests {
         let mut editor = Editor::new();
         editor.brush_mut().radius = 40.0;
         let page = editor.page_rect();
-        let mut layer = test_stroke_layer(&device);
-        let mut canvas = test_canvas(&device, page, &layer);
-        let mut history = History::new(&device);
+        let mut layer = test_stroke_layer(device);
+        let mut canvas = test_canvas(device, page, &layer);
+        let mut history = History::new(device);
         let mut recording = Vec::new();
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
@@ -509,8 +509,8 @@ mod tests {
         editor.stroke_to(openpaint_core::brush::Sample::at(500.0, 500.0, 1.0));
         editor.stroke_end();
         run_frame(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut canvas,
             &mut layer,
             &mut history,
@@ -526,8 +526,8 @@ mod tests {
         editor.stroke_to(openpaint_core::brush::Sample::at(900.0, 500.0, 1.0));
         editor.stroke_to(openpaint_core::brush::Sample::at(1500.0, 500.0, 1.0));
         run_frame(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut canvas,
             &mut layer,
             &mut history,
@@ -543,8 +543,8 @@ mod tests {
         canvas.begin_frame();
         let mut enc = device.create_command_encoder(&Default::default());
         canvas.prepare(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut enc,
             view.page_to_ndc(VIEW, VIEW),
             view.visible_rect(VIEW, VIEW),
@@ -555,7 +555,7 @@ mod tests {
         );
         queue.submit(std::iter::once(enc.finish()));
         let screen =
-            crate::canvas_renderer::tests::draw_to_target(&device, &queue, &canvas, VIEW, VIEW);
+            crate::canvas_renderer::tests::draw_to_target(device, queue, &canvas, VIEW, VIEW);
 
         let at = |px: f32, py: f32| {
             let (sx, sy) = view.canvas_to_screen(px, py, VIEW, VIEW);
@@ -612,9 +612,9 @@ mod tests {
         let mut editor = Editor::new();
         editor.brush_mut().radius = 30.0;
         let page = editor.page_rect();
-        let mut layer = test_stroke_layer(&device);
-        let mut canvas = test_canvas(&device, page, &layer);
-        let mut history = History::new(&device);
+        let mut layer = test_stroke_layer(device);
+        let mut canvas = test_canvas(device, page, &layer);
+        let mut history = History::new(device);
         let mut recording = Vec::new();
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
@@ -624,8 +624,8 @@ mod tests {
         editor.stroke_end();
         let bottom_id = editor.active_layer_id();
         run_frame_on(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut canvas,
             &mut layer,
             &mut history,
@@ -649,8 +649,8 @@ mod tests {
         editor.stroke_to(openpaint_core::brush::Sample::at(1500.0, 1250.0, 1.0));
         editor.stroke_end();
         run_frame_on(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut canvas,
             &mut layer,
             &mut history,
@@ -662,7 +662,7 @@ mod tests {
 
         // What is on the GPU right now, to compare against.
         let before: std::collections::HashMap<_, _> = canvas
-            .snapshot_all(&device, &queue)
+            .snapshot_all(device, queue)
             .into_iter()
             .map(|(k, t)| (k, t.bytes().to_vec()))
             .collect();
@@ -684,7 +684,7 @@ mod tests {
             }
         }
         let refs = canvas
-            .snapshot_all(&device, &queue)
+            .snapshot_all(device, queue)
             .into_iter()
             .filter_map(|(key, tile)| {
                 let page = *page_of_layer.get(&key.layer.0)?;
@@ -742,9 +742,9 @@ mod tests {
         editor.brush_mut().radius = 40.0;
         editor.brush_mut().hardness = 1.0;
         let page = editor.page_rect();
-        let mut layer = test_stroke_layer(&device);
-        let mut canvas = test_canvas(&device, page, &layer);
-        let mut history = History::new(&device);
+        let mut layer = test_stroke_layer(device);
+        let mut canvas = test_canvas(device, page, &layer);
+        let mut history = History::new(device);
         let mut recording = Vec::new();
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
@@ -754,8 +754,8 @@ mod tests {
         editor.stroke_to(openpaint_core::brush::Sample::at(800.0, 400.0, 1.0));
         editor.stroke_end();
         run_frame_on(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut canvas,
             &mut layer,
             &mut history,
@@ -772,8 +772,8 @@ mod tests {
         editor.stroke_to(openpaint_core::brush::Sample::at(800.0, 400.0, 1.0));
         editor.stroke_end();
         run_frame_on(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut canvas,
             &mut layer,
             &mut history,
@@ -783,9 +783,8 @@ mod tests {
             top,
         );
 
-        let painted =
-            crate::test_gpu::readback_tile(&device, &queue, &canvas, LayerId(top), (2, 1))
-                .expect("resident");
+        let painted = crate::test_gpu::readback_tile(device, queue, &canvas, LayerId(top), (2, 1))
+            .expect("resident");
         let at = |t: &Vec<[f32; 4]>, x: usize, y: usize| {
             t[(y % openpaint_core::tile::TILE_SIZE) * openpaint_core::tile::TILE_SIZE
                 + (x % openpaint_core::tile::TILE_SIZE)]
@@ -803,8 +802,8 @@ mod tests {
         editor.stroke_to(openpaint_core::brush::Sample::at(620.0, 400.0, 1.0));
         editor.stroke_end();
         run_frame_on(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut canvas,
             &mut layer,
             &mut history,
@@ -814,7 +813,7 @@ mod tests {
             top,
         );
 
-        let erased = crate::test_gpu::readback_tile(&device, &queue, &canvas, LayerId(top), (2, 1))
+        let erased = crate::test_gpu::readback_tile(device, queue, &canvas, LayerId(top), (2, 1))
             .expect("resident");
         let hole = at(&erased, 610, 400);
         assert!(
@@ -833,9 +832,8 @@ mod tests {
         assert!(kept[3] > 0.9, "the erase spread too far: {kept:?}");
 
         // And the layer *below* still has its paint -- the erase must not have reached it.
-        let under =
-            crate::test_gpu::readback_tile(&device, &queue, &canvas, LayerId(bottom), (2, 1))
-                .expect("resident");
+        let under = crate::test_gpu::readback_tile(device, queue, &canvas, LayerId(bottom), (2, 1))
+            .expect("resident");
         assert!(
             at(&under, 610, 400)[3] > 0.9,
             "the erase went through to the layer below: {:?}",
@@ -857,9 +855,9 @@ mod tests {
         editor.brush_mut().radius = 40.0;
         editor.brush_mut().hardness = 1.0;
         let page = editor.page_rect();
-        let mut layer = test_stroke_layer(&device);
-        let mut canvas = test_canvas(&device, page, &layer);
-        let mut history = History::new(&device);
+        let mut layer = test_stroke_layer(device);
+        let mut canvas = test_canvas(device, page, &layer);
+        let mut history = History::new(device);
         let mut recording = Vec::new();
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
         let id = editor.active_layer_id();
@@ -868,8 +866,8 @@ mod tests {
         editor.stroke_to(openpaint_core::brush::Sample::at(800.0, 400.0, 1.0));
         editor.stroke_end();
         run_frame_on(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut canvas,
             &mut layer,
             &mut history,
@@ -886,8 +884,8 @@ mod tests {
         editor.stroke_to(openpaint_core::brush::Sample::at(620.0, 400.0, 1.0));
         editor.stroke_end();
         run_frame_on(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut canvas,
             &mut layer,
             &mut history,
@@ -946,9 +944,9 @@ mod tests {
             editor.resize_page(openpaint_core::PageRect::from_size(SIDE, SIDE));
             let page = editor.page_rect();
 
-            let mut layer = test_stroke_layer(&device);
-            let mut canvas = test_canvas(&device, page, &layer);
-            let mut history = History::new(&device);
+            let mut layer = test_stroke_layer(device);
+            let mut canvas = test_canvas(device, page, &layer);
+            let mut history = History::new(device);
             let mut recording = Vec::new();
             let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
 
@@ -966,7 +964,7 @@ mod tests {
                     }
                 }
                 let mut enc = device.create_command_encoder(&Default::default());
-                canvas.upload_dirty(&device, &queue, &mut enc, LayerId(erased_id), &mut cpu);
+                canvas.upload_dirty(device, queue, &mut enc, LayerId(erased_id), &mut cpu);
                 queue.submit(std::iter::once(enc.finish()));
             }
 
@@ -992,8 +990,8 @@ mod tests {
                 editor.stroke_to(openpaint_core::brush::Sample::at(240.0, 120.0, 0.6));
                 editor.stroke_end();
                 run_frame_on(
-                    &device,
-                    &queue,
+                    device,
+                    queue,
                     &mut canvas,
                     &mut layer,
                     &mut history,
@@ -1004,22 +1002,12 @@ mod tests {
                 );
             }
 
-            let painted = crate::test_gpu::readback_tile(
-                &device,
-                &queue,
-                &canvas,
-                LayerId(painted_id),
-                (0, 0),
-            )
-            .expect("the painted layer should be resident");
-            let erased = crate::test_gpu::readback_tile(
-                &device,
-                &queue,
-                &canvas,
-                LayerId(erased_id),
-                (0, 0),
-            )
-            .expect("the erased layer should be resident");
+            let painted =
+                crate::test_gpu::readback_tile(device, queue, &canvas, LayerId(painted_id), (0, 0))
+                    .expect("the painted layer should be resident");
+            let erased =
+                crate::test_gpu::readback_tile(device, queue, &canvas, LayerId(erased_id), (0, 0))
+                    .expect("the erased layer should be resident");
 
             let mut touched = false;
             for y in 0..SIDE as usize {
@@ -1071,9 +1059,9 @@ mod tests {
         let mut editor = Editor::new();
         editor.resize_page(openpaint_core::PageRect::from_size(SIDE, SIDE));
         let page = editor.page_rect();
-        let layer = test_stroke_layer(&device);
-        let mut canvas = test_canvas(&device, page, &layer);
-        let mut stroke = test_stroke_layer(&device);
+        let layer = test_stroke_layer(device);
+        let mut canvas = test_canvas(device, page, &layer);
+        let mut stroke = test_stroke_layer(device);
 
         // Two layers with pixels: a red field below, a blue patch above at 60% Multiply.
         let lower_index = 0;
@@ -1110,11 +1098,11 @@ mod tests {
         let mut fill = |target: LayerId, rect: openpaint_core::PageRect, colour: [f32; 4]| {
             let selection = openpaint_core::Selection::from_rect(rect, page);
             let mut encoder = device.create_command_encoder(&Default::default());
-            stroke.set_page(&queue, page);
-            stroke.set_paint(&queue, colour, 1.0, crate::editor::PaintMode::Normal);
+            stroke.set_page(queue, page);
+            stroke.set_paint(queue, colour, 1.0, crate::editor::PaintMode::Normal);
             stroke.begin_stroke();
-            stroke.fill_from_mask(&device, &queue, &mut encoder, &selection, page);
-            stroke.bake(&device, &queue, &mut encoder, &mut canvas, target);
+            stroke.fill_from_mask(device, queue, &mut encoder, &selection, page);
+            stroke.bake(device, queue, &mut encoder, &mut canvas, target);
             queue.submit(std::iter::once(encoder.finish()));
         };
         // The lower layer stops at 180; the upper patch runs past it to 190. The overhang is
@@ -1137,13 +1125,13 @@ mod tests {
         ];
         let seen_before: Vec<[f32; 4]> = probes
             .iter()
-            .map(|&(x, y)| canvas.sample_page_pixel(&device, &queue, x, y, &layers))
+            .map(|&(x, y)| canvas.sample_page_pixel(device, queue, x, y, &layers))
             .collect();
 
         // The detour has to actually do something: if the upper layer changes nothing, then
         // "the picture is unchanged" is true of a merge that did nothing at all, and the test
         // proves only that removing an invisible layer is invisible.
-        let bare = canvas.sample_page_pixel(&device, &queue, 60, 60, &layers[..1]);
+        let bare = canvas.sample_page_pixel(device, queue, 60, 60, &layers[..1]);
         assert!(
             (bare[2] - seen_before[0][2]).abs() > 0.05
                 || (bare[0] - seen_before[0][0]).abs() > 0.05,
@@ -1155,14 +1143,14 @@ mod tests {
         // Merge, exactly as the app does.
         let upper = layers[upper_index].clone();
         let lower = layers[lower_index].clone();
-        let mut renderer_history = History::new(&device);
+        let mut renderer_history = History::new(device);
         let _ = &mut renderer_history;
-        merge_for_test(&device, &queue, &mut canvas, &upper, &lower);
+        merge_for_test(device, queue, &mut canvas, &upper, &lower);
         editor.document_mut().active_mut().remove_layer(upper_index);
 
         let after_layers = editor.document().active().layers().to_vec();
         for (i, &(x, y)) in probes.iter().enumerate() {
-            let now = canvas.sample_page_pixel(&device, &queue, x, y, &after_layers);
+            let now = canvas.sample_page_pixel(device, queue, x, y, &after_layers);
             for c in 0..4 {
                 assert!(
                     (now[c] - seen_before[i][c]).abs() < 0.02,
@@ -1215,10 +1203,10 @@ mod tests {
         let mut editor = Editor::new();
         editor.resize_page(openpaint_core::PageRect::from_size(SIDE, SIDE));
         let page = editor.page_rect();
-        let layer = test_stroke_layer(&device);
-        let mut canvas = test_canvas(&device, page, &layer);
-        let mut stroke = test_stroke_layer(&device);
-        let mut history = History::new(&device);
+        let layer = test_stroke_layer(device);
+        let mut canvas = test_canvas(device, page, &layer);
+        let mut stroke = test_stroke_layer(device);
+        let mut history = History::new(device);
         let id = LayerId(editor.active_layer_id());
 
         // A rectangle, then a manual half-coverage stripe down one column of it, so the same fill
@@ -1230,17 +1218,17 @@ mod tests {
         selection.set_coverage(120, 100, 128);
 
         let mut encoder = device.create_command_encoder(&Default::default());
-        stroke.set_page(&queue, page);
-        stroke.set_paint(&queue, RED, 1.0, crate::editor::PaintMode::Normal);
+        stroke.set_page(queue, page);
+        stroke.set_paint(queue, RED, 1.0, crate::editor::PaintMode::Normal);
         stroke.begin_stroke();
-        stroke.fill_from_mask(&device, &queue, &mut encoder, &selection, page);
+        stroke.fill_from_mask(device, queue, &mut encoder, &selection, page);
         let tiles = stroke.tiles_to_bake(page);
         let before = history.snapshot_tiles(&mut encoder, &canvas, id, &tiles);
-        stroke.bake(&device, &queue, &mut encoder, &mut canvas, id);
+        stroke.bake(device, queue, &mut encoder, &mut canvas, id);
         queue.submit(std::iter::once(encoder.finish()));
         assert!(before.is_some(), "the fill should have been recordable");
 
-        let after = crate::test_gpu::readback_tile(&device, &queue, &canvas, id, (0, 0))
+        let after = crate::test_gpu::readback_tile(device, queue, &canvas, id, (0, 0))
             .expect("the filled layer should be resident");
         let at = |x: usize, y: usize| after[y * openpaint_core::tile::TILE_SIZE + x];
 
@@ -1288,8 +1276,8 @@ mod tests {
         let mut editor = Editor::new();
         editor.resize_page(openpaint_core::PageRect::from_size(SIDE, SIDE));
         let page = editor.page_rect();
-        let probe = test_stroke_layer(&device);
-        let mut canvas = test_canvas(&device, page, &probe);
+        let probe = test_stroke_layer(device);
+        let mut canvas = test_canvas(device, page, &probe);
         let id = LayerId(editor.active_layer_id());
 
         // A solid square in one corner of the layer.
@@ -1300,7 +1288,7 @@ mod tests {
             }
         }
         let mut enc = device.create_command_encoder(&Default::default());
-        canvas.upload_dirty(&device, &queue, &mut enc, id, &mut cpu);
+        canvas.upload_dirty(device, queue, &mut enc, id, &mut cpu);
         queue.submit(std::iter::once(enc.finish()));
 
         // Lift it through a selection of exactly that square, and put it down 100 px right.
@@ -1309,7 +1297,7 @@ mod tests {
             page,
         );
         // Read the layer back as a tile, the shape `Lifted::from_layer` asks for.
-        let texels = crate::test_gpu::readback_tile(&device, &queue, &canvas, id, (0, 0))
+        let texels = crate::test_gpu::readback_tile(device, queue, &canvas, id, (0, 0))
             .expect("the layer should be resident");
         let mut whole = openpaint_core::tile::Tile::transparent();
         for (i, texel) in texels.iter().enumerate() {
@@ -1362,10 +1350,10 @@ mod tests {
             .collect();
         let (under, over) = (LayerId(layer_ids[0]), LayerId(layer_ids[1]));
 
-        let stroke_probe = test_stroke_layer(&device);
-        let mut canvas = test_canvas(&device, page, &stroke_probe);
-        let mut stroke = test_stroke_layer(&device);
-        let mut history = History::new(&device);
+        let stroke_probe = test_stroke_layer(device);
+        let mut canvas = test_canvas(device, page, &stroke_probe);
+        let mut stroke = test_stroke_layer(device);
+        let mut history = History::new(device);
 
         // Both layers opaque, so anything visible on the lower one after the clear got there by
         // removal and not by painting.
@@ -1377,7 +1365,7 @@ mod tests {
                 }
             }
             let mut enc = device.create_command_encoder(&Default::default());
-            canvas.upload_dirty(&device, &queue, &mut enc, id, &mut cpu);
+            canvas.upload_dirty(device, queue, &mut enc, id, &mut cpu);
             queue.submit(std::iter::once(enc.finish()));
         }
 
@@ -1387,17 +1375,17 @@ mod tests {
         );
 
         let mut encoder = device.create_command_encoder(&Default::default());
-        stroke.set_page(&queue, page);
-        stroke.set_paint(&queue, [0.0; 4], 1.0, crate::editor::PaintMode::Erase);
+        stroke.set_page(queue, page);
+        stroke.set_paint(queue, [0.0; 4], 1.0, crate::editor::PaintMode::Erase);
         stroke.begin_stroke();
-        stroke.fill_from_mask(&device, &queue, &mut encoder, &selection, page);
+        stroke.fill_from_mask(device, queue, &mut encoder, &selection, page);
         let tiles = stroke.tiles_to_bake(page);
         let before = history.snapshot_tiles(&mut encoder, &canvas, over, &tiles);
-        stroke.bake(&device, &queue, &mut encoder, &mut canvas, over);
+        stroke.bake(device, queue, &mut encoder, &mut canvas, over);
         queue.submit(std::iter::once(encoder.finish()));
         assert!(before.is_some(), "the clear should have been recordable");
 
-        let after = crate::test_gpu::readback_tile(&device, &queue, &canvas, over, (0, 0))
+        let after = crate::test_gpu::readback_tile(device, queue, &canvas, over, (0, 0))
             .expect("the cleared layer should be resident");
         let at = |x: usize, y: usize| after[y * openpaint_core::tile::TILE_SIZE + x];
 
@@ -1439,9 +1427,9 @@ mod tests {
         let mut editor = Editor::new();
         editor.resize_page(openpaint_core::PageRect::from_size(SIDE, SIDE));
         let page = editor.page_rect();
-        let mut layer = test_stroke_layer(&device);
-        let mut canvas = test_canvas(&device, page, &layer);
-        let mut history = History::new(&device);
+        let mut layer = test_stroke_layer(device);
+        let mut canvas = test_canvas(device, page, &layer);
+        let mut history = History::new(device);
         let mut recording = Vec::new();
         let mut recording_paint = ([0.0; 4], 1.0, crate::editor::PaintMode::Normal);
         let id = editor.active_layer_id();
@@ -1456,10 +1444,10 @@ mod tests {
         }
         {
             let mut enc = device.create_command_encoder(&Default::default());
-            canvas.upload_dirty(&device, &queue, &mut enc, LayerId(id), &mut cpu);
+            canvas.upload_dirty(device, queue, &mut enc, LayerId(id), &mut cpu);
             queue.submit(std::iter::once(enc.finish()));
         }
-        let before = crate::test_gpu::readback_tile(&device, &queue, &canvas, LayerId(id), (0, 0))
+        let before = crate::test_gpu::readback_tile(device, queue, &canvas, LayerId(id), (0, 0))
             .expect("the layer should be resident");
 
         // Lock it, then scrub right across the patch and well beyond it.
@@ -1481,8 +1469,8 @@ mod tests {
         editor.stroke_to(openpaint_core::brush::Sample::at(180.0, 100.0, 1.0));
         editor.stroke_end();
         run_frame_on(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut canvas,
             &mut layer,
             &mut history,
@@ -1492,7 +1480,7 @@ mod tests {
             id,
         );
 
-        let after = crate::test_gpu::readback_tile(&device, &queue, &canvas, LayerId(id), (0, 0))
+        let after = crate::test_gpu::readback_tile(device, queue, &canvas, LayerId(id), (0, 0))
             .expect("the layer should still be resident");
 
         let at = |t: &Vec<[f32; 4]>, x: usize, y: usize| t[y * openpaint_core::tile::TILE_SIZE + x];

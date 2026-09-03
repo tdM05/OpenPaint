@@ -194,14 +194,16 @@ expect layers 2
 expect layer-names Layer 1, Layer 2
 shot menu-layer-deleted
 
-# File > Export PNG takes no dialog at all: it writes openpaint-<unix seconds>.png into the
-# working directory. No run can name the file it is about to make, and the status message
-# quotes that unpredictable absolute path, so what is asserted here is the rest of it -- that
-# it asked for no dialog, and left the document exactly as it found it. The picture beside
-# this scene and the "exported <path>" line in the run's log are the other half of the proof.
+# File > Export puts the export dialog up rather than writing anything. Driving it to a file is
+# `export.txt`'s job; what is asserted here is that the menu item asks the question and that
+# putting the question away changes nothing about the document.
 press Menu:File
-press Menu:Export PNG
+press Menu:Export
+expect exporting true
 expect dialog false
+shot menu-exporting
+press Not now
+expect exporting false
 expect layers 2
 expect dirty true
 shot menu-exported

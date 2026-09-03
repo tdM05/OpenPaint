@@ -208,6 +208,25 @@ pub enum Op {
     /// A layer moved up or down the stack. Metadata only: nothing is drawn differently, the
     /// composite order changes, and there are no pixels to keep.
     MoveLayer { from: usize, to: usize },
+    /// A layer's settings changed: its opacity, blend, visibility, locks or clipping.
+    ///
+    /// **These were outside undo entirely**, and the argument for leaving them out was that a
+    /// switch is not artwork. It does not survive contact with the medium: dropping a layer to
+    /// 20% by catching the slider looks exactly like a mistake, Ctrl+Z is what anybody presses,
+    /// and what it used to do was take back the *stroke before it* -- destroying work in the
+    /// course of fixing something that was not destroyed. Every comparable application records
+    /// these. One `Settings` on each side rather than a variant per property, so the day a
+    /// property is added it is undoable without anybody remembering to make it so.
+    ///
+    /// Metadata only, like [`Op::MoveLayer`]: no pixel changed, so there is nothing to snapshot.
+    LayerSettings {
+        index: usize,
+        before: openpaint_core::layer::Settings,
+        after: openpaint_core::layer::Settings,
+        /// When it was recorded, so dragging a slider coalesces into one undo -- the same
+        /// mechanism, and for the same reason, as typing into a caption.
+        at: std::time::Instant,
+    },
     /// A page that was made. The mirror of [`Op::DeletePage`], for the same reason
     /// [`Op::AddLayer`] mirrors [`Op::DeleteLayer`]: a document with pages has two ways to change
     /// its shape and both belong in one stack.
@@ -246,7 +265,9 @@ impl Op {
             | Self::DeletePage { tiles, .. } => tiles.into_iter().map(|(_, slot)| slot).collect(),
             Self::AddPage { tiles, .. } => tiles.into_iter().map(|(_, slot)| slot).collect(),
             // Nothing but two indices.
-            Self::MoveLayer { .. } | Self::MovePage { .. } => Vec::new(),
+            Self::MoveLayer { .. } | Self::MovePage { .. } | Self::LayerSettings { .. } => {
+                Vec::new()
+            }
             // Both halves: a merge holds the layer it consumed *and* the before-image of the layer
             // it was folded into. Releasing one and forgetting the other leaks the pool until the
             // app restarts, which is exactly the shape of bug this function exists to prevent.
@@ -443,6 +464,40 @@ impl History {
             self.release(op);
         }
 
+        // A slider dragged across its track is one decision, not forty. The same coalescing the
+        // caption editor gets -- but keyed on *which property moved* as well as on the layer and
+        // the clock.
+        //
+        // **Not the layer alone.** That merged "set the opacity" with "and lock it" whenever they
+        // happened within the window, which they do when a hand moves between two controls: one
+        // Ctrl+Z then undid a decision the artist had not asked it to. What makes a slider drag
+        // one step is that every one of its forty edits changes the same field.
+        if let Op::LayerSettings {
+            index,
+            before,
+            after,
+            at,
+        } = &op
+        {
+            if let Some(Op::LayerSettings {
+                index: prev_index,
+                before: prev_before,
+                after: prev_after,
+                at: prev_at,
+            }) = self.undo.last_mut()
+            {
+                let same_edit = prev_before.differences(*prev_after) == before.differences(*after);
+                if prev_index == index
+                    && same_edit
+                    && at.duration_since(*prev_at).as_millis() < TEXT_COALESCE_MS
+                {
+                    *prev_after = *after;
+                    *prev_at = *at;
+                    return;
+                }
+            }
+        }
+
         if let Op::Content {
             layer,
             after,
@@ -562,7 +617,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut h = history(&device);
+        let mut h = history(device);
         let start = std::time::Instant::now();
         h.push(edit(start, "", "H"));
         h.push(edit(
@@ -595,7 +650,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut h = history(&device);
+        let mut h = history(device);
         let start = std::time::Instant::now();
         h.push(edit(start, "", "Hi"));
         h.push(edit(
@@ -614,7 +669,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut h = history(&device);
+        let mut h = history(device);
         let start = std::time::Instant::now();
         h.push(edit(start, "", "a"));
         h.push(Op::Content {
@@ -635,7 +690,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut h = history(&device);
+        let mut h = history(device);
         let before = h.bytes_held();
         h.push(edit(
             std::time::Instant::now(),
@@ -656,7 +711,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut h = history(&device);
+        let mut h = history(device);
         let start = std::time::Instant::now();
         h.push(edit(start, "", "one"));
         let op = h.pop_undo().expect("an entry");
@@ -677,7 +732,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut h = history(&device);
+        let mut h = history(device);
         assert_eq!((h.undo_depth(), h.redo_depth()), (0, 0));
         h.push(resize());
         assert_eq!((h.undo_depth(), h.redo_depth()), (1, 0));
@@ -697,7 +752,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut h = history(&device);
+        let mut h = history(device);
         h.push(resize());
         let op = h.pop_undo().expect("op");
         h.finish_undo(op);
@@ -714,7 +769,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut h = history(&device);
+        let mut h = history(device);
         for _ in 0..1000 {
             h.push(resize());
         }
@@ -730,7 +785,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut h = history(&device);
+        let mut h = history(device);
         let capacity = h.pool.capacity();
 
         // Fill the pool one single-tile op at a time.
@@ -759,7 +814,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut h = history(&device);
+        let mut h = history(device);
         let capacity = h.pool.capacity();
 
         let one = |h: &mut History| {

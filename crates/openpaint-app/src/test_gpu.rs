@@ -25,7 +25,38 @@ pub const SURFACE: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 pub const SIZE: u32 = 128;
 
 /// A headless device, or `None` where there is no usable adapter.
-pub fn try_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+///
+/// **One device for the whole test binary, not one per test.**
+///
+/// Seventy-odd tests each asked for their own instance, adapter and device, and the harness runs
+/// them across as many threads as the machine has cores -- so a run stood up and tore down dozens
+/// of D3D12 devices at once. The binary peaked at gigabytes, and roughly one run in ten either
+/// hung or died at process level with no named test to blame (`TODO.md` §2). A test that builds a
+/// configuration the application never has is testing something nobody ships.
+///
+/// The application has exactly one device. So does this now. Isolation is unaffected: what a test
+/// wants its own of is a `CanvasRenderer`, a `TilePool` or a `TileStore`, and each of those is
+/// still built per test, on top of the shared device.
+///
+/// **It is never dropped**, because a `static` is not, and that is deliberate rather than
+/// overlooked: the process is ending, the operating system reclaims everything, and the driver
+/// teardown path this used to run dozens of times in parallel is the one that was crashing. Not
+/// running it at all is a better answer than running it once.
+///
+/// The cost, stated: an uncaptured validation error now belongs to the binary rather than to the
+/// test that caused it. That is a real loss of attribution, and it is worth less than a suite
+/// that hangs.
+pub fn try_device() -> Option<(&'static wgpu::Device, &'static wgpu::Queue)> {
+    static DEVICE: std::sync::OnceLock<Option<(wgpu::Device, wgpu::Queue)>> =
+        std::sync::OnceLock::new();
+    DEVICE
+        .get_or_init(open_device)
+        .as_ref()
+        .map(|(device, queue)| (device, queue))
+}
+
+/// Ask the platform for a device. Called once; see [`try_device`].
+fn open_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
         ..Default::default()
@@ -47,6 +78,20 @@ pub fn try_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     .ok()
 }
 
+/// GPU memory a test canvas may hold: 32 tiles.
+///
+/// **Sized to what these tests draw, which is very little.** [`SIZE`] is 128 pixels -- smaller
+/// than a single tile -- and the largest page any of them builds is 512, which is four tiles and
+/// sixteen with layers on top. Thirty-two is double that and still nothing.
+///
+/// It was 128 MiB, which is *two hundred and fifty-six* tiles, and it was allocated up front:
+/// `TilePool::new` creates its whole texture array at once. Seventy-odd GPU tests running across
+/// as many threads as the machine has cores therefore asked an integrated GPU -- which shares its
+/// memory with everything else -- for gigabytes at a time. The test binary sat at 2.6 GB, and the
+/// suite would occasionally hang or die at process level with no named test to blame, which is
+/// `TODO.md` §2. A budget is not free just because it is a maximum.
+const TEST_BUDGET_BYTES: u64 = 32 * openpaint_core::tile::TILE_BYTES as u64;
+
 /// A canvas renderer with a residency budget generous enough that tests exercising the
 /// *paint* path are not also fighting eviction.
 ///
@@ -57,7 +102,7 @@ pub fn test_canvas(
     page: openpaint_core::PageRect,
     stroke: &StrokeLayer,
 ) -> CanvasRenderer {
-    CanvasRenderer::new(device, SURFACE, page, 128 * 1024 * 1024, stroke)
+    CanvasRenderer::new(device, SURFACE, page, TEST_BUDGET_BYTES, stroke)
 }
 
 /// A stroke layer for tests. Separate because the compositor needs it at construction.

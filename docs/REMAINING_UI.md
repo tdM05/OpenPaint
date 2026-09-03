@@ -1,55 +1,42 @@
-# What is left before the old side panel can be deleted
+# The workspace is the UI
 
-The workspace is the UI: the application opens into it, and every section of the old side panel
-that an artist reaches for has a panel of its own. **F2 still switches**, and the old panel is
-still there for one reason, named at the bottom of this file.
+The old side panel is **gone** (2026-09-02), and with it `F2`, which used to switch between the
+two. What follows is the record of what moved where, and of what the descriptor vocabulary still
+lacks -- which is the part that is still true.
 
 Checked against the code, not from memory.
 
-## Moved
+## Where everything lives
 
 One module each, in `crates/openpaint-app/src/panels/`. Each exports one `show`, and every one of
 them is a pure `controls(...)` building the list plus a pure `picked(...)`/`answer(...)` mapping a
-change — which is what makes them testable without a GPU.
+change -- which is what makes them testable without a GPU.
 
 | Panel | What it holds |
 |---|---|
 | Menu | File / Edit / Layer / Select / View, and the panel list |
 | Tools | six tools, with icons |
 | Brush | size, opacity, hardness, spacing, roundness, angle, flow, stabilisation; presets with a name field; the tip; all six response curves with their source pickers; reset |
-| Layers | the list with per-row eyes, blend, opacity, lock alpha, clip below, reorder, add / duplicate / merge / delete |
+| Layers | the list with per-row eyes, blend, opacity, the layer lock, alpha lock, clip below, reorder, add / duplicate / merge / delete |
 | Colour | the wheel in three shapes, the hex readout, and the document palette |
 | Transform | scale, rotation, lock, flips, apply / cancel, resampling |
 | Pages | add, select, reorder, delete |
 | Page | size, extend on four sides, crop, trim |
 | Text | add, convert, load a font, and the whole caption editor |
 | Select | the four tools, the wand's three settings, fill and clear |
-| History | the depth readout, and undo / redo as buttons |
+| History | the depth readout, undo / redo as buttons, and the housekeeping the old panel used to carry: the autosave line, tile residency and traffic, and the pen and frame timings |
 | Canvas | the artwork itself; never a described panel |
 
 History is **ahead** of the old panel rather than level with it: the old one was a readout and
-nothing else. A real list — rows you can click to walk back to — is not reachable, and
+nothing else. A real list -- rows you can click to walk back to -- is not reachable, and
 `panels/history.rs` says exactly why in its module comment and exactly what would be needed.
 
-## The one reason the old panel is still here
+## The prompts are part of it too
 
-Three read-only sections, all diagnostics, with no home in the workspace:
-
-- **View** — zoom and rotation as numbers.
-- **Canvas memory** — GPU tiles resident, tiles spilled to the CPU, and the traffic between.
-- **Speed** — stroke and frame timings, pen sample rate, step size, and the autosave line.
-
-They were always meant to stay out of the workspace: they are development instruments, not artist
-tools, and a panel of them beside the brush settings would be a workspace that mixes two audiences.
-But **deleting the old panel deletes them**, so one of these has to happen first:
-
-1. A **Diagnostics** panel, listed in `PANELS` like any other and simply not in the default
-   arrangement — reached from the panel list when it is wanted. Cheapest, and it keeps them out of
-   the artist's way without throwing them away.
-2. Or they move into the workspace's own settings popup, which is already where the look is set.
-3. Or they are genuinely no longer wanted, and go.
-
-Until one of those, `F2` is the way to them and the old panel earns its place.
+The unsaved-changes question, the offer of recovered work and the export dialog are drawn by the
+same descriptor layer, in the same theme, and land in the same control atlas -- see
+`crates/openpaint-app/src/prompt.rs`. While one is up the workspace is told the pointer is not its
+(`workspace::Attention`), so the panels behind it grey out and cannot be pressed through.
 
 ## What the vocabulary still lacks
 

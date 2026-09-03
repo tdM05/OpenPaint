@@ -718,6 +718,29 @@ fn clip_below_round_trips() {
     assert!(!layers[1].lock_alpha, "clip_below leaked into lock_alpha");
 }
 
+/// A locked layer comes back locked, and nothing else comes back locked with it.
+///
+/// **A lock that did not survive the save would be worse than no lock at all**: an artist who
+/// locked the sketch, saved, reopened and inked would find the lock gone and would have no reason
+/// to check. Three adjacent flag columns is exactly where a mix-up hides, so each is asserted
+/// against the other two.
+#[test]
+fn a_locked_layer_round_trips() {
+    let f = TempFile::new("locked");
+    let mut doc = sample();
+    doc.add_layer();
+    doc.active_mut().layer_mut(0).expect("bottom").locked = true;
+    save(f.path(), &doc, [], &[]).expect("save");
+
+    let back = load(f.path()).expect("load");
+    let layers = back.document.active().layers();
+    assert!(layers[0].locked, "the lock did not survive the file");
+    assert!(!layers[1].locked, "an unlocked layer came back locked");
+    assert!(!layers[0].lock_alpha, "locked leaked into lock_alpha");
+    assert!(!layers[0].clip_below, "locked leaked into clip_below");
+    assert!(layers[0].visible, "locking a layer hid it");
+}
+
 /// A caption is only editable on Thursday if the *text* survived the save, not the pixels.
 #[test]
 fn a_text_layer_round_trips_everything_it_holds() {

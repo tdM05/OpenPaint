@@ -106,13 +106,22 @@ pub struct Pull {
 /// eaten its own handle. So the inner reach shrinks to keep `least` units of interior, reaching
 /// zero exactly at the smallest a window is allowed to be, where the border is entirely outside
 /// it. `least` is the same floor the resize itself stops at, asked once.
+///
+/// **And the top edge reaches outward only, whatever the size.** That rule above is about the
+/// *window* keeping a handle; this is about the handle keeping itself. A window's top edge is its
+/// header, and the header is 28 units tall -- so an inner reach of 13 made the upper half of every
+/// tab a resize border. Grabbing a tab a little high resized the window instead of moving it,
+/// which is the same complaint the panels drew before ("only that tiny little tab is the button"),
+/// arrived at from the other direction. Resizing from the top is still there, from just outside
+/// the window, which is where a frame is.
 #[must_use]
 pub fn edge_at(rect: Rect, grab: f32, least: f32, x: f32, y: f32) -> Option<Pull> {
     let outer = grab / 2.0;
-    let near = |v: f32, low: f32, size: f32| -> Option<i8> {
+    let near = |v: f32, low: f32, size: f32, inner_low: f32| -> Option<i8> {
         let high = low + size;
         let inner = ((size - least) / 2.0).clamp(0.0, outer);
-        if v >= low - outer && v <= low + inner {
+        let inner_low = inner.min(inner_low);
+        if v >= low - outer && v <= low + inner_low {
             Some(-1)
         } else if v >= high - inner && v <= high + outer {
             Some(1)
@@ -123,8 +132,9 @@ pub fn edge_at(rect: Rect, grab: f32, least: f32, x: f32, y: f32) -> Option<Pull
             None
         }
     };
-    let px = near(x, rect.x, rect.w)?;
-    let py = near(y, rect.y, rect.h)?;
+    let px = near(x, rect.x, rect.w, outer)?;
+    // Zero, and only here: see the note above about the header.
+    let py = near(y, rect.y, rect.h, 0.0)?;
     // The middle of both axes is the inside of the panel, which is nobody's edge.
     (px != 0 || py != 0).then_some(Pull { x: px, y: py })
 }
@@ -839,8 +849,10 @@ mod tests {
             (r.x + r.w / 2.0, 0),
             (r.x + r.w - 1.0, 1),
         ];
+        // A unit *outside* the top, because a unit inside it is the header now and belongs to
+        // whoever moves the window -- see `edge_at`.
         let ys = [
-            (r.y + 1.0, -1_i8),
+            (r.y - 1.0, -1_i8),
             (r.y + r.h / 2.0, 0),
             (r.y + r.h - 1.0, 1),
         ];
@@ -907,6 +919,48 @@ mod tests {
                 "the outer half should not give way"
             );
         }
+    }
+
+    /// **The whole of the header is the handle**, and the top border does not reach into it.
+    ///
+    /// The border straddles every other edge, half in and half out. On the top edge the inner half
+    /// would be thirteen units of a twenty-eight unit header -- so a tab grabbed anywhere in its
+    /// upper half resized the window instead of moving it. `windows-apart.txt` was written before
+    /// this rule and holds a tab one physical pixel below the window's top edge; that step used to
+    /// resize.
+    #[test]
+    fn the_top_border_stays_out_of_the_header() {
+        let m = metrics();
+        let (grab, least) = (m.splitter_grab, m.header.max(m.row));
+        let r = Rect::new(60.0, 60.0, 320.0, 338.0);
+        // Every depth into the header, from its very first unit to its last.
+        for dy in [0.5, 1.0, 4.0, 13.0, m.header - 0.5] {
+            assert_eq!(
+                edge_at(r, grab, least, r.x + r.w / 2.0, r.y + dy),
+                None,
+                "{dy} units into the header answered as a border"
+            );
+        }
+        // From outside, the top edge is still a border -- that is where a frame is.
+        for dy in [0.5, 6.0, grab / 2.0 - 0.5] {
+            assert_eq!(
+                edge_at(r, grab, least, r.x + r.w / 2.0, r.y - dy),
+                Some(Pull { x: 0, y: -1 }),
+                "{dy} units above the window was not the top border"
+            );
+        }
+        // And the other three edges keep their inner half: they have a panel body behind them,
+        // not a handle.
+        assert_eq!(
+            edge_at(r, grab, least, r.x + 1.0, r.y + r.h / 2.0),
+            Some(Pull { x: -1, y: 0 }),
+            "the left border lost its inner half"
+        );
+        assert_eq!(
+            edge_at(r, grab, least, r.x + r.w / 2.0, r.y + r.h - 1.0),
+            Some(Pull { x: 0, y: 1 }),
+            "the bottom border lost its inner half"
+        );
     }
 
     /// The edges a pull names move; the others stay exactly where they were.

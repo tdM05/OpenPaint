@@ -260,44 +260,50 @@ pub fn shoot_panels(name: &str, screen: Rect, ws: &mut Workspace) {
             transform_box: None,
             kernel: openpaint_core::Kernel::default(),
             autosave: "",
+            export: None,
             selection: &[],
             select_tool: Some(crate::ui::SelectTool::Wand),
             has_selection: true,
             wand: crate::ui::WandSettings::default(),
         };
-        ws.show(c, screen, |panel, ui, direction, place| {
-            let mut paint = crate::ui::Painting {
-                theme: &theme,
-                direction,
-                input: panel_input.entry(panel.0).or_default(),
-                menu: &mut menu,
-                pick: &mut pick,
-                extend_by: 512,
-                preset_name: "",
-                ctx: c,
-                wheel_shape: &mut wheel_shape,
-                wheel_hold: &mut wheel_hold,
-            };
-            crate::panels::show(
-                panel,
-                ui,
-                &mut brush,
-                &mut colour,
-                &status,
-                &mut paint,
-                place,
-            );
-        });
+        ws.show(
+            c,
+            screen,
+            crate::workspace::Attention::Workspace,
+            |panel, ui, direction, place| {
+                let mut paint = crate::ui::Painting {
+                    theme: &theme,
+                    direction,
+                    input: panel_input.entry(panel.0).or_default(),
+                    menu: &mut menu,
+                    pick: &mut pick,
+                    extend_by: 512,
+                    preset_name: "",
+                    ctx: c,
+                    wheel_shape: &mut wheel_shape,
+                    wheel_hold: &mut wheel_hold,
+                };
+                crate::panels::show(
+                    panel,
+                    ui,
+                    &mut brush,
+                    &mut colour,
+                    &status,
+                    &mut paint,
+                    place,
+                );
+            },
+        );
     });
 
-    let mut renderer = egui_wgpu::Renderer::new(&device, crate::test_gpu::SURFACE, None, 1, true);
+    let mut renderer = egui_wgpu::Renderer::new(device, crate::test_gpu::SURFACE, None, 1, true);
     for pass in &passes {
         for (id, delta) in &pass.textures_delta.set {
-            renderer.update_texture(&device, &queue, *id, delta);
+            renderer.update_texture(device, queue, *id, delta);
         }
     }
     let output = passes.pop().expect("at least one pass");
-    render_to_png(name, screen, &device, &queue, &mut renderer, &ctx, output);
+    render_to_png(name, screen, device, queue, &mut renderer, &ctx, output);
 }
 
 /// A workspace with the built-in arrangement and the built-in look.
@@ -327,20 +333,25 @@ pub fn shoot(name: &str, screen: Rect, pokes: &[Poke], ws: &mut Workspace) {
     };
     let ctx = egui::Context::default();
     let mut passes = run_frames(&ctx, screen, pokes, |c| {
-        ws.show(c, screen, |panel, ui, direction, place| {
-            filler(panel, ui, direction, place);
-        });
+        ws.show(
+            c,
+            screen,
+            crate::workspace::Attention::Workspace,
+            |panel, ui, direction, place| {
+                filler(panel, ui, direction, place);
+            },
+        );
     });
 
-    let mut renderer = egui_wgpu::Renderer::new(&device, crate::test_gpu::SURFACE, None, 1, true);
+    let mut renderer = egui_wgpu::Renderer::new(device, crate::test_gpu::SURFACE, None, 1, true);
     // Every pass's textures, in order: the font atlas arrives with the first one and never again.
     for pass in &passes {
         for (id, delta) in &pass.textures_delta.set {
-            renderer.update_texture(&device, &queue, *id, delta);
+            renderer.update_texture(device, queue, *id, delta);
         }
     }
     let output = passes.pop().expect("at least one pass");
-    render_to_png(name, screen, &device, &queue, &mut renderer, &ctx, output);
+    render_to_png(name, screen, device, queue, &mut renderer, &ctx, output);
 }
 
 /// Rasterise a finished egui frame and write it out.
@@ -667,22 +678,14 @@ mod tests {
             }
         });
         let mut renderer =
-            egui_wgpu::Renderer::new(&device, crate::test_gpu::SURFACE, None, 1, true);
+            egui_wgpu::Renderer::new(device, crate::test_gpu::SURFACE, None, 1, true);
         for pass in &passes {
             for (id, delta) in &pass.textures_delta.set {
-                renderer.update_texture(&device, &queue, *id, delta);
+                renderer.update_texture(device, queue, *id, delta);
             }
         }
         let output = passes.pop().expect("a pass");
-        render_to_png(
-            "icons",
-            screen,
-            &device,
-            &queue,
-            &mut renderer,
-            &ctx,
-            output,
-        );
+        render_to_png("icons", screen, device, queue, &mut renderer, &ctx, output);
     }
 
     /// All three colour wheels, at the size a docked Colour panel gives them.
@@ -753,18 +756,18 @@ mod tests {
             }
         });
         let mut renderer =
-            egui_wgpu::Renderer::new(&device, crate::test_gpu::SURFACE, None, 1, true);
+            egui_wgpu::Renderer::new(device, crate::test_gpu::SURFACE, None, 1, true);
         for pass in &passes {
             for (id, delta) in &pass.textures_delta.set {
-                renderer.update_texture(&device, &queue, *id, delta);
+                renderer.update_texture(device, queue, *id, delta);
             }
         }
         let output = passes.pop().expect("a pass");
         render_to_png(
             "colour-wheels",
             screen,
-            &device,
-            &queue,
+            device,
+            queue,
             &mut renderer,
             &ctx,
             output,
@@ -843,29 +846,34 @@ mod tests {
                 ],
                 |c| {
                     changed.clear();
-                    ws.show(c, screen, |panel, ui, direction, place| {
-                        if panel == crate::workspace::BRUSH {
-                            let theme = Theme::default();
-                            let mut input = crate::panel_draw::PanelInput::default();
-                            changed = crate::panel_draw::show(
-                                ui,
-                                &[Control::Slider {
-                                    id: 0,
-                                    text: "Size".to_owned(),
-                                    value: 14.0,
-                                    min: 0.5,
-                                    max: 400.0,
-                                    unit: "px",
-                                    log: true,
-                                }],
-                                &theme,
-                                direction,
-                                &mut input,
-                            );
-                        } else {
-                            filler(panel, ui, direction, place);
-                        }
-                    });
+                    ws.show(
+                        c,
+                        screen,
+                        crate::workspace::Attention::Workspace,
+                        |panel, ui, direction, place| {
+                            if panel == crate::workspace::BRUSH {
+                                let theme = Theme::default();
+                                let mut input = crate::panel_draw::PanelInput::default();
+                                changed = crate::panel_draw::show(
+                                    ui,
+                                    &[Control::Slider {
+                                        id: 0,
+                                        text: "Size".to_owned(),
+                                        value: 14.0,
+                                        min: 0.5,
+                                        max: 400.0,
+                                        unit: "px",
+                                        log: true,
+                                    }],
+                                    &theme,
+                                    direction,
+                                    &mut input,
+                                );
+                            } else {
+                                filler(panel, ui, direction, place);
+                            }
+                        },
+                    );
                 },
             );
 
@@ -1174,6 +1182,7 @@ mod tests {
                     transform_box: None,
                     kernel: openpaint_core::Kernel::default(),
                     autosave: "",
+                    export: None,
                     selection: &[],
                     select_tool: None,
                     has_selection: false,

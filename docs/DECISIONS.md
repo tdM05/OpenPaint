@@ -87,6 +87,7 @@ as tabs. Sizes are the weights. Stacking is a leaf with several panels. Floating
 second tree in a second window.
 
 ```
+  
 Split(vertical, [
   Split(horizontal, [ Leaf[Layers, History] , Leaf[Canvas] , Leaf[Colour] ]),
   Leaf[Timeline],
@@ -2008,6 +2009,169 @@ live document. Accepting duplicates work in progress; it destroys nothing. Telli
 "abandoned" from "in use" needs an OS file lock, which is not worth a dependency
 until multiple windows exist.
 
+
+### 7b. A picture can get in, and a page can get out — landed 2026-09-02
+
+Until this, `Open` read `.openpaint` and nothing else, and "export" wrote one PNG of the current
+page under a timestamped name into whatever directory the application had been started in. Both
+were placeholders that had outlived their moment: a comics page usually *starts* as a scan, and
+the delivery format this whole application aims at is a webtoon strip, which could not be
+produced at all.
+
+**Import decides by the bytes, not by the name.** PNG and JPEG, sniffed by magic number — a phone
+writes `.jpg`, somebody renames it `.png` when a website asks, and the bytes never change.
+Refusing a perfectly good picture *and saying something untrue about why* is the worst of the
+available behaviours. Two decoders rather than the `image` crate, for the reason the export side
+already gave: `image` brings a dozen formats and the two we need are the two we took.
+
+Opening a picture makes a document sized to it and **leaves `document_path` empty**, so Save asks
+where to put a `.openpaint` rather than quietly writing over somebody's photograph. Placing one
+adds it as a layer above the active one, centred, at its own size — not scaled to fit, because
+pixels thrown away by an automatic resample are gone and moving it is one drag.
+
+**Export is a modal built from the same `Control`s as every panel** (§3's descriptor layer), not
+a second kind of window: this page, every page as numbered files, or every page stacked into one
+tall strip, at 10–100% of the page's size. The scale is applied *while reading the composited
+tiles*, so a quarter-size export of a 2048-pixel page never materialises the full-size image, and
+the average is taken in linear light — downscaling in sRGB is the classic way to make artwork come
+out darker than it is. Numbered files are zero-padded, because `page-9` and `page-10` sort the
+wrong way round in every file manager there is, and the artist would find out from a reader.
+
+---
+
+### 7c. The clipboard is the system's — landed 2026-09-02
+
+There was no clipboard at all: not within OpenPaint and not with the machine. Nobody reads a menu
+to find out whether Ctrl+C works, so its absence read as breakage.
+
+An internal clipboard would have been easier and would have been the wrong thing — the whole value
+is that the pixels can **leave**. Copy takes the selection's content from the *active layer*,
+never the composite: copying what you can see would copy the sketch under the inks and the flats
+under the shading, and pasting the result back would flatten them into one. Every application with
+both offers "copy merged" separately. Cut is copy plus the erase Delete already does, so it costs
+exactly one more undo step than a copy — not two.
+
+Paste lands on a new layer, through the same code an imported file lands through, so "where does
+it go, what is it called, and how does undo take it back" has one answer rather than two.
+
+---
+
+### 7d. Locking a layer, and settings that can be taken back — landed 2026-09-02
+
+**`locked` is not `lock_alpha` and not `visible`.** Alpha lock is a way of *painting* — only where
+there are already pixels — which an artist switches on in order to work. A lock is switched on in
+order not to work on something: the sketch under the inks. Hiding it instead would take away the
+thing you are drawing over, which is the whole reason it is there. Schema **v8** carries it, and a
+lock that did not survive a save would be worse than no lock, because nobody would think to check.
+
+**Layer settings are in the undo stack**, reversing an earlier decision recorded in the code as
+"a switch is not artwork, and Ctrl+Z should reverse artwork". That does not survive the medium:
+catching the opacity slider on the way past looks exactly like a mistake, Ctrl+Z is what anybody
+presses, and what it used to do was take back *the stroke before it* — destroying work in the
+course of fixing something that had not been destroyed. One `layer::Settings` value on each side
+of the operation rather than a variant per property, so a property added later is undoable without
+anyone remembering to make it so; consecutive changes to one layer coalesce, so dragging a slider
+is one undo rather than forty.
+
+---
+
+### 5h. The float is resampled by the GPU — landed 2026-09-02
+
+The live transform preview rebuilt itself on the CPU: every destination pixel, a twenty-tap filter
+over the source, once per pointer sample. 33 ms for a 256-pixel selection and 453 ms for a
+1024-pixel one — not a tuning problem, because resampling is O(area) with a wide filter and no
+amount of care makes the CPU the right machine for a preview that has to keep up with a pen.
+
+**The lifted pixels go up once, at the lift**, as one texture with a transparent pixel of margin on
+every side; each frame, every destination tile the transform touches gets a render pass whose
+fragment shader is `Transform::invert` written out in WGSL — deliberately the same expression in
+the same order, so the preview and the commit cannot disagree about where a pixel goes. The margin
+is why the shader needs no bounds check: `ClampToEdge` extends transparency rather than smearing
+the outermost row of artwork across the page.
+
+`Lifted`, the compositor and the commit are untouched. A floating selection is an ordinary layer
+(§5g), so nothing downstream knows this happened.
+
+**The preview filters bilinear and the commit still filters Mitchell on the CPU.** The commit runs
+once per gesture and that is where the quality is worth paying for (§5d), so the preview is very
+slightly softer than the result it previews — the trade every comparable application makes, and
+the open question `TODO.md` §3 named.
+
+**It falls back rather than failing**: a selection too large for one texture on this device, or a
+machine that will not build the pipeline, goes back to the CPU path. Slow is a complaint; a preview
+that does not appear is a bug.
+
+The safety is one test comparing the GPU tiles against `Lifted::transformed` — the code it
+replaced and the code the commit still uses — and a second that knows independently where a scaled,
+moved square should land, because a mistake shared by both sides would pass the first.
+
+---
+
+### 1d. A window's top edge is its header — landed 2026-09-02
+
+The resize border straddles every edge of a floating window, half outside and half in, at the same
+26-unit reach a divider gets. On the top edge that inner half was thirteen units of a header that
+is twenty-eight units tall — so the upper half of every tab was a resize handle, and a tab grabbed
+a little high resized the window instead of moving it.
+
+The top border now reaches **outward only**. Resizing from the top is still there, from just
+outside the window, which is where a frame is; the whole of the header belongs to the gesture that
+moves the window. The other three edges keep their inner half, because what is behind them is a
+panel body rather than a handle.
+
+Same complaint as *"it is only that tiny little tab that is the button"*, arrived at from the other
+side: there the grab surface was too small, here it was being eaten.
+
+---
+
+### 5i. A selection belongs to the page it was drawn on — landed 2026-09-03
+
+A mask is in page coordinates, so on another page it describes a region of artwork nobody
+selected. `load_from` has said exactly this since the beginning — opening a document clears the
+selection — and turning to another page of the *same* document is the same fact. It was missed:
+the marching ants went on being drawn over a page that had never been selected on, and a fill
+there would have been confined by a shape belonging to a different drawing.
+
+Cleared in `follow_active_page`, which is the one door every page change goes through, and not
+while a transform is in flight: those pixels are in the air and the mask is what puts them down.
+
+**Found by driving a whole session rather than a feature.** Every part of this worked on its own;
+what was wrong was the seam between two of them, and no unit test was ever going to be pointed at
+it. See `tools/scenes/comic.txt`.
+
+---
+
+### 6e. A menu and its popup are one fact — landed 2026-09-02
+
+Choosing a menu item cleared the menu's own state and left the workspace's popup standing, so every
+command reached from a menu left an **empty dark box** over the artwork until something else
+happened to close it. It had been in `menu-new.png` for as long as that screenshot has existed, and
+no scenario noticed because none of them looks at an empty box.
+
+The rule is now kept in both directions, next to each other: a popup dismissed some other way
+clears the menu, and a menu that has closed itself closes the popup. The first fix for this set a
+flag that is read earlier in the same frame — dead the moment it was written, and the scenarios
+passed anyway. Clippy caught it; nothing else would have.
+
+---
+
+### 6f. One place refusals go — landed 2026-09-02
+
+§6b says a refusal must say what happened. `TODO.md` §1 is the audit of where that was not yet
+true, and the note under it said why the audit kept going stale: every refusal wrote its own
+sentence at its own call site, so coverage was a list somebody maintained by hand.
+
+`OpenPaint::refuse` is now the one door, and painting asks `Editor::paint_refusal` for the
+*reason* rather than each caller guessing. The guessing was not hypothetical: every path said
+"this layer's alpha is locked", including on a text layer, where it was simply untrue — the artist
+would go and unlock an alpha lock that was not on. A refusal that sends you somewhere is worse
+than one that says nothing.
+
+Three more that used to happen in silence now speak: painting on a hidden layer (refused
+outright — a stroke that lands and shows nothing is indistinguishable from a broken brush),
+undo and redo with nothing left in the stack, and copy or cut with no selection.
+
+---
 
 ## 8. Roadmap — rewritten 2026-08-29
 

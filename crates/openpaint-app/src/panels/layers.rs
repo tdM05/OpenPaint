@@ -22,6 +22,7 @@ const CLIP_BELOW: ControlId = FIRST_COMMAND + 7;
 const OPACITY: ControlId = FIRST_COMMAND + 8;
 const UP: ControlId = FIRST_COMMAND + 9;
 const DOWN: ControlId = FIRST_COMMAND + 10;
+const LOCKED: ControlId = FIRST_COMMAND + 11;
 
 /// The blend modes, as the dropdown lists them.
 ///
@@ -110,15 +111,29 @@ fn controls(layers: &[Layer], active: usize) -> Vec<Control> {
         text: "Clip to the layer below".to_owned(),
         on: current.is_some_and(Layer::clips_below),
     });
+    // **Above the two that sound like it, not below**, because it is the one an artist reaches
+    // for constantly and the other two are a colouring technique. Named "Lock this layer" rather
+    // than "Lock" so it cannot be misread as the alpha lock two rows down.
+    controls.push(Control::Toggle {
+        id: LOCKED,
+        text: "Lock this layer".to_owned(),
+        on: current.is_some_and(Layer::is_locked),
+    });
     // The old panel carried this in hover text on two one-glyph toggles. There is no hover here,
-    // and a pen has no hover to give -- so what those tooltips said is said in the open. Two
+    // and a pen has no hover to give -- so what those tooltips said is said in the open. Three
     // switches whose names sound alike and whose difference decides a whole colouring workflow are
     // exactly the case where the explanation has to be readable without being hunted for.
+    //
+    // **One clause each, and no longer.** It ran to six lines once the lock was added to it, and
+    // an end-to-end session showed the cost: with four layers the list was down to a single row
+    // and the buttons had gone off the bottom of the panel. An explanation that pushes away the
+    // thing it explains has stopped explaining. What each switch *is* survives the cut; the
+    // second clause on each did not.
     controls.push(Control::Label {
-        text: "Lock alpha paints only where this layer already has pixels and never changes its \
-               transparency -- how colour goes inside line art without a selection. Clipping shows \
-               this layer only where the one beneath it has pixels and leaves it separately \
-               editable -- how shading and highlights sit over flats."
+        text: "Lock sets a layer aside so nothing can change it -- how a sketch survives being \
+               inked over. Lock alpha paints only where the layer already has pixels -- how \
+               colour goes inside line art. Clipping shows a layer only where the one below \
+               it has pixels -- how shading sits over flats."
             .to_owned(),
     });
     controls.push(Control::Separator);
@@ -134,9 +149,8 @@ fn controls(layers: &[Layer], active: usize) -> Vec<Control> {
         });
     }
     controls.push(Control::Label {
-        text: "Multiply darkens what is under it, Screen lightens. Deleting and merging are \
-               undoable -- otherwise they would not be offered. Duplicating is not, because the \
-               way back is to delete the copy."
+        text: "Deleting and merging are undoable -- otherwise they would not be offered. \
+               Duplicating is not: the way back is to delete the copy."
             .to_owned(),
     });
     controls
@@ -168,6 +182,10 @@ fn picked(change: &Change, count: usize, active: usize) -> Option<Picked> {
         Change::Toggled(CLIP_BELOW, clip) => layer(LayerAction::SetClipBelow {
             index: active,
             clip,
+        }),
+        Change::Toggled(LOCKED, locked) => layer(LayerAction::SetLocked {
+            index: active,
+            locked,
         }),
         Change::Set(OPACITY, opacity) => layer(LayerAction::SetOpacity {
             index: active,
@@ -370,6 +388,7 @@ mod tests {
         layers[1].opacity = 0.25;
         layers[1].lock_alpha = true;
         layers[1].clip_below = true;
+        layers[1].locked = true;
         let list = controls(&layers, 1);
 
         assert_eq!(
@@ -392,7 +411,7 @@ mod tests {
                 log: false,
             }
         );
-        for id in [LOCK_ALPHA, CLIP_BELOW] {
+        for id in [LOCK_ALPHA, CLIP_BELOW, LOCKED] {
             assert!(
                 matches!(find(&list, id), Control::Toggle { on: true, .. }),
                 "the switch should be showing the active layer's own setting"
@@ -401,7 +420,7 @@ mod tests {
 
         // And the layer next door has none of it, so the panel is not showing a mixture.
         let list = controls(&layers, 2);
-        for id in [LOCK_ALPHA, CLIP_BELOW] {
+        for id in [LOCK_ALPHA, CLIP_BELOW, LOCKED] {
             assert!(matches!(find(&list, id), Control::Toggle { on: false, .. }));
         }
     }
@@ -524,6 +543,13 @@ mod tests {
             Some(Picked::Layer(LayerAction::SetClipBelow {
                 index: 1,
                 clip: true,
+            }))
+        );
+        assert_eq!(
+            at(Change::Toggled(LOCKED, true)),
+            Some(Picked::Layer(LayerAction::SetLocked {
+                index: 1,
+                locked: true,
             }))
         );
         assert_eq!(

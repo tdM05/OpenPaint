@@ -689,13 +689,13 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut s = store(&device, 4);
-        let mut enc = encoder(&device);
+        let mut s = store(device, 4);
+        let mut enc = encoder(device);
         let layer = s
-            .ensure(&device, &queue, &mut enc, key(0, 0), TRANSPARENT)
+            .ensure(device, queue, &mut enc, key(0, 0), TRANSPARENT)
             .expect("room");
         assert_eq!(
-            s.ensure(&device, &queue, &mut enc, key(0, 0), TRANSPARENT),
+            s.ensure(device, queue, &mut enc, key(0, 0), TRANSPARENT),
             Ok(layer),
             "a second ensure should return the same layer"
         );
@@ -709,17 +709,17 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut s = store(&device, 1);
+        let mut s = store(device, 1);
 
-        let mut enc = encoder(&device);
-        s.ensure(&device, &queue, &mut enc, key(0, 0), TRANSPARENT)
+        let mut enc = encoder(device);
+        s.ensure(device, queue, &mut enc, key(0, 0), TRANSPARENT)
             .expect("first");
         queue.submit(std::iter::once(enc.finish()));
 
         // A later frame, so the first tile is an eligible victim.
         s.begin_frame();
-        let mut enc = encoder(&device);
-        s.ensure(&device, &queue, &mut enc, key(1, 0), TRANSPARENT)
+        let mut enc = encoder(device);
+        s.ensure(device, queue, &mut enc, key(1, 0), TRANSPARENT)
             .expect("evicts the first");
         queue.submit(std::iter::once(enc.finish()));
 
@@ -736,13 +736,13 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut s = store(&device, 1);
+        let mut s = store(device, 1);
 
         // Paint tile (0,0) a known colour by clearing it to red, and mark it dirty.
-        let mut enc = encoder(&device);
+        let mut enc = encoder(device);
         s.ensure(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut enc,
             key(0, 0),
             Init::Clear(wgpu::Color::RED),
@@ -753,8 +753,8 @@ mod tests {
 
         // Next frame: a second tile forces the first out, which now owes a readback.
         s.begin_frame();
-        let mut enc = encoder(&device);
-        s.ensure(&device, &queue, &mut enc, key(1, 0), TRANSPARENT)
+        let mut enc = encoder(device);
+        s.ensure(device, queue, &mut enc, key(1, 0), TRANSPARENT)
             .expect("evicts the first");
         queue.submit(std::iter::once(enc.finish()));
         assert_eq!(s.traffic().0, 1, "a dirty tile must be read back");
@@ -762,14 +762,14 @@ mod tests {
 
         // Next frame: ask for it again. It must come back with its pixels.
         s.begin_frame();
-        let mut enc = encoder(&device);
+        let mut enc = encoder(device);
         let layer = s
-            .ensure(&device, &queue, &mut enc, key(0, 0), TRANSPARENT)
+            .ensure(device, queue, &mut enc, key(0, 0), TRANSPARENT)
             .expect("restored");
         queue.submit(std::iter::once(enc.finish()));
         assert_eq!(s.traffic().1, 1, "it should have been uploaded back");
 
-        let texel = read_texel(&device, &queue, s.pool(), layer);
+        let texel = read_texel(device, queue, s.pool(), layer);
         assert!(
             texel[0] > 0.9 && texel[1] < 0.1 && texel[2] < 0.1,
             "the tile came back wrong: {texel:?}"
@@ -784,12 +784,12 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut s = store(&device, 1);
+        let mut s = store(device, 1);
 
-        let mut enc = encoder(&device);
+        let mut enc = encoder(device);
         s.ensure(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut enc,
             key(0, 0),
             Init::Clear(wgpu::Color::GREEN),
@@ -799,24 +799,24 @@ mod tests {
         s.mark_dirty(key(0, 0));
 
         s.begin_frame();
-        let mut enc = encoder(&device);
-        s.ensure(&device, &queue, &mut enc, key(1, 0), TRANSPARENT)
+        let mut enc = encoder(device);
+        s.ensure(device, queue, &mut enc, key(1, 0), TRANSPARENT)
             .expect("evict");
         queue.submit(std::iter::once(enc.finish()));
 
         // Deliberately *without* a begin_frame, so the readback has had no chance to be
         // drained: `ensure` must resolve it itself.
-        let mut enc = encoder(&device);
+        let mut enc = encoder(device);
         // (1,0) was touched this frame, so it cannot be the victim; make room by removing it.
         if let Some(slot) = s.remove(key(1, 0)) {
             s.release(slot);
         }
         let layer = s
-            .ensure(&device, &queue, &mut enc, key(0, 0), TRANSPARENT)
+            .ensure(device, queue, &mut enc, key(0, 0), TRANSPARENT)
             .expect("restored");
         queue.submit(std::iter::once(enc.finish()));
 
-        let texel = read_texel(&device, &queue, s.pool(), layer);
+        let texel = read_texel(device, queue, s.pool(), layer);
         assert!(
             texel[1] > 0.9 && texel[0] < 0.1,
             "restored from a stale copy: {texel:?}"
@@ -832,17 +832,17 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut s = store(&device, 2);
-        let mut enc = encoder(&device);
+        let mut s = store(device, 2);
+        let mut enc = encoder(device);
 
-        s.ensure(&device, &queue, &mut enc, key(0, 0), TRANSPARENT)
+        s.ensure(device, queue, &mut enc, key(0, 0), TRANSPARENT)
             .expect("first");
-        s.ensure(&device, &queue, &mut enc, key(1, 0), TRANSPARENT)
+        s.ensure(device, queue, &mut enc, key(1, 0), TRANSPARENT)
             .expect("second");
 
         // Both were touched this frame, so a third has nowhere to go.
         assert_eq!(
-            s.ensure(&device, &queue, &mut enc, key(2, 0), TRANSPARENT),
+            s.ensure(device, queue, &mut enc, key(2, 0), TRANSPARENT),
             Err(Pressure::WorkingSetTooLarge)
         );
         assert!(
@@ -853,8 +853,8 @@ mod tests {
         // A frame later, both are eligible and the third fits.
         queue.submit(std::iter::once(enc.finish()));
         s.begin_frame();
-        let mut enc = encoder(&device);
-        s.ensure(&device, &queue, &mut enc, key(2, 0), TRANSPARENT)
+        let mut enc = encoder(device);
+        s.ensure(device, queue, &mut enc, key(2, 0), TRANSPARENT)
             .expect("should fit once the frame moved on");
     }
 
@@ -865,25 +865,25 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut s = store(&device, 2);
+        let mut s = store(device, 2);
 
-        let mut enc = encoder(&device);
-        s.ensure(&device, &queue, &mut enc, key(0, 0), TRANSPARENT)
+        let mut enc = encoder(device);
+        s.ensure(device, queue, &mut enc, key(0, 0), TRANSPARENT)
             .expect("a");
-        s.ensure(&device, &queue, &mut enc, key(1, 0), TRANSPARENT)
+        s.ensure(device, queue, &mut enc, key(1, 0), TRANSPARENT)
             .expect("b");
         queue.submit(std::iter::once(enc.finish()));
 
         // Touch (0,0) again so (1,0) is the older of the two.
         s.begin_frame();
-        let mut enc = encoder(&device);
-        s.ensure(&device, &queue, &mut enc, key(0, 0), TRANSPARENT)
+        let mut enc = encoder(device);
+        s.ensure(device, queue, &mut enc, key(0, 0), TRANSPARENT)
             .expect("touch a");
         queue.submit(std::iter::once(enc.finish()));
 
         s.begin_frame();
-        let mut enc = encoder(&device);
-        s.ensure(&device, &queue, &mut enc, key(2, 0), TRANSPARENT)
+        let mut enc = encoder(device);
+        s.ensure(device, queue, &mut enc, key(2, 0), TRANSPARENT)
             .expect("c");
         queue.submit(std::iter::once(enc.finish()));
 
@@ -902,12 +902,12 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut s = store(&device, 4);
-        let mut enc = encoder(&device);
+        let mut s = store(device, 4);
+        let mut enc = encoder(device);
         let a = s
             .ensure(
-                &device,
-                &queue,
+                device,
+                queue,
                 &mut enc,
                 TileKey::new(LayerId(0), (0, 0)),
                 TRANSPARENT,
@@ -915,8 +915,8 @@ mod tests {
             .expect("layer 0");
         let b = s
             .ensure(
-                &device,
-                &queue,
+                device,
+                queue,
                 &mut enc,
                 TileKey::new(LayerId(1), (0, 0)),
                 TRANSPARENT,
@@ -934,12 +934,12 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut s = store(&device, 1);
+        let mut s = store(device, 1);
 
-        let mut enc = encoder(&device);
+        let mut enc = encoder(device);
         s.ensure(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut enc,
             key(0, 0),
             Init::Clear(wgpu::Color::RED),
@@ -950,8 +950,8 @@ mod tests {
 
         // Spill it, then delete it.
         s.begin_frame();
-        let mut enc = encoder(&device);
-        s.ensure(&device, &queue, &mut enc, key(1, 0), TRANSPARENT)
+        let mut enc = encoder(device);
+        s.ensure(device, queue, &mut enc, key(1, 0), TRANSPARENT)
             .expect("evict");
         queue.submit(std::iter::once(enc.finish()));
         assert!(s.contains(key(0, 0)));

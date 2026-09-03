@@ -1,0 +1,79 @@
+# Copy, cut and paste -- which did not exist at all before, in any form.
+#
+# Not "there was no *system* clipboard": there was no clipboard. Ctrl+C did nothing, and so did
+# every other way of asking. Nobody reads a menu to find out whether copy works, so its absence
+# read as breakage rather than as a missing feature, and it cut the application off from every
+# other program on the machine.
+#
+# The round trip here goes out through the operating system's clipboard and back in again, which
+# is the whole point of it: what this proves is that the pixels can leave.
+
+expect layers 1
+expect layer-names Layer 1
+expect undo 0
+
+# Three strokes in the top-left quarter of the page, so there is a solid patch to copy and so the
+# place it came from is somewhere the paste will not land.
+drag 480 300 700 470
+drag 480 340 700 510
+drag 480 380 700 550
+expect undo 3
+ink 500 320 680 520 20
+
+# The middle of the page is bare, and stays the thing every paste below is measured against.
+ink 920 700 1010 790 0
+
+# --- Copy, then paste: a new layer, centred, with the pixels on it ---
+#
+# The copy is the *content* of the selection rather than its rectangle -- a lasso round a small
+# mark in a big loop should copy the mark -- so what comes back is the patch, centred on the page,
+# nowhere near where it was drawn.
+key ctrl+a
+key ctrl+c
+key ctrl+v
+expect layers 2
+expect layer-names Layer 1, Pasted
+ink 920 700 1010 790 10
+shot clipboard-pasted
+
+# One gesture, one undo step, and the pixels go with the layer.
+key ctrl+z
+expect layers 1
+ink 920 700 1010 790 0
+key ctrl+shift+z
+expect layers 2
+ink 920 700 1010 790 10
+key ctrl+z
+expect layers 1
+
+# --- Cut: the same, and the pixels leave the layer they came from ---
+#
+# A cut is a copy and the erase that Delete already does, so it costs exactly one more undo step
+# than the copy did -- not two, and not none.
+key ctrl+a
+key ctrl+x
+ink 500 320 680 520 0
+key ctrl+v
+expect layers 2
+ink 920 700 1010 790 10
+shot clipboard-cut-and-pasted
+
+# Undo puts back the paste, then the cut: the patch returns to where it was drawn.
+key ctrl+z
+expect layers 1
+key ctrl+z
+ink 500 320 680 520 20
+
+# --- Refused out loud, both ways ---
+#
+# With nothing selected there is nothing to copy, and with nothing on the clipboard there is
+# nothing to paste. Both have to say so: a shortcut that silently does nothing is the failure
+# DECISIONS 6b is about, and it is the one people report as "copy is broken".
+key ctrl+d
+key ctrl+c
+expect status Select something first: there is nothing to be copied.
+expect layers 1
+key ctrl+x
+expect status Select something first: there is nothing to be cut.
+expect layers 1
+shot clipboard-refused

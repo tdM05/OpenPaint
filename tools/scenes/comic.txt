@@ -1,0 +1,210 @@
+# A page, start to finish, the way somebody would actually make one.
+#
+# Every other scenario here drives one panel or one command. This drives a *session*: a scan comes
+# in, gets locked out of the way, is inked over on a layer of its own, coloured, lettered,
+# transformed, copied onto a second page, exported as a strip, saved, and opened again. Nothing in
+# it is new ground -- every step is covered somewhere else -- and that is the point. The failures
+# this kind of run finds are the ones between features, where each half works and the pair does
+# not.
+#
+# It is also the run to *look* at. Its shots are in order and they are meant to be read as a
+# sequence: if something is drawn wrong, or in the wrong place, or is missing, this is where it
+# shows.
+#
+# Coordinates on the canvas are in the window's own pixels. The page is 2048x2048 fitted into the
+# canvas panel, which puts it at x 320..1609, y 103..1392 -- so the middle of the page is about
+# (964, 748) and a comfortable working area is 500..1400 by 250..1250.
+
+expect pages 1
+expect layers 1
+expect undo 0
+expect dirty false
+shot comic-01-empty
+
+# --- The sketch comes in from a scan, and is set aside ---
+#
+# Place, not Open: the page is already the size it should be, and the scan is a reference to draw
+# over rather than the document itself.
+press Menu:File
+press Menu:Place image
+wait 3000
+expect dialog true
+type C:\Users\taddm\code\OpenPaint\target\drive\import-fixture.png
+wait 1000
+key enter
+wait 2500
+expect dialog false
+expect layers 2
+expect layer-names Layer 1, import-fixture
+
+# Down to a quarter, so it reads as a sketch under the ink rather than competing with it, and then
+# locked so that no stroke can land on it by accident. Both are undoable now, which is the whole
+# reason the lock is safe to reach for.
+slide Layers:Opacity 0.25
+about active.opacity 0.25 0.05
+press Lock this layer
+expect active.locked true
+shot comic-02-sketch-placed
+
+# Drawing on it is refused, by name, which is what makes the lock worth having.
+drag 700 500 900 700
+expect status "import-fixture" is locked, so it cannot be painted on. Unlock it in the Layers panel.
+expect undo 3
+
+# --- Inking, on a layer of its own ---
+press Layers:Add
+expect layers 3
+expect active.locked false
+drag 600 400 1300 400
+drag 1300 400 1300 1100
+drag 1300 1100 600 1100
+drag 600 1100 600 400
+expect undo 8
+ink 600 400 1300 1100 20
+shot comic-03-inked
+
+# --- Colour, chosen from the wheel and put down with the bucket ---
+#
+# The wand with "fill on click" *is* the bucket, and the panel says so. Filling inside the box just
+# drawn is the colouring workflow in one press: a region found by colour, confined to what the ink
+# encloses.
+tab Colour
+pressat colour:0 188 142
+expect colour 414180
+tab Select
+press Select:Wand
+expect select-tool wand
+click 950 750
+expect undo 9
+shot comic-04-filled
+
+# --- A second layer of ink, transformed ---
+#
+# Lasso a corner of the box, lift it, turn it, and put it down. The transform preview is drawn by
+# the GPU now, so this is also the one place a whole session sees that path.
+tab Select
+press Select:Lasso
+expect select-tool lasso
+path 620 420 900 420 900 620 620 620 620 420
+expect selection true
+tab Transform
+press Transform selection
+expect dragging true
+slide Transform:Rotation 0.6
+press Transform:Apply
+expect status Applied the transform
+expect dragging false
+shot comic-05-transformed
+
+# --- Lettering ---
+tab Text
+press text:Add text layer
+expect layers 4
+expect active.kind text
+press text:Caption
+type Panel one
+# Committed with Enter before the name is asked for: a caption is applied when the field is
+# finished with, never per keystroke, or a layer would be renamed once per letter and the undo
+# stack would fill with them.
+key enter
+wait 500
+expect active.name Panel one
+shot comic-06-lettered
+
+# --- A second page, and the panel copied onto it ---
+#
+# **Onto the inking layer first.** Copy takes the selection's content from the *active* layer and
+# never from the composite (DECISIONS 7c), which is what every application does by default -- so
+# copying while the caption is active copies the caption. Driving this as an artist would is what
+# showed it: the first run of this scene pasted the words "Panel one" onto page two and was
+# perfectly correct to.
+key ctrl+d
+tab Layers
+press layers:2
+expect active.name Layer 3
+tab Select
+press Select:Rect
+drag 620 420 1000 800
+expect selection true
+# The message names the size of what was copied, and that is the *content's* size rather than the
+# selection's -- a lasso round a small mark in a big loop copies the mark. Which pixels of the ink
+# fall inside this rectangle is not something a scene can predict, so what is asserted is that
+# something was copied and that pasting it produces a layer with ink on it.
+key ctrl+c
+tab Pages
+press pages:Add page
+expect pages 2
+expect page 1
+expect layers 1
+# **The selection stayed behind with its page.** A mask is in page coordinates, so on another page
+# it describes a region of artwork nobody selected -- and the marching ants used to go on being
+# drawn over it.
+expect selection false
+key ctrl+v
+expect layers 2
+expect layer-names Layer 1, Pasted
+ink 900 700 1030 830 10
+shot comic-07-second-page
+
+# --- Out as a strip, and saved ---
+press Menu:File
+press Menu:Export
+press Every page, one tall strip
+press Export
+wait 3000
+expect dialog true
+type C:\Users\taddm\code\OpenPaint\target\drive\out-comic.png
+wait 1000
+key enter
+wait 3000
+expect dialog false
+wrote C:\Users\taddm\code\OpenPaint\target\drive\out-comic.png 2048x4096
+
+key ctrl+s
+wait 3000
+expect dialog true
+type C:\Users\taddm\code\OpenPaint\target\drive\out-comic-page
+wait 1000
+key enter
+wait 3000
+expect dialog false
+expect dirty false
+expect file out-comic-page.openpaint
+shot comic-08-saved
+
+# --- And opened again, which is the only proof the file is worth anything ---
+press Menu:File
+press Menu:New
+expect layers 1
+expect pages 1
+press Menu:File
+press Menu:Open
+wait 3000
+expect dialog true
+type C:\Users\taddm\code\OpenPaint\target\drive\out-comic-page.openpaint
+wait 1000
+key enter
+wait 3000
+expect dialog false
+expect pages 2
+expect file out-comic-page.openpaint
+
+# Everything the session made, back off the disk: the pages, the layers of page one, their names,
+# the lock on the sketch, and the ink.
+tab Pages
+press pages:Page 1
+expect layers 4
+# Bottom to top: the layer the document started with, the scan placed above it, the inking layer,
+# and the caption. The scan keeps its file name, which is the whole point of naming a placed layer
+# after the file -- a document reopened a week later says where its sketch came from -- and the
+# text layer is named after its own words.
+expect layer-names Layer 1, import-fixture, Layer 3, Panel one
+# **The lock survived the file.** A lock that did not would be worse than none: the artist would
+# have no reason to check, and would ink straight onto the sketch.
+tab Layers
+press layers:1
+expect active.name import-fixture
+expect active.locked true
+about active.opacity 0.25 0.05
+ink 600 400 1300 1100 20
+shot comic-09-reopened

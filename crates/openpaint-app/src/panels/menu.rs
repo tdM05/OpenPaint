@@ -188,19 +188,31 @@ pub(crate) fn menu_items(
         0 => vec![
             named("New", Picked::Command(Command::New)),
             named("Open", Picked::Command(Command::Open)),
+            // Directly under Open, because "get a picture in" is the same errand: Open replaces
+            // what is here, Place adds to it, and the pair is easier to tell apart together than
+            // either is to find alone.
+            named("Place image", Picked::Command(Command::PlaceImage)),
             named("Save", Picked::Command(Command::Save)),
             named("Save As", Picked::Command(Command::SaveAs)),
-            named("Export PNG", Picked::Command(Command::ExportPng)),
+            // Not "Export PNG" any more: it asks what to export and where to put it, and the
+            // format was never the interesting half of that sentence.
+            named("Export", Picked::Command(Command::ExportPng)),
         ],
         1 => {
             let mut items = vec![
                 named("Undo", Picked::Command(Command::Undo)),
                 named("Redo", Picked::Command(Command::Redo)),
+                // Paste is offered whatever is selected: what it needs is on the clipboard,
+                // which this panel cannot see and must not guess about. Copy and Cut need a
+                // selection and are added below with the rest of the selection commands.
+                named("Paste", Picked::Command(Command::Paste)),
             ];
             // **Not offered with nothing selected**, for the same reason Delete is not offered on
             // the only layer: a menu that offers what it will refuse teaches you not to trust the
             // menu. Filling "the selection" when there is none has nothing to fill.
             if has_selection {
+                items.push(named("Copy", Picked::Command(Command::Copy)));
+                items.push(named("Cut", Picked::Command(Command::Cut)));
                 items.push(named(
                     "Fill selection",
                     Picked::Selection(SelectAction::Fill),

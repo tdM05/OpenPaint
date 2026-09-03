@@ -369,7 +369,7 @@ mod tests {
             return;
         };
         // 64 MiB of 512 KiB tiles.
-        let n = layers_for_budget(&device, BPT, 64 * 1024 * 1024);
+        let n = layers_for_budget(device, BPT, 64 * 1024 * 1024);
         let limit = device.limits().max_texture_array_layers;
         assert_eq!(n, 128.min(limit));
     }
@@ -382,7 +382,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        assert_eq!(layers_for_budget(&device, BPT, 1), 1);
+        assert_eq!(layers_for_budget(device, BPT, 1), 1);
     }
 
     /// The device's array limit is a hard ceiling, and exceeding it fails texture
@@ -395,7 +395,7 @@ mod tests {
         };
         let huge = 1024u64 * 1024 * 1024 * 1024;
         assert_eq!(
-            layers_for_budget(&device, BPT, huge),
+            layers_for_budget(device, BPT, huge),
             device.limits().max_texture_array_layers
         );
     }
@@ -406,7 +406,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut p = pool(&device, 3);
+        let mut p = pool(device, 3);
         let slots: Vec<Slot> = std::iter::from_fn(|| p.alloc()).collect();
         assert_eq!(slots.len(), 3);
         assert_eq!(p.used(), p.capacity());
@@ -426,7 +426,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut p = pool(&device, 1);
+        let mut p = pool(device, 1);
         let s = p.alloc().expect("first alloc");
         assert!(p.alloc().is_none());
         p.free(s);
@@ -440,7 +440,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut p = pool(&device, 4);
+        let mut p = pool(device, 4);
         assert_eq!(p.bytes_used(), 0);
         let s = p.alloc().expect("alloc");
         assert_eq!(p.bytes_used(), 512 * 1024);
@@ -456,7 +456,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut p = pool(&device, 2);
+        let mut p = pool(device, 2);
         let mut m = TileMap::default();
 
         let a = p.alloc().expect("a");
@@ -482,7 +482,7 @@ mod tests {
             eprintln!("skipping: no usable GPU adapter");
             return;
         };
-        let mut p = pool(&device, 2);
+        let mut p = pool(device, 2);
         let mut m = TileMap::default();
         let s = p.alloc().expect("alloc");
         assert!(m.insert((-3, -7), s).is_none());

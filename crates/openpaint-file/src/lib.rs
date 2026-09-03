@@ -57,7 +57,7 @@ use openpaint_core::{
 /// the counter proved derivable from the layers themselves. Both were `NOT NULL`, so a version-1
 /// *writer* cannot fill a version-2 file -- hence the bump. Reading needs no branch at all: a
 /// version-2 reader simply stops asking for them, which works on both.
-pub const SCHEMA_VERSION: i32 = 7;
+pub const SCHEMA_VERSION: i32 = 8;
 
 /// How a tile's bytes are encoded in the file.
 ///
@@ -270,6 +270,7 @@ const STRUCTURE_SCHEMA: &str = "
             visible  INTEGER NOT NULL,
             lock_alpha INTEGER NOT NULL DEFAULT 0,
             clip_below INTEGER NOT NULL DEFAULT 0,
+            locked     INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (page_idx, idx)
         );
         CREATE TABLE layer_text (
@@ -366,6 +367,7 @@ fn migrate(db: &rusqlite::Connection, from: i32) -> Result<(), Error> {
     //   v4 added `layer.lock_alpha`; v5 added `layer.clip_below`.
     //   v6 added `layer_text`.
     //   v7 added `palette`.
+    //   v8 added `layer.locked`.
     //
     // Nothing is migrated *into* the new shapes, and nothing needs to be: a file written before a
     // flag existed did not have that flag set, and one written before `layer_text` had no text
@@ -465,8 +467,9 @@ pub fn save(
         for (li, layer) in page.layers().iter().enumerate() {
             tx.execute(
                 "INSERT INTO layer
-                     (page_idx, idx, id, name, opacity, blend, visible, lock_alpha, clip_below)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     (page_idx, idx, id, name, opacity, blend, visible, lock_alpha, clip_below,
+                      locked)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     index as i64,
                     li as i64,
@@ -477,6 +480,7 @@ pub fn save(
                     i64::from(layer.visible),
                     i64::from(layer.lock_alpha),
                     i64::from(layer.clip_below),
+                    i64::from(layer.locked),
                 ],
             )?;
             if let Some(block) = layer.text() {
@@ -586,7 +590,7 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
         db.prepare("SELECT idx, x, y, w, h, dpi, active_layer FROM page ORDER BY idx")?;
     let mut layer_stmt = db
         .prepare(
-            "SELECT id, name, opacity, blend, visible, lock_alpha, clip_below
+            "SELECT id, name, opacity, blend, visible, lock_alpha, clip_below, locked
          FROM layer WHERE page_idx = ?1 ORDER BY idx",
         )
         // v4 added `lock_alpha`. Prefer the richer query and fall back to one that supplies the default
@@ -595,7 +599,7 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
         // position lock -- and this is the pattern each should follow.
         .or_else(|_| {
             db.prepare(
-                "SELECT id, name, opacity, blend, visible, 0, 0
+                "SELECT id, name, opacity, blend, visible, 0, 0, 0
              FROM layer WHERE page_idx = ?1 ORDER BY idx",
             )
         })?;
@@ -667,15 +671,17 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
                     r.get::<_, i64>(4)? != 0,
                     r.get::<_, i64>(5)? != 0,
                     r.get::<_, i64>(6)? != 0,
+                    r.get::<_, i64>(7)? != 0,
                 ))
             })?
             .enumerate()
             .map(|(layer_idx, row)| {
-                let (id, name, opacity, blend_text, visible, lock_alpha, clip_below) = row?;
+                let (id, name, opacity, blend_text, visible, lock_alpha, clip_below, locked) = row?;
                 let blend = blend_from_name(&blend_text)
                     .ok_or_else(|| Error::Malformed(format!("unknown blend {blend_text:?}")))?;
                 let layer =
-                    Layer::restored(id, name, opacity, blend, visible, lock_alpha, clip_below);
+                    Layer::restored(id, name, opacity, blend, visible, lock_alpha, clip_below)
+                        .with_lock(locked);
                 Ok(match blocks.remove(&layer_idx) {
                     Some(block) => layer.with_text(block),
                     None => layer,

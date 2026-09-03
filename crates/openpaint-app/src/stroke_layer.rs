@@ -1504,19 +1504,19 @@ mod tests {
         let (device, queue) = try_device().expect("checked by caller");
 
         let page = openpaint_core::PageRect::from_size(SIZE, SIZE);
-        let mut layer = test_stroke_layer(&device);
-        let mut canvas = test_canvas(&device, page, &layer);
+        let mut layer = test_stroke_layer(device);
+        let mut canvas = test_canvas(device, page, &layer);
 
         // Every uniform written once, before the single submission -- the ordering rule
         // this module exists to respect.
-        layer.set_page(&queue, page);
-        layer.set_tip(&device, &queue, tip);
-        layer.set_paint(&queue, BLACK, opacity, crate::editor::PaintMode::Normal);
-        layer.upload_dabs(&device, &queue, dabs);
+        layer.set_page(queue, page);
+        layer.set_tip(device, queue, tip);
+        layer.set_paint(queue, BLACK, opacity, crate::editor::PaintMode::Normal);
+        layer.upload_dabs(device, queue, dabs);
 
         let mut encoder = device.create_command_encoder(&Default::default());
         layer.begin_stroke();
-        let tiles = layer.prepare_tiles(&queue, &mut encoder, dabs, page);
+        let tiles = layer.prepare_tiles(queue, &mut encoder, dabs, page);
 
         // Split into `batches` draw calls, mimicking several input batches landing in a
         // single frame.
@@ -1529,10 +1529,10 @@ mod tests {
                 start += len;
             }
         }
-        layer.bake(&device, &queue, &mut encoder, &mut canvas, L0);
+        layer.bake(device, queue, &mut encoder, &mut canvas, L0);
         queue.submit(std::iter::once(encoder.finish()));
 
-        readback_page(&device, &queue, &canvas, L0)
+        readback_page(device, queue, &canvas, L0)
     }
 
     /// Rasterize the same dabs through the CPU reference implementation.
@@ -1574,25 +1574,25 @@ mod tests {
         let (device, queue) = try_device().expect("checked by caller");
 
         let page = openpaint_core::PageRect::from_size(SIZE, SIZE);
-        let mut layer = test_stroke_layer(&device);
-        let mut canvas = test_canvas(&device, page, &layer);
+        let mut layer = test_stroke_layer(device);
+        let mut canvas = test_canvas(device, page, &layer);
 
-        layer.set_page(&queue, page);
-        layer.set_tip(&device, &queue, &openpaint_core::dab::Tip::default());
-        layer.set_paint(&queue, BLACK, 1.0, crate::editor::PaintMode::Normal);
-        layer.confine_to(&queue, selection.cloned());
-        layer.upload_dabs(&device, &queue, dabs);
+        layer.set_page(queue, page);
+        layer.set_tip(device, queue, &openpaint_core::dab::Tip::default());
+        layer.set_paint(queue, BLACK, 1.0, crate::editor::PaintMode::Normal);
+        layer.confine_to(queue, selection.cloned());
+        layer.upload_dabs(device, queue, dabs);
 
         let mut encoder = device.create_command_encoder(&Default::default());
         layer.begin_stroke();
-        let tiles = layer.prepare_tiles(&queue, &mut encoder, dabs, page);
+        let tiles = layer.prepare_tiles(queue, &mut encoder, dabs, page);
         for index in 0..tiles {
             layer.stamp_range(&mut encoder, index, 0, dabs.len());
         }
-        layer.bake(&device, &queue, &mut encoder, &mut canvas, L0);
+        layer.bake(device, queue, &mut encoder, &mut canvas, L0);
         queue.submit(std::iter::once(encoder.finish()));
 
-        readback_page(&device, &queue, &canvas, L0)
+        readback_page(device, queue, &canvas, L0)
     }
 
     /// A brush stops at the edge of a selection, and a partly selected pixel takes partly.
@@ -1678,28 +1678,28 @@ mod tests {
             page,
         );
 
-        let mut layer = test_stroke_layer(&device);
-        let mut canvas = test_canvas(&device, page, &layer);
+        let mut layer = test_stroke_layer(device);
+        let mut canvas = test_canvas(device, page, &layer);
         // Centred on the boundary and wide enough to reach well into both tiles.
         let dabs = [dab(side as f32, side as f32 / 2.0, 100.0, 1.0, 1.0)];
 
-        layer.set_page(&queue, page);
-        layer.set_tip(&device, &queue, &openpaint_core::dab::Tip::default());
-        layer.set_paint(&queue, BLACK, 1.0, crate::editor::PaintMode::Normal);
-        layer.confine_to(&queue, Some(selection));
-        layer.upload_dabs(&device, &queue, &dabs);
+        layer.set_page(queue, page);
+        layer.set_tip(device, queue, &openpaint_core::dab::Tip::default());
+        layer.set_paint(queue, BLACK, 1.0, crate::editor::PaintMode::Normal);
+        layer.confine_to(queue, Some(selection));
+        layer.upload_dabs(device, queue, &dabs);
 
         let mut encoder = device.create_command_encoder(&Default::default());
         layer.begin_stroke();
-        let tiles = layer.prepare_tiles(&queue, &mut encoder, &dabs, page);
+        let tiles = layer.prepare_tiles(queue, &mut encoder, &dabs, page);
         assert!(tiles >= 2, "the dab should straddle two tiles, got {tiles}");
         for index in 0..tiles {
             layer.stamp_range(&mut encoder, index, 0, dabs.len());
         }
-        layer.bake(&device, &queue, &mut encoder, &mut canvas, L0);
+        layer.bake(device, queue, &mut encoder, &mut canvas, L0);
         queue.submit(std::iter::once(encoder.finish()));
 
-        let left = crate::test_gpu::readback_tile(&device, &queue, &canvas, L0, (0, 0))
+        let left = crate::test_gpu::readback_tile(device, queue, &canvas, L0, (0, 0))
             .expect("the left tile was painted");
         let at = |t: &[[f32; 4]], x: usize, y: usize| t[y * openpaint_core::tile::TILE_SIZE + x];
         assert!(
@@ -1714,7 +1714,7 @@ mod tests {
         );
 
         // The right tile is outside the selection entirely. Absent coverage means none, not all.
-        if let Some(right) = crate::test_gpu::readback_tile(&device, &queue, &canvas, L0, (1, 0)) {
+        if let Some(right) = crate::test_gpu::readback_tile(device, queue, &canvas, L0, (1, 0)) {
             for x in [10, 40, 80] {
                 assert!(
                     at(&right, x, 128)[3] < 0.01,
@@ -1742,10 +1742,10 @@ mod tests {
         let dabs = [dab(64.0, 64.0, 50.0, 1.0, 1.0)];
 
         let (device, queue) = try_device().expect("checked above");
-        let mut layer = test_stroke_layer(&device);
-        layer.confine_to(&queue, Some(selection));
+        let mut layer = test_stroke_layer(device);
+        layer.confine_to(queue, Some(selection));
         assert!(layer.is_confined());
-        layer.confine_to(&queue, None);
+        layer.confine_to(queue, None);
         assert!(!layer.is_confined(), "the confinement was not lifted");
 
         let after = gpu_render_confined(&dabs, None);
@@ -2124,23 +2124,23 @@ mod tests {
             .collect();
 
         let page = openpaint_core::PageRect::from_size(W, H);
-        let mut layer = test_stroke_layer(&device);
-        let mut canvas = test_canvas(&device, page, &layer);
+        let mut layer = test_stroke_layer(device);
+        let mut canvas = test_canvas(device, page, &layer);
 
-        layer.set_page(&queue, page);
-        layer.set_paint(&queue, BLACK, 1.0, crate::editor::PaintMode::Normal);
-        layer.upload_dabs(&device, &queue, &dabs);
+        layer.set_page(queue, page);
+        layer.set_paint(queue, BLACK, 1.0, crate::editor::PaintMode::Normal);
+        layer.upload_dabs(device, queue, &dabs);
         let mut encoder = device.create_command_encoder(&Default::default());
         layer.begin_stroke();
-        let tiles = layer.prepare_tiles(&queue, &mut encoder, &dabs, page);
+        let tiles = layer.prepare_tiles(queue, &mut encoder, &dabs, page);
         assert!(tiles >= 4, "expected several tiles, got {tiles}");
         for index in 0..tiles {
             layer.stamp_range(&mut encoder, index, 0, dabs.len());
         }
-        layer.bake(&device, &queue, &mut encoder, &mut canvas, L0);
+        layer.bake(device, queue, &mut encoder, &mut canvas, L0);
         queue.submit(std::iter::once(encoder.finish()));
 
-        let gpu = readback_page(&device, &queue, &canvas, L0);
+        let gpu = readback_page(device, queue, &canvas, L0);
 
         let mut reference = Canvas::new(W, H);
         let mut painter = StrokePainter::new();

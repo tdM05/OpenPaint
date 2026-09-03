@@ -22,24 +22,20 @@
 //! a button and wrong for dragging anything. Tracked in OPEN_QUESTIONS Q14 — which said the
 //! opposite until the author picked up a pen and disproved it.
 //!
-//! To stop strokes landing "through" the panel, [`Ui::blocks_point`] reports the
-//! region egui occupies and the caller skips painting there. That check is needed
-//! for the pen specifically, because egui's own pointer-capture logic never sees
-//! it.
+//! To stop strokes landing "through" the UI, the *workspace* is asked which points belong to it
+//! --- see [`crate::workspace::Workspace::takes_point`]. That check is needed for the pen
+//! specifically, because egui's own pointer-capture logic never sees it, and it is asked of the
+//! workspace rather than of a rectangle cached here so there is only one answer to keep true.
 
 use crate::editor::Tool;
 use crate::workspace::{Anchor, Place};
 use egui::ViewportId;
-use openpaint_core::{Blend, Brush, Curve, Layer, Response, Source};
+use openpaint_core::{Blend, Brush, Layer};
 use winit::window::Window;
 
 use crate::editor::DEFAULT_EXTEND;
 use crate::renderer::Overlay;
-use crate::view::View;
 use openpaint_core::Side;
-
-/// Width of the side panel in logical points.
-const PANEL_WIDTH: f32 = 280.0;
 
 /// Read-only state the panel displays.
 ///
@@ -109,6 +105,14 @@ pub enum PageAction {
 pub enum Command {
     New,
     Open,
+    /// Bring a picture into the open document as a layer.
+    PlaceImage,
+    /// The selected pixels to the system clipboard.
+    Copy,
+    /// The same, and off the layer.
+    Cut,
+    /// Whatever the system clipboard holds, onto a new layer.
+    Paste,
     Save,
     SaveAs,
     ExportPng,
@@ -141,6 +145,8 @@ pub enum LayerAction {
     SetVisible { index: usize, visible: bool },
     /// Freeze or unfreeze a layer's transparency.
     SetLockAlpha { index: usize, lock: bool },
+    /// Set a layer aside, or bring it back.
+    SetLocked { index: usize, locked: bool },
     /// Mask a layer by the layer below it, or stop.
     SetClipBelow { index: usize, clip: bool },
     /// Set a layer's opacity.
@@ -323,6 +329,11 @@ pub struct Status<'a> {
     pub kernel: openpaint_core::Kernel,
     /// What autosave has to report: a line of text, ready to show.
     pub autosave: &'a str,
+    /// The export dialog's settings while it is up, and `None` while it is not.
+    ///
+    /// `Option` rather than a separate flag beside it: "the dialog is open" and "what it is set
+    /// to" are one fact, and two fields would be two chances to disagree about it.
+    pub export: Option<crate::export::Choices>,
     /// Selection boundary in screen space, as closed loops.
     pub selection: &'a [Vec<[f32; 2]>],
     /// Which selection tool is active, if any.
@@ -331,312 +342,6 @@ pub struct Status<'a> {
     pub has_selection: bool,
     /// Wand settings: colour tolerance, how far to grow the region, and whether a click fills.
     pub wand: WandSettings,
-}
-
-/// A small editable response curve.
-///
-/// Drag a point to move it, click empty space to add one, right-click a point to remove it. The
-/// ends stay pinned in x, because a curve that does not span the input range has an undefined
-/// answer at the edges — and "what happens at full pressure" is not a question a brush may decline.
-///
-/// Drawn rather than assembled from widgets, for the same reason the crop and selection overlays
-/// are: this is direct manipulation of a shape, and a shape is not a stack of rectangles.
-fn curve_editor(ui: &mut egui::Ui, label: &str, curve: &mut Curve) -> bool {
-    const SIDE: f32 = 140.0;
-    ui.label(egui::RichText::new(label).small());
-    // An **explicit** id, not the automatic one. egui derives automatic ids from a per-frame
-    // counter, so anything that changes what the panel contains -- the wand's sliders appearing,
-    // the layer list growing -- renumbers every widget after it. A click is press on one frame and
-    // release on another, so a widget whose id moved in between never sees either half, and the
-    // editor simply did not respond. Sliders survive that because they are dragged, not clicked.
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(SIDE, SIDE), egui::Sense::hover());
-    let response = ui.interact(
-        rect,
-        ui.id().with(("curve-editor", label)),
-        egui::Sense::click_and_drag(),
-    );
-    let painter = ui.painter_at(rect);
-
-    // Curve space is (0,0) bottom-left to (1,1) top-right; screen y runs the other way.
-    let to_screen = |p: (f32, f32)| {
-        egui::pos2(
-            rect.left() + p.0 * rect.width(),
-            rect.bottom() - p.1 * rect.height(),
-        )
-    };
-    let to_curve = |p: egui::Pos2| {
-        (
-            ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
-            ((rect.bottom() - p.y) / rect.height()).clamp(0.0, 1.0),
-        )
-    };
-
-    painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
-    // The identity, as a reference against which a curve's shape is legible.
-    painter.line_segment(
-        [to_screen((0.0, 0.0)), to_screen((1.0, 1.0))],
-        egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color()),
-    );
-
-    let mut points: Vec<(f32, f32)> = curve.points().to_vec();
-    let mut changed = false;
-
-    let id = response.id;
-    let nearest = |pos: egui::Pos2, points: &[(f32, f32)]| {
-        points
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (i, to_screen(*p).distance(pos)))
-            .filter(|(_, d)| *d < 10.0)
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(i, _)| i)
-    };
-
-    // Which point a drag grabbed, latched for the length of the drag. Re-picking the nearest
-    // point every frame looks equivalent and is not: drag two points close together and the drag
-    // hops to whichever is now nearer, so a point can be dropped somewhere nobody aimed for.
-    if response.drag_started() {
-        let grabbed = response
-            .interact_pointer_pos()
-            .and_then(|p| nearest(p, &points));
-        ui.memory_mut(|m| m.data.insert_temp(id, grabbed));
-    }
-    if response.drag_stopped() {
-        ui.memory_mut(|m| m.data.remove::<Option<usize>>(id));
-    }
-
-    if let Some(pos) = response.interact_pointer_pos() {
-        let hit = if response.dragged() {
-            ui.memory(|m| m.data.get_temp::<Option<usize>>(id))
-                .flatten()
-        } else {
-            nearest(pos, &points)
-        };
-
-        if response.secondary_clicked() {
-            // Never below two, and never an end: an end is what defines the range.
-            if let Some(i) = hit {
-                if points.len() > 2 && i != 0 && i != points.len() - 1 {
-                    points.remove(i);
-                    changed = true;
-                }
-            }
-        } else if response.dragged() || response.clicked() {
-            let target = to_curve(pos);
-            match hit {
-                Some(i) => {
-                    // The ends may move in y but not in x, and interior points stay between their
-                    // neighbours -- a curve whose points crossed over would have two answers at one
-                    // input.
-                    let x = if i == 0 {
-                        points[0].0
-                    } else if i == points.len() - 1 {
-                        points[i].0
-                    } else {
-                        target
-                            .0
-                            .clamp(points[i - 1].0 + 0.02, points[i + 1].0 - 0.02)
-                    };
-                    points[i] = (x, target.1);
-                    changed = true;
-                }
-                None if response.clicked() => {
-                    let at = points
-                        .iter()
-                        .position(|p| p.0 > target.0)
-                        .unwrap_or(points.len());
-                    if at > 0 && at < points.len() {
-                        points.insert(at, target);
-                        changed = true;
-                    }
-                }
-                None => {}
-            }
-        }
-    }
-
-    if changed {
-        if let Some(next) = Curve::from_points(points.clone()) {
-            *curve = next;
-        } else {
-            // Refused rather than repaired: the clamping above should make this unreachable, and
-            // silently sorting the points would hide it if it were not.
-            changed = false;
-        }
-    }
-
-    // The curve itself, sampled.
-    let samples: Vec<egui::Pos2> = (0..=48)
-        .map(|i| {
-            let x = i as f32 / 48.0;
-            to_screen((x, curve.at(x)))
-        })
-        .collect();
-    painter.add(egui::Shape::line(
-        samples,
-        egui::Stroke::new(2.0_f32, ui.visuals().strong_text_color()),
-    ));
-    for p in curve.points() {
-        painter.circle_filled(to_screen(*p), 3.5, ui.visuals().strong_text_color());
-    }
-    changed
-}
-
-/// The controls for one text block. Returns whether anything changed.
-///
-/// Every edit here invalidates the layer's pixels, so the return value is not a convenience — the
-/// caller must re-derive on it, and a control added later that forgets to report would leave the
-/// canvas showing the previous wording.
-///
-/// The words themselves are edited in an ordinary `TextEdit` rather than with a caret drawn on the
-/// canvas. Deliberate: this panel is throwaway (DECISIONS §3), a canvas caret is a text editor's
-/// worth of work, and `TextEdit` already brings a caret, selection, clipboard and IME — which is
-/// what makes Japanese and Korean input work today rather than after the real UI lands.
-fn text_editor(
-    ui: &mut egui::Ui,
-    block: &mut openpaint_core::TextBlock,
-    families: &[String],
-    substituted: Option<&str>,
-) -> bool {
-    let mut changed = false;
-
-    if let Some(actual) = substituted {
-        // Loud, because the alternative is shipping a page lettered in the wrong face.
-        ui.colored_label(
-            egui::Color32::from_rgb(220, 160, 60),
-            format!(
-                "\u{26a0} {:?} is not installed. Showing {actual:?}.",
-                block.font.family
-            ),
-        );
-    }
-
-    changed |= ui
-        .add(
-            egui::TextEdit::multiline(&mut block.text)
-                .desired_rows(3)
-                .desired_width(f32::INFINITY)
-                .hint_text("Type the caption"),
-        )
-        .changed();
-
-    ui.horizontal(|ui| {
-        ui.label("Font");
-        let current = if block.font.family.is_empty() {
-            "(default)".to_owned()
-        } else {
-            block.font.family.clone()
-        };
-        egui::ComboBox::from_id_salt("text-font-family")
-            .selected_text(current)
-            .width(180.0)
-            .show_ui(ui, |ui| {
-                if ui
-                    .selectable_label(block.font.family.is_empty(), "(default)")
-                    .clicked()
-                {
-                    block.font.family.clear();
-                    changed = true;
-                }
-                for family in families {
-                    if ui
-                        .selectable_label(&block.font.family == family, family)
-                        .clicked()
-                    {
-                        block.font.family.clone_from(family);
-                        changed = true;
-                    }
-                }
-            });
-    });
-
-    ui.horizontal(|ui| {
-        let mut bold = block.font.weight >= 600;
-        if ui.checkbox(&mut bold, "Bold").changed() {
-            block.font.weight = if bold { 700 } else { 400 };
-            changed = true;
-        }
-        changed |= ui.checkbox(&mut block.font.italic, "Italic").changed();
-    });
-
-    changed |= ui
-        .add(egui::Slider::new(&mut block.size, 6.0..=300.0).text("Size px"))
-        .changed();
-    changed |= ui
-        .add(egui::Slider::new(&mut block.line_height, 0.5..=3.0).text("Line height"))
-        .changed();
-    changed |= ui
-        .add(egui::Slider::new(&mut block.letter_spacing, -10.0..=40.0).text("Letter spacing"))
-        .changed();
-
-    ui.horizontal(|ui| {
-        ui.label("Align");
-        for align in openpaint_core::text::Align::ALL {
-            if ui
-                .selectable_label(block.align == align, align.label())
-                .clicked()
-            {
-                block.align = align;
-                changed = true;
-            }
-        }
-    });
-
-    ui.horizontal(|ui| {
-        ui.label("Colour");
-        changed |= ui.color_edit_button_srgb(&mut block.color_srgb8).changed();
-    });
-
-    ui.horizontal(|ui| {
-        // `None` is a single line that grows as it is typed; `Some` is a box that wraps. Two ways
-        // of placing text, one field, rather than two kinds of block.
-        let mut wraps = block.wrap_width.is_some();
-        if ui
-            .checkbox(&mut wraps, "Wrap")
-            .on_hover_text("Off: one line that grows. On: wraps at the width below.")
-            .changed()
-        {
-            block.wrap_width = wraps.then_some(400.0);
-            changed = true;
-        }
-        if let Some(width) = block.wrap_width.as_mut() {
-            changed |= ui
-                .add(egui::Slider::new(width, 40.0..=4000.0).text("px"))
-                .changed();
-        }
-    });
-
-    ui.horizontal(|ui| {
-        ui.label("Position");
-        changed |= ui
-            .add(egui::DragValue::new(&mut block.x).speed(1.0))
-            .changed();
-        changed |= ui
-            .add(egui::DragValue::new(&mut block.y).speed(1.0))
-            .changed();
-    });
-
-    changed
-}
-
-/// One brush parameter's modulation: which input drives it, and the curve that maps it.
-///
-/// Built in a loop over [`Brush::responses_mut`] rather than written out per parameter, so adding a
-/// modulatable parameter to the engine makes an editor for it appear rather than needing a second
-/// edit here that is easy to forget.
-fn response_editor(ui: &mut egui::Ui, label: &str, response: &mut Response) {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).small().strong());
-        egui::ComboBox::from_id_salt(("modulation-source", label))
-            .selected_text(response.source.label())
-            .width(96.0)
-            .show_ui(ui, |ui| {
-                for source in Source::ALL {
-                    ui.selectable_value(&mut response.source, source, source.label());
-                }
-            });
-    });
-    curve_editor(ui, label, &mut response.curve);
 }
 
 /// What each panel of the workspace shows.
@@ -780,102 +485,297 @@ pub(crate) enum Picked {
     Wand(WandSettings),
 }
 
-/// The two prompts that stop everything until they are answered.
+/// What every panel is handed in a test.
 ///
-/// **Drawn whichever UI is up.** They used to sit at the end of the old side panel's branch, and
-/// the workspace returns before it -- so in the workspace they were never drawn at all, while
-/// `Status::recovery` and `Status::confirm` went on refusing every pen stroke (`decide_capture`).
-/// A leftover recovery file from any previous crash therefore made the brush do nothing, for good,
-/// with nothing on screen to say why. Reported as "most things do not work".
+/// **One definition, in the file that owns the type.** Two panels' tests both need a status with
+/// something in every field, and a second literal beside the first is a second thing to update
+/// whenever a field is added -- the one that goes stale being whichever the author was not
+/// looking at. The borrowed parts are arguments because a `&'a [Layer]` has to come from
+/// somewhere that outlives the call; `crate::screenshot::sample_document` is where the rest of
+/// the tests get theirs.
+#[cfg(test)]
+impl<'a> Status<'a> {
+    pub(crate) fn sample(
+        layers: &'a [Layer],
+        palette: &'a [[u8; 3]],
+        presets: &'a [openpaint_core::BrushPreset],
+        font_families: &'a [String],
+    ) -> Self {
+        Self {
+            history: (3, 1, 2 * 1024 * 1024),
+            message: Some("something happened"),
+            page_size: (1200, 1600),
+            crop: None,
+            crop_rect: None,
+            residency: (12, 4),
+            spilled: 0,
+            traffic: (7, 9),
+            layers,
+            active_layer: 3,
+            pages: (3, 0),
+            tool: Tool::Brush,
+            confirm: None,
+            brush_cursor: None,
+            perf: crate::perf::PerfSnapshot::default(),
+            recovery: None,
+            palette,
+            presets,
+            preset_trouble: Some("the brush library could not be written"),
+            font_families,
+            font_substituted: Some("Some Missing Face"),
+            transform: None,
+            transform_box: None,
+            kernel: openpaint_core::Kernel::default(),
+            autosave: "saved a moment ago",
+            export: None,
+            selection: &[],
+            select_tool: Some(SelectTool::Wand),
+            has_selection: true,
+            wand: WandSettings::default(),
+        }
+    }
+}
+
+/// How wide a prompt is, in ems of the theme's body text.
 ///
-/// A prompt that blocks input and cannot be seen is the worst thing in this file; it belongs to
-/// the application rather than to either UI, and now it is drawn like it.
+/// Typography rather than taste: a line much longer than thirty ems is hard to come back from at
+/// the end of, and one much shorter chops a sentence into too many pieces. In ems so it follows
+/// the theme's text size — a fixed width would be wrong the moment the type changed, and §5a is
+/// explicit that a number like this is never a constant in pixels.
+const PROMPT_EMS: f32 = 30.0;
+
+/// The prompts that stop everything until they are answered.
+///
+/// **Drawn like the rest of the UI, because they are part of it.** These were raw `egui::Window`s
+/// with raw buttons long after every panel had been ported: they ignored the theme, looked like
+/// nothing else on screen, and had to be written into the control atlas through a reporting path
+/// of their own. Now they are described in [`crate::prompt`] as [`Control`](crate::panel_ui::Control)s
+/// and drawn by [`crate::panel_draw`], which is the same layer, the same theme and the same atlas
+/// as every panel.
+///
+/// **One at a time.** A modal question is modal: two of them stacked would leave the artist
+/// answering the top one to find another underneath. Recovered work is asked first because it is
+/// asked at start-up, before there is a document to have unsaved changes in; anything asked while
+/// it is up waits its turn rather than being lost, since the shell holds it until it is answered.
+///
+/// They used to sit at the end of the old side panel's branch, and the workspace returned before
+/// reaching it — so in the workspace they were never drawn at all, while `Status::recovery` and
+/// `Status::confirm` went on refusing every pen stroke (`decide_capture`). A leftover recovery
+/// file from any previous crash therefore made the brush do nothing, for good, with nothing on
+/// screen to say why. Reported as "most things do not work".
 fn prompts(
     ctx: &egui::Context,
-    recovery: Option<&str>,
-    confirm: Option<&'static str>,
-) -> (Option<RecoveryChoice>, Option<ConfirmChoice>) {
-    let mut answers = (None, None);
-    // A button in a prompt is a thing to press like any other, so it is written down like any
-    // other. See `panel_draw::report_widget`.
-    let ppp = ctx.pixels_per_point();
-    let say = |label: &str, resp: &egui::Response| {
-        crate::panel_draw::report_widget(label, resp.rect, ppp);
+    theme: &crate::theme::Theme,
+    status: &Status<'_>,
+    input: &mut crate::panel_draw::PanelInput,
+) -> Answered {
+    use crate::prompt::{Answer, Ask};
+    let mut answered = Answered::default();
+    // **Recovered work first, then the unsaved question, then the export dialog.** The order is
+    // the order they become possible: recovery is asked before there is a document to have
+    // changes in, and an export cannot be asked for while either is up, because the workspace
+    // that offers it is inert. Only one is ever drawn.
+    let asked = status
+        .recovery
+        .map(Ask::Recovered)
+        .or_else(|| status.confirm.map(Ask::Unsaved))
+        .or_else(|| {
+            status.export.as_ref().map(|choices| Ask::Export {
+                choices,
+                pages: status.pages.0,
+                page: status.page_size,
+            })
+        });
+    let Some(ask) = asked else {
+        return answered;
     };
-    // Recovered work gets its own window rather than being folded into the unsaved-changes
-    // prompt: the question is different (there is nothing to save yet) and so are the
-    // answers. If a third prompt ever appears, that is the point at which these should
-    // become one general one -- two is not yet worth the indirection.
-    if let Some(what) = recovery {
-        egui::Window::new("Recovered work")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("OpenPaint closed with unsaved changes.");
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(what).strong());
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        // Recover first and leftmost: it is the answer that loses nothing, and
-                        // the one the artist almost always wants.
-                        let recover = ui.button("Recover");
-                        say("Recover", &recover);
-                        if recover.clicked() {
-                            answers.0 = Some(RecoveryChoice::Recover);
-                        }
-                        let discard = ui.button("Discard");
-                        say("Discard recovered work", &discard);
-                        if discard.clicked() {
-                            answers.0 = Some(RecoveryChoice::Discard);
-                        }
-                    });
-                    ui.label(
-                        egui::RichText::new(
-                            "Recovering opens it as unsaved work pointed at the original file, so nothing is overwritten until you save.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                });
+    let (answer, changes) = ask_on_screen(ctx, theme, ask, input);
+    if let Ask::Export { .. } = ask {
+        // Applied to a copy and handed back, the way the transform box and the wand hand back
+        // what they now hold: the modal owns no state, and the shell owns exactly one copy of it.
+        let mut now = status.export.unwrap_or_default();
+        if changes.iter().any(|c| crate::export::apply(&mut now, c)) {
+            answered.export_set = Some(now);
+        }
     }
+    match answer {
+        Some(Answer::Recover) => answered.recovery = Some(RecoveryChoice::Recover),
+        Some(Answer::DiscardRecovered) => answered.recovery = Some(RecoveryChoice::Discard),
+        Some(Answer::SaveFirst) => answered.confirm = Some(ConfirmChoice::SaveFirst),
+        Some(Answer::DiscardChanges) => answered.confirm = Some(ConfirmChoice::Discard),
+        Some(Answer::Cancel) => answered.confirm = Some(ConfirmChoice::Cancel),
+        Some(Answer::Export) => answered.export = Some(ExportChoice::Go),
+        Some(Answer::StopExport) => answered.export = Some(ExportChoice::Stop),
+        None => {}
+    }
+    answered
+}
 
-    if let Some(what) = confirm {
-        egui::Window::new("Unsaved changes")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(format!(
-                    "This document has changes that are not in a file. Save before you {what}?"
-                ));
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    // Save first, and leftmost, because it is the answer that loses nothing.
-                    let save = ui.button("Save");
-                    say("Save first", &save);
-                    if save.clicked() {
-                        answers.1 = Some(ConfirmChoice::SaveFirst);
-                    }
-                    let discard = ui.button("Discard");
-                    say("Discard changes", &discard);
-                    if discard.clicked() {
-                        answers.1 = Some(ConfirmChoice::Discard);
-                    }
-                    let cancel = ui.button("Cancel");
-                    say("Cancel", &cancel);
-                    if cancel.clicked() {
-                        answers.1 = Some(ConfirmChoice::Cancel);
-                    }
-                });
-                ui.label(
-                    egui::RichText::new("Enter saves, Escape cancels.")
-                        .small()
-                        .weak(),
-                );
-            });
-    }
-    answers
+/// What a modal produced in one frame.
+#[derive(Default)]
+struct Answered {
+    recovery: Option<RecoveryChoice>,
+    confirm: Option<ConfirmChoice>,
+    export: Option<ExportChoice>,
+    /// The export settings as the dialog now holds them, when one of them moved.
+    export_set: Option<crate::export::Choices>,
+}
+
+/// What the export dialog was told to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportChoice {
+    /// Ask where to put it, then write it.
+    Go,
+    /// Put the dialog away.
+    Stop,
+}
+
+/// Draw one prompt, centred over a dimmed workspace, and report what was pressed.
+///
+/// The box is sized to what it is about to say rather than to a figure picked here: the words are
+/// laid out at the width they will get, and the height comes from where they actually land. A
+/// prompt whose sentence is one line longer must grow, not clip — the sentence is the whole point
+/// of it.
+fn ask_on_screen(
+    ctx: &egui::Context,
+    theme: &crate::theme::Theme,
+    ask: crate::prompt::Ask<'_>,
+    input: &mut crate::panel_draw::PanelInput,
+) -> (Option<crate::prompt::Answer>, Vec<crate::panel_ui::Change>) {
+    use crate::layout::Rect;
+    use crate::panel_ui::{extent, place, Direction};
+    let m = &theme.metrics;
+    let p = theme.palette;
+    let screen = ctx.screen_rect();
+    let to_egui = |r: Rect| egui::Rect::from_min_size(egui::pos2(r.x, r.y), egui::vec2(r.w, r.h));
+    let colour = |c: crate::theme::Color| egui::Color32::from_rgb(c.0[0], c.0[1], c.0[2]);
+
+    let words = ask.words();
+    let body = ask.body();
+    let answers = ask.answers();
+    // Measured by the thing that draws them, so the room made and the room used are one answer.
+    let text_of = |c: &crate::panel_ui::Control| crate::panel_draw::text_width(ctx, m.body, c);
+    let tall_of =
+        |c: &crate::panel_ui::Control, w: f32| crate::panel_draw::wrapped_height(ctx, m.body, c, w);
+
+    // Never wider than the window it is centred in, and never so wide the sentence is hard to
+    // read. A small window wins, because a prompt with its buttons off the edge cannot be
+    // answered at all.
+    let width = (m.body * PROMPT_EMS).min(screen.width() - m.padding * 4.0);
+    let inner = (width - m.padding * 2.0).max(0.0);
+    // **Measured in a box of no height on purpose.** A row of controls centres itself in the
+    // height it is given, so measuring one inside a box as tall as the window measures the
+    // window: the buttons came out halfway down the screen and the prompt was drawn tall enough
+    // to hold them. Nothing is centred in nothing, so what comes back is the block itself.
+    let measure = |controls: &[crate::panel_ui::Control], direction| {
+        let origin = Rect::new(0.0, 0.0, inner, 0.0);
+        let laid = place(controls, origin, m, direction, &text_of, &tall_of);
+        extent(&laid, origin).1
+    };
+    let words_h = measure(&words, Direction::Column);
+    // A question with nothing to set spends nothing on the room for it, including the gap.
+    let body_h = if body.is_empty() {
+        0.0
+    } else {
+        measure(&body, Direction::Column) + m.padding
+    };
+    // **Across if they fit, stacked if they do not.** `Auto` decides once for the whole row, which
+    // is exactly the question a set of answers asks: three buttons side by side in a narrow window
+    // would each be too small to hit, and three stacked in a wide one would look like a list.
+    let answers_h = measure(&answers, Direction::Auto);
+    let height = m.header + m.padding * 2.0 + words_h + body_h + m.padding + answers_h;
+
+    let box_rect = Rect::new(
+        (screen.width() - width) / 2.0,
+        ((screen.height() - height) / 2.0).max(0.0),
+        width,
+        height.min(screen.height()),
+    );
+
+    let layer = egui::LayerId::new(crate::workspace::prompt_order(), egui::Id::new("prompt"));
+    let painter = ctx.layer_painter(layer);
+    // **The workspace goes quiet behind it.** Toward the theme's own ground rather than to grey:
+    // the ground is what the window shows where nothing is, so dimming toward it says "there is
+    // nothing here for you" in the palette's own voice. The workspace is inert underneath as well
+    // — see `workspace::Attention` — so this says what is true rather than covering for it.
+    //
+    // **A veil, not a curtain.** The unsaved-changes prompt asks a question *about the artwork*,
+    // and hiding the drawing behind a heavy scrim would take away the one thing the artist is
+    // deciding on. It has to read as waiting, not as gone — so the page stays plainly legible and
+    // the ink on it stays ink.
+    painter.rect_filled(
+        screen,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(p.ground.0[0], p.ground.0[1], p.ground.0[2], 90),
+    );
+    painter.rect_filled(to_egui(box_rect), m.radius, colour(p.panel));
+    painter.rect_stroke(
+        to_egui(box_rect),
+        m.radius,
+        egui::Stroke::new(1.0_f32, colour(p.edge)),
+    );
+    // A header, drawn the way a panel's is: this is a window of the same UI, not a dialog from
+    // somewhere else.
+    let header = Rect::new(box_rect.x, box_rect.y, box_rect.w, m.header);
+    painter.rect_filled(to_egui(header), m.radius, colour(p.header));
+    painter.text(
+        egui::pos2(header.x + m.padding, header.y + header.h / 2.0),
+        egui::Align2::LEFT_CENTER,
+        ask.title(),
+        egui::FontId::proportional(m.label),
+        colour(p.bright),
+    );
+
+    let region = |y: f32, h: f32| Rect::new(box_rect.x + m.padding, y, inner, h);
+    let words_at = region(header.y + header.h + m.padding, words_h);
+    let body_at = region(
+        words_at.y + words_h + m.padding,
+        (body_h - m.padding).max(0.0),
+    );
+    let answers_at = region(words_at.y + words_h + body_h + m.padding, answers_h);
+
+    let draw = |name: &str,
+                at: Rect,
+                controls: &[crate::panel_ui::Control],
+                direction,
+                input: &mut crate::panel_draw::PanelInput| {
+        let mut ui = egui::Ui::new(
+            ctx.clone(),
+            layer,
+            egui::Id::new(("prompt", name)),
+            egui::UiBuilder::new().max_rect(to_egui(at)),
+        );
+        ui.set_clip_rect(to_egui(at));
+        crate::panel_draw::report_panel("prompt");
+        crate::panel_draw::show(&mut ui, controls, theme, direction, input)
+    };
+    // The words hold nothing between frames: there is no slider to latch and the box is sized to
+    // fit its own sentences, so there is nothing to scroll either. Somewhere to put the answer is
+    // all `show` wants.
+    let mut nothing_held = crate::panel_draw::PanelInput::default();
+    draw(
+        "words",
+        words_at,
+        &words,
+        Direction::Column,
+        &mut nothing_held,
+    );
+    // **The body gets the kept input, not the buttons.** A slider is the only control here that
+    // has to be followed between frames -- it latches on the press and keeps the value under a
+    // pointer that has slid off the row -- and there is one of those at a time on screen.
+    let mut changes = if body.is_empty() {
+        Vec::new()
+    } else {
+        draw("body", body_at, &body, Direction::Column, input)
+    };
+    let mut spare = crate::panel_draw::PanelInput::default();
+    let pressed = draw("answers", answers_at, &answers, Direction::Auto, &mut spare);
+    let answer = pressed.iter().find_map(|change| match change {
+        crate::panel_ui::Change::Pressed(id) => ask.answer(*id),
+        _ => None,
+    });
+    changes.extend(pressed);
+    (answer, changes)
 }
 
 /// Draw a box with its eight handles.
@@ -945,6 +845,10 @@ pub struct Outcome {
     pub confirm: Option<ConfirmChoice>,
     /// The answer to the offer of recovered work.
     pub recovery: Option<RecoveryChoice>,
+    /// What the export dialog was told to do, if it was told anything.
+    pub export: Option<ExportChoice>,
+    /// The export settings as the dialog now holds them.
+    pub export_set: Option<crate::export::Choices>,
     /// A selection command.
     pub select: Option<SelectAction>,
     /// Wand settings, as the panel currently holds them.
@@ -969,14 +873,10 @@ pub struct Ui {
     ctx: egui::Context,
     state: egui_winit::State,
     renderer: egui_wgpu::Renderer,
-    /// Screen-space rect (physical pixels) egui is currently occupying, so canvas
-    /// input can be excluded from it.
-    occupied: egui::Rect,
     /// Where the canvas may draw, in physical pixels.
     ///
-    /// The whole surface minus the side panel in the old layout; the canvas *panel's* rectangle
-    /// in the workspace. A rectangle either way, because the canvas is a panel and can be
-    /// anywhere (§1c) — see [`crate::view::View::set_viewport`].
+    /// The canvas *panel's* rectangle, because the canvas is a panel and can be anywhere (§1c)
+    /// — see [`crate::view::View::set_viewport`].
     canvas_viewport: (f32, f32, f32, f32),
     /// How much an Extend adds. Lives in the UI because it is a user preference; it
     /// will move to settings when those exist (DECISIONS §5a: never a constant).
@@ -996,6 +896,11 @@ pub struct Ui {
     menu_open: Option<u32>,
     /// Which control's dropdown is open, if any. Kept between frames, like `menu_open`.
     pick_open: Option<crate::panel_ui::ControlId>,
+    /// The prompt's half-finished gesture, kept for the same reason a panel's is.
+    ///
+    /// Its own, not one of `panel_input`'s: a prompt belongs to no panel, and filing it under one
+    /// would mean the prompt and that panel sharing a latch.
+    prompt_input: crate::panel_draw::PanelInput,
     /// Which colour wheel the artist chose.
     wheel_shape: crate::colour_wheel::Shape,
     /// Which part of the wheel a drag has hold of.
@@ -1024,11 +929,11 @@ impl Ui {
             ctx,
             state,
             renderer,
-            occupied: egui::Rect::NOTHING,
             canvas_viewport: (0.0, 0.0, 1.0, 1.0),
             extend_amount: DEFAULT_EXTEND,
             preset_name: String::new(),
             panel_input: std::collections::HashMap::new(),
+            prompt_input: crate::panel_draw::PanelInput::default(),
             menu_open: None,
             pick_open: None,
             wheel_shape: crate::colour_wheel::Shape::default(),
@@ -1078,22 +983,6 @@ impl Ui {
         self.panel_input.values().any(|i| i.editing.is_some())
     }
 
-    /// Whether a point in physical window pixels lies over the old side panel.
-    ///
-    /// Used to keep pen strokes from painting underneath the UI. egui's own pointer handling
-    /// cannot do this for us because it never sees pen input.
-    ///
-    /// **The workspace answers for itself** — see [`crate::workspace::Workspace::takes_point`].
-    /// This used to hold a cached copy of where the canvas was, and the copy is what went wrong.
-    pub fn blocks_point(&self, x: f64, y: f64) -> bool {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "window coordinates, which are far inside f32"
-        )]
-        let (x, y) = (x as f32, y as f32);
-        self.occupied.contains(egui::pos2(x, y))
-    }
-
     /// Build the panel, render it over the frame, and apply any edits to `brush`.
     ///
     /// The returned [`Outcome`] carries both whether egui wants another frame soon
@@ -1101,10 +990,9 @@ impl Ui {
     /// is only interactive while frames keep coming -- and any action the panel
     /// requested.
     #[must_use]
-    // Eight, and the shape is already the fix: `Status` exists because this grew past the lint
-    // once before. Splitting further would mean a struct per call rather than per concern, which
-    // is bookkeeping rather than clarity -- and the workspace argument goes away entirely when
-    // the old panel does.
+    // Six, and the shape is already the fix: `Status` exists because this grew past the lint once
+    // before. Splitting further would mean a struct per call rather than per concern, which is
+    // bookkeeping rather than clarity.
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -1112,9 +1000,8 @@ impl Ui {
         gpu: Overlay<'_>,
         brush: &mut Brush,
         text: Option<&mut openpaint_core::TextBlock>,
-        view: &View,
         status: Status<'_>,
-        mut workspace: Option<&mut crate::workspace::Workspace>,
+        workspace: &mut crate::workspace::Workspace,
     ) -> Outcome {
         let Overlay {
             device,
@@ -1143,15 +1030,17 @@ impl Ui {
         let mut tool_action = None;
         let mut confirm_choice = None;
         let mut recovery_choice = None;
+        let mut export_choice = None;
+        let mut export_set = None;
         let mut select_action = None;
         let mut command: Option<Command> = None;
         let mut wand = status.wand;
 
-        let mut panel_rect = egui::Rect::NOTHING;
         let mut panel_canvas: Option<(f32, f32, f32, f32)> = None;
         // Taken for the duration of the frame because `self.ctx.run` has `self` borrowed, and put
         // back the moment it does not.
         let mut panel_input = std::mem::take(&mut self.panel_input);
+        let mut prompt_input = std::mem::take(&mut self.prompt_input);
         let mut menu_open = self.menu_open;
         let mut pick_open = self.pick_open;
         let mut wheel_shape = self.wheel_shape;
@@ -1160,7 +1049,8 @@ impl Ui {
             // The panel workspace, when it is switched on. Drawn *instead of* the side panel
             // rather than beside it: they are two answers to the same question, and showing both
             // would put the same controls on screen twice.
-            if let Some(ws) = workspace.as_deref_mut() {
+            {
+                let ws = &mut *workspace;
                 let screen = ctx.screen_rect();
                 let area = crate::layout::Rect::new(
                     screen.min.x,
@@ -1179,31 +1069,49 @@ impl Ui {
                 // menu bar, which had nothing to draw in it. An empty box, and no way to choose a
                 // blend mode at all. Hardcoding one panel's identity into shared machinery is the
                 // §1c mistake in a different costume, and this is the shape that cannot make it.
-                let mut menu_request: Option<(crate::layout::PanelId, crate::layout::Rect, (f32, f32), Anchor)> =
-                    None;
+                let mut menu_request: Option<(
+                    crate::layout::PanelId,
+                    crate::layout::Rect,
+                    (f32, f32),
+                    Anchor,
+                )> = None;
                 let mut close_menu = false;
                 let mut show_settings = false;
                 // Copied out because `ws` is borrowed for the whole of `show`, and the panel that
                 // wants the theme runs inside it.
                 let theme = ws.theme;
-                ws.show(ctx, area, |panel, ui, direction, place| {
-                    if let Some(picked) =
-                        workspace_panel(panel, ui, brush, &mut color_srgb, &status,
-                            &mut Painting {
-                                theme: &theme,
-                                direction,
-                                input: panel_input.entry(panel.0).or_default(),
-                                menu: &mut menu_open,
-                                pick: &mut pick_open,
-                                extend_by: extend_amount,
-                                preset_name: &preset_name_now,
-                                ctx,
-                                wheel_shape: &mut wheel_shape,
-                                wheel_hold: &mut wheel_hold,
-                            },
-                            place,
-                        )
-                    {
+                // **A question being asked owns the pointer.** The workspace reads the pointer
+                // out of egui itself, so drawing over it would not stop a press landing on a
+                // panel underneath a prompt -- it has to be told.
+                let attention = if status.recovery.is_some()
+                    || status.confirm.is_some()
+                    || status.export.is_some()
+                {
+                    crate::workspace::Attention::Elsewhere
+                } else {
+                    crate::workspace::Attention::Workspace
+                };
+                ws.show(ctx, area, attention, |panel, ui, direction, place| {
+                    if let Some(picked) = workspace_panel(
+                        panel,
+                        ui,
+                        brush,
+                        &mut color_srgb,
+                        &status,
+                        &mut Painting {
+                            theme: &theme,
+                            direction,
+                            input: panel_input.entry(panel.0).or_default(),
+                            menu: &mut menu_open,
+                            pick: &mut pick_open,
+                            extend_by: extend_amount,
+                            preset_name: &preset_name_now,
+                            ctx,
+                            wheel_shape: &mut wheel_shape,
+                            wheel_hold: &mut wheel_hold,
+                        },
+                        place,
+                    ) {
                         match picked {
                             // Both: choosing a paint tool must also put any selection tool down,
                             // or the pen would still be lassoing while the rail says Brush.
@@ -1268,21 +1176,47 @@ impl Ui {
                 if let Some((panel, at, size, side)) = menu_request {
                     ws.open_popup_for(panel, at, size, side, area);
                 }
-                // A menu whose popup has been dismissed some other way -- a press elsewhere,
-                // Escape -- must not leave its button lit claiming to be open.
-                if menu_open.is_some() && !ws.popup_is_for(crate::workspace::MENU) && menu_request.is_none() {
+                // **A menu's popup and a menu being open are one fact, and it is kept true in
+                // both directions.**
+                //
+                // A popup dismissed some other way -- a press elsewhere, Escape -- must not leave
+                // the menu's button lit claiming to be open.
+                if menu_open.is_some()
+                    && !ws.popup_is_for(crate::workspace::MENU)
+                    && menu_request.is_none()
+                {
                     menu_open = None;
                 }
+                // And a menu that has closed itself -- which is what choosing an item does -- must
+                // not leave its popup standing. It did: the frame stayed with nothing drawn in it,
+                // so every command reached from a menu left an empty dark box over the artwork
+                // until something else happened to close it. Visible in `menu-new.png` for as long
+                // as that shot has existed, and the same shape as the empty dropdowns reported
+                // before.
+                if menu_open.is_none()
+                    && ws.popup_is_for(crate::workspace::MENU)
+                    && menu_request.is_none()
+                {
+                    // Closed here rather than by setting `close_menu`: that flag is read a few
+                    // lines above this, so setting it now would do nothing at all until something
+                    // else happened to set it again. Clippy said so, and it was right -- the fix
+                    // was dead the moment it was written, and the scenes passed anyway because
+                    // none of them looks at an empty box.
+                    ws.close_popup();
+                }
                 let scale = ctx.pixels_per_point();
-                let px = |r: crate::layout::Rect| (r.x * scale, r.y * scale, r.w * scale, r.h * scale);
+                let px =
+                    |r: crate::layout::Rect| (r.x * scale, r.y * scale, r.w * scale, r.h * scale);
                 // Where the *renderer* draws, which still needs an answer with the canvas panel
                 // closed, and the whole surface is the only honest fallback. Where the *pen* may
                 // go is a different question, and the workspace is asked it directly.
                 // Before the return below, because the workspace path never reaches the old
                 // panel's end -- which is exactly how these came to be invisible.
-                let answered = prompts(ctx, status.recovery, status.confirm);
-                recovery_choice = answered.0.or(recovery_choice);
-                confirm_choice = answered.1.or(confirm_choice);
+                let answered = prompts(ctx, &theme, &status, &mut prompt_input);
+                recovery_choice = answered.recovery.or(recovery_choice);
+                confirm_choice = answered.confirm.or(confirm_choice);
+                export_choice = answered.export.or(export_choice);
+                export_set = answered.export_set.or(export_set);
                 if std::env::var_os("OPENPAINT_TRACE_INPUT").is_some() {
                     println!(
                         "ui: screen {:?} scale {scale} canvas {:?}",
@@ -1296,1015 +1230,41 @@ impl Ui {
                     screen.width(),
                     screen.height(),
                 ))));
-                // Nothing is "the panel" any more, so the pen must be refused only where a panel
-                // actually is -- which is everywhere except the canvas, and everywhere the
-                // workspace draws on top of it.
+                // **What the application last said, over the artwork.**
                 //
-                // **With no canvas panel there is no canvas anywhere.** The workspace fills the
-                // window with ground in that case, so the artwork is not on screen at all; falling
-                // back to "the whole surface is canvas" let the pen paint on a drawing nobody
-                // could see.
-                return;
+                // This used to be drawn at the foot of the side panel, and the side panel was the
+                // only place it appeared. Taking that away would have taken with it every "refused
+                // out loud" message the design leans on (DECISIONS 6b) -- "That colour is already
+                // in the palette", "A document needs at least one page", "Page is already
+                // 2048x65536" -- and a refusal nobody is told about is indistinguishable from a
+                // button that does not work.
+                //
+                // Against the canvas rather than against a panel edge, because there is no panel
+                // edge any more; the workspace says where the artwork is.
+                if let Some(msg) = status.message {
+                    let over = ws
+                        .canvas_rect()
+                        .unwrap_or(crate::layout::Rect::new(0.0, 0.0, area.w, area.h));
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        crate::workspace::artwork_order(),
+                        egui::Id::new("status-bar"),
+                    ));
+                    let text = painter.layout_no_wrap(
+                        msg.to_owned(),
+                        egui::FontId::proportional(13.0),
+                        egui::Color32::from_white_alpha(230),
+                    );
+                    let pad = egui::vec2(10.0, 5.0);
+                    let size = text.size() + pad * 2.0;
+                    let at = egui::pos2(over.x + 12.0, over.y + over.h - size.y - 12.0);
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(at, size),
+                        4.0,
+                        egui::Color32::from_black_alpha(190),
+                    );
+                    painter.galley(at + pad, text, egui::Color32::WHITE);
+                }
             }
-
-            let panel = egui::SidePanel::left("brush-panel")
-                .exact_width(PANEL_WIDTH)
-                .show(ctx, |ui| {
-                    // Scrollable, because the panel already stands taller than a window and
-                    // every section below the fold was simply unreachable -- the speed readout
-                    // was invisible on a laptop screen. `auto_shrink` off so it fills the panel
-                    // instead of collapsing onto its content.
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false; 2])
-                        // Off, or a drag on any control inside scrolls the panel instead of
-                        // reaching the control. Harmless for sliders, which egui claims first, and
-                        // fatal for anything doing its own dragging.
-                        .drag_to_scroll(false)
-                        .show(ui, |ui| {
-                            ui.heading("Tool");
-                            ui.horizontal(|ui| {
-                                for tool in Tool::ALL {
-                                    if ui
-                                        .selectable_label(status.tool == tool, tool.label())
-                                        .clicked()
-                                    {
-                                        tool_action = Some(tool);
-                                    }
-                                }
-                            });
-                            ui.label(
-                                egui::RichText::new(
-                                    "B and E switch tool. Each keeps its own size, because an eraser \
-                                     almost never wants the brush's. [ and ] resize; Shift+[ and \
-                                     Shift+] rotate the canvas.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-
-                            ui.separator();
-                            ui.heading("Select");
-                            ui.horizontal(|ui| {
-                                for (tool, label) in [
-                                    (SelectTool::Lasso, "Lasso"),
-                                    (SelectTool::Rect, "Rectangle"),
-                                    (SelectTool::Wand, "Wand"),
-                                    (SelectTool::Move, "Move"),
-                                ] {
-                                    let on = status.select_tool == Some(tool);
-                                    if ui.selectable_label(on, label).clicked() {
-                                        select_action = Some(SelectAction::Use(tool));
-                                    }
-                                }
-                            });
-                            ui.horizontal(|ui| {
-                                if ui.button("All").clicked() {
-                                    select_action = Some(SelectAction::All);
-                                }
-                                // Disabled rather than hidden, so the commands do not move around
-                                // depending on state.
-                                if ui
-                                    .add_enabled(status.has_selection, egui::Button::new("None"))
-                                    .clicked()
-                                {
-                                    select_action = Some(SelectAction::None);
-                                }
-                                if ui
-                                    .add_enabled(status.has_selection, egui::Button::new("Invert"))
-                                    .clicked()
-                                {
-                                    select_action = Some(SelectAction::Invert);
-                                }
-                            });
-                            if status.select_tool == Some(SelectTool::Wand) {
-                                ui.add(
-                                    egui::Slider::new(&mut wand.tolerance, 0..=128)
-                                        .text("Tolerance"),
-                                );
-                                ui.add(egui::Slider::new(&mut wand.expand, 0..=8).text("Expand"));
-                                ui.checkbox(&mut wand.fill_on_click, "Fill on click (bucket)");
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Tolerance is how far up an anti-aliased edge still counts as the region; Expand tucks the result under the ink so no pale fringe is left. With Fill off the wand leaves a selection instead.",
-                                    )
-                                    .small()
-                                    .weak(),
-                                );
-                            }
-
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add_enabled(
-                                        status.has_selection,
-                                        egui::Button::new("Fill with brush colour"),
-                                    )
-                                    .clicked()
-                                {
-                                    select_action = Some(SelectAction::Fill);
-                                }
-                                if ui
-                                    .add_enabled(status.has_selection, egui::Button::new("Clear"))
-                                    .clicked()
-                                {
-                                    select_action = Some(SelectAction::Clear);
-                                }
-                            });
-                            ui.label(
-                                egui::RichText::new(
-                                    "Ctrl+A selects everything, Ctrl+D deselects, Ctrl+Shift+I inverts, Ctrl+F fills and Delete clears. Fill never erases and Clear always does, so neither depends on which tool is selected.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-
-                            ui.separator();
-                            ui.heading("Brush");
-                            ui.add_space(4.0);
-
-                            // The saved brushes come first, because picking one is the common
-                            // action and dialling sliders is the rare one. Nobody draws a page with
-                            // a single brush, so this is the section that turns a demo into a tool.
-                            if let Some(trouble) = status.preset_trouble {
-                                ui.colored_label(egui::Color32::from_rgb(220, 120, 60), trouble);
-                            }
-                            for (i, p) in status.presets.iter().enumerate() {
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .button(&p.name)
-                                        .on_hover_text(format!(
-                                            "Size {:.0}, spacing {:.2}{}",
-                                            p.brush.radius,
-                                            p.brush.spacing,
-                                            match &p.tip {
-                                                openpaint_core::TipRef::Round => String::new(),
-                                                openpaint_core::TipRef::File { path } =>
-                                                    format!(", tip {path}"),
-                                            }
-                                        ))
-                                        .clicked()
-                                    {
-                                        brush_action = Some(BrushAction::ApplyPreset(i));
-                                    }
-                                    if ui
-                                        .small_button("\u{d7}")
-                                        .on_hover_text("Forget this brush.")
-                                        .clicked()
-                                    {
-                                        brush_action = Some(BrushAction::DeletePreset(i));
-                                    }
-                                });
-                            }
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut preset_name)
-                                        .hint_text("Name")
-                                        .desired_width(120.0),
-                                );
-                                // Nameless presets are refused here rather than saved and puzzled
-                                // over later: a row with no label is one nobody can pick on purpose.
-                                if ui
-                                    .add_enabled(
-                                        !preset_name.trim().is_empty(),
-                                        egui::Button::new("Save brush"),
-                                    )
-                                    .on_hover_text(
-                                        "Keep these settings under that name. Saving over a name \
-                                         you already used updates it.",
-                                    )
-                                    .on_disabled_hover_text("Give it a name first.")
-                                    .clicked()
-                                {
-                                    brush_action = Some(BrushAction::SavePreset);
-                                }
-                            });
-                            ui.label(
-                                egui::RichText::new(
-                                    "A brush keeps its size, edge, shape and response curves -- \
-                                     but never your colour.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                            ui.add_space(4.0);
-
-                            ui.add(
-                                egui::Slider::new(&mut brush.radius, 0.5..=400.0)
-                                    .logarithmic(true)
-                                    .text("Size (radius px)"),
-                            );
-                            ui.add(
-                                egui::Slider::new(&mut brush.hardness, 0.0..=1.0)
-                                    .text("Hardness")
-                                    .custom_formatter(|v, _| {
-                                        // Name the ends, because a bare number gives no
-                                        // clue which way round it goes.
-                                        match v {
-                                            v if v <= 0.001 => "0.00 soft".to_owned(),
-                                            v if v >= 0.999 => "1.00 hard".to_owned(),
-                                            v => format!("{v:.2}"),
-                                        }
-                                    }),
-                            );
-                            ui.add(egui::Slider::new(&mut brush.spacing, 0.01..=1.0).text("Spacing"));
-                            ui.add(
-                                egui::Slider::new(&mut brush.roundness, 0.02..=1.0)
-                                    .text("Roundness")
-                                    .custom_formatter(|v, _| match v {
-                                        v if v >= 0.999 => "1.00 round".to_owned(),
-                                        v => format!("{v:.2}"),
-                                    }),
-                            );
-                            ui.add(
-                                egui::Slider::new(&mut brush.angle, 0.0..=1.0)
-                                    .text("Angle (turns)")
-                                    .custom_formatter(|v, _| format!("{:.0}°", v * 360.0)),
-                            );
-                            ui.label(
-                                egui::RichText::new(
-                                    "A flattened dab is a chisel nib. Point Angle at Direction with a straight curve and it follows the stroke, which is where inked line weight comes from.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                            ui.label(
-                                egui::RichText::new(
-                                    "Alt+click picks the colour under the pointer, sampled from the composited image rather than from one layer.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-
-                            ui.separator();
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut brush.stabilization_ms,
-                                    0.0..=openpaint_core::stabilizer::MAX_LAG_MS,
-                                )
-                                .text("Stabilization (ms)"),
-                            );
-                            // The control is denominated in its own price. A one-pole filter trails
-                            // its input by exactly its time constant, so the setting *is* the
-                            // latency it adds -- there is no abstract "strength" to translate, and
-                            // no invented maximum to scale against. Latency being the top quality
-                            // axis (DECISIONS §4.1), the artist should be spending it in units they
-                            // can compare with the Speed readout.
-                            ui.label(
-                                egui::RichText::new(if brush.stabilization_ms <= 0.0 {
-                                    "Off. Smooths pen shake; the cost is lag, in the same \
-                                     milliseconds as the stroke time under Speed."
-                                } else {
-                                    "Smooths pen shake. The line trails the pen by this long, \
-                                     on top of the stroke time under Speed."
-                                })
-                                .small()
-                                .weak(),
-                            );
-
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new(
-                                    "What drives each parameter, and how. Pick an input, then shape the curve: drag a point, click to add one, right-click to remove. A flat curve means the input is ignored. The slider above is what you get at full input.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                            // Stacked rather than side by side. Side by side put the right-hand
-                            // editor's top-right corner under the scroll bar's hover zone, which
-                            // floats over the content -- so the one control at (1, 1) could not be
-                            // grabbed. Stacking keeps every editor at the left margin, well clear
-                            // of it, and leaves room for larger boxes, which are easier to aim at.
-                            for (name, response) in brush.responses_mut() {
-                                response_editor(ui, name, response);
-                                ui.add_space(2.0);
-                            }
-
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new("Tip").strong(),
-                            );
-                            if let Some(stamp) = brush.tip.stamp() {
-                                ui.label(format!(
-                                    "Bitmap, {}x{}",
-                                    stamp.width(),
-                                    stamp.height()
-                                ));
-                                ui.label(
-                                    egui::RichText::new(
-                                        "A bitmap tip carries its own edge, so hardness and the \
-                                         edge profile do not apply to it.",
-                                    )
-                                    .small()
-                                    .weak(),
-                                );
-                                if ui.button("Back to a round tip").clicked() {
-                                    brush.tip = openpaint_core::dab::Tip::default();
-                                }
-                            } else {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "The dab's edge profile: how coverage falls from the \
-                                         solid core out to the rim. Not driven by anything -- its \
-                                         axis is distance within the dab, not an input. A \
-                                         straight line is the plain ramp; bowing it out makes a \
-                                         marker, bowing it in makes an airbrush.",
-                                    )
-                                    .small()
-                                    .weak(),
-                                );
-                                if let Some(falloff) = brush.tip.falloff_mut() {
-                                    curve_editor(ui, "Edge profile", falloff);
-                                }
-                            }
-                            if ui
-                                .button("Load brush tip\u{2026}")
-                                .on_hover_text(
-                                    "A PNG of the mark a single dab makes. Drawn on transparent \
-                                     or drawn in black on white -- either way, what looks like \
-                                     ink is ink.",
-                                )
-                                .clicked()
-                            {
-                                brush_action = Some(BrushAction::LoadTip);
-                            }
-
-                            ui.separator();
-                            ui.add(egui::Slider::new(&mut brush.flow, 0.0..=1.0).text("Flow"));
-                            ui.add(egui::Slider::new(&mut brush.opacity, 0.0..=1.0).text("Opacity"));
-                            ui.label(
-                                egui::RichText::new(
-                                    "Direction = paint per dab. Opacity = ceiling for the whole \
-                                     stroke. Set direction low and opacity mid to see build-up \
-                                     stop at the ceiling; lift and stroke again to go darker.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                ui.label("Color");
-                                ui.color_edit_button_srgb(&mut color_srgb);
-                                if ui
-                                    .small_button("+")
-                                    .on_hover_text("Keep this colour with the document.")
-                                    .clicked()
-                                {
-                                    brush_action = Some(BrushAction::SaveColor);
-                                }
-                            });
-
-                            ui.separator();
-                            // The swatches. Saved *with the document*, because a comic's palette
-                            // is a property of the comic: the skin tone that has to match on page
-                            // forty is the one from page one.
-                            if !status.palette.is_empty() {
-                                ui.horizontal_wrapped(|ui| {
-                                    for (i, rgb) in status.palette.iter().enumerate() {
-                                        let colour =
-                                            egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                                        let (rect, response) = ui.allocate_exact_size(
-                                            egui::vec2(18.0, 18.0),
-                                            egui::Sense::click(),
-                                        );
-                                        ui.painter().rect_filled(rect, 2.0_f32, colour);
-                                        // A hairline border, so a white swatch on a light panel is
-                                        // still a swatch rather than a gap.
-                                        ui.painter().rect_stroke(
-                                            rect,
-                                            2.0_f32,
-                                            egui::Stroke::new(
-                                                1.0_f32,
-                                                egui::Color32::from_black_alpha(90),
-                                            ),
-                                        );
-                                        if response.clicked() {
-                                            brush_action = Some(BrushAction::UseColor(*rgb));
-                                        }
-                                        // Right-click to forget, so the row stays swatches rather
-                                        // than swatches interleaved with delete buttons.
-                                        if response.secondary_clicked() {
-                                            brush_action = Some(BrushAction::ForgetColor(i));
-                                        }
-                                        response.on_hover_text(format!(
-                                            "#{:02X}{:02X}{:02X} \u{2014} click to use, \
-                                             right-click to forget",
-                                            rgb[0], rgb[1], rgb[2]
-                                        ));
-                                    }
-                                });
-                            }
-                            if ui.button("Reset to defaults").clicked() {
-                                *brush = Brush::default();
-                                color_srgb = brush.color_srgb8();
-                            }
-
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Spacing is a fraction of diameter (Photoshop ~0.25), so \n dabs land every {:.2} px.",
-                                    brush.radius * 2.0 * brush.spacing
-                                ))
-                                .small()
-                                .weak(),
-                            );
-                            ui.separator();
-                            ui.heading("Transform");
-                            if let Some(state) = transform_state.as_mut() {
-                                let t = &mut state.transform;
-                                ui.label(
-                                    egui::RichText::new(
-                                        "On the canvas: drag inside to move, a handle to scale, \
-                                         just outside to rotate. Enter applies, Esc puts it back.",
-                                    )
-                                    .small()
-                                    .weak(),
-                                );
-                                let mut uniform = lock_aspect;
-                                ui.horizontal(|ui| {
-                                    ui.label("Scale");
-                                    let mut x = t.scale.0 * 100.0;
-                                    if ui
-                                        .add(egui::DragValue::new(&mut x).speed(0.5).suffix("%"))
-                                        .changed()
-                                    {
-                                        t.scale.0 = x / 100.0;
-                                        if uniform {
-                                            t.scale.1 = t.scale.0;
-                                        }
-                                    }
-                                    let mut y = t.scale.1 * 100.0;
-                                    if ui
-                                        .add(egui::DragValue::new(&mut y).speed(0.5).suffix("%"))
-                                        .changed()
-                                    {
-                                        t.scale.1 = y / 100.0;
-                                        if uniform {
-                                            t.scale.0 = t.scale.1;
-                                        }
-                                    }
-                                    if ui
-                                        .checkbox(&mut uniform, "Lock")
-                                        .on_hover_text(
-                                            "Keep the two axes equal, here and when dragging a \
-                                             corner.",
-                                        )
-                                        .changed()
-                                        && uniform
-                                    {
-                                        t.scale.1 = t.scale.0;
-                                    }
-                                });
-                                lock_aspect = uniform;
-                                let mut degrees = t.rotation.to_degrees();
-                                if ui
-                                    .add(
-                                        egui::Slider::new(&mut degrees, -180.0..=180.0)
-                                            .text("Rotation")
-                                            .suffix("\u{b0}"),
-                                    )
-                                    .changed()
-                                {
-                                    t.rotation = degrees.to_radians();
-                                }
-                                ui.horizontal(|ui| {
-                                    if ui.button("Flip horizontally").clicked() {
-                                        t.scale.0 = -t.scale.0;
-                                    }
-                                    if ui.button("Flip vertically").clicked() {
-                                        t.scale.1 = -t.scale.1;
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    if ui.button("Apply").clicked() {
-                                        transform_action = Some(TransformAction::Apply);
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        transform_action = Some(TransformAction::Cancel);
-                                    }
-                                });
-                                state.kernel = kernel;
-                                state.lock_aspect = lock_aspect;
-                            } else {
-                                ui.add_enabled_ui(status.has_selection, |ui| {
-                                    if ui
-                                        .button("Transform selection")
-                                        .on_hover_text(
-                                            "Lift the selection so it can be scaled and rotated \
-                                             before it lands.",
-                                        )
-                                        .clicked()
-                                    {
-                                        transform_action = Some(TransformAction::Begin);
-                                    }
-                                });
-                            }
-                            ui.horizontal(|ui| {
-                                ui.label("Resampling");
-                                egui::ComboBox::from_id_salt("transform-kernel")
-                                    .selected_text(kernel.label())
-                                    .show_ui(ui, |ui| {
-                                        for option in openpaint_core::Kernel::ALL {
-                                            ui.selectable_value(
-                                                &mut kernel,
-                                                option,
-                                                option.label(),
-                                            );
-                                        }
-                                    });
-                            });
-                            if let Some(state) = transform_state.as_mut() {
-                                state.kernel = kernel;
-                            }
-
-                            ui.separator();
-                            ui.heading("Text");
-                            if let Some(block) = text.as_deref_mut() {
-                                text_changed |= text_editor(
-                                    ui,
-                                    block,
-                                    status.font_families,
-                                    status.font_substituted,
-                                );
-                                ui.separator();
-                                if ui
-                                    .button("Convert to raster layer")
-                                    .on_hover_text(
-                                        "Keeps the pixels and stops re-deriving them, so the \
-                                         layer can be painted on. The text stops existing \
-                                         as text; undo brings it back, retyping does not.",
-                                    )
-                                    .clicked()
-                                {
-                                    text_action = Some(TextAction::ConvertToRaster);
-                                }
-                            } else {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "The active layer is not a text layer. A text layer keeps \
-                                         the words rather than the pixels, so a caption stays \
-                                         retypeable — and cannot be painted on.",
-                                    )
-                                    .small()
-                                    .weak(),
-                                );
-                            }
-                            ui.horizontal(|ui| {
-                                if ui.button("Add text layer").clicked() {
-                                    text_action = Some(TextAction::AddLayer);
-                                }
-                                if ui
-                                    .button("Load font file\u{2026}")
-                                    .on_hover_text(
-                                        "Use a .ttf or .otf without installing it. Available for \
-                                         this session.",
-                                    )
-                                    .clicked()
-                                {
-                                    text_action = Some(TextAction::LoadFontFile);
-                                }
-                            });
-
-                            ui.separator();
-                            ui.heading("View");
-                            ui.label(format!(
-                                "Zoom {:.0}%    Rotation {:.0} deg",
-                                view.scale() * 100.0,
-                                view.rotation().to_degrees()
-                            ));
-                            ui.label(
-                                egui::RichText::new(
-                                    "Wheel zooms at the cursor. Space+drag or middle-drag pans. \
-                                     [ and ] rotate. 0 fits, 1 goes to 100%.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                            ui.label(
-                                egui::RichText::new(
-                                    "Navigation is mouse and keyboard for now -- these are \
-                                     shortcuts, not gestures.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                            ui.separator();
-                            ui.heading("History");
-                            let (undo_depth, redo_depth, bytes) = status.history;
-                            ui.label(format!(
-                                "Undo {undo_depth}   Redo {redo_depth}   ({:.1} MiB)",
-                                bytes as f32 / (1024.0 * 1024.0)
-                            ));
-                            ui.label(
-                                egui::RichText::new(
-                                    "Ctrl+Z undoes, Ctrl+Shift+Z or Ctrl+Y redoes. Snapshots cover \
-                                     only the tiles a stroke touched.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                            ui.separator();
-                            ui.heading("Pages");
-                            let (page_count, active_page) = status.pages;
-                            if ui.button("Add page").clicked() {
-                                page_action = Some(PageAction::Add);
-                            }
-                            for index in 0..page_count {
-                                ui.horizontal(|ui| {
-                                    let selected = index == active_page;
-                                    if ui
-                                        .selectable_label(selected, format!("Page {}", index + 1))
-                                        .clicked()
-                                    {
-                                        page_action = Some(PageAction::Select(index));
-                                    }
-                                    if selected {
-                                        if ui
-                                            .add_enabled(index > 0, egui::Button::new("Up"))
-                                            .clicked()
-                                        {
-                                            page_action = Some(PageAction::Move {
-                                                from: index,
-                                                to: index - 1,
-                                            });
-                                        }
-                                        if ui
-                                            .add_enabled(index + 1 < page_count, egui::Button::new("Down"))
-                                            .clicked()
-                                        {
-                                            page_action = Some(PageAction::Move {
-                                                from: index,
-                                                to: index + 1,
-                                            });
-                                        }
-                                        // The last page cannot go: a document must have somewhere to
-                                        // draw.
-                                        if ui
-                                            .add_enabled(page_count > 1, egui::Button::new("Delete"))
-                                            .clicked()
-                                        {
-                                            page_action = Some(PageAction::Delete(index));
-                                        }
-                                    }
-                                });
-                            }
-                            ui.label(
-                                egui::RichText::new(
-                                    "A webtoon is one very tall page, a sketchbook is many -- one model \
-                                     either way (DECISIONS §5a). Deleting a page is undoable.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-
-                            ui.separator();
-                            ui.heading("Layers");
-                            if ui.button("Add layer").clicked() {
-                                layer_action = Some(LayerAction::Add);
-                            }
-                            // Top-down, because that is how every drawing app shows a stack and how
-                            // artists talk about it -- the document stores it bottom-first.
-                            let count = status.layers.len();
-                            for (index, layer) in status.layers.iter().enumerate().rev() {
-                                let selected = index == status.active_layer;
-                                ui.push_id(layer.id(), |ui| {
-                                    ui.horizontal(|ui| {
-                                        let mut visible = layer.visible;
-                                        if ui.checkbox(&mut visible, "").changed() {
-                                            layer_action =
-                                                Some(LayerAction::SetVisible { index, visible });
-                                        }
-                                        if ui.selectable_label(selected, &layer.name).clicked() {
-                                            layer_action = Some(LayerAction::Select(index));
-                                        }
-                                        // In the row, next to visibility, because both are per-layer
-                                        // switches an artist flips constantly while colouring.
-                                        let mut lock = layer.lock_alpha;
-                                        if ui
-                                            .toggle_value(&mut lock, "α")
-                                            .on_hover_text(
-                                                "Lock alpha: paint only where this layer already has pixels, and never change its transparency. How colour goes inside line art without a selection.",
-                                            )
-                                            .changed()
-                                        {
-                                            layer_action =
-                                                Some(LayerAction::SetLockAlpha { index, lock });
-                                        }
-                                        let mut clip = layer.clip_below;
-                                        if ui
-                                            .toggle_value(&mut clip, "⊂")
-                                            .on_hover_text(
-                                                "Clip to the layer below: this layer only shows where the one beneath it has pixels, and stays separately editable. How shading and highlights sit over flats.",
-                                            )
-                                            .changed()
-                                        {
-                                            layer_action =
-                                                Some(LayerAction::SetClipBelow { index, clip });
-                                        }
-                                    });
-                                    if selected {
-                                        ui.horizontal(|ui| {
-                                            let mut opacity = layer.opacity;
-                                            if ui
-                                                .add(
-                                                    egui::Slider::new(&mut opacity, 0.0..=1.0)
-                                                        .text("opacity"),
-                                                )
-                                                .changed()
-                                            {
-                                                layer_action =
-                                                    Some(LayerAction::SetOpacity { index, opacity });
-                                            }
-                                        });
-                                        ui.horizontal(|ui| {
-                                            egui::ComboBox::from_id_salt("blend")
-                                                .selected_text(layer.blend.label())
-                                                .show_ui(ui, |ui| {
-                                                    for mode in Blend::ALL {
-                                                        if ui
-                                                            .selectable_label(
-                                                                layer.blend == mode,
-                                                                mode.label(),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            layer_action = Some(LayerAction::SetBlend {
-                                                                index,
-                                                                blend: mode,
-                                                            });
-                                                        }
-                                                    }
-                                                });
-                                            if ui
-                                                .add_enabled(index + 1 < count, egui::Button::new("Up"))
-                                                .clicked()
-                                            {
-                                                layer_action = Some(LayerAction::Move {
-                                                    from: index,
-                                                    to: index + 1,
-                                                });
-                                            }
-                                            if ui.add_enabled(index > 0, egui::Button::new("Down")).clicked()
-                                            {
-                                                layer_action = Some(LayerAction::Move {
-                                                    from: index,
-                                                    to: index - 1,
-                                                });
-                                            }
-                                            // The last layer cannot go: a page with nowhere to paint is
-                                            // a state every caller would have to special-case.
-                                            if ui
-                                                .add_enabled(count > 1, egui::Button::new("Delete"))
-                                                .clicked()
-                                            {
-                                                layer_action = Some(LayerAction::Delete(index));
-                                            }
-                                        });
-                                        ui.horizontal(|ui| {
-                                            if ui
-                                                .button("Duplicate")
-                                                .on_hover_text(
-                                                    "Copy this layer, pixels and all, above itself.",
-                                                )
-                                                .clicked()
-                                            {
-                                                layer_action = Some(LayerAction::Duplicate(index));
-                                            }
-                                            // Nothing below means nothing to merge into, and a
-                                            // button that explains itself beats one that does
-                                            // nothing when pressed.
-                                            if ui
-                                                .add_enabled(
-                                                    index > 0,
-                                                    egui::Button::new("Merge down"),
-                                                )
-                                                .on_hover_text(
-                                                    "Fold this layer into the one below, as it looks now. Undoable.",
-                                                )
-                                                .on_disabled_hover_text(
-                                                    "There is no layer below this one.",
-                                                )
-                                                .clicked()
-                                            {
-                                                layer_action = Some(LayerAction::MergeDown(index));
-                                            }
-                                        });
-                                    }
-                                });
-                            }
-                            ui.label(
-                                egui::RichText::new(
-                                    "Multiply darkens what is under it, Screen lightens. Deleting \
-                                     and merging are undoable -- otherwise they would not be \
-                                     offered. Duplicating is not, because the way back is to \
-                                     delete the copy.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-
-                            ui.separator();
-                            ui.heading("Canvas memory");
-                            let (used, capacity) = status.residency;
-                            ui.label(format!(
-                                "GPU {used} / {capacity} tiles ({:.0} of {:.0} MiB)",
-                                used as f32 * 0.5,
-                                capacity as f32 * 0.5
-                            ));
-                            if status.spilled > 0 {
-                                let (out, back) = status.traffic;
-                                ui.label(format!(
-                                    "CPU {} tiles ({:.0} MiB), {out} out / {back} back",
-                                    status.spilled,
-                                    status.spilled as f32 * 0.5
-                                ));
-                            }
-                            if ui.button("Trim to canvas").clicked() {
-                                trim = true;
-                            }
-                            ui.label(
-                                egui::RichText::new(
-                                    "Cropping keeps the pixels outside the page, so nothing is lost \
-                                     by accident. Trim discards them for good -- undoably.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                            ui.separator();
-                            ui.heading("Speed");
-                            // Shown in the app, not only logged, because the number has to be visible at
-                            // the moment something feels wrong -- that is when it is worth reading, and a
-                            // log read afterwards cannot tell you what you were doing at the time.
-                            match status.perf.input {
-                                Some((mean, peak)) => {
-                                    ui.label(format!("Stroke {mean:.1} ms, peak {peak:.1}"));
-                                }
-                                None => {
-                                    ui.label("Stroke -- draw something");
-                                }
-                            }
-                            if let Some((mean, peak)) = status.perf.frame {
-                                ui.label(format!("Frame {mean:.1} ms, peak {peak:.1}"));
-                            }
-                            ui.label(
-                                egui::RichText::new(
-                                    "Stroke time is from the sample reaching us to the frame being \
-                                     presented. It leaves out the tablet, the driver and the display, \
-                                     so the real figure is higher.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                            // The step-6 readout: how many samples the input path is actually
-                            // handing us, and how far the pen moved between them.
-                            match status.perf.rate {
-                                Some(hz) => {
-                                    let verdict = if hz >= 120.0 {
-                                        "full pen rate"
-                                    } else if hz >= 90.0 {
-                                        "some samples lost"
-                                    } else {
-                                        "about one a frame -- samples are being dropped"
-                                    };
-                                    ui.label(format!("Pen {hz:.0} samples/s ({verdict})"));
-                                }
-                                None => {
-                                    ui.label("Pen rate -- draw for a second");
-                                }
-                            }
-                            if let Some((mean, peak)) = status.perf.step {
-                                // Both, because either alone misleads. Page pixels are what the
-                                // brush engine interpolates across and so what decides whether a
-                                // curve facets; screen pixels are what the hand actually moved.
-                                // Printing only the first made 40 px look alarming when the canvas
-                                // was simply zoomed out — the figure was right and unreadable.
-                                let zoom = view.scale().max(f32::MIN_POSITIVE);
-                                ui.label(format!(
-                                    "Step {mean:.1} page px, peak {peak:.1} ({:.1} / {:.1} on \
-                                     screen at {:.0}%)",
-                                    mean * zoom,
-                                    peak * zoom,
-                                    zoom * 100.0
-                                ));
-                            }
-                            ui.label(
-                                egui::RichText::new(
-                                    "A tablet reports around 200 times a second. Near that means \
-                                     nothing is being lost; near 60 means we are only seeing one \
-                                     sample a frame, which is what makes a fast curve come out \
-                                     faceted.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                            ui.label(status.autosave);
-                            ui.separator();
-                            ui.heading("Export");
-                            ui.label(
-                                egui::RichText::new(
-                                    "Ctrl+E writes a PNG in the working directory. Ctrl+S \
-                                     saves the document itself, Ctrl+Shift+S under a new \
-                                     name, Ctrl+O opens one and Ctrl+N starts one.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                            ui.separator();
-                            ui.heading("Page");
-                            ui.label(format!(
-                                "{} x {} px",
-                                status.page_size.0, status.page_size.1
-                            ));
-                            ui.add(
-                                egui::Slider::new(&mut extend_amount, 32..=4096)
-                                    .logarithmic(true)
-                                    .text("Extend by (px)"),
-                            );
-                            ui.horizontal(|ui| {
-                                if ui.button("Extend down").clicked() {
-                                    extend = Some((Side::Bottom, extend_amount));
-                                }
-                                if ui.button("up").clicked() {
-                                    extend = Some((Side::Top, extend_amount));
-                                }
-                                if ui.button("left").clicked() {
-                                    extend = Some((Side::Left, extend_amount));
-                                }
-                                if ui.button("right").clicked() {
-                                    extend = Some((Side::Right, extend_amount));
-                                }
-                            });
-                            ui.label(
-                                egui::RichText::new(
-                                    "All four directions exist in the engine; the real UI \
-                                     will show only what a mode needs (DECISIONS 5a). This \
-                                     is a debug panel, so it shows everything.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                            ui.separator();
-                            match status.crop_rect {
-                                None => {
-                                    if ui.button("Crop / resize by dragging").clicked() {
-                                        crop_action = Some(CropAction::Start);
-                                    }
-                                }
-                                Some((x, y, w, h)) => {
-                                    ui.label(format!("Crop to {w} x {h} at ({x}, {y})"));
-                                    ui.horizontal(|ui| {
-                                        if ui.button("Apply").clicked() {
-                                            crop_action = Some(CropAction::Apply);
-                                        }
-                                        if ui.button("Cancel").clicked() {
-                                            crop_action = Some(CropAction::Cancel);
-                                        }
-                                    });
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Drag an edge or corner; drag inside to move it. Dragging \
-                                             outward extends the page. Enter applies, Escape cancels.",
-                                        )
-                                        .small()
-                                        .weak(),
-                                    );
-                                }
-                            }
-                        });
-                });
-            panel_rect = panel.response.rect;
-
-            // The status bar. It used to be a label at the bottom of this panel, under Export,
-            // below several hundred pixels of other controls -- so it scrolled off screen and was
-            // reported, fairly, as "what status line? I don't see it". Feedback nobody can see is
-            // not feedback.
-            //
-            // Along the bottom of the *canvas*, where every application puts one, and drawn rather
-            // than laid out so it cannot push the canvas around the way the confirm window once
-            // did.
-            if let Some(msg) = status.message {
-                let screen = ctx.screen_rect();
-                let left = panel_rect.right();
-                let painter = ctx.layer_painter(egui::LayerId::new(
-                    crate::workspace::artwork_order(),
-                    egui::Id::new("status-bar"),
-                ));
-                let text = painter.layout_no_wrap(
-                    msg.to_owned(),
-                    egui::FontId::proportional(13.0),
-                    egui::Color32::from_white_alpha(230),
-                );
-                let pad = egui::vec2(10.0, 5.0);
-                let size = text.size() + pad * 2.0;
-                let at = egui::pos2(left + 12.0, screen.bottom() - size.y - 12.0);
-                let box_rect = egui::Rect::from_min_size(at, size);
-                painter.rect_filled(box_rect, 4.0, egui::Color32::from_black_alpha(190));
-                painter.galley(at + pad, text, egui::Color32::WHITE);
-            }
-
-            let answered = prompts(ctx, status.recovery, status.confirm);
-            recovery_choice = answered.0.or(recovery_choice);
-            confirm_choice = answered.1.or(confirm_choice);
-
         });
 
         // Paint the crop rectangle and the transform box over the canvas. Deliberately painted,
@@ -2408,33 +1368,24 @@ impl Ui {
         self.extend_amount = extend_amount;
         self.preset_name.clone_from(&preset_name);
 
-        // Record which pixels the *panel* owns, in physical coordinates, for `blocks_point` and
-        // for the canvas inset.
-        //
-        // Deliberately the panel's own rect, not `used_rect()`. `used_rect` is the union of
-        // everything egui drew, so a centred floating window -- the unsaved-changes prompt --
-        // made it span half the screen and shoved the canvas sideways. The inset means "how much
-        // of the left edge the panel covers", and only the panel can answer that.
+        // Put back the state the frame borrowed.
         self.panel_input = panel_input;
+        self.prompt_input = prompt_input;
         self.menu_open = menu_open;
         self.pick_open = pick_open;
         self.wheel_shape = wheel_shape;
         self.wheel_hold = wheel_hold;
-        let scale = self.ctx.pixels_per_point();
-        let used = panel_rect;
-        self.occupied = egui::Rect::from_min_max(
-            egui::pos2(used.min.x * scale, used.min.y * scale),
-            egui::pos2(used.max.x * scale, used.max.y * scale),
-        );
-        self.canvas_viewport = panel_canvas.unwrap_or((
-            self.occupied.max.x.max(0.0),
-            0.0,
-            (size_px[0] as f32 - self.occupied.max.x).max(1.0),
-            size_px[1] as f32,
-        ));
-        // In the workspace the canvas is a panel, so everything that is *not* it belongs to the
-        // UI. Expressed as the complement rather than as a list of panel rectangles: one
-        // answer cannot drift from another, and a new panel needs no bookkeeping here.
+        // **Where the canvas may draw: the canvas panel's rectangle, and nothing else.**
+        //
+        // The whole surface is the fallback rather than a computed inset, because there is no
+        // side panel to subtract any more -- and because a *wrong* rectangle here is worse than
+        // a too-large one: it shoves the artwork sideways. The old code derived it from the
+        // panel's width, which is why a centred prompt once moved the canvas.
+        //
+        // Which points the pen may reach is a different question, and the workspace is asked it
+        // directly rather than answered from this.
+        self.canvas_viewport =
+            panel_canvas.unwrap_or((0.0, 0.0, size_px[0] as f32, size_px[1] as f32));
 
         self.state
             .handle_platform_output(window, output.platform_output);
@@ -2495,6 +1446,8 @@ impl Ui {
             trim,
             layer: layer_action,
             page: page_action,
+            export: export_choice,
+            export_set,
             tool: tool_action,
             confirm: confirm_choice,
             recovery: recovery_choice,

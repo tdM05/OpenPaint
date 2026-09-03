@@ -102,6 +102,14 @@ pub struct Autosave {
     last: Option<(SystemTime, Duration, usize)>,
     /// Whether a copy is currently on disk.
     live: bool,
+    /// Why the last attempt failed, if it did.
+    ///
+    /// **A silent autosave failure is the worst thing in this file.** The artist believes their
+    /// work is being protected; nothing on screen disagrees; the protection is not happening. It
+    /// used to go to `eprintln!`, which in a windowed application is printing into nothing. Kept
+    /// here rather than reported once and forgotten, so the readout can go on saying it for as
+    /// long as it is true.
+    trouble: Option<String>,
 }
 
 impl Autosave {
@@ -113,6 +121,7 @@ impl Autosave {
             due_at: Instant::now() + INTERVAL,
             last: None,
             live: false,
+            trouble: None,
         }
     }
 
@@ -146,12 +155,27 @@ impl Autosave {
     pub fn record(&mut self, took: Duration, tiles: usize) {
         self.last = Some((SystemTime::now(), took, tiles));
         self.live = true;
+        self.trouble = None;
         self.due_at = Instant::now() + INTERVAL;
     }
 
     /// Note a failed write and try again later rather than every frame.
-    pub fn postpone(&mut self) {
+    ///
+    /// Returns whether this is *news* -- the first failure, or a different one from last time --
+    /// so the shell can say it out loud once instead of every minute. Nagging about background
+    /// work every sixty seconds would be its own kind of failure, and the readout carries the
+    /// standing version.
+    pub fn postpone(&mut self, why: String) -> bool {
+        let news = self.trouble.as_deref() != Some(why.as_str());
+        self.trouble = Some(why);
         self.due_at = Instant::now() + INTERVAL;
+        news
+    }
+
+    /// Why autosave is not working, if it is not.
+    #[must_use]
+    pub fn trouble(&self) -> Option<&str> {
+        self.trouble.as_deref()
     }
 
     /// Throw away this session's copy, because there is nothing unsaved to recover.
@@ -391,8 +415,41 @@ mod tests {
     fn a_failure_backs_off_too() {
         let mut a = Autosave::new();
         a.due_at = Instant::now();
-        a.postpone();
+        assert!(a.postpone("the disk is full".to_owned()));
         assert!(!a.is_due(true, false));
+    }
+
+    /// A failure is news once, and stays true until a write succeeds.
+    ///
+    /// **Both halves matter.** Saying it every minute would be nagging about background work; not
+    /// saying it at all is the failure this exists to prevent, where the artist believes their
+    /// work is protected and it is not. So: loud once, then standing in the readout, and gone the
+    /// moment a copy is actually written.
+    #[test]
+    fn a_failure_is_news_once_and_then_stands() {
+        let mut a = Autosave::new();
+        assert_eq!(a.trouble(), None, "a fresh autosave is not in trouble");
+
+        assert!(
+            a.postpone("the disk is full".to_owned()),
+            "the first failure is news"
+        );
+        assert_eq!(a.trouble(), Some("the disk is full"));
+        assert!(
+            !a.postpone("the disk is full".to_owned()),
+            "the same failure again is not news"
+        );
+        assert!(
+            a.postpone("permission denied".to_owned()),
+            "a different failure is news again"
+        );
+
+        a.record(Duration::from_millis(3), 2);
+        assert_eq!(
+            a.trouble(),
+            None,
+            "a successful write left the trouble standing"
+        );
     }
 
     #[test]

@@ -1,0 +1,85 @@
+# Bringing a picture in: as a layer, and as a document.
+#
+# Until this existed there was no way at all to get an image into OpenPaint -- `Open` read
+# `.openpaint` and nothing else -- so a scanned pencil sketch, which is how most comics pages
+# start, could not be opened. Both halves are driven here because they are different operations
+# that only look alike: Place adds a layer to what is open, Open replaces it and takes the page
+# size from the picture.
+#
+# The two fixtures are written by the sweep before it runs, so the paths are known. A PNG and a
+# JPEG, because those are the two decoders; driving one of them would say nothing about the other.
+#
+# The dialog is native and runs on its own thread; it needs a good while to appear and take the
+# keyboard, and a path typed before it has goes into the application instead.
+
+expect layers 1
+expect layer-names Layer 1
+expect undo 0
+expect dirty false
+expect dialog false
+
+# --- Place: the picture arrives as a layer of its own, named after the file ---
+press Menu:File
+press Menu:Place image
+wait 3000
+expect dialog true
+type C:\Users\taddm\code\OpenPaint\target\drive\import-fixture.png
+wait 1000
+key enter
+wait 2500
+expect dialog false
+expect layers 2
+expect layer-names Layer 1, import-fixture
+expect dirty true
+expect page-size 2048	2048
+
+# **Where it landed, not merely that something did.** The fixture is 1400x900 on a 2048x2048
+# page, so centred it covers the middle and leaves the top of the page bare. One box inside it
+# and one above it: the first alone would pass if the picture had been stretched over everything,
+# which is the likeliest way for a placement to be wrong.
+ink 900 700 1000 800 20
+ink 900 200 1000 300 0
+shot import-placed
+
+# --- One gesture, one undo step, and the pixels go with it ---
+#
+# A layer that undoes to an empty layer rather than to no layer would leave the stack one deeper
+# every time; a layer that goes and leaves its pixels behind would leave them on the page with
+# nothing owning them. Both are asserted, in both directions.
+key ctrl+z
+expect layers 1
+expect layer-names Layer 1
+ink 900 700 1000 800 0
+key ctrl+shift+z
+expect layers 2
+expect layer-names Layer 1, import-fixture
+ink 900 700 1000 800 20
+shot import-undone-and-back
+
+# --- Open: a picture becomes a document, and the page becomes its size ---
+#
+# The document is dirty by now, so this is also the unsaved-changes prompt in its new clothes:
+# it has to be answered before the file dialog appears at all.
+press Menu:File
+press Menu:Open
+expect confirm true
+shot import-unsaved-prompt
+press Discard changes
+wait 3000
+expect dialog true
+type C:\Users\taddm\code\OpenPaint\target\drive\import-fixture.jpg
+wait 1000
+key enter
+wait 2500
+expect dialog false
+expect page-size 800	600
+expect layers 1
+
+# **No path.** A picture opened is not a document that was saved and reopened: Save must ask
+# where to put a `.openpaint` rather than quietly writing over somebody's photograph.
+expect file -
+expect dirty true
+shot import-opened
+
+# The whole page is the picture now, so anywhere on it is ink.
+ink 900 700 1000 800 20

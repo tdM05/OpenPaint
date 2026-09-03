@@ -51,8 +51,13 @@
                         hiding a command that would be refused. Note that it passes trivially if
                         the panel holding it is not showing either, so open the menu first.
     ink X1 Y1 X2 Y2 N   at least N dark pixels in that box of the page (N=0 means none at all)
+    wrote PATH [WxH]    a PNG exists on disk, of that size if one is given -- the only
+                        step that looks outside the application
 
     tab NAME            bring that panel's tab to the front
+    holdtab NAME        hold that panel's tab, which asks it for its settings
+    holdtab NAME DX DY  ...and then carry it that far, which is how a window is taken
+    dragtab NAME DX DY  take that tab and carry it that far
     press NAME          press the control whose label matches, anywhere on screen
     press PANEL:NAME    ...or only in that panel, when two of them share a word
     rpress NAME         the other button, on the same control
@@ -73,6 +78,8 @@ param(
     [string]$Script = '',
     [int]$Width = 1280,
     [int]$Height = 820,
+    # The display scale the scenarios are calibrated against. See the check after the first frame.
+    [double]$Scale = 0,
     [int]$Settle = 3000,
     [switch]$Keep,
     [switch]$KeepWorkspace,
@@ -374,6 +381,47 @@ try {
     $ox = $o.X
     $oy = $o.Y
 
+    # **The size has to stick, and the run must stop if it does not.**
+    #
+    # Every coordinate in every scenario is in this client area, so a window that came out a
+    # different size does not make a run slightly wrong -- it makes every number in it point
+    # somewhere else. From outside that looks like eighteen scenarios failing at once with
+    # assertions about ink and layout, which reads as the application having broken overnight.
+    #
+    # It happened. A second monitor was plugged in, the two displays had different scale factors,
+    # and moving the window across triggered a DPI change that winit answered by restoring the
+    # application's *own* default size -- 1280x800 -- undoing the `MoveWindow` above. The suite
+    # then drove 2200x1450 coordinates into a 1280x800 window and reported the results with total
+    # confidence.
+    #
+    # So: measure, try again, and give up loudly. The tolerance is the window frame, which
+    # `MoveWindow` counts and `GetClientRect` does not -- a correctly placed 2200x1450 window has
+    # a client area of about 2184x1411 here. Anything further out is a different window from the
+    # one the scenes were written against.
+    $frame = 80
+    for ($try = 0; $try -lt 3; $try++) {
+        [void][Win]::GetClientRect($h, [ref]$c)
+        if ($Width - $c.Right -le $frame -and $Height - $c.Bottom -le $frame) { break }
+        [void][Win]::MoveWindow($h, 60, 60, $Width, $Height, $true)
+        Start-Sleep -Milliseconds 400
+    }
+    [void][Win]::GetClientRect($h, [ref]$c)
+    if ($Width - $c.Right -gt $frame -or $Height - $c.Bottom -gt $frame) {
+        throw ("the window will not stay at ${Width}x${Height}: its client area is " +
+               "$($c.Right)x$($c.Bottom). Every coordinate in a scenario is in that area, so " +
+               'nothing below would mean what it says. This happens when displays of different ' +
+               'scale factors are attached and the window is restored to its own default size; ' +
+               'run on a single display, or pass -Width and -Height that stick.')
+    }
+    # **A fresh point.** `ClientToScreen` converts in place, and the one above already holds
+    # screen coordinates -- converting it twice adds the window's origin twice, which puts every
+    # press about seventy pixels from where the scene said. The window may have been moved again
+    # by the retry above, so the origin does have to be read afresh; the point does too.
+    $origin = New-Object Win+POINT
+    [void][Win]::ClientToScreen($h, [ref]$origin)
+    $ox = $origin.X
+    $oy = $origin.Y
+
     function Point-At([int]$x, [int]$y) {
         [Win]::MoveTo($ox + $x, $oy + $y)
         Start-Sleep -Milliseconds 25
@@ -597,6 +645,14 @@ try {
 
     # Every assertion this run made, so the end of a run says what it proved rather than only that
     # it did not crash.
+    # **Last run's evidence goes first, before this one can be mistaken for it.**
+    #
+    # The checks file used to be written only on the way out of a successful run, so a run that
+    # stopped left the previous one's on disk -- and everything that read it afterwards described
+    # a run that never happened. It is written on failure now as well, but a throw from outside
+    # the step loop still bypasses that, so the file is also removed here: absent evidence is
+    # honest, and stale evidence is not.
+    Remove-Item -LiteralPath (Join-Path $outDir "$Shot.checks") -Force -ErrorAction SilentlyContinue
     $checks = New-Object System.Collections.ArrayList
 
     # `about KEY VALUE` -- the same check for a number that came off a drag. A slider set by
@@ -669,6 +725,27 @@ try {
 
     # A step that fails says why, and shows what it was looking at. A message about a control
     # that would not come into view is a guess until you can see the screen it was on.
+    # **The scenarios are calibrated against one display, and this is where that is checked.**
+    #
+    # Panels are laid out in *logical* units, so the scale factor decides how much workspace there
+    # is: the same 2200x1450 window is 1452x929 at scale 1.5 and 2184x1411 at scale 1. Tabs that
+    # wrap on one do not wrap on the other, a floating window's default size differs, and a scene
+    # that names a tab position or a window rectangle is describing a screen it is not on.
+    #
+    # Without this, plugging in a second monitor made eighteen scenarios fail at once with
+    # assertions about ink and layout -- which reads as the application having broken overnight,
+    # and cost an hour before anyone looked at the scale factor.
+    if ($Scale -gt 0) {
+        $got = [double](Read-State)['scale']
+        if ([Math]::Abs($got - $Scale) -gt 0.01) {
+            throw ("this run is at display scale $got and the scenarios are written for $Scale. " +
+                   'Panels are laid out in logical units, so at another scale the workspace is a ' +
+                   'different size and the tabs, windows and canvas are not where the scenes say. ' +
+                   'Run on the display the suite was calibrated on, or pass -Scale to say that ' +
+                   'the numbers have been recalibrated for this one.')
+        }
+    }
+
     $script:onScreen = $true
     # One step, as a function, so a step can contain a step -- which `holding` needs: it presses a
     # key, does one thing, and lets go.
@@ -713,9 +790,62 @@ try {
                 [Win]::mouse_event([Win]::LUP, 0, 0, 0, [IntPtr]::Zero)
                 Start-Sleep -Milliseconds 500
             }
+            'holdtab' {
+                # `holdtab NAME [DX DY]` -- hold that panel's tab, and then carry it that far.
+                #
+                # Without the offsets it holds in place, which is what asks a panel for its
+                # settings. With them it holds *and then* moves, which is the gesture that takes a
+                # window: nothing rearranges until the pointer has been still for `HOLD_MS`.
+                #
+                # **The named form of `holdat`, and the reason it exists.** A tab's position
+                # depends on how wide every label before it measures and on how the panel column
+                # is split, so a scenario that holds a raw coordinate is holding whatever ends up
+                # there. `windows-apart.txt` did, and when the tabs moved it silently began
+                # floating History where it said Pages -- passing steps that meant something else,
+                # which is worse than failing. Names come out of the same atlas `tab` reads.
+                $moved = $a.Count -ge 4
+                $name = if ($moved) { $rest -replace '\s+\S+\s+\S+$', '' } else { $rest }
+                $r = Rect-Of $name -Tab
+                $x = $r.X + [int]($r.W / 2)
+                $y = $r.Y + [int]($r.H / 2)
+                Point-At $x $y
+                Start-Sleep -Milliseconds 120
+                [Win]::mouse_event([Win]::LDOWN, 0, 0, 0, [IntPtr]::Zero)
+                Start-Sleep -Milliseconds 700
+                if ($moved) {
+                    $steps = 24
+                    for ($i = 1; $i -le $steps; $i++) {
+                        $t = $i / $steps
+                        Point-At ([int]($x + [int]$a[-2] * $t)) ([int]($y + [int]$a[-1] * $t))
+                    }
+                    Start-Sleep -Milliseconds 250
+                }
+                [Win]::mouse_event([Win]::LUP, 0, 0, 0, [IntPtr]::Zero)
+                Start-Sleep -Milliseconds 400
+            }
+            'dragtab' {
+                # `dragtab NAME DX DY` -- take that tab and carry it by that much.
+                #
+                # Named for the same reason, and offset rather than absolute because what a drag
+                # of a window means is "this far", not "to there".
+                $name = $rest -replace '\s+\S+\s+\S+$', ''
+                $r = Rect-Of $name -Tab
+                $x = $r.X + [int]($r.W / 2)
+                $y = $r.Y + [int]($r.H / 2)
+                Point-At $x $y
+                [Win]::mouse_event([Win]::LDOWN, 0, 0, 0, [IntPtr]::Zero)
+                Start-Sleep -Milliseconds 60
+                $steps = 30
+                for ($i = 1; $i -le $steps; $i++) {
+                    $t = $i / $steps
+                    Point-At ([int]($x + [int]$a[-2] * $t)) ([int]($y + [int]$a[-1] * $t))
+                }
+                [Win]::mouse_event([Win]::LUP, 0, 0, 0, [IntPtr]::Zero)
+                Start-Sleep -Milliseconds 400
+            }
             'holdat' {
                 # `holdat X Y` -- press and hold in one place, which is what asks a panel for its
-                # settings, and let go.
+                # settings, and let go. Prefer `holdtab` where the thing being held is a tab.
                 Point-At $a[1] $a[2]
                 Start-Sleep -Milliseconds 120
                 [Win]::mouse_event([Win]::LDOWN, 0, 0, 0, [IntPtr]::Zero)
@@ -856,6 +986,44 @@ try {
                     $script:failed = $true
                 }
             }
+            'wrote' {
+                # `wrote PATH WIDTHxHEIGHT` -- a file exists on disk, and is a PNG of that size.
+                #
+                # **The only step that looks outside the application.** Everything else asks the
+                # app what it believes; an export is the one operation whose whole purpose is a
+                # file somebody else will open, and an app that says "Exported" while writing
+                # nothing would pass every other kind of check here. The size is read out of the
+                # PNG header, so a file that exists and is empty, or is the wrong page, fails.
+                # The size is optional: a file whose dimensions come from a slider cannot be
+                # predicted by a scene, because a slider is dragged to a pixel and not typed.
+                $want = if ($a.Count -ge 3) { $a[2] } else { $null }
+                $file = $a[1]
+                if (-not (Test-Path -LiteralPath $file)) {
+                    [void]$checks.Add("  FAIL  no file at $file")
+                    $script:failed = $true
+                } else {
+                    $bytes = [System.IO.File]::ReadAllBytes($file)
+                    if ($bytes.Length -lt 24 -or $bytes[1] -ne 0x50 -or $bytes[2] -ne 0x4e) {
+                        [void]$checks.Add("  FAIL  $file is not a PNG")
+                        $script:failed = $true
+                    } else {
+                        # IHDR: width and height as big-endian 32-bit, at bytes 16 and 20.
+                        $w = ([int]$bytes[16] -shl 24) -bor ([int]$bytes[17] -shl 16) -bor
+                             ([int]$bytes[18] -shl 8) -bor [int]$bytes[19]
+                        $h = ([int]$bytes[20] -shl 24) -bor ([int]$bytes[21] -shl 16) -bor
+                             ([int]$bytes[22] -shl 8) -bor [int]$bytes[23]
+                        $got = "${w}x${h}"
+                        if ($null -eq $want) {
+                            [void]$checks.Add("  ok    $file is a PNG of $got")
+                        } elseif ($got -eq $want) {
+                            [void]$checks.Add("  ok    $file is a PNG of $got")
+                        } else {
+                            [void]$checks.Add("  FAIL  $file is $got, wanted $want")
+                            $script:failed = $true
+                        }
+                    }
+                }
+            }
             'path' {
                 # `path X1 Y1 X2 Y2 X3 Y3 ...` -- a press, a walk through every point in turn, and
                 # a release. **A `drag` is a straight line**, so a lasso drawn with it is a
@@ -964,11 +1132,28 @@ try {
         }
     }
 
+    # **Written whatever happens, including when a step throws.**
+    #
+    # They used not to be: a run that stopped part-way left the *previous* run's checks on disk,
+    # and reading them afterwards described a run that never happened. Two defects were chased
+    # for an hour each against stale evidence -- which is a worse failure than the one being
+    # chased, because it is invisible.
+    function Save-Checks {
+        if ($checks.Count) {
+            # Beside the pictures, so the result of a run outlives the console it scrolled past.
+            $checks | Set-Content -LiteralPath (Join-Path $outDir "$Shot.checks") -Encoding utf8
+            Write-Output '--- checks ---'
+            $checks | Write-Output
+        }
+    }
+
     foreach ($step in $steps) {
         try {
             Do-Step $step
         } catch {
             Save-Shot "$Shot-failed"
+            [void]$checks.Add("  STOPPED at: $step")
+            Save-Checks
             Write-Output "the step that failed was: $step"
             throw
         }
@@ -976,12 +1161,7 @@ try {
 
     Start-Sleep -Milliseconds 500
     Save-Shot $Shot
-    if ($checks.Count) {
-        # Beside the pictures, so the result of a run outlives the console it scrolled past.
-        $checks | Set-Content -LiteralPath (Join-Path $outDir "$Shot.checks") -Encoding utf8
-        Write-Output '--- checks ---'
-        $checks | Write-Output
-    }
+    Save-Checks
     if ($failed) { throw "${Shot}: one or more checks failed" }
 }
 finally {

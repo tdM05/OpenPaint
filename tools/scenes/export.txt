@@ -1,0 +1,145 @@
+# Getting a page out: the dialog, the three things it can do, and the files it actually wrote.
+#
+# What was here before was not an export. `Ctrl+E` wrote one PNG of the current page, under a
+# timestamped name, into whatever directory the application had been started in -- no way to say
+# where it went, no way to export a second page, and no way to produce a webtoon strip, which is
+# the one delivery format this whole application is aimed at.
+#
+# **The `wrote` steps are the point of this scenario.** Every other check in this suite asks the
+# application what it believes; an export is the one operation whose entire purpose is a file
+# somebody else opens, and an application that says "Exported" while writing nothing would pass
+# every check but those.
+#
+# The files are called `out-*`, and the sweep deletes them before every run. Not tidiness: a save
+# dialog handed a name that already exists asks whether to overwrite it, and that question is a
+# second native modal this harness cannot answer -- so a leftover file from a failed run makes the
+# next one hang on a dialog and report the *old* file's size. Which is exactly what happened.
+#
+# The exports at full size come first and the scaled one last, on purpose. A slider is dragged to
+# a pixel rather than typed, so where it lands is close and not exact -- the first run of this
+# scene put "the far end" at 11% -- and only a scale nobody has touched lets the file's size be
+# predicted. So the exact-size checks are on the exports before the slider is moved, and the
+# scaled one afterwards proves that a scaled export writes a file at all.
+
+expect exporting false
+expect pages 1
+expect dirty false
+
+# Something on the page, so an exported file is a picture of something rather than of paper.
+ink 600 400 800 600 0
+drag 700 450 1100 800
+expect undo 1
+ink 600 400 800 600 20
+
+# --- The dialog: what it offers a one-page document, and what it does not ---
+#
+# One page cannot be exported three ways, so only "This page" is offered. Two of the three would
+# do exactly the same thing, and a choice with no consequence is one the artist has to think
+# about for nothing.
+press Menu:File
+press Menu:Export
+expect exporting true
+expect export-what this page
+expect export-scale 100
+absent Every page, one file each
+absent Every page, one tall strip
+shot export-dialog-one-page
+press Not now
+expect exporting false
+
+# --- A second page, so all three ways out are on offer ---
+#
+# Adding a page makes it the active one, so the scene goes back to page 1 afterwards: "this page"
+# has to mean the page with the stroke on it, or the file written proves nothing about where the
+# pixels went.
+tab Pages
+press pages:Add page
+expect pages 2
+press pages:Page 1
+expect page 0
+
+# --- This page, at the size it was drawn ---
+press Menu:File
+press Menu:Export
+expect exporting true
+expect export-what this page
+shot export-dialog-two-pages
+press Export
+wait 3000
+expect dialog true
+type C:\Users\taddm\code\OpenPaint\target\drive\out-one.png
+wait 1000
+key enter
+wait 3000
+expect dialog false
+expect exporting false
+wrote C:\Users\taddm\code\OpenPaint\target\drive\out-one.png 2048x2048
+
+# --- Every page, one file each ---
+#
+# Two pages, so two files, numbered -- and the numbers are what a reader's page order depends on.
+press Menu:File
+press Menu:Export
+press Every page, one file each
+expect export-what every page
+press Export
+wait 3000
+expect dialog true
+type C:\Users\taddm\code\OpenPaint\target\drive\out-pages.png
+wait 1000
+key enter
+wait 3000
+expect dialog false
+wrote C:\Users\taddm\code\OpenPaint\target\drive\out-pages-1.png 2048x2048
+wrote C:\Users\taddm\code\OpenPaint\target\drive\out-pages-2.png 2048x2048
+
+# --- Every page, one tall strip: the webtoon ---
+#
+# One file, as wide as a page and as tall as both of them together. Stitching this by hand in
+# another program is the step that would have made OpenPaint useless for the thing it is for.
+press Menu:File
+press Menu:Export
+press Every page, one tall strip
+expect export-what strip
+press Export
+wait 3000
+expect dialog true
+type C:\Users\taddm\code\OpenPaint\target\drive\out-strip.png
+wait 1000
+key enter
+wait 3000
+expect dialog false
+wrote C:\Users\taddm\code\OpenPaint\target\drive\out-strip.png 2048x4096
+shot export-strip-done
+
+# --- And smaller ---
+#
+# The size is remembered between exports on purpose, so this also says which way that goes: the
+# dialog opens on what it was last set to, not back at 100%.
+press Menu:File
+press Menu:Export
+slide Export size 0
+about export-scale 10 3
+shot export-dialog-small
+press Export
+wait 3000
+expect dialog true
+type C:\Users\taddm\code\OpenPaint\target\drive\out-small.png
+wait 1000
+key enter
+wait 3000
+expect dialog false
+wrote C:\Users\taddm\code\OpenPaint\target\drive\out-small.png
+press Menu:File
+press Menu:Export
+about export-scale 10 3
+press Not now
+
+# The document came through all of it untouched: an export reads the artwork and writes a file,
+# and must not so much as move the page the artist was on. **Nor may the dialog's own slider
+# paint**: it is drawn over the canvas, and the first run of this scene ended with an undo depth
+# of ten because dragging it put strokes on the page underneath.
+expect pages 2
+expect page 0
+expect undo 2
+ink 600 400 800 600 20

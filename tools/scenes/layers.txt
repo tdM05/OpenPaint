@@ -41,7 +41,16 @@ press Up
 expect layer-names Layer 1, Layer 2, Layer 2 copy
 
 # Properties of the active layer.
+#
+# **Every one of these is undoable now, and that is asserted here.** They used to sit outside the
+# history entirely, on the argument that a switch is not artwork -- so catching the opacity slider
+# by accident and pressing Ctrl+Z took back the *stroke before it*, destroying work in the course
+# of fixing something that had not been destroyed.
 slide Layers:Opacity 0.5
+about active.opacity 0.5
+key ctrl+z
+about active.opacity 1.0
+key ctrl+y
 about active.opacity 0.5
 press Lock alpha
 expect active.lock-alpha true
@@ -51,6 +60,22 @@ press Clip to the layer below
 expect active.clip-below true
 press Clip to the layer below
 expect active.clip-below false
+
+# Locking sets the layer aside: it stays visible, its alpha is its own, and nothing can paint on
+# it until it is unlocked. The refusal names the layer, because not noticing which layer you are
+# on is the entire mistake this prevents.
+press Lock this layer
+expect active.locked true
+expect active.visible true
+expect active.lock-alpha false
+drag 700 450 900 600
+expect status "Layer 2 copy" is locked, so it cannot be painted on. Unlock it in the Layers panel.
+press Lock this layer
+expect active.locked false
+key ctrl+z
+expect active.locked true
+key ctrl+y
+expect active.locked false
 shot layers-props
 
 # Merge down folds the active layer into the one beneath it.

@@ -8,7 +8,7 @@
 > An item leaves this file when it ships, and the reasoning behind it moves to
 > `DECISIONS.md`.
 
-Last updated: 2026-08-29
+Last updated: 2026-09-02
 
 > UI work has its own document: **`UI_PLAN.md`**. This file keeps what is not part of
 > that sequence.
@@ -34,8 +34,9 @@ question, and only for the few refusals that risk work.
 | Situation | Today | Wanted |
 | --- | --- | --- |
 | Paint on a text layer | status line, and only on the *first* refused stroke | in-canvas notice; offer "convert to raster" |
-| Paint on a hidden layer | nothing happens at all | say the layer is hidden, offer to show it |
-| Paint on a locked layer | (lock not built yet) | say so when it is |
+| Paint on a hidden layer | **refused, and says so** — a stroke that lands and shows nothing is indistinguishable from a broken brush | done 2026-09-02 |
+| Paint on a locked layer | **refused, and names the layer** | done 2026-09-02 |
+| Copy or cut with nothing selected | says so | done 2026-09-02 |
 | Fill / delete with no selection | status line | fine, but should not be panel-only |
 | Bucket click entirely outside the selection | status line | good — this is the model |
 | Saving a colour already in the palette | status line | good |
@@ -44,7 +45,7 @@ question, and only for the few refusals that risk work.
 | Transform an empty selection | status line | same |
 | Press outside the transform box | nothing happens | probably right, but confirm it does not read as dead |
 | Wand finds nothing at the seed | (unverified) | say "no region here at this tolerance" |
-| Undo with an empty stack | nothing happens | say "nothing to undo" |
+| Undo with an empty stack | **says how far the history goes** | done 2026-09-02 |
 | An edit too large to record in history | status line, after the fact | should be *before*, or at least unmissable |
 | Save fails (permissions, disk full) | (unverified) | must be a dialog, never a status line |
 | A font in the document is not installed | reported in the panel | good — this is the model for the rest |
@@ -53,12 +54,10 @@ question, and only for the few refusals that risk work.
 | The brush library will not load | shown in the Brush section | good |
 | Autosave fails | (unverified) | must be visible; silent autosave failure is the worst case here |
 
-**One thing to build before the table can be finished: a single place refusals go.**
-
-Today each refusal writes its own string at its own call site, which is exactly how
-coverage ends up patchy — the same shape as the pointer-capture bug in §4l, where every
-tool had its own idea of who owned the pointer. One `refuse(reason)` seam, and the audit
-above becomes "who calls it" rather than a list somebody has to keep up to date by hand.
+**The single place refusals go now exists** (`OpenPaint::refuse`, DECISIONS §6f), and painting
+asks `Editor::paint_refusal` for the *reason* rather than each caller guessing. The guessing was
+not hypothetical: every path said "this layer's alpha is locked", including on a text layer, where
+it was untrue. The audit above is now "who calls `refuse`", which is greppable.
 
 Later, and separately: a **dialog** for the few refusals that risk work — a failed save,
 a failed autosave. Those must not be a line anyone can scroll past. Everything else the
@@ -66,38 +65,43 @@ status line already handles.
 
 ---
 
-## 2. Known defects
+## 2. Known defects — **the one that was here is fixed, 2026-09-03**
 
-- **The app test binary occasionally dies with `STATUS_ACCESS_VIOLATION`** rather than
-  failing a test — roughly one run in ten on the dev box, always at process level, never
-  in a named test. Suspected wgpu/D3D12 teardown in the GPU cross-check tests. Not
-  chased yet; recorded because a sabotage sweep read one such crash as "the sabotage was
-  not caught", which is a false negative of exactly the kind §11a warns about.
+Was: the app test binary occasionally died with `STATUS_ACCESS_VIOLATION`, roughly one run in ten,
+always at process level and never in a named test. It also *hung*, which had not been noticed —
+a run was caught sitting at 2.6 GB with nothing happening.
+
+**The cause was the tests, not the application.** Seventy-odd of them each asked for their own
+wgpu instance, adapter and device, and the harness runs tests across as many threads as the
+machine has cores — so a run stood up and tore down dozens of D3D12 devices at once, on an
+integrated GPU that shares its memory with everything else. Each test canvas also allocated a
+128 MiB tile pool *up front* for a page smaller than a single tile.
+
+Both are now what the application actually does: **one device for the binary**, and a budget sized
+to what the tests draw. Peak memory went from **4144 MiB to 792 MiB** and a run from 13.5 s to
+7.7 s, with all 652 tests still passing.
+
+Worth keeping as a lesson rather than only a fix: a test that builds a configuration the
+application never has is testing something nobody ships, and here it was also the thing breaking
+the suite. The false negative it caused is recorded in §11a — a sabotage sweep once read one of
+these crashes as "the sabotage was not caught".
 
 ---
 
-## 3. The next real piece of work: render the float on the GPU
+## 3. Rendering the float on the GPU — **done 2026-09-02**
 
-A live transform still resamples on the **CPU** (§5g). After the obvious waste was
-removed it is 33 ms per frame for a 256-pixel selection and 453 ms for a 1024-pixel one
-— usable at small sizes, not a live drag at large ones. That is not a tuning problem:
-resampling is O(area) with a twenty-tap filter, so no amount of care makes the CPU the
-right machine for a preview that has to keep up with a pen.
+Was: a live transform resampled on the **CPU**, 33 ms per frame for a 256-pixel selection and
+453 ms for a 1024-pixel one. The fix was §4a applied where it had not been, and it is now in
+`float_pass.rs`: the lifted pixels go up as one texture at the lift, and each destination tile
+gets a render pass whose fragment shader asks `Transform::invert` where each pixel came from.
 
-**The fix is §4a applied where it was not: produce the float's destination tiles with a
-render pass instead of a loop.** The lifted pixels go up as a texture once at the lift;
-each frame draws the destination tiles sampling through the inverse transform. Nothing
-else changes — not `Lifted`, not the compositor, not the commit path, which keeps the
-CPU Mitchell resample because it runs once per gesture and that is where the quality is
-worth paying for (§5d).
+What did **not** change, as planned: `Lifted`, the compositor, and the commit path, which keeps
+the CPU Mitchell resample because it runs once per gesture and that is where the quality is worth
+paying for (§5d).
 
-Worth deciding rather than assuming, because it is the same class of change as layer
-groups: a new pipeline writing into the tile pool's array texture.
-
-Open question inside it: whether the preview filters with the hardware's bilinear or a
-cubic in the shader. The commit is Mitchell either way, so the only question is whether
-a preview that is slightly softer than the result is acceptable — every other app says
-yes.
+The open question inside it is answered: the preview filters **bilinear**, in hardware. The commit
+is Mitchell either way, so a preview very slightly softer than the result is the trade — which is
+what every comparable application does. The reasoning is in `DECISIONS.md` §5h.
 
 ---
 

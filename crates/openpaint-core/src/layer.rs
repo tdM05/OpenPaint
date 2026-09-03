@@ -127,6 +127,8 @@ pub struct Layer {
     pub lock_alpha: bool,
     /// Mask this layer by the layer below it. See [`Layer::clips_below`].
     pub clip_below: bool,
+    /// Nothing may change this layer's pixels at all. See [`Layer::is_locked`].
+    pub locked: bool,
     /// What this layer is made of. See [`Content`].
     ///
     /// Private, and reached through [`Layer::content`] / [`Layer::set_content`], because changing it
@@ -136,7 +138,98 @@ pub struct Layer {
     content: Content,
 }
 
+/// Everything about a layer except its name, its id and its pixels.
+///
+/// **One value rather than six fields to chase.** These are what the Layers panel sets, and the
+/// reason they are gathered is undo: recording "this layer's settings were *that*" needs one
+/// snapshot and one restore, where a variant per property needed six of each and would have
+/// needed a seventh the day a property was added. `Copy`, because it is six machine words and is
+/// snapshotted on every change.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Settings {
+    pub opacity: f32,
+    pub blend: Blend,
+    pub visible: bool,
+    pub lock_alpha: bool,
+    pub clip_below: bool,
+    pub locked: bool,
+}
+
+impl Settings {
+    /// Which fields differ between two sets of settings, as a bitmask.
+    ///
+    /// **For deciding whether two changes are the same change.** Undo coalesces a run of edits to
+    /// one layer so that dragging a slider is one step rather than forty -- but "the opacity moved
+    /// again" and "and then it was locked" are two decisions, and merging them makes one Ctrl+Z
+    /// undo something the artist did not ask it to. Comparing *what changed* tells them apart;
+    /// comparing the layer alone does not.
+    ///
+    /// A mask rather than an enum of properties: it costs nothing, and a field added to `Settings`
+    /// that nobody remembers to add here shows up as two edits refusing to coalesce, which is
+    /// merely ungainly. The other way round -- a new field silently merging with everything --
+    /// would be an undo step quietly eating an edit.
+    #[must_use]
+    pub fn differences(self, other: Self) -> u8 {
+        let mut mask = 0;
+        // Bit-exact, deliberately: a slider that lands on the same value twice reports no change,
+        // and `set_layer_settings` has already refused that case before it gets here.
+        if self.opacity.to_bits() != other.opacity.to_bits() {
+            mask |= 1;
+        }
+        if self.blend != other.blend {
+            mask |= 2;
+        }
+        if self.visible != other.visible {
+            mask |= 4;
+        }
+        if self.lock_alpha != other.lock_alpha {
+            mask |= 8;
+        }
+        if self.clip_below != other.clip_below {
+            mask |= 16;
+        }
+        if self.locked != other.locked {
+            mask |= 32;
+        }
+        mask
+    }
+}
+
 impl Layer {
+    /// This layer's settings, as one value.
+    #[must_use]
+    pub fn settings(&self) -> Settings {
+        Settings {
+            opacity: self.opacity,
+            blend: self.blend,
+            visible: self.visible,
+            lock_alpha: self.lock_alpha,
+            clip_below: self.clip_below,
+            locked: self.locked,
+        }
+    }
+
+    /// Put settings back onto this layer.
+    ///
+    /// Every field, deliberately: a partial restore is how undo ends up leaving one property at
+    /// the value it had *after* the thing being undone.
+    pub fn set_settings(&mut self, settings: Settings) {
+        let Settings {
+            opacity,
+            blend,
+            visible,
+            lock_alpha,
+            clip_below,
+            locked,
+        } = settings;
+        self.opacity = opacity;
+        self.blend = blend;
+        self.visible = visible;
+        self.lock_alpha = lock_alpha;
+        self.clip_below = clip_below;
+        self.locked = locked;
+    }
+
     /// Rebuild a layer exactly as it was, for loading a document.
     ///
     /// Takes the id rather than assigning one, because tiles are keyed by it: a load that
@@ -160,8 +253,20 @@ impl Layer {
             visible,
             lock_alpha,
             clip_below,
+            locked: false,
             content: Content::Raster,
         }
+    }
+
+    /// The same layer, locked.
+    ///
+    /// A builder rather than an eighth positional argument, for the reason [`Layer::restored`]'s
+    /// own comment gives: that call already takes three bools in a row, and a fourth would make
+    /// every call site a line of `true, false, false, true` that nobody can read correctly.
+    #[must_use]
+    pub fn with_lock(mut self, locked: bool) -> Self {
+        self.locked = locked;
+        self
     }
 
     /// The same layer, carrying text instead of pixels.
@@ -187,6 +292,7 @@ impl Layer {
             visible: true,
             lock_alpha: false,
             clip_below: false,
+            locked: false,
             content: Content::Raster,
         }
     }
@@ -272,7 +378,22 @@ impl Layer {
     /// cannot forget: painting, filling, clearing, erasing and moving all go through this.
     #[must_use]
     pub fn accepts_paint(&self) -> bool {
-        matches!(self.content, Content::Raster)
+        matches!(self.content, Content::Raster) && !self.locked
+    }
+
+    /// Whether this layer has been set aside: nothing may change its pixels.
+    ///
+    /// **Not a painting mode, unlike [`locks_alpha`](Layer::locks_alpha).** Alpha lock is
+    /// something an artist switches on in order to work -- paint only where there is paint --
+    /// while this is switched on in order *not* to work on something: the sketch under the inks,
+    /// the flats under the shading. Inking onto the sketch layer is the commonest mistake in this
+    /// medium, and the reason every comparable application has this.
+    ///
+    /// Not the same as hiding it either. Hiding a layer to protect it takes away the thing you
+    /// are drawing over, which is the whole reason it is there.
+    #[must_use]
+    pub fn is_locked(&self) -> bool {
+        self.locked
     }
 
     /// Opacity clamped to the range the compositor accepts.
@@ -289,6 +410,150 @@ impl Layer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A locked layer takes no paint, whatever else is true of it.
+    ///
+    /// **Through `accepts_paint`, which is the one question everything that paints asks.** Adding
+    /// the check anywhere else -- in the brush, in the fill, in the clear -- would have been
+    /// three checks and a fourth one missing, which is exactly how a text layer came to be
+    /// paintable through one path and not another.
+    #[test]
+    fn a_locked_layer_takes_no_paint() {
+        let mut layer = Layer::new(1, "Sketch");
+        assert!(layer.accepts_paint(), "an ordinary layer refuses paint");
+        layer.locked = true;
+        assert!(!layer.accepts_paint(), "a locked layer accepted paint");
+        assert!(layer.is_locked());
+
+        // And unlocking gives it back: a lock is a state, not a conversion.
+        layer.locked = false;
+        assert!(layer.accepts_paint());
+    }
+
+    /// Locking is not hiding, and not an alpha lock.
+    ///
+    /// Three switches that sound alike; the panel puts them next to each other, and each one
+    /// means something the other two do not. A layer set aside must still be visible -- the whole
+    /// reason to lock a sketch is to keep drawing over it.
+    #[test]
+    fn a_lock_leaves_a_layer_visible_and_its_alpha_alone() {
+        let mut layer = Layer::new(1, "Sketch");
+        layer.locked = true;
+        assert!(layer.visible, "locking hid the layer");
+        assert!(
+            layer.effective_opacity() > 0.0,
+            "locking stopped it drawing"
+        );
+        assert!(!layer.locks_alpha(), "locking froze its transparency");
+    }
+
+    /// Two settings differ in exactly the fields that were changed, and no others.
+    ///
+    /// **This is what tells one edit from another**, and undo leans on it: a run of changes to the
+    /// *same* field is one decision -- a slider dragged across its track -- while a change to a
+    /// different field is a second decision that must not be swallowed by the first.
+    #[test]
+    fn differences_name_the_fields_that_moved() {
+        let plain = Layer::new(1, "Ink").settings();
+        let opaque_less = Settings {
+            opacity: 0.5,
+            ..plain
+        };
+        let locked = Settings {
+            locked: true,
+            ..plain
+        };
+
+        assert_eq!(
+            plain.differences(plain),
+            0,
+            "nothing changed, and it said so"
+        );
+        assert_ne!(plain.differences(opaque_less), 0);
+        assert_ne!(plain.differences(locked), 0);
+
+        // The point: two edits to the same field look the same, and two edits to different fields
+        // do not.
+        let opaque_least = Settings {
+            opacity: 0.25,
+            ..plain
+        };
+        assert_eq!(
+            plain.differences(opaque_less),
+            opaque_less.differences(opaque_least),
+            "two moves of the opacity slider are not the same kind of edit"
+        );
+        assert_ne!(
+            plain.differences(opaque_less),
+            plain.differences(locked),
+            "changing the opacity and locking the layer read as the same edit"
+        );
+
+        // Every field, so one added later without a bit here shows up as its own mask rather than
+        // silently sharing another's.
+        let each = [
+            Settings {
+                opacity: 0.5,
+                ..plain
+            },
+            Settings {
+                blend: Blend::Multiply,
+                ..plain
+            },
+            Settings {
+                visible: false,
+                ..plain
+            },
+            Settings {
+                lock_alpha: true,
+                ..plain
+            },
+            Settings {
+                clip_below: true,
+                ..plain
+            },
+            Settings {
+                locked: true,
+                ..plain
+            },
+        ];
+        let mut seen: Vec<u8> = each.iter().map(|s| plain.differences(*s)).collect();
+        assert!(
+            seen.iter().all(|m| *m != 0),
+            "a field moved and nothing noticed"
+        );
+        let all = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), all, "two fields share a bit: {seen:?}");
+    }
+
+    /// Settings go out and come back as one value, every field of them.
+    ///
+    /// The failure this stops is a partial restore: undo putting five of the six back and leaving
+    /// the sixth at the value it had *after* the thing being undone, which nothing on screen
+    /// would explain.
+    #[test]
+    fn settings_survive_a_round_trip_whole() {
+        let mut layer = Layer::new(1, "Ink");
+        let plain = layer.settings();
+        layer.opacity = 0.25;
+        layer.blend = Blend::Multiply;
+        layer.visible = false;
+        layer.lock_alpha = true;
+        layer.clip_below = true;
+        layer.locked = true;
+        let changed = layer.settings();
+        assert_ne!(plain, changed);
+
+        layer.set_settings(plain);
+        assert_eq!(layer.settings(), plain, "something did not go back");
+        assert!(layer.visible && !layer.locked && !layer.lock_alpha && !layer.clip_below);
+        assert!((layer.opacity - 1.0).abs() < f32::EPSILON);
+
+        layer.set_settings(changed);
+        assert_eq!(layer.settings(), changed, "something did not come forward");
+    }
 
     /// The default is what every layer has always been, so adding a content kind changed no
     /// existing layer.

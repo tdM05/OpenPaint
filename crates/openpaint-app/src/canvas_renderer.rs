@@ -637,6 +637,17 @@ impl CanvasRenderer {
             .collect()
     }
 
+    /// Drop one tile of a layer, giving its slot back.
+    ///
+    /// The single-tile form of [`discard_layer`](Self::discard_layer), which the float pass needs:
+    /// a transform that has moved off a tile must give it up, and giving up the *whole* layer to
+    /// do it would hand back every tile still in use and take them all again next frame.
+    pub fn discard_tile(&mut self, layer: LayerId, coord: TileCoord) {
+        if let Some(slot) = self.store.remove(TileKey::new(layer, coord)) {
+            self.store.release(slot);
+        }
+    }
+
     /// Drop every tile belonging to a deleted layer.
     pub fn discard_layer(&mut self, layer: LayerId) {
         let doomed: Vec<TileCoord> = self.layer_tiles(layer).collect();
@@ -1054,9 +1065,9 @@ pub(crate) mod tests {
         let doc = document.active();
         let layers = doc.layers().to_vec();
 
-        let stroke = crate::test_gpu::test_stroke_layer(&device);
+        let stroke = crate::test_gpu::test_stroke_layer(device);
         let mut canvas =
-            CanvasRenderer::new(&device, SURFACE, doc.rect(), 64 * 1024 * 1024, &stroke);
+            CanvasRenderer::new(device, SURFACE, doc.rect(), 64 * 1024 * 1024, &stroke);
 
         // Base: opaque red on the left third, HALF-covered red in the middle third, nothing on the
         // right. The middle is what proves the mask is alpha rather than a boolean.
@@ -1084,7 +1095,7 @@ pub(crate) mod tests {
             }
             let id = LayerId(layers[index].id());
             let mut enc = device.create_command_encoder(&Default::default());
-            canvas.upload_dirty(&device, &queue, &mut enc, id, &mut cpu);
+            canvas.upload_dirty(device, queue, &mut enc, id, &mut cpu);
             queue.submit(std::iter::once(enc.finish()));
         }
 
@@ -1092,8 +1103,8 @@ pub(crate) mod tests {
         view.fit(W, H, doc.rect());
         let mut enc = device.create_command_encoder(&Default::default());
         canvas.prepare(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut enc,
             view.page_to_ndc(W, H),
             view.visible_rect(W, H),
@@ -1103,12 +1114,12 @@ pub(crate) mod tests {
             None,
         );
         queue.submit(std::iter::once(enc.finish()));
-        let _ = draw_to_target(&device, &queue, &canvas, W, H);
+        let _ = draw_to_target(device, queue, &canvas, W, H);
 
         // Sample through the CPU rule, which the eyedropper and the export both use.
-        let opaque = canvas.sample_page_pixel(&device, &queue, 10, 32, &layers);
-        let half = canvas.sample_page_pixel(&device, &queue, 30, 32, &layers);
-        let empty = canvas.sample_page_pixel(&device, &queue, 55, 32, &layers);
+        let opaque = canvas.sample_page_pixel(device, queue, 10, 32, &layers);
+        let half = canvas.sample_page_pixel(device, queue, 30, 32, &layers);
+        let empty = canvas.sample_page_pixel(device, queue, 55, 32, &layers);
 
         // Over an opaque base, the topmost clipped layer wins outright: solid blue.
         assert!(
@@ -1161,9 +1172,9 @@ pub(crate) mod tests {
         let doc = document.active();
         let layers = doc.layers().to_vec();
 
-        let stroke = crate::test_gpu::test_stroke_layer(&device);
+        let stroke = crate::test_gpu::test_stroke_layer(device);
         let mut canvas =
-            CanvasRenderer::new(&device, SURFACE, doc.rect(), 64 * 1024 * 1024, &stroke);
+            CanvasRenderer::new(device, SURFACE, doc.rect(), 64 * 1024 * 1024, &stroke);
 
         // Bottom layer: entirely empty, as a flats layer is before you fill it.
         // Top layer: a black vertical line at x = 64, as inked line art.
@@ -1173,7 +1184,7 @@ pub(crate) mod tests {
         }
         let top = LayerId(layers[1].id());
         let mut enc = device.create_command_encoder(&Default::default());
-        canvas.upload_dirty(&device, &queue, &mut enc, top, &mut ink);
+        canvas.upload_dirty(device, queue, &mut enc, top, &mut ink);
         queue.submit(std::iter::once(enc.finish()));
 
         let mut cache: std::collections::HashMap<TileCoord, Vec<[u8; 3]>> =
@@ -1182,7 +1193,7 @@ pub(crate) mod tests {
             let coord = tile_of(x, y);
             let tile = cache
                 .entry(coord)
-                .or_insert_with(|| canvas.composited_tile(&device, &queue, coord, &layers));
+                .or_insert_with(|| canvas.composited_tile(device, queue, coord, &layers));
             let side = TILE_SIZE as i32;
             tile[y.rem_euclid(side) as usize * TILE_SIZE + x.rem_euclid(side) as usize]
         });
@@ -1232,9 +1243,9 @@ pub(crate) mod tests {
         document.active_mut().layer_mut(1).expect("top").opacity = 0.7;
         let doc = document.active();
 
-        let stroke = crate::test_gpu::test_stroke_layer(&device);
+        let stroke = crate::test_gpu::test_stroke_layer(device);
         let mut canvas =
-            CanvasRenderer::new(&device, SURFACE, doc.rect(), 64 * 1024 * 1024, &stroke);
+            CanvasRenderer::new(device, SURFACE, doc.rect(), 64 * 1024 * 1024, &stroke);
 
         for (index, fill) in [UNDER, OVER].iter().enumerate() {
             let mut cpu = Canvas::new(W, H);
@@ -1247,7 +1258,7 @@ pub(crate) mod tests {
             }
             let id = LayerId(doc.layers()[index].id());
             let mut enc = device.create_command_encoder(&Default::default());
-            canvas.upload_dirty(&device, &queue, &mut enc, id, &mut cpu);
+            canvas.upload_dirty(device, queue, &mut enc, id, &mut cpu);
             queue.submit(std::iter::once(enc.finish()));
         }
 
@@ -1255,8 +1266,8 @@ pub(crate) mod tests {
         view.fit(W, H, doc.rect());
         let mut enc = device.create_command_encoder(&Default::default());
         canvas.prepare(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut enc,
             view.page_to_ndc(W, H),
             view.visible_rect(W, H),
@@ -1266,7 +1277,7 @@ pub(crate) mod tests {
             None,
         );
         queue.submit(std::iter::once(enc.finish()));
-        let rendered = draw_to_target(&device, &queue, &canvas, W, H);
+        let rendered = draw_to_target(device, queue, &canvas, W, H);
 
         // The fit insets the page, so screen and page coordinates are not the same. The fills are
         // uniform, so read the screen at its centre -- guaranteed inside the page -- and compare
@@ -1275,7 +1286,7 @@ pub(crate) mod tests {
 
         let layers = doc.layers().to_vec();
         for (x, y) in [(0_i32, 0_i32), (17, 31), (63, 63)] {
-            let sampled = canvas.sample_page_pixel(&device, &queue, x, y, &layers);
+            let sampled = canvas.sample_page_pixel(device, queue, x, y, &layers);
             let sampled = crate::export::to_srgb8_for_test(sampled);
             for c in 0..3 {
                 let d = i32::from(sampled[c]) - i32::from(shown[c]);
@@ -1288,7 +1299,7 @@ pub(crate) mod tests {
 
         // A pixel no layer has painted must read as the paper, not as transparent black: it is
         // what the artist can see there.
-        let empty = canvas.sample_page_pixel(&device, &queue, -500, -500, &layers);
+        let empty = canvas.sample_page_pixel(device, queue, -500, -500, &layers);
         let empty = crate::export::to_srgb8_for_test(empty);
         let paper = crate::export::to_srgb8_for_test(Canvas::paper_color());
         assert_eq!(empty, paper, "unpainted canvas should sample as the paper");
@@ -1326,9 +1337,9 @@ pub(crate) mod tests {
             document.active_mut().layer_mut(1).expect("top").blend = mode;
             let doc = document.active();
 
-            let stroke = crate::test_gpu::test_stroke_layer(&device);
+            let stroke = crate::test_gpu::test_stroke_layer(device);
             let mut canvas =
-                CanvasRenderer::new(&device, SURFACE, doc.rect(), 64 * 1024 * 1024, &stroke);
+                CanvasRenderer::new(device, SURFACE, doc.rect(), 64 * 1024 * 1024, &stroke);
 
             for (index, fill) in [UNDER, OVER].iter().enumerate() {
                 let mut cpu = Canvas::new(W, H);
@@ -1341,7 +1352,7 @@ pub(crate) mod tests {
                 }
                 let id = LayerId(doc.layers()[index].id());
                 let mut enc = device.create_command_encoder(&Default::default());
-                canvas.upload_dirty(&device, &queue, &mut enc, id, &mut cpu);
+                canvas.upload_dirty(device, queue, &mut enc, id, &mut cpu);
                 queue.submit(std::iter::once(enc.finish()));
             }
 
@@ -1349,8 +1360,8 @@ pub(crate) mod tests {
             view.fit(W, H, doc.rect());
             let mut enc = device.create_command_encoder(&Default::default());
             canvas.prepare(
-                &device,
-                &queue,
+                device,
+                queue,
                 &mut enc,
                 view.page_to_ndc(W, H),
                 view.visible_rect(W, H),
@@ -1360,7 +1371,7 @@ pub(crate) mod tests {
                 None,
             );
             queue.submit(std::iter::once(enc.finish()));
-            let gpu = draw_to_target(&device, &queue, &canvas, W, H);
+            let gpu = draw_to_target(device, queue, &canvas, W, H);
 
             // The same stack through the CPU reference.
             let mut expected = Canvas::paper_color();
@@ -1519,13 +1530,13 @@ pub(crate) mod tests {
             }
         }
 
-        let stroke = crate::test_gpu::test_stroke_layer(&device);
+        let stroke = crate::test_gpu::test_stroke_layer(device);
         let mut canvas =
-            CanvasRenderer::new(&device, SURFACE, doc.rect(), 64 * 1024 * 1024, &stroke);
+            CanvasRenderer::new(device, SURFACE, doc.rect(), 64 * 1024 * 1024, &stroke);
         let mut enc = device.create_command_encoder(&Default::default());
         canvas.upload_dirty(
-            &device,
-            &queue,
+            device,
+            queue,
             &mut enc,
             LayerId(doc.layers()[0].id()),
             &mut cpu,
@@ -1542,8 +1553,8 @@ pub(crate) mod tests {
         let mut enc = device.create_command_encoder(&Default::default());
         assert!(
             !canvas.prepare(
-                &device,
-                &queue,
+                device,
+                queue,
                 &mut enc,
                 view.page_to_ndc(VIEW, VIEW),
                 view.visible_rect(VIEW, VIEW),
@@ -1556,7 +1567,7 @@ pub(crate) mod tests {
         );
         queue.submit(std::iter::once(enc.finish()));
 
-        let pixels = draw_to_target(&device, &queue, &canvas, VIEW, VIEW);
+        let pixels = draw_to_target(device, queue, &canvas, VIEW, VIEW);
         let at = |x: u32, y: u32| pixels[(y * VIEW + x) as usize];
 
         // Paper is bright in every channel; the backdrop is pure blue.

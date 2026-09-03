@@ -19,7 +19,12 @@
 param(
     [string[]]$Only = @(),
     [int]$Width = 2200,
-    [int]$Height = 1450
+    [int]$Height = 1450,
+    # **What the scenes are calibrated against.** The Surface's own screen reports 1.5, which makes
+    # the 2200x1450 window a 1452x929 workspace -- the size every tab position, window rectangle
+    # and canvas coordinate in `scenes/` was measured on. A run at another scale is refused rather
+    # than reported as failures; see the check in `drive.ps1`.
+    [double]$Scale = 1.5
 )
 
 $ErrorActionPreference = 'Continue'
@@ -37,13 +42,44 @@ if (-not (Test-Path $exe)) {
 Get-ChildItem -Path $root -Filter 'openpaint-*.png' -File -ErrorAction SilentlyContinue |
     Remove-Item -Force -ErrorAction SilentlyContinue
 
+# The import scenario brings pictures in through the same dialog, so it needs two: a PNG with
+# transparency, and a JPEG, because those are the two decoders and a suite that exercises one of
+# them says nothing about the other. Solid rectangles rather than anything drawn: what is being
+# asserted is *where the pixels landed*, and a flat block is the shape that makes an ink count
+# mean something.
+$fixtures = Join-Path $root 'target' | Join-Path -ChildPath 'drive'
+New-Item -ItemType Directory -Force -Path $fixtures | Out-Null
+Add-Type -AssemblyName System.Drawing
+$png = Join-Path $fixtures 'import-fixture.png'
+if (-not (Test-Path $png)) {
+    # Wider than it is tall and smaller than the default page, so a scene can assert both that it
+    # arrived and that it did not cover the whole page -- "it filled everything" and "it landed
+    # correctly" are otherwise the same ink count.
+    $bmp = New-Object System.Drawing.Bitmap 1400, 900
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.Clear([System.Drawing.Color]::FromArgb(255, 20, 20, 24))
+    $g.Dispose()
+    $bmp.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+}
+$jpg = Join-Path $fixtures 'import-fixture.jpg'
+if (-not (Test-Path $jpg)) {
+    # A different size from the PNG and from the default page, so "the page became the picture's
+    # size" cannot pass by accident.
+    $bmp = New-Object System.Drawing.Bitmap 800, 600
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.Clear([System.Drawing.Color]::FromArgb(255, 24, 20, 20))
+    $g.Dispose()
+    $bmp.Save($jpg, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+    $bmp.Dispose()
+}
+
 # The bitmap-tip scenario loads a PNG through the application's own file dialog, so one has to
 # exist at a known path. Drawn here rather than kept in the repository: it is a fixture of the
 # suite, not an asset of the application, and a few lines of arithmetic are clearer than a blob.
 $tip = Join-Path $root 'target' | Join-Path -ChildPath 'drive' |
     Join-Path -ChildPath 'stamp-fixture.png'
 if (-not (Test-Path $tip)) {
-    Add-Type -AssemblyName System.Drawing
     $n = 96
     $bmp = New-Object System.Drawing.Bitmap $n, $n
     for ($y = 0; $y -lt $n; $y++) {
@@ -59,6 +95,17 @@ if (-not (Test-Path $tip)) {
     $bmp.Save($tip, [System.Drawing.Imaging.ImageFormat]::Png)
     $bmp.Dispose()
 }
+
+# Whatever the export scenario wrote last time. A save dialog given a name that already exists
+# asks whether to overwrite it, and that question is a native modal with none of our controls on
+# screen -- so a leftover file does not get overwritten, it *hangs the run*, and the checks then
+# read the stale file's size as the new one's. Deleted rather than answered.
+# `out-*`, whatever the extension: the export scenario writes PNGs and the end-to-end one writes
+# an `.openpaint` document as well, and a saved document left behind traps the next run exactly
+# the same way -- a save dialog handed a name that already exists asks whether to overwrite it,
+# and that question is a native modal with none of our controls on screen.
+Get-ChildItem -Path $fixtures -Filter 'out-*' -File -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
 
 $results = @()
 foreach ($scene in $scenes) {
@@ -82,6 +129,7 @@ foreach ($scene in $scenes) {
     $out = @()
     try {
         $out = & (Join-Path $PSScriptRoot 'drive.ps1') -Shot $name -Width $Width -Height $Height `
+            -Scale $Scale `
             -Script $scene.FullName @extra 2>&1
     } catch {
         $out = @($_)

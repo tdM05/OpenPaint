@@ -45,7 +45,7 @@ pub(crate) fn show(
 ) -> Option<Picked> {
     let mut picked: Option<Picked> = None;
     let _ = (&mut *brush, &mut *color_srgb, place);
-    let controls = controls(state.history);
+    let controls = controls(state, state.history);
     for change in paint.show(ui, &controls) {
         picked = answer(&change);
     }
@@ -57,7 +57,7 @@ pub(crate) fn show(
 /// Split out because it is the whole of what this panel decides, and deciding it against a
 /// rectangle rather than a GPU is what makes it testable -- the same split the rest of the
 /// described panels get for free.
-fn controls(history: (usize, usize, u64)) -> Vec<Control> {
+fn controls(state: &Status<'_>, history: (usize, usize, u64)) -> Vec<Control> {
     let (undo_depth, redo_depth, bytes) = history;
     let mut controls = vec![Control::Label {
         text: format!(
@@ -94,6 +94,54 @@ fn controls(history: (usize, usize, u64)) -> Vec<Control> {
                stroke touched."
             .to_owned(),
     });
+
+    // **Everything else the application is holding on the artist's behalf.**
+    //
+    // These lived in the old side panel and nowhere else, so removing it would have taken them
+    // with it -- and "when was my work last copied somewhere safe" is not a developer's question.
+    // This is already the panel about what is being kept and what it costs, so they belong here
+    // rather than in a panel invented to hold them.
+    controls.push(Control::Separator);
+    controls.push(Control::Label {
+        text: state.autosave.to_owned(),
+    });
+
+    let (resident, cpu) = state.residency;
+    let (readbacks, uploads) = state.traffic;
+    controls.push(Control::Label {
+        text: format!(
+            "Canvas: {resident} tiles on the GPU, {cpu} held on the CPU, {} spilled.",
+            state.spilled
+        ),
+    });
+    controls.push(Control::Label {
+        text: format!("Tiles read back {readbacks}, sent {uploads}."),
+    });
+
+    // Whether the pen feels right, which is the one thing a readout can answer that a screenshot
+    // cannot. Each is a mean and a peak, and each is absent until something has been measured --
+    // a zero here would read as an answer rather than as a silence.
+    let p = &state.perf;
+    if let Some((mean, peak)) = p.input {
+        controls.push(Control::Label {
+            text: format!("Pen to screen {mean:.0} ms, worst {peak:.0} ms."),
+        });
+    }
+    if let Some((mean, peak)) = p.frame {
+        controls.push(Control::Label {
+            text: format!("Frame {mean:.1} ms, worst {peak:.1} ms."),
+        });
+    }
+    if let Some(rate) = p.rate {
+        controls.push(Control::Label {
+            text: format!("The pen reports {rate:.0} times a second."),
+        });
+    }
+    if let Some((mean, peak)) = p.step {
+        controls.push(Control::Label {
+            text: format!("It travels {mean:.1} page pixels between samples, at most {peak:.1}."),
+        });
+    }
     controls
 }
 
@@ -116,8 +164,18 @@ fn answer(change: &Change) -> Option<Picked> {
 mod tests {
     use super::*;
 
+    /// The panel's controls for a given history, with everything else the shell would say.
+    ///
+    /// The readouts below the shortcut line come from the status rather than from the history
+    /// tuple, so the tests need a whole one.
+    fn shown(history: (usize, usize, u64)) -> Vec<Control> {
+        let (layers, palette, presets, fonts) = crate::screenshot::sample_document();
+        let state = Status::sample(&layers, &palette, &presets, &fonts);
+        controls(&state, history)
+    }
+
     fn buttons(history: (usize, usize, u64)) -> Vec<String> {
-        controls(history)
+        shown(history)
             .into_iter()
             .filter_map(|c| match c {
                 Control::Button { text, .. } => Some(text),
@@ -127,7 +185,7 @@ mod tests {
     }
 
     fn labels(history: (usize, usize, u64)) -> Vec<String> {
-        controls(history)
+        shown(history)
             .into_iter()
             .filter_map(|c| match c {
                 Control::Label { text } => Some(text),
@@ -183,10 +241,15 @@ mod tests {
     #[test]
     fn the_hint_is_always_there() {
         for history in [(0, 0, 0), (1, 0, 0), (0, 1, 0), (4, 4, 1 << 20)] {
-            let hint = labels(history).pop().expect("a hint");
+            // Found by what it says, not by where it is in the list: the housekeeping readouts
+            // now sit below it, and a test that assumed "last" would have called their arrival a
+            // missing hint.
+            let said = labels(history);
             assert!(
-                hint.contains("Ctrl+Z") && hint.contains("Ctrl+Y") && hint.contains("tiles"),
-                "the hint went missing at {history:?}: {hint}"
+                said.iter().any(|hint| hint.contains("Ctrl+Z")
+                    && hint.contains("Ctrl+Y")
+                    && hint.contains("tiles")),
+                "the hint went missing at {history:?}: {said:?}"
             );
         }
     }

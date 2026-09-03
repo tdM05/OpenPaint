@@ -804,37 +804,6 @@ pub fn report_panel(name: &str) {
     }
 }
 
-/// Where one thing that is not a described control landed.
-///
-/// The two prompts are drawn with egui widgets rather than through the descriptor layer, because
-/// they belong to the application and not to any panel -- so they are not in the atlas the way
-/// everything else is, and the most dangerous UI here would be the one thing a scenario had to hit
-/// by measuring a screenshot. The prompt that blocks every pen stroke should be the easiest thing
-/// to press on purpose, not the hardest.
-pub fn report_widget(name: &str, rect: egui::Rect, ppp: f32) {
-    let Some(path) = std::env::var_os("OPENPAINT_CONTROLS") else {
-        return;
-    };
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)
-    {
-        use std::io::Write as _;
-        // Its own heading, and no viewport line: a prompt is a window of its own, and filed
-        // under whichever panel reported last it would inherit that panel's scrolling.
-        let _ = writeln!(
-            f,
-            "# prompt
-0\t{:.0}\t{:.0}\t{:.0}\t{:.0}\t{name}",
-            rect.min.x * ppp,
-            rect.min.y * ppp,
-            rect.width() * ppp,
-            rect.height() * ppp
-        );
-    }
-}
-
 /// Where a panel's tab landed, so a harness can bring that panel to the front by name.
 pub fn report_tab(name: &str, rect: crate::layout::Rect, ppp: f32) {
     let Some(path) = std::env::var_os("OPENPAINT_CONTROLS") else {

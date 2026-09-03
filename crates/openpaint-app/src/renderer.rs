@@ -52,6 +52,12 @@ pub enum HistoryChange {
     LayerMoved { from: usize, to: usize },
     /// A page put back in the running order.
     PageMoved { from: usize, to: usize },
+    /// A layer's settings put back to what they were. Reported rather than applied, like every
+    /// other change to the document's structure: the stack is the shell's.
+    LayerSettingsRestored {
+        index: usize,
+        settings: openpaint_core::layer::Settings,
+    },
     /// A page has to be taken away, and whoever does it must hand back what it held so that a redo
     /// can put it there again. The page itself lives in the document, which is the caller's.
     PageTaken { index: usize },
@@ -104,6 +110,8 @@ pub struct Renderer {
     canvas_renderer: CanvasRenderer,
     /// GPU dab rasterization and the in-progress stroke.
     stroke_layer: StrokeLayer,
+    /// The floating selection's pixels, and the pass that resamples them (`TODO.md` §3).
+    float_pass: crate::float_pass::FloatPass,
     /// Undo/redo. GPU-side because the GPU owns the pixels (see `crate::history`).
     history: History,
     /// Dabs of the stroke being recorded, accumulated across frames so redo can
@@ -228,6 +236,7 @@ impl Renderer {
         // The stroke layer first: the compositor reads its accumulation to show the preview,
         // so it needs that texture at construction (see `canvas_renderer`).
         let stroke_layer = StrokeLayer::new(&device, CANVAS_FORMAT);
+        let float_pass = crate::float_pass::FloatPass::new(&device, CANVAS_FORMAT);
         let canvas_renderer = CanvasRenderer::new(&device, format, page, budget, &stroke_layer);
         let history = History::new(&device);
 
@@ -238,6 +247,7 @@ impl Renderer {
             config,
             canvas_renderer,
             stroke_layer,
+            float_pass,
             history,
             recording: Vec::new(),
             recording_paint: ([0.0; 4], 1.0, crate::editor::PaintMode::Normal),
@@ -566,6 +576,28 @@ impl Renderer {
         });
     }
 
+    /// Record a change to a layer's settings, for undo.
+    ///
+    /// Nothing is captured but the two values: no pixel changed, so there is nothing to snapshot.
+    /// Consecutive changes to the same layer coalesce inside [`History::push`], so dragging the
+    /// opacity slider is one undo rather than one per frame.
+    pub fn record_layer_settings(
+        &mut self,
+        index: usize,
+        before: openpaint_core::layer::Settings,
+        after: openpaint_core::layer::Settings,
+    ) {
+        if before == after {
+            return;
+        }
+        self.history.push(Op::LayerSettings {
+            index,
+            before,
+            after,
+            at: std::time::Instant::now(),
+        });
+    }
+
     /// Re-derive a text layer's pixels from its text.
     ///
     /// **Replaces the layer's tiles rather than compositing onto them.** A text layer's pixels are
@@ -593,6 +625,20 @@ impl Renderer {
         // tail on the page.
         self.canvas_renderer.set_layer_tiles(layer, tiles);
         Ok(rendered.font)
+    }
+
+    /// Put pixels into a layer, replacing whatever it held.
+    ///
+    /// The seam an imported picture arrives through, and the same one a re-rendered caption uses
+    /// -- tiles are tiles, and a layer holding a photograph is an ordinary layer in every way
+    /// that matters afterwards. Recorded for undo by the caller, which is the only one that knows
+    /// whether this is a new layer appearing or an existing one being replaced.
+    pub fn place_tiles(
+        &mut self,
+        layer: LayerId,
+        tiles: impl IntoIterator<Item = (openpaint_core::tile::TileCoord, openpaint_core::tile::Tile)>,
+    ) {
+        self.canvas_renderer.set_layer_tiles(layer, tiles);
     }
 
     /// Move every tile of every layer of a page into history, so the page can be deleted
@@ -806,10 +852,92 @@ impl Renderer {
         before
     }
 
+    /// Draw the float's tiles with the GPU. Returns whether it managed it.
+    ///
+    /// Everything here is per frame and has to stay cheap: the tiles that are still covered keep
+    /// their slots, only the ones the transform has moved off are given up, and the pass records
+    /// one draw per tile into a single submission.
+    fn float_on_gpu(&mut self, transform: &openpaint_core::Transform, float: LayerId) -> bool {
+        let coords = self.float_pass.tiles_for(transform);
+        if coords.is_empty() {
+            self.canvas_renderer.discard_layer(float);
+            return true;
+        }
+        // Tiles the transform has moved off. Given up rather than left holding last frame's
+        // pixels, which is what a trail behind a dragged selection is made of.
+        let wanted: std::collections::HashSet<openpaint_core::tile::TileCoord> =
+            coords.iter().copied().collect();
+        let stale: Vec<openpaint_core::tile::TileCoord> = self
+            .canvas_renderer
+            .layer_tiles(float)
+            .filter(|c| !wanted.contains(c))
+            .collect();
+        for coord in stale {
+            self.canvas_renderer.discard_tile(float, coord);
+        }
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("float-encoder"),
+            });
+        let mut drawn = Vec::with_capacity(coords.len());
+        for coord in &coords {
+            if self
+                .canvas_renderer
+                .ensure_tile(&self.device, &self.queue, &mut encoder, float, *coord)
+                .is_ok()
+            {
+                drawn.push(*coord);
+            }
+        }
+        // Disjoint field borrows: the pass is one field and the canvas another, so the closure
+        // can hand out targets while the pass records into the encoder.
+        let canvas = &self.canvas_renderer;
+        let ok = self.float_pass.draw(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            transform,
+            &drawn,
+            |coord| canvas.tile_target(float, coord),
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+        if !ok {
+            return false;
+        }
+        // After the draw, and after the borrow it needed: a tile written by a pass is dirty, and
+        // a tile the store thinks is clean is one it will drop without reading back.
+        for coord in drawn {
+            self.canvas_renderer.mark_dirty(float, coord);
+        }
+        true
+    }
+
     /// Lift the selected pixels off a layer, clearing them from it.
     ///
     /// Returns the pixels and what the clear overwrote, so the caller can record the whole move as
     /// one operation when it is put down.
+    /// Read the pixels a selection covers, without taking them off the layer.
+    ///
+    /// The read-only half of [`lift_selection`](Self::lift_selection), which copy needs and cut
+    /// gets for free: cutting is this plus the clear that already existed, and building it the
+    /// other way round -- lift, then put back if it was only a copy -- would put an erase and an
+    /// un-erase on the undo stack for an operation that changes nothing.
+    pub fn read_selection(
+        &mut self,
+        selection: &openpaint_core::Selection,
+        layer: LayerId,
+    ) -> Option<openpaint_core::Lifted> {
+        let coords: Vec<openpaint_core::tile::TileCoord> =
+            selection.tiles().map(|(c, _)| *c).collect();
+        let source = self
+            .canvas_renderer
+            .read_tiles(&self.device, &self.queue, layer, &coords);
+        let lifted = openpaint_core::Lifted::from_layer(selection, |c| source.get(&c).cloned());
+        (!lifted.is_empty()).then_some(lifted)
+    }
+
     pub fn lift_selection(
         &mut self,
         selection: &openpaint_core::Selection,
@@ -827,6 +955,10 @@ impl Renderer {
         if lifted.is_empty() {
             return None;
         }
+        // **Uploaded once, here, because this is the moment the pixels stop changing.** They are
+        // then dragged for as long as the gesture lasts, and re-uploading them every frame would
+        // be the same waste the CPU resample was.
+        self.float_pass.hold(&self.device, &self.queue, &lifted);
         // Colour is irrelevant to an erase; the blend discards the source entirely.
         let before = self.paint_mask_unrecorded(
             selection,
@@ -850,13 +982,37 @@ impl Renderer {
         kernel: openpaint_core::Kernel,
         float: LayerId,
     ) {
+        // **First, and on every path out of here.** The compositor draws the float layer only
+        // while this names it, and there are three ways through this function now. Two of them
+        // used to end in an early `return` that stepped over this line, and the consequence was
+        // that the selection *vanished* the instant a transform began: the lift takes the pixels
+        // off the layer, and nothing was drawing them anywhere else. `transform.txt` caught it;
+        // no unit test could, because what went wrong was a line not reached.
+        self.floating = Some(float);
+
+        // **A plain move is a copy.** No resampling at any price, on either machine: the pixels
+        // land on whole pixels, and filtering them would be a quality loss for nothing (§5d).
+        // Kept ahead of the GPU path because it is both faster and *better*.
+        //
+        // The second half is the fallback: pixels this pass is not holding -- too large for one
+        // texture on this device, or a lift it never saw -- go the way they always went.
+        if transform.is_a_plain_move() || !self.float_pass.holds(lifted) {
+            self.canvas_renderer
+                .set_layer_tiles(float, lifted.transformed(transform, kernel));
+            return;
+        }
+        if self.float_on_gpu(transform, float) {
+            return;
+        }
         self.canvas_renderer
             .set_layer_tiles(float, lifted.transformed(transform, kernel));
-        self.floating = Some(float);
     }
 
     /// Stop showing the floating pixels.
     pub fn drop_float(&mut self, float: LayerId) {
+        // The pixels on the GPU go with it: the gesture is over, and a selection's worth of
+        // texture held until the next lift is a selection's worth of texture held for nothing.
+        self.float_pass.let_go();
         self.canvas_renderer.discard_layer(float);
         self.floating = None;
     }
@@ -1038,21 +1194,27 @@ impl Renderer {
         );
     }
 
-    /// Read the canvas back and write it as an sRGB PNG.
+    /// Flatten one page at a scale, ready to write or to stack into a strip.
     ///
-    /// Stalls on the GPU while the readback maps, which is acceptable for an
-    /// explicit user action -- the drawing path never reads back.
-    pub fn export_png(
+    /// The page is passed in rather than taken from the canvas, so every page of a document can
+    /// be exported without the artist's view moving off the one they are drawing on -- every
+    /// page's tiles are in the store already, whichever is on screen.
+    ///
+    /// # Errors
+    /// [`crate::export::ExportError::TooLarge`] when the result would not fit in memory.
+    pub fn compose_page(
         &self,
         layers: &[Layer],
-        path: &std::path::Path,
-    ) -> Result<(), crate::export::ExportError> {
-        crate::export::export_tiles_png(
+        page: openpaint_core::PageRect,
+        scale: u32,
+    ) -> Result<crate::export::Sheet, crate::export::ExportError> {
+        crate::export::compose(
             &self.device,
             &self.queue,
             &self.canvas_renderer,
             layers,
-            path,
+            page,
+            scale,
         )
     }
 
@@ -1200,6 +1362,10 @@ impl Renderer {
             Op::MoveLayer { from, to } => HistoryChange::LayerMoved {
                 from: *to,
                 to: *from,
+            },
+            Op::LayerSettings { index, before, .. } => HistoryChange::LayerSettingsRestored {
+                index: *index,
+                settings: *before,
             },
             // Undoing "a page was made" is deleting it. What it held is collected by the caller,
             // which owns the document, and handed back through `keep_page`.
@@ -1356,6 +1522,10 @@ impl Renderer {
             Op::MoveLayer { from, to } => HistoryChange::LayerMoved {
                 from: *from,
                 to: *to,
+            },
+            Op::LayerSettings { index, after, .. } => HistoryChange::LayerSettingsRestored {
+                index: *index,
+                settings: *after,
             },
             Op::AddPage { index, page, tiles } => {
                 self.restore_tiles(tiles);

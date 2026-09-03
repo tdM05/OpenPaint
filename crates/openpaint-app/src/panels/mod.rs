@@ -207,37 +207,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |c| {
-            let status = crate::ui::Status {
-                history: (3, 1, 2 * 1024 * 1024),
-                message: Some("something happened"),
-                page_size: (1200, 1600),
-                crop: None,
-                crop_rect: None,
-                residency: (0, 0),
-                spilled: 0,
-                traffic: (0, 0),
-                layers: &layers,
-                active_layer: 3,
-                pages: (3, 0),
-                tool: crate::editor::Tool::Brush,
-                confirm: None,
-                brush_cursor: None,
-                perf: crate::perf::PerfSnapshot::default(),
-                recovery: None,
-                palette: &palette,
-                presets: &presets,
-                preset_trouble: Some("the brush library could not be written"),
-                font_families: &fonts,
-                font_substituted: Some("Some Missing Face"),
-                transform: None,
-                transform_box: None,
-                kernel: openpaint_core::Kernel::default(),
-                autosave: "saved a moment ago",
-                selection: &[],
-                select_tool: Some(crate::ui::SelectTool::Wand),
-                has_selection: true,
-                wand: crate::ui::WandSettings::default(),
-            };
+            let status = crate::ui::Status::sample(&layers, &palette, &presets, &fonts);
             egui::CentralPanel::default().show(c, |ui| {
                 for panel in [
                     ws::MENU,

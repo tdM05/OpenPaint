@@ -68,6 +68,10 @@ Every panel, every menu, every keyboard chord and every core-loop action is driv
 | `window-body.txt` | that a floating panel's own controls work and do not drag its window, for two different panels |
 | `file.txt`, `saving.txt` | a document written and read back; Ctrl+S over a path; all three answers to the unsaved-changes question |
 | `recovery.txt`, `autosave.txt` | the recovered-work prompt, autosave writing, and closing the window with unsaved work |
+| `comic.txt` | a whole page made start to finish: scan, lock, ink, colour, transform, letter, second page, strip, save, reopen |
+| `import.txt` | a PNG placed as a layer and a JPEG opened as a document, through the real file dialog |
+| `export.txt` | the export dialog, and the files it writes read back off the disk |
+| `clipboard.txt` | copy, cut and paste, out through the system clipboard and back |
 
 ## What is not covered, and why
 
@@ -84,3 +88,90 @@ Every panel, every menu, every keyboard chord and every core-loop action is driv
   behind it (a file that will not open, an extension appended) stay out of reach.
 - **The brush library's trouble branch**, which needs the library file to be unwritable. Reachable
   by making it read-only before a run; not done.
+
+## The release sitting — 2026-09-02
+
+Every scenario the session's work could reach was driven. `import.txt` (27), `export.txt` (38) and
+`clipboard.txt` (23) are new; `layers.txt` (50), `menu.txt` (90), `keyboard.txt` (48) and
+`gestures.txt` have new steps. The rest were run because the changes reach further than the
+features do -- layer settings entered the undo stack, and every refusal moved to one seam.
+
+**Twenty-five of twenty-seven pass.** `transform.txt` (182) is the one worth naming: it now drives
+the *GPU* float pass end to end -- every scale, rotation, flip, corner and kernel -- against a
+preview that no longer touches the CPU.
+
+### What the driving caught that the unit tests did not
+
+Three, and all three were invisible to `cargo test`:
+
+- **The export dialog did not stop the pen.** Its size slider is drawn over the canvas, and
+  dragging it painted strokes underneath: the scene ended a run of exports with an undo depth of
+  ten instead of two. The three modals were listed one at a time in `decide_capture` and the
+  newest was not among them; they now come from one `asking()`.
+- **The float layer stopped being composited.** Moving the resample onto the GPU added two early
+  returns to `float_at`, and both stepped over `self.floating = Some(float)` at the end of it --
+  so the selection *vanished* the moment a transform began. No unit test could have caught it:
+  what went wrong was a line not reached.
+- **A save dialog handed an existing name asks whether to overwrite**, and that question is a
+  native modal this harness cannot answer. A leftover file from a failed run hangs the next one
+  and then reports the stale file's size as the new one's. The sweep now deletes `out-*.png`
+  first.
+
+### Three defects it found, all fixed
+
+Checked first by stashing the session's changes and rebuilding at `ac108f4`: all three behave the
+same there, so none of them came from the release work. They are fixed anyway -- a release does not
+ship with the panel UI broken, and two of them were in the gestures an artist uses every day.
+
+- **A window's top edge was eating its own handle.** `splitter_grab` is 26, so the resize border
+  reached thirteen units *inside* a header that is twenty-eight tall: the upper half of every
+  floating window's tab was a resize handle, and a tab grabbed a little high resized the window
+  instead of moving it. `chrome::edge_at` now reaches outward only on the top edge; the other three
+  keep their inner half, because a panel body is behind them and not a handle. DECISIONS §1d.
+- **A menu was left standing, and empty, after an item was chosen.** The panel cleared its own
+  state and the workspace's popup stayed, so every command reached from a menu left a dark box over
+  the artwork. It is in `menu-new.png` for as long as that shot has existed. DECISIONS §6e. The
+  first attempt at this set a flag that is read *earlier in the same frame* -- dead the moment it
+  was written, and every scenario passed straight through it, because none of them looks at an
+  empty box. Clippy caught it.
+- **Two scenes were holding coordinates that had stopped meaning anything.** A second floating
+  window used to cascade to `88,88` and now lands beside the first at `387,60`; tabs are laid out
+  from measured labels, so `holdat 1900 91` had drifted from the Pages tab onto History. Both
+  scenes went on *passing steps that meant something else*, which is worse than failing, and then
+  failed in a way that read as a bug in the application: `gestures.txt` pressed empty canvas where
+  it meant a window's edge, and the run ended with the windows merged away.
+
+  The fix is `holdtab NAME [DX DY]` and `dragtab NAME DX DY`, which read the same atlas `tab`
+  reads. **A scenario should never name a tab by where it happens to be.**
+
+### And one in the harness
+
+**A run that stopped threw away its own evidence.** The checks file was written only on the way out
+of a successful run, so a stopped one left the *previous* run's checks on disk -- and reading them
+afterwards described a run that never happened. Two of the defects above were chased for an hour
+each against stale evidence before that was noticed, which is a worse failure than either of them:
+it is invisible, and it makes every conclusion drawn from it wrong. The checks are now written
+whatever happens, with the step that stopped the run recorded as its last line.
+
+## Drawing a whole page — 2026-09-03
+
+`comic.txt` is not another panel's scenario. It is a *session*: a scan placed and locked, inked
+over on a layer of its own, coloured with the bucket, a corner lassoed and rotated, lettered,
+copied onto a second page, exported as a strip, saved, and opened again — with a shot at every
+step, meant to be read in order.
+
+**Every step of it is covered elsewhere, and it still found two things**, because what it tests is
+the seams:
+
+- **A selection followed the artist to another page.** A mask is in page coordinates; on page two
+  it described a region of artwork nobody had selected, and the marching ants were drawn over it.
+  Fixed in `follow_active_page` — DECISIONS §5i.
+- **The Layers panel had grown too tall to use.** Adding the lock and its sentence pushed the
+  explanation to six lines, and with four layers the list was down to a single row with the
+  buttons off the bottom. An explanation that pushes away the thing it explains has stopped
+  explaining; both paragraphs are now a clause each.
+
+And one thing that looked like a bug and was not: copying a rectangle over the artwork pasted the
+*caption*, because the caption's layer was active and copy takes the active layer, never the
+composite (DECISIONS §7c) — which is what every comparable application does. The scenario was the
+thing that was unrealistic; it now selects the inking layer first, as a person would.
