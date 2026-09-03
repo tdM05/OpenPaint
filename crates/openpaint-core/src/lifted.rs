@@ -687,6 +687,18 @@ mod tests {
     /// impossible to pass with the wrong *shape* of loop while being impossible to fail on a slow
     /// machine with the right one. Note it is a debug-profile bound too, which is where this runs
     /// by default.
+    ///
+    /// **It failed on a shared CI runner at 3.19 s, with the right loop.** So the second half of
+    /// that promise was not true, and the bound is now four times the slowest honest measurement
+    /// rather than a little above the fastest.
+    ///
+    /// **And the first half is not true either**, which is worse and is worth saying here rather
+    /// than leaving for whoever trusts it next: the defect this names measured *620 ms*, which is
+    /// comfortably inside any bound loose enough to survive a slow machine. A wall clock cannot
+    /// tell these two shapes apart on hardware it does not control. What would is counting the
+    /// source lookups per destination pixel -- constant for the grid, per-tap for the `HashMap` --
+    /// and that is recorded in `TODO.md` as the thing this should become. Until then this is a
+    /// smoke test that the rotation finishes and produces pixels, and it should be read as one.
     #[test]
     fn a_rotation_is_not_slow() {
         let page = PageRect::from_size(2048, 2048);
@@ -705,7 +717,7 @@ mod tests {
 
         assert!(!out.is_empty(), "the rotation produced nothing");
         assert!(
-            took < std::time::Duration::from_millis(2500),
+            took < std::time::Duration::from_millis(12_000),
             "rotating a 512x512 selection took {took:?}; that is the shape of the loop, not a slow machine"
         );
     }

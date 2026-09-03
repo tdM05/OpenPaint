@@ -65,7 +65,17 @@ status line already handles.
 
 ---
 
-## 2. Known defects — **the one that was here is fixed, 2026-09-03**
+## 2. Known defects
+
+- **`lifted::tests::a_rotation_is_not_slow` cannot do its job.** It asserts a wall clock, and a
+  wall clock on hardware we do not control cannot tell a fast machine running the wrong loop from
+  a slow one running the right loop -- it failed on a CI runner at 3.19 s with the loop correct.
+  Worse, the defect it is named for measured *620 ms*, which is inside any bound loose enough to
+  survive a shared runner. What it should assert is the number of source lookups per destination
+  pixel: constant for the grid the transform uses now, per-filter-tap for the `HashMap` it used
+  to. Until then it is a smoke test that the rotation finishes, and the doc comment on it says so.
+
+### The crash that was here is fixed — 2026-09-03
 
 Was: the app test binary occasionally died with `STATUS_ACCESS_VIOLATION`, roughly one run in ten,
 always at process level and never in a named test. It also *hung*, which had not been noticed —
