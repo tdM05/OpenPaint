@@ -1,8 +1,17 @@
-# The transform story. The panel is one of three shapes and the document alone decides which, so
-# this scene is mostly about creating state: with no selection it offers a sentence and a filter,
-# with a selection it offers one button, and only with a transform in the air does it offer the
-# sliders, the lock, the flips and the two commands that end it. A scene that never lifts anything
-# never sees eleven of its controls.
+# The transform story. A transform is a *task in flight*, not a tool: it exists only between Begin
+# and Apply, and it has a Cancel. So it has no panel of its own on show -- it borrows Tool options
+# while it is in the air and gives it back the moment it ends, which is what
+# `docs/CONTEXTUAL_PANELS.md` means by transient. A scene that never lifts anything never sees any
+# of its controls at all, which is the point: the panel is the brush's until there is a transform.
+#
+# **Beginning one is a command, and commands live in menus and on the keyboard.** Ctrl+T here, and
+# Edit > Transform selection, which `menu.txt` drives. It used to be a button in a Transform panel
+# that had to be permanently on show for the sake of a task lasting a few seconds.
+#
+# The standalone Transform panel still exists -- every section does, for anyone who wants it docked
+# somewhere permanently -- and the last block of this scene opens it from the panel list to drive
+# the two shapes that cannot be reached any other way: the filter with nothing in the air, and what
+# the panel says when there is nothing to lift.
 #
 # **Where the canvas points come from.** In a 2200x1450 window the canvas viewport is about
 # x 330..1450 by y 130..1250 -- a square of roughly 1120 -- and `View::fit` takes the smaller of
@@ -48,24 +57,16 @@ about zoom 0.5916 0.02
 # The filter the next transform will use, before anybody has touched it: `Kernel::default`.
 expect kernel Mitchell
 
-tab Transform
+tab Tool options
 shot transform-empty
 
-# Shape three: nothing selected. There is one interactive control and it is the resampling filter,
-# offered whether or not there is anything to transform because it is the filter the *next* one
-# will use. What belongs to a transform in flight is not merely dead here, it is gone.
-absent Transform selection
-absent Transform:Scale X
-absent Transform:Lock
-absent Transform:Apply
-# Choosing one with nothing in flight hangs it on the identity, and that guard is worth driving: it
-# must not conjure a transform nobody started, must not touch the document, and must not make an
-# undo step. `kernel` is the witness that the pick reached the application at all; the four lines
-# after it are the witnesses that nothing else moved with it.
-press Resampling
-shot transform-kernels
-press Fast (bilinear)
-expect kernel Bilinear
+# Nothing in the air, so Tool options is the brush's and not the transform's. None of the eleven
+# controls a transform steers is merely dead here: it is gone, because the section that holds them
+# is not the section on screen.
+absent Tool options:Scale X
+absent Tool options:Lock
+absent Tool options:Apply
+absent Tool options:Resampling
 expect dragging false
 expect selection false
 expect undo 0
@@ -93,12 +94,12 @@ expect select-tool -
 expect selection true
 shot transform-ready
 
-# Shape two: a selection and no transform, which is the only state in which "Transform selection"
-# exists -- and still no sliders. Beginning lifts the pixels and holds them in the air; nothing is
-# recorded yet, because nothing has landed.
-absent Transform:Scale X
-absent Transform:Apply
-press Transform selection
+# A selection and no transform: still the brush's panel, still no sliders. Ctrl+T lifts the pixels
+# and holds them in the air; nothing is recorded yet, because nothing has landed -- and the panel
+# changes hands in the same breath, which is what every `Tool options:` name below depends on.
+absent Tool options:Scale X
+absent Tool options:Apply
+key ctrl+t
 expect dragging true
 expect selection true
 expect undo 1
@@ -111,14 +112,24 @@ expect transform.scale 1.0000	1.0000
 expect transform.rotation 0.0000
 expect transform.offset 0.0	0.0
 expect transform.lock false
-expect transform.kernel Bilinear
 expect transform.persistent true
-absent Transform selection
 shot transform-in-flight
+
+# **The filter, chosen while the transform is in the air**, which is where it matters: the preview
+# filters bilinear in hardware whatever this says, and this is what the commit will use. It belongs
+# to the *next* transform as much as to this one, so `kernel` is asserted again after this one has
+# been put back, at the end of the scene.
+press Tool options:Resampling
+shot transform-kernels
+press Fast (bilinear)
+expect kernel Bilinear
+expect transform.kernel Bilinear
+expect dragging true
+expect undo 1
 
 # Cancel puts them back and records nothing: the layer has been untouched since the lift, so an
 # abandoned transform is not an edit to undo but an edit that never happened.
-press Transform:Cancel
+press Tool options:Cancel
 expect dragging false
 expect selection true
 expect undo 1
@@ -135,17 +146,17 @@ shot transform-cancelled
 
 # Scale X, driven off the low end of its track and pinned there. The first number is 0.1000 and the
 # second is untouched, which is the whole point: a Scale X wired to `scale.1` fails this line.
-press Transform selection
+key ctrl+t
 expect dragging true
 expect transform.lock false
-slide Transform:Scale X -0.40
+slide Tool options:Scale X -0.40
 expect dragging true
 expect transform.scale 0.1000	1.0000
 # And a scale is not a rotation and not a move.
 expect transform.rotation 0.0000
 expect transform.offset 0.0	0.0
 shot transform-scaled-x
-press Transform:Apply
+press Tool options:Apply
 expect dragging false
 expect status Applied the transform
 expect selection true
@@ -158,14 +169,14 @@ expect selection true
 expect status Moved the selection back
 
 # Scale Y, the same drag on the other slider, and the pair comes out the other way round.
-press Transform selection
+key ctrl+t
 expect dragging true
-slide Transform:Scale Y -0.40
+slide Tool options:Scale Y -0.40
 expect dragging true
 expect transform.scale 1.0000	0.1000
 expect transform.rotation 0.0000
 shot transform-scaled-y
-press Transform:Apply
+press Tool options:Apply
 expect dragging false
 expect status Applied the transform
 expect undo 2
@@ -177,16 +188,16 @@ expect status Moved the selection back
 # The lock, as a flag and as a snap. Turning it on evens the axes there and then rather than at the
 # next drag -- a lock that only bit later is a lock you cannot tell you have set -- so the axes are
 # made to differ first and the toggle is what brings them back together.
-press Transform selection
+key ctrl+t
 expect transform.lock false
-slide Transform:Scale X -0.40
+slide Tool options:Scale X -0.40
 expect transform.scale 0.1000	1.0000
-press Transform:Lock
+press Tool options:Lock
 expect dragging true
 expect transform.lock true
 expect transform.scale 0.1000	0.1000
 shot transform-locked
-press Transform:Apply
+press Tool options:Apply
 expect dragging false
 expect status Applied the transform
 expect undo 2
@@ -198,14 +209,14 @@ expect status Moved the selection back
 # And what the lock does to a slider: with it on, one slider moves both axes. This is the same
 # gesture as the Scale Y block above, on the same slider, and the answer is different -- there it
 # left the first number at 1.0000, here it drags that number down with the second.
-press Transform selection
-press Transform:Lock
+key ctrl+t
+press Tool options:Lock
 expect transform.lock true
 expect transform.scale 1.0000	1.0000
-slide Transform:Scale Y -0.40
+slide Tool options:Scale Y -0.40
 expect transform.scale 0.1000	0.1000
 shot transform-locked-slider
-press Transform:Apply
+press Tool options:Apply
 expect status Applied the transform
 expect undo 2
 key ctrl+z
@@ -230,7 +241,7 @@ expect selection true
 # k = (460 + 720) / (2 * 460) = 1.283, so the content reaches x 660 + 460*1.283 = 1250 and the far
 # end of the stroke lands at (1199,999), crossing the box that was empty a moment ago. Apply's
 # status is in both halves because an `ink ... 0` alone would also pass if the grab had missed.
-press Transform selection
+key ctrl+t
 expect transform.lock false
 ink 1135 900 1235 1010 0
 drag 1120 920 1120 1180
@@ -240,15 +251,15 @@ about transform.scale-x 1.0 0.02
 about transform.scale-y 1.57 0.2
 ink 1135 900 1235 1010 0
 shot transform-corner-unlocked
-press Transform:Apply
+press Tool options:Apply
 expect status Applied the transform
 expect undo 2
 key ctrl+z
 expect undo 1
 expect selection true
 
-press Transform selection
-press Transform:Lock
+key ctrl+t
+press Tool options:Lock
 expect transform.lock true
 drag 1120 920 1120 1180
 expect dragging true
@@ -259,7 +270,7 @@ about transform.scale-x 1.28 0.15
 about transform.scale-y 1.28 0.15
 ink 1135 900 1235 1010 20
 shot transform-corner-locked
-press Transform:Apply
+press Tool options:Apply
 expect status Applied the transform
 expect undo 2
 key ctrl+z
@@ -271,9 +282,9 @@ expect status Moved the selection back
 # slider that can be driven to the middle of its track and read back: 0.60 of -180..180 is 36
 # degrees, which is 0.6283 radians, and the drag lands a little short of the fraction it is given
 # because `slide` keeps eight pixels of padding at each end of the row. Hence `about`.
-press Transform selection
+key ctrl+t
 expect dragging true
-slide Transform:Rotation 0.60
+slide Tool options:Rotation 0.60
 expect dragging true
 about transform.rotation 0.60 0.05
 # A rotation is not a scale: the sliders carry size and this one carries angle, and neither reaches
@@ -281,7 +292,7 @@ about transform.rotation 0.60 0.05
 expect transform.scale 1.0000	1.0000
 expect transform.offset 0.0	0.0
 shot transform-rotated
-press Transform:Apply
+press Tool options:Apply
 expect dragging false
 expect status Applied the transform
 expect undo 2
@@ -292,30 +303,30 @@ expect status Moved the selection back
 
 # The two flips, one per block. A flip is a negative scale, so each one is answerable in the sign of
 # its own number and in nothing else -- the sliders carry magnitude and do not move.
-press Transform selection
-press Transform:Flip horizontally
+key ctrl+t
+press Tool options:Flip horizontally
 expect dragging true
 expect transform.scale -1.0000	1.0000
 shot transform-flipped-h
 # **And the slider carries how big, not which way round.** Driving Scale X down the track on a
 # flipped axis leaves it flipped: `resize` puts the magnitude back on the axis it found, sign and
 # all, so a touch of the slider cannot quietly unflip a selection.
-slide Transform:Scale X -0.40
+slide Tool options:Scale X -0.40
 expect transform.scale -0.1000	1.0000
 shot transform-flipped-scaled
-press Transform:Apply
+press Tool options:Apply
 expect status Applied the transform
 expect undo 2
 key ctrl+z
 expect undo 1
 expect selection true
 
-press Transform selection
-press Transform:Flip vertically
+key ctrl+t
+press Tool options:Flip vertically
 expect dragging true
 expect transform.scale 1.0000	-1.0000
 shot transform-flipped-v
-press Transform:Apply
+press Tool options:Apply
 expect status Applied the transform
 expect undo 2
 key ctrl+z
@@ -328,7 +339,7 @@ expect selection true
 # the 0.5916 this window reports is 169.03 page pixels, which rounds to 169. That is the number to
 # re-derive if the window size or the fit ever changes; nothing else here leans on the zoom to more
 # than a handle's width.
-press Transform selection
+key ctrl+t
 expect dragging true
 expect transform.offset 0.0	0.0
 drag 890 690 990 790
@@ -338,7 +349,7 @@ expect transform.offset 169.0	169.0
 expect transform.scale 1.0000	1.0000
 expect transform.rotation 0.0000
 shot transform-moved
-press Transform:Apply
+press Tool options:Apply
 expect status Applied the transform
 expect undo 2
 key ctrl+z
@@ -352,7 +363,7 @@ expect status Moved the selection back
 # about its own centre, which is (890,690): the press is due right of it at zero degrees and the
 # release is down and to the right at forty-five, so the transform turns by 0.7854 radians. Off a
 # pointer, so `about` -- and rotation is one number, which is what lets `about` serve at all.
-press Transform selection
+key ctrl+t
 expect dragging true
 drag 1140 690 1067 867
 expect dragging true
@@ -360,7 +371,7 @@ about transform.rotation 0.7854 0.05
 expect transform.scale 1.0000	1.0000
 expect transform.offset 0.0	0.0
 shot transform-ring
-press Transform:Apply
+press Tool options:Apply
 expect status Applied the transform
 expect undo 2
 key ctrl+z
@@ -372,10 +383,10 @@ expect status Moved the selection back
 # floating pixels. Choosing it must not end the transform, it must reach the transform that is up --
 # `transform.kernel` -- and it must also become the application's own preference for the next one,
 # which is why `set_transform` writes both and why both are checked.
-press Transform selection
+key ctrl+t
 expect dragging true
 expect transform.kernel Bilinear
-press Resampling
+press Tool options:Resampling
 shot transform-kernels-live
 press Sharp (Catmull-Rom)
 expect dragging true
@@ -385,9 +396,9 @@ expect kernel CatmullRom
 # A filter is not a placement: choosing one leaves the transform where it was, so the pixels have
 # to be moved before Apply has anything to announce.
 expect transform.scale 1.0000	1.0000
-slide Transform:Scale X -0.40
+slide Tool options:Scale X -0.40
 expect transform.scale 0.1000	1.0000
-press Transform:Apply
+press Tool options:Apply
 expect status Applied the transform
 expect undo 2
 key ctrl+z
@@ -397,7 +408,7 @@ expect selection true
 # Esc puts it back and Enter applies it, the two keys the panel's own first line promises. They are
 # claimed only while a transform is in the air, which is why they are driven last: everything above
 # has already proved the state they depend on.
-press Transform selection
+key ctrl+t
 expect dragging true
 key escape
 expect dragging false
@@ -405,7 +416,7 @@ expect status Transform cancelled
 expect undo 1
 expect redo 1
 
-press Transform selection
+key ctrl+t
 expect dragging true
 drag 890 690 990 790
 expect transform.offset 169.0	169.0
@@ -424,3 +435,45 @@ expect status Moved the selection back
 expect page-size 2048	2048
 expect layers 1
 shot transform-done
+
+# --- The section is still a panel, and that is where the other two shapes live ---
+#
+# Sections rather than tabs is the answer to "some people want it always in one place": the same
+# module serves the contextual panel and a standalone one, opened from the panel list and docked
+# wherever the artist likes. Opened here because it is the only way to see what the transform
+# section says when nothing is in the air -- Tool options is the brush's then, correctly.
+#
+# The list is reached with a secondary press anywhere, which is the workspace's own gesture, and
+# switching a panel *on* puts it in the air rather than anywhere in particular -- the click after it
+# is what says where. Without that click the panel is in neither tree, and the three `absent`s below
+# pass for the wrong reason: `docs/DRIVING.md` warns about exactly that, and this scene was written
+# without the click and demonstrated it before the run stopped a step later.
+right 890 690
+press popup-panels:Transform
+click 1970 335
+expect dragging false
+
+# With a selection and nothing lifted: no sliders, and words saying where a transform is begun.
+expect selection true
+absent Transform:Scale X
+absent Transform:Apply
+absent Transform:Lock
+shot transform-standalone
+
+# The filter survived the transform that chose it, which is the whole reason it is offered outside
+# one: it is the filter the next lift will commit with. Catmull-Rom is what the live block above
+# left it at, and it is still that after four transforms have come and gone.
+expect kernel CatmullRom
+press Transform:Resampling
+press Smooth (Mitchell)
+expect kernel Mitchell
+expect dragging false
+expect selection true
+expect dirty true
+
+# And with nothing selected at all, the same panel says what is missing rather than going quiet.
+key ctrl+d
+expect selection false
+absent Transform:Scale X
+shot transform-standalone-empty
+key f3

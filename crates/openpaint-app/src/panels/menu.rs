@@ -5,7 +5,7 @@
 use super::{Painting, Picked};
 use crate::panel_ui::Direction;
 use crate::ui::Status;
-use crate::ui::{Command, LayerAction, SelectAction};
+use crate::ui::{Command, LayerAction, SelectAction, TextAction, TransformAction};
 use crate::workspace::Anchor;
 use crate::workspace::Place;
 use openpaint_core::Brush;
@@ -20,12 +20,8 @@ pub(crate) fn show(
     place: Place,
 ) -> Option<Picked> {
     let mut picked: Option<Picked> = None;
-    let _ = (&mut *brush, &mut *color_srgb, state, place);
-    let layers = state.layers;
-    let active_layer = state.active_layer;
-    let tool = state.tool;
-    let select_tool = state.select_tool;
-    let _ = (layers, active_layer, tool, select_tool);
+    let _ = (&mut *brush, &mut *color_srgb, place);
+    let doc = Doc::of(state);
     // **A menu drops down under its own button.** It replaced the strip's contents at
     // first, which was a mistake: the menu bar is a landmark, and replacing it makes you
     // lose your place. Touch-friendliness comes from the size of the targets and from
@@ -74,13 +70,7 @@ pub(crate) fn show(
                     Change::Chose(which) => {
                         *paint.menu = Some(which);
                         if let Some(at) = paint.input.pressed_rect {
-                            let size = menu_size(
-                                which,
-                                active_layer,
-                                layers.len(),
-                                state.has_selection,
-                                paint,
-                            );
+                            let size = menu_size(which, doc, paint);
                             picked = Some(Picked::OpenMenu {
                                 at,
                                 size,
@@ -103,7 +93,7 @@ pub(crate) fn show(
             let Some(which) = *paint.menu else {
                 return picked;
             };
-            let items = menu_items(which, active_layer, layers.len(), state.has_selection);
+            let items = menu_items(which, doc);
             let controls: Vec<Control> = items
                 .iter()
                 .enumerate()
@@ -129,6 +119,35 @@ pub(crate) fn show(
     picked
 }
 
+/// What the menus need to know about the document to decide what to offer.
+///
+/// **A summary, not three loose arguments.** `menu_items(2, 0, 1, false)` is a call nobody can read
+/// and nobody can be sure they wrote in the right order -- and it is written in three places and in
+/// every test of what a menu offers, which is where the reading matters most. Not `Status`: the
+/// whole point of these being pure is that a test can state a document in one line without building
+/// one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Doc {
+    /// Index of the layer being painted.
+    pub(crate) active_layer: usize,
+    /// How many layers there are.
+    pub(crate) layers: usize,
+    /// Whether there is a selection to act on.
+    pub(crate) has_selection: bool,
+}
+
+impl Doc {
+    /// Read the summary off the document as it stands.
+    #[must_use]
+    fn of(state: &Status<'_>) -> Self {
+        Self {
+            active_layer: state.active_layer,
+            layers: state.layers.len(),
+            has_selection: state.has_selection,
+        }
+    }
+}
+
 /// The menus, and what each one is called.
 ///
 /// The names live here and the commands live in [`menu_items`], because a menu's contents depend
@@ -147,19 +166,12 @@ pub(crate) const MENUS: &[(&str, ())] = &[
 /// Measured from the items it is about to show, because the workspace places the popup before the
 /// panel draws into it: a guess would either clip the longest command or leave a margin of nothing
 /// beside the shortest.
-fn menu_size(
-    which: u32,
-    active_layer: usize,
-    layers: usize,
-    has_selection: bool,
-    paint: &Painting<'_>,
-) -> (f32, f32) {
+fn menu_size(which: u32, doc: Doc, paint: &Painting<'_>) -> (f32, f32) {
     let m = &paint.theme.metrics;
-    let controls: Vec<crate::panel_ui::Control> =
-        menu_items(which, active_layer, layers, has_selection)
-            .into_iter()
-            .map(|(name, _)| crate::panel_ui::Control::Button { id: 0, text: name })
-            .collect();
+    let controls: Vec<crate::panel_ui::Control> = menu_items(which, doc)
+        .into_iter()
+        .map(|(name, _)| crate::panel_ui::Control::Button { id: 0, text: name })
+        .collect();
     let text_of =
         |c: &crate::panel_ui::Control| crate::panel_draw::text_width(paint.ctx, m.body, c);
     let widest = controls.iter().map(&text_of).fold(0.0_f32, f32::max);
@@ -177,13 +189,13 @@ fn menu_size(
 /// **Commands that cannot be carried out are not offered.** Deleting the last layer would leave
 /// nothing to paint on, and a menu entry that refuses when pressed teaches you not to trust the
 /// menu (DECISIONS 6b).
-pub(crate) fn menu_items(
-    which: u32,
-    active_layer: usize,
-    layers: usize,
-    has_selection: bool,
-) -> Vec<(String, Picked)> {
+pub(crate) fn menu_items(which: u32, doc: Doc) -> Vec<(String, Picked)> {
     let named = |name: &str, what: Picked| (name.to_owned(), what);
+    let Doc {
+        active_layer,
+        layers,
+        has_selection,
+    } = doc;
     match which {
         0 => vec![
             named("New", Picked::Command(Command::New)),
@@ -217,12 +229,28 @@ pub(crate) fn menu_items(
                     "Fill selection",
                     Picked::Selection(SelectAction::Fill),
                 ));
+                // **Beginning a transform is a command, and this is where commands live.** It was
+                // a button in the Transform panel, which was the only way to start one -- and that
+                // panel has stopped being a peer tab, because a transform is a task in flight
+                // rather than a tool (`docs/CONTEXTUAL_PANELS.md`). The task borrows the Tool
+                // options panel once it is in the air; getting it into the air belongs here,
+                // beside the other things Edit does to a selection, and on Ctrl+T.
+                items.push(named(
+                    "Transform selection",
+                    Picked::Transform(TransformAction::Begin),
+                ));
             }
             items
         }
         2 => {
             let mut items = vec![
                 named("Add", Picked::Layer(LayerAction::Add)),
+                // **Beside Add, because it is the same errand.** It used to be a button in the
+                // Text panel, which is the one place somebody who has never made a text layer
+                // would not think to look -- and that panel is now Properties, which shows what
+                // the active layer is *made of* and does not make layers. Always offered: a text
+                // layer can be added to any document, whatever is active.
+                named("Add text layer", Picked::Text(TextAction::AddLayer)),
                 named(
                     "Duplicate",
                     Picked::Layer(LayerAction::Duplicate(active_layer)),
@@ -272,16 +300,30 @@ pub(crate) fn menu_items(
 mod tests {
     use super::*;
 
+    /// A document stated in one line, which is the whole reason [`Doc`] is a struct.
+    fn doc(active_layer: usize, layers: usize, has_selection: bool) -> Doc {
+        Doc {
+            active_layer,
+            layers,
+            has_selection,
+        }
+    }
+
+    /// What one menu offers, by name, for a given document.
+    fn names(which: u32, doc: Doc) -> Vec<String> {
+        menu_items(which, doc)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
     /// **A menu never offers something it would refuse.** Deleting the last layer would leave
     /// nothing to paint on, and an entry that refuses when pressed teaches you not to trust the
     /// menu at all.
     #[test]
     fn the_layer_menu_hides_delete_when_there_is_one_layer_left() {
-        let names = |items: &[(String, Picked)]| -> Vec<String> {
-            items.iter().map(|(n, _)| n.clone()).collect()
-        };
-        assert!(!names(&menu_items(2, 0, 1, false)).contains(&"Delete".to_owned()));
-        assert!(names(&menu_items(2, 0, 2, false)).contains(&"Delete".to_owned()));
+        assert!(!names(2, doc(0, 1, false)).contains(&"Delete".to_owned()));
+        assert!(names(2, doc(0, 2, false)).contains(&"Delete".to_owned()));
     }
 
     /// The same rule for everything else a menu would refuse.
@@ -291,26 +333,46 @@ mod tests {
     /// the test above exists to prevent -- it just only covered Delete.
     #[test]
     fn a_menu_offers_nothing_it_would_refuse() {
-        let names = |items: &[(String, Picked)]| -> Vec<String> {
-            items.iter().map(|(n, _)| n.clone()).collect()
-        };
         assert!(
-            !names(&menu_items(2, 0, 3, false)).contains(&"Merge down".to_owned()),
+            !names(2, doc(0, 3, false)).contains(&"Merge down".to_owned()),
             "the bottom layer has nothing to merge into"
         );
-        assert!(names(&menu_items(2, 1, 3, false)).contains(&"Merge down".to_owned()));
+        assert!(names(2, doc(1, 3, false)).contains(&"Merge down".to_owned()));
 
-        assert!(!names(&menu_items(1, 0, 3, false)).contains(&"Fill selection".to_owned()));
-        assert!(names(&menu_items(1, 0, 3, true)).contains(&"Fill selection".to_owned()));
+        assert!(!names(1, doc(0, 3, false)).contains(&"Fill selection".to_owned()));
+        assert!(names(1, doc(0, 3, true)).contains(&"Fill selection".to_owned()));
 
-        let without = names(&menu_items(3, 0, 3, false));
+        // **And beginning a transform**, which needs something to transform in exactly the way
+        // Fill does. It was a button in a panel that put a sentence where the button would have
+        // been; as a menu entry it simply is not offered.
+        assert!(!names(1, doc(0, 3, false)).contains(&"Transform selection".to_owned()));
+        assert!(names(1, doc(0, 3, true)).contains(&"Transform selection".to_owned()));
+
+        let without = names(3, doc(0, 3, false));
         assert_eq!(
             without,
             vec!["All".to_owned()],
             "with nothing selected, only Select all has anything to do"
         );
-        let with = names(&menu_items(3, 0, 3, true));
+        let with = names(3, doc(0, 3, true));
         assert!(with.contains(&"Deselect".to_owned()) && with.contains(&"Clear".to_owned()));
+    }
+
+    /// **The one way to make a text layer is in the Layer menu**, where the other layer-making
+    /// commands are, and it is offered whatever is active.
+    ///
+    /// It used to be a button in the Text panel: the one place somebody who had never made a text
+    /// layer would not think to look, and a panel that is now Properties and does not make layers.
+    /// The sabotage for this is putting it back behind a condition -- offered only on a text layer,
+    /// say -- which makes the command reachable only once you already have the thing it makes.
+    #[test]
+    fn a_text_layer_can_be_made_from_the_layer_menu_whatever_is_active() {
+        for d in [doc(0, 1, false), doc(2, 4, true)] {
+            assert!(
+                names(2, d).contains(&"Add text layer".to_owned()),
+                "no way to make a text layer with {d:?} active"
+            );
+        }
     }
 
     /// Every menu offers something, and every entry is named.
@@ -320,7 +382,7 @@ mod tests {
     #[test]
     fn every_menu_offers_something_you_can_press() {
         for (which, (name, ())) in MENUS.iter().enumerate() {
-            let items = menu_items(u32::try_from(which).expect("small"), 0, 4, false);
+            let items = menu_items(u32::try_from(which).expect("small"), doc(0, 4, false));
             assert!(!items.is_empty(), "the {name} menu is empty");
             for (label, _) in &items {
                 assert!(!label.is_empty(), "an unnamed entry in the {name} menu");
@@ -334,7 +396,7 @@ mod tests {
     /// send Duplicate at whichever layer happened to be first.
     #[test]
     fn layer_menu_entries_act_on_the_active_layer() {
-        let items = menu_items(2, 3, 5, false);
+        let items = menu_items(2, doc(3, 5, false));
         assert!(
             items
                 .iter()

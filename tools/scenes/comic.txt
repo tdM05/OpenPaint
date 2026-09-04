@@ -71,8 +71,7 @@ shot comic-03-inked
 tab Colour
 pressat colour:0 188 142
 expect colour 414180
-tab Select
-press Select:Wand
+press Tools:Wand
 expect select-tool wand
 click 950 750
 expect undo 9
@@ -82,26 +81,31 @@ shot comic-04-filled
 #
 # Lasso a corner of the box, lift it, turn it, and put it down. The transform preview is drawn by
 # the GPU now, so this is also the one place a whole session sees that path.
-tab Select
-press Select:Lasso
+press Tools:Lasso
 expect select-tool lasso
 path 620 420 900 420 900 620 620 620 620 420
 expect selection true
-tab Transform
-press Transform selection
+# Ctrl+T lifts it, and the Tool options panel becomes the transform's for as long as it is in the
+# air -- which is why the two names below resolve at all.
+key ctrl+t
 expect dragging true
-slide Transform:Rotation 0.6
-press Transform:Apply
+slide Tool options:Rotation 0.6
+press Tool options:Apply
 expect status Applied the transform
 expect dragging false
 shot comic-05-transformed
 
 # --- Lettering ---
-tab Text
-press text:Add text layer
+#
+# The command that makes a text layer is in the Layer menu, beside Add; the words it makes are
+# edited in Properties, which follows the active layer and turns into the caption editor the moment
+# one is up.
+press Menu:Layer
+press Menu:Add text layer
 expect layers 4
 expect active.kind text
-press text:Caption
+tab Properties
+press Properties:Caption
 type Panel one
 # Committed with Enter before the name is asked for: a caption is applied when the field is
 # finished with, never per keystroke, or a layer would be renamed once per letter and the undo
@@ -122,8 +126,7 @@ key ctrl+d
 tab Layers
 press layers:2
 expect active.name Layer 3
-tab Select
-press Select:Rect
+press Tools:Rect
 drag 620 420 1000 800
 expect selection true
 # The message names the size of what was copied, and that is the *content's* size rather than the

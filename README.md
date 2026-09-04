@@ -30,6 +30,8 @@ What is there:
   very tall one.
 - **Selection** by lasso, rectangle and wand, a bucket, an eyedropper, and a transform with a live
   preview on the GPU.
+- **Panels that follow what you are doing** — one shows the settings of the tool in your hand, one
+  shows what the active layer is made of, and neither is a tab you have to go and find.
 - **Text layers** where the text stays editable, with font substitution reported rather than
   silently swapped.
 - **Import** of PNG and JPEG, as a document or as a layer; **export** of a page, of every page, or
@@ -54,8 +56,8 @@ platform-specific part is one input backend.
 Two kinds, and the second exists because the first was not enough:
 
 ```
-cargo test --workspace     # 970 tests
-./tools/sweep.ps1          # 28 scenarios, 1125 assertions, driving the real application
+cargo test --workspace     # 975 tests
+./tools/sweep.ps1          # 30 scenarios, 1266 assertions, driving the real application
 ```
 
 The scenarios operate the running application through the real UI -- moving the pointer, pressing

@@ -22,13 +22,13 @@ holdtab Pages
 press Float
 # Floating a tab leaves its *neighbour* showing, not the first tab in the group -- which is
 # what closing a tab does everywhere else.
-expect layout *Menu / *Tools / *Canvas / Layers,History,*Page / *Brush,Transform,Select,Text / *Colour | Pages
+expect layout *Menu / *Tools / *Canvas / Layers,Properties,History,*Page / *Tool options / *Colour | Pages
 expect windows 60,60 319x325
 
 tab History
 holdtab History
 press Float
-expect layout *Menu / *Tools / *Canvas / Layers,*Page / *Brush,Transform,Select,Text / *Colour | Pages / History
+expect layout *Menu / *Tools / *Canvas / Layers,Properties,*Page / *Tool options / *Colour | Pages / History
 # Side by side with a clear gap, not stacked: the second window's left edge is past the first
 # window's right edge, which is the whole of the fix. 60 + 319 = 379, and the second starts at 387.
 expect windows 60,60 319x325 / 387,60 319x325

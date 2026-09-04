@@ -11,10 +11,10 @@
 #
 # Colour is floated from its own settings rather than by dragging its tab out: a tab let go over
 # the canvas docks into the canvas slot, which is what `PanelDrag::release` does with `Floated`.
-expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / *Brush,Transform,Select,Text / *Colour
+expect layout *Menu / *Tools / *Canvas / *Layers,Properties,History,Pages,Page / *Tool options / *Colour
 holdat 1816 1043
 press Float
-expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / *Brush,Transform,Select,Text | Colour
+expect layout *Menu / *Tools / *Canvas / *Layers,Properties,History,Pages,Page / *Tool options | Colour
 shot window-floated
 
 # Where the window is now, so any movement of it would show.
@@ -52,16 +52,18 @@ shot window-moved
 # --- And it is not a fact about the Colour panel ---
 #
 # The rule is "what a panel draws in is the panel's", so it has to hold for every panel that can be
-# floated. Brush is the other extreme: a list far taller than any window, so its controls have to
-# be scrolled to as well as pressed, and both are presses inside a floating window.
-# The Brush tab has moved since the start of this scene -- Colour leaving the right-hand column
-# resized what is left -- so the point comes from the atlas beside the last screenshot, not from
-# the arrangement this file opened with.
-holdat 1813 861
+# floated. Tool options is the other extreme: with the brush in hand it is the brush section, a list
+# far taller than any window, so its controls have to be scrolled to as well as pressed, and both
+# are presses inside a floating window.
+#
+# **By its tab's name, not by a point.** Colour leaving the right-hand column resized what is left,
+# so the tab is not where the arrangement this file opened with put it -- and a raw coordinate for
+# a tab is the stale number `holdtab` exists to stop being written.
+holdtab Tool options
 press Float
-expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / *Transform,Select,Text | Colour / Brush
+expect layout *Menu / *Tools / *Canvas / *Layers,Properties,History,Pages,Page | Colour / Tool options
 expect brush.size 8.000
-slide brush:1048577 0.6
+slide Tool options:1048577 0.6
 about brush.size 25 12
 shot window-brush-slider
 press Reset to defaults

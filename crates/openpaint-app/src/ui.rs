@@ -891,11 +891,30 @@ pub struct Ui {
     /// Per panel, because two of them can be on screen at once and a list scrolled in one has
     /// nothing to say about the other. Keyed by panel id rather than by position, so rearranging
     /// the workspace does not shuffle the offsets between panels.
-    panel_input: std::collections::HashMap<u32, crate::panel_draw::PanelInput>,
+    ///
+    /// **And by the section that panel is showing**, which is the second half of the key. A
+    /// contextual panel shows the brush one moment and the wand the next; one entry between them
+    /// would drop the artist halfway down a list they never scrolled and carry a half-typed preset
+    /// name into a tolerance. `panels::section_of` decides which section is up, and it is the same
+    /// answer the panel itself is drawn from. An ordinary panel is its own section, so its key is
+    /// the pair it always was.
+    panel_input: std::collections::HashMap<(u32, u32), crate::panel_draw::PanelInput>,
     /// Which menu the menu strip is drilled into, if any.
     menu_open: Option<u32>,
     /// Which control's dropdown is open, if any. Kept between frames, like `menu_open`.
     pick_open: Option<crate::panel_ui::ControlId>,
+    /// Which of those were actually drawn on the last frame.
+    ///
+    /// **Because a field nobody can see does not have the caret.** `editing` is dropped only by
+    /// the panel that draws the field, on the way out of it -- so a panel that stops being drawn
+    /// keeps its half-typed text, which is right, and used to keep `typing()` saying *true*, which
+    /// was not: every unmodified shortcut in the application stayed dead until that panel came
+    /// back. Clicking into the brush's name box and then changing tab was enough, and a contextual
+    /// panel makes it a press on the tool rail.
+    ///
+    /// Two facts, kept apart: the field remembers what was typed into it, and the *keyboard* is
+    /// only claimed by a field that is on screen.
+    drawn: std::collections::HashSet<(u32, u32)>,
     /// The prompt's half-finished gesture, kept for the same reason a panel's is.
     ///
     /// Its own, not one of `panel_input`'s: a prompt belongs to no panel, and filing it under one
@@ -933,6 +952,7 @@ impl Ui {
             extend_amount: DEFAULT_EXTEND,
             preset_name: String::new(),
             panel_input: std::collections::HashMap::new(),
+            drawn: std::collections::HashSet::new(),
             prompt_input: crate::panel_draw::PanelInput::default(),
             menu_open: None,
             pick_open: None,
@@ -980,7 +1000,11 @@ impl Ui {
     /// layer and the shortcuts live in the shell, so one of them must know about the other.
     #[must_use]
     pub fn typing(&self) -> bool {
-        self.panel_input.values().any(|i| i.editing.is_some())
+        self.drawn.iter().any(|key| {
+            self.panel_input
+                .get(key)
+                .is_some_and(|i| i.editing.is_some())
+        })
     }
 
     /// Build the panel, render it over the frame, and apply any edits to `brush`.
@@ -1040,6 +1064,9 @@ impl Ui {
         // Taken for the duration of the frame because `self.ctx.run` has `self` borrowed, and put
         // back the moment it does not.
         let mut panel_input = std::mem::take(&mut self.panel_input);
+        // Rebuilt each frame rather than added to: a panel that has gone is a panel whose field no
+        // longer has the keyboard, and that is the whole point of keeping the set.
+        let mut drawn: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
         let mut prompt_input = std::mem::take(&mut self.prompt_input);
         let mut menu_open = self.menu_open;
         let mut pick_open = self.pick_open;
@@ -1092,6 +1119,8 @@ impl Ui {
                     crate::workspace::Attention::Workspace
                 };
                 ws.show(ctx, area, attention, |panel, ui, direction, place| {
+                    let key = (panel.0, crate::panels::section_of(panel, &status).0);
+                    drawn.insert(key);
                     if let Some(picked) = workspace_panel(
                         panel,
                         ui,
@@ -1101,7 +1130,7 @@ impl Ui {
                         &mut Painting {
                             theme: &theme,
                             direction,
-                            input: panel_input.entry(panel.0).or_default(),
+                            input: panel_input.entry(key).or_default(),
                             menu: &mut menu_open,
                             pick: &mut pick_open,
                             extend_by: extend_amount,
@@ -1370,6 +1399,7 @@ impl Ui {
 
         // Put back the state the frame borrowed.
         self.panel_input = panel_input;
+        self.drawn = drawn;
         self.prompt_input = prompt_input;
         self.menu_open = menu_open;
         self.pick_open = pick_open;

@@ -1,8 +1,11 @@
-# The Text panel's caption editor, and the two doors either side of it.
+# The Properties panel's caption editor, and the two doors either side of it.
 #
-# Fourteen of this panel's controls exist only while the active layer is a text layer -- the
-# editor and the "not a text layer" label are mutually exclusive -- so nothing here can be
-# pressed until "Add text layer" has made one. That button is the whole scene's precondition.
+# **Properties follows the active layer**, so what it shows is the active layer's contents: the
+# caption editor when that layer keeps words, and words about what would fill it when it keeps
+# pixels. Fourteen of those controls therefore exist only while a text layer is active, so nothing
+# here can be pressed until Layer > Add text layer has made one. That command is the whole scene's
+# precondition, and it is in a menu rather than in this panel because it makes a layer rather than
+# describing one.
 # Which of those controls are on screen when is `absences.txt`'s subject and not this one's.
 #
 # **Every control here is now checked against the field it is supposed to move.** It was not.
@@ -23,23 +26,33 @@
 # which is why every edit below is preceded by `wait 900` -- that is what makes each one its own
 # step, and the count below it a statement about that control and no other.
 #
-# Every press says `text:` first. Half these words -- Size, Colour, Width, Font -- belong to
+# Every press says `Properties:` first. Half these words -- Size, Colour, Width, Font -- belong to
 # another panel as well, and the atlas refuses a name that fits two controls; the panel's own
 # drop-down is filed under the panel too, so the font list is reached the same way.
-tab Text
+tab Properties
 expect layers 1
 expect active.kind raster
 expect undo 0
 expect dirty false
 
+# **With a raster layer active the panel says what would fill it**, and none of the editor is
+# there. That is the whole contextual-panel bargain: a tab advertises that text layers exist and a
+# panel that goes blank does not, so the blank state carries the advertisement instead.
+absent Properties:Caption
+absent Properties:Convert to raster layer
+shot text-nothing-to-set
+
 # A text layer keeps the words rather than the pixels. It is named after its own caption, and
-# with no caption yet that name is "Text".
-press text:Add text layer
+# with no caption yet that name is "Text". Making one is recorded, exactly as making a raster
+# layer is -- the two sit side by side in the Layer menu, and one of them being outside the undo
+# stack read as Ctrl+Z being broken rather than as the command being outside it.
+press Menu:Layer
+press Menu:Add text layer
 expect layers 2
 expect active.kind text
 expect active.name Text
 expect dirty true
-expect undo 0
+expect undo 1
 
 # **The block every assertion below is a change from.** These are `TextBlock::default`, and
 # writing them down is what turns a later number into evidence: a size near 110 proves the Size
@@ -66,12 +79,12 @@ shot text-added
 # so the tool afterwards is still the brush, and that is checked. The words and only the words:
 # typing a caption is not a change of face or of size.
 wait 900
-press text:Caption
+press Properties:Caption
 type Be here
 key enter
 expect text Be here
 expect active.name Be here
-expect undo 1
+expect undo 2
 expect tool Brush
 expect text.font -
 expect text.size 32.00
@@ -88,14 +101,14 @@ shot text-typed
 # proved instead is that the pick left the family where it was and wrote into nothing else: the
 # three fields a mis-wired pick would land in are checked, and so is the depth.
 wait 900
-press text:Font
+press Properties:Font
 shot text-font-list
-press text:(default)
+press Properties:(default)
 expect text.font -
 expect text.weight 400
 expect text.size 32.00
 expect text.colour 141418
-expect undo 1
+expect undo 2
 expect text Be here
 expect active.kind text
 
@@ -104,15 +117,15 @@ expect active.kind text
 # Each is asked about the other's field as well: two switches one under the next are the pair
 # most easily crossed, and crossed they would each still cost their one undo step.
 wait 900
-press text:Bold
+press Properties:Bold
 expect text.weight 700
 expect text.italic false
-expect undo 2
+expect undo 3
 wait 900
-press text:Italic
+press Properties:Italic
 expect text.italic true
 expect text.weight 700
-expect undo 3
+expect undo 4
 shot text-weight
 
 # The three metric sliders. A drag lands wherever the track puts it -- `about`, not `expect` --
@@ -122,22 +135,22 @@ shot text-weight
 # -10..40 px. Each drag is followed by the other two fields, still at the defaults above:
 # three sliders in a column are three chances to write into the row above or below.
 wait 900
-slide text:Size 0.75
+slide Properties:Size 0.75
 about text.size 110 25
 expect text.line-height 1.200
 expect text.letter-spacing 0.00
-expect undo 4
-wait 900
-slide text:Line height 0.8
-about text.line-height 2.5 0.2
-expect text.letter-spacing 0.00
 expect undo 5
 wait 900
-slide text:Letter spacing 0.6
+slide Properties:Line height 0.8
+about text.line-height 2.5 0.2
+expect text.letter-spacing 0.00
+expect undo 6
+wait 900
+slide Properties:Letter spacing 0.6
 about text.letter-spacing 20 3
 about text.line-height 2.5 0.2
 about text.size 110 25
-expect undo 6
+expect undo 7
 expect text Be here
 shot text-metrics
 
@@ -146,17 +159,17 @@ shot text-metrics
 # is the editor's own rule that a value set to what it already was costs no undo step. The
 # value cannot tell those two presses apart, both leaving Center behind: the depth can.
 wait 900
-press text:Center
+press Properties:Center
 expect text.align Center
-expect undo 7
-wait 900
-press text:Center
-expect text.align Center
-expect undo 7
-wait 900
-press text:Start
-expect text.align Start
 expect undo 8
+wait 900
+press Properties:Center
+expect text.align Center
+expect undo 8
+wait 900
+press Properties:Start
+expect text.align Start
+expect undo 9
 shot text-align
 
 # Colour, typed as three or six hex digits and reported back as the six the block holds. A good
@@ -165,17 +178,17 @@ shot text-align
 # put says the typing reached the right field, and the depth that stayed put says it was a
 # refusal rather than an edit to something invisible.
 wait 900
-press text:Colour
+press Properties:Colour
 type #3A7F5C
 key enter
 expect text.colour 3a7f5c
-expect undo 9
+expect undo 10
 wait 900
-press text:Colour
+press Properties:Colour
 type zzz
 key enter
 expect text.colour 3a7f5c
-expect undo 9
+expect undo 10
 expect text Be here
 expect active.kind text
 shot text-colour
@@ -187,18 +200,18 @@ shot text-colour
 # altogether, which is what `-` says, and only undo brings it back. That the Width control
 # itself comes and goes with the toggle is `absences.txt`'s check rather than this one's.
 wait 900
-press text:Wrap
+press Properties:Wrap
 expect text.wrap 400
-expect undo 10
-wait 900
-slide text:Width 0.25
-about text.wrap 1075 200
 expect undo 11
+wait 900
+slide Properties:Width 0.25
+about text.wrap 1075 200
+expect undo 12
 shot text-wrapped
 wait 900
-press text:Wrap
+press Properties:Wrap
 expect text.wrap -
-expect undo 12
+expect undo 13
 
 # Position. Typed, not dragged: a caption can sit anywhere on a page of any size, so there is
 # no range to give a slider. `text.at` carries both coordinates at once, which is what makes
@@ -207,30 +220,30 @@ expect undo 12
 # number is an edit; anything that is not a number is refused the way a bad colour is, and a
 # position that did not move under a depth that did not move is what a refusal looks like.
 wait 900
-press text:X
+press Properties:X
 type 543
 key enter
 expect text.at 543	819
-expect undo 13
+expect undo 14
 wait 900
-press text:Y
+press Properties:Y
 type 377
 key enter
 expect text.at 543	377
-expect undo 14
+expect undo 15
 wait 900
-press text:X
+press Properties:X
 type xyz
 key enter
 expect text.at 543	377
-expect undo 14
+expect undo 15
 shot text-placed
 
 # Retyping the caption. The field arrives selected, so the first keystroke replaces the lot --
 # and the layer's name follows the new words, not the old ones. Nothing else the caption was
 # set to moves with them: retyping is not a reset.
 wait 900
-press text:Caption
+press Properties:Caption
 type Not that caption
 key enter
 expect text Not that caption
@@ -240,7 +253,7 @@ expect text.italic true
 expect text.align Start
 expect text.colour 3a7f5c
 expect text.at 543	377
-expect undo 15
+expect undo 16
 
 # Convert to raster: the pixels stay and the words stop existing, which is what `text -` says --
 # there is no block left to report, and the ten fields under it go with it. One way, and undo is
@@ -248,11 +261,11 @@ expect undo 15
 # weight, the slant, the alignment, the colour, the metrics and the placement all have to come
 # back with them, or what came back is a different caption wearing the same words.
 wait 900
-press text:Convert to raster layer
+press Properties:Convert to raster layer
 expect active.kind raster
 expect text -
 expect layers 2
-expect undo 16
+expect undo 17
 shot text-raster
 key ctrl+z
 expect active.kind text
@@ -267,7 +280,7 @@ expect text.at 543	377
 about text.size 110 25
 about text.line-height 2.5 0.2
 about text.letter-spacing 20 3
-expect undo 15
+expect undo 16
 expect redo 1
 shot text-undone
 
@@ -276,7 +289,11 @@ shot text-undone
 # with Escape: the dialog runs on its own thread and nothing in the application reads Escape
 # while it is up, so the key reaches the dialog and cancels it. Pressed by id because the
 # button's label ends in a U+2026 ellipsis, and a scene file has no business carrying one.
-press text:514
+#
+# **513, not 514.** Add text layer left this panel for the Layer menu, so the commands under the
+# editor renumbered -- which is the cost of naming a control by its id, and it is still cheaper
+# than putting an ellipsis in a scene file.
+press Properties:513
 wait 1200
 expect dialog true
 # A native modal takes a moment to appear and take the keyboard; an Escape sent before it has

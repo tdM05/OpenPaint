@@ -58,6 +58,8 @@
     holdtab NAME        hold that panel's tab, which asks it for its settings
     holdtab NAME DX DY  ...and then carry it that far, which is how a window is taken
     dragtab NAME DX DY  take that tab and carry it that far
+    dragtabto NAME X Y  take that tab and carry it to that point -- for a drop into a *slot*,
+                        whose place is fixed while the tab's is not
     press NAME          press the control whose label matches, anywhere on screen
     press PANEL:NAME    ...or only in that panel, when two of them share a word
     rpress NAME         the other button, on the same control
@@ -913,6 +915,30 @@ try {
                 for ($i = 1; $i -le $steps; $i++) {
                     $t = $i / $steps
                     Point-At ([int]($x + [int]$a[-2] * $t)) ([int]($y + [int]$a[-1] * $t))
+                }
+                [Win]::mouse_event([Win]::LUP, 0, 0, 0, [IntPtr]::Zero)
+                Start-Sleep -Milliseconds 400
+            }
+            'dragtabto' {
+                # `dragtabto NAME X Y` -- take that tab and carry it to a point.
+                #
+                # The offset form above is right for carrying a *window*, where what the drag means
+                # is "this far". It is wrong for dropping a tab into a *slot*, where what the drag
+                # means is "into there": the destination is fixed by the layout and the starting
+                # point is wherever the tab happens to have been laid out, so an offset is a number
+                # that silently stops meaning anything the moment a label changes width. That is
+                # the same hazard `dragtab` was added to fix, on the other end of the same drag.
+                $name = $rest -replace '\s+\S+\s+\S+$', ''
+                $r = Rect-Of $name -Tab
+                $x = $r.X + [int]($r.W / 2)
+                $y = $r.Y + [int]($r.H / 2)
+                Point-At $x $y
+                [Win]::mouse_event([Win]::LDOWN, 0, 0, 0, [IntPtr]::Zero)
+                Start-Sleep -Milliseconds 60
+                $steps = 30
+                for ($i = 1; $i -le $steps; $i++) {
+                    $t = $i / $steps
+                    Point-At ([int]($x + ([int]$a[-2] - $x) * $t)) ([int]($y + ([int]$a[-1] - $y) * $t))
                 }
                 [Win]::mouse_event([Win]::LUP, 0, 0, 0, [IntPtr]::Zero)
                 Start-Sleep -Milliseconds 400

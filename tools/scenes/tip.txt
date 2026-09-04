@@ -9,16 +9,16 @@
 # The image is written by the sweep before it runs, so the path is known. It is called
 # `stamp-fixture.png` rather than `tip.png` because this scenario's own screenshots are called
 # `tip*.png` -- the picture would have overwritten the fixture it loads.
-tab Brush
+tab Tool options
 expect brush-tip round
-press brush:1048590
+press Tool options:1048590
 absent Back to a round tip
 
 # The dialog is native and runs on its own thread; it needs a good while to appear and take the
 # keyboard, and a path typed before it has goes into the application instead.
 # By id: the button's label ends in a U+2026 ellipsis, and a scene file has no business
 # carrying one. 1048587 is LOAD_TIP.
-press brush:1048587
+press Tool options:1048587
 wait 3000
 expect dialog true
 type C:\Users\taddm\code\OpenPaint\target\drive\stamp-fixture.png
@@ -30,9 +30,9 @@ expect brush-tip bitmap
 shot tip-loaded
 
 # The edge profile is gone, and the way back is offered in its place.
-absent brush:1048590
+absent Tool options:1048590
 press Back to a round tip
 expect brush-tip round
-press brush:1048590
+press Tool options:1048590
 absent Back to a round tip
 shot tip-round-again

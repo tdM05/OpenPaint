@@ -56,14 +56,18 @@ shot absences-selection
 
 # None of the caption editor exists until the active layer is a text layer, and the wrap width
 # exists only while wrapping is on.
-tab Text
-absent text:Caption
-press Add text layer
+#
+# Properties follows the active layer, so with a raster one up the editor is not merely disabled,
+# it is not there -- and what is there instead is the sentence saying what would put it there.
+tab Properties
+absent Properties:Caption
+press Menu:Layer
+press Menu:Add text layer
 expect active.kind text
 # A caption does not wrap to begin with, so there is no width to set.
-absent text:Width
-press text:Wrap
-press text:Width
-press text:Wrap
-absent text:Width
+absent Properties:Width
+press Properties:Wrap
+press Properties:Width
+press Properties:Wrap
+absent Properties:Width
 shot absences-text

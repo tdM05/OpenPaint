@@ -1518,11 +1518,24 @@ impl OpenPaint {
     /// differ and by how much (`openpaint_core::selection`), and what a box does once it has the
     /// right rectangle (`transform_box`). The choice made on this line is the gap between them.
     fn begin_transform(&mut self) {
+        // **Said rather than ignored.** Doing nothing was defensible while the only way in was a
+        // button that was not on screen at the time; Ctrl+T and a menu entry can both arrive with
+        // one already in the air, and a shortcut that silently does nothing reads as a shortcut
+        // that does not work (DECISIONS 6b).
         if self.dragging.is_some() {
+            self.status_message = Some(
+                "A transform is already in the air. Enter puts it down, Esc puts it back."
+                    .to_owned(),
+            );
+            self.request_redraw();
             return;
         }
         let Some(selection) = self.selection.as_ref().map(|s| s.mask.clone()) else {
-            self.status_message = Some("Nothing is selected".to_owned());
+            self.status_message = Some(
+                "Nothing is selected, so there is nothing to lift. Select something first, \
+                      with the lasso, the rectangle or the wand."
+                    .to_owned(),
+            );
             self.request_redraw();
             return;
         };
@@ -1956,9 +1969,22 @@ impl OpenPaint {
                         page.y as f32 + page.h as f32 * 0.4,
                     )
                 };
-                self.editor.add_text_layer(block);
+                let index = self.editor.add_text_layer(block);
+                // **Recorded, exactly as `LayerAction::Add` is.** Adding a text layer sat outside
+                // history while adding a raster one was in it, so Ctrl+Z after the one did nothing
+                // and after the other worked -- the same shape as the defect in `DRIVE_LOG` #4,
+                // which is that an operation outside the stack reads as undo being broken rather
+                // than as the operation being inapplicable. It shows now that the two commands are
+                // side by side in the Layer menu.
+                if let Some((r, layer)) = self
+                    .renderer
+                    .as_mut()
+                    .zip(self.editor.layers().get(index).cloned())
+                {
+                    r.record_layer_addition(index, layer);
+                }
                 self.status_message =
-                    Some("Text layer added — type the caption in the Text panel.".to_owned());
+                    Some("Text layer added — type the caption in the Properties panel.".to_owned());
                 self.mark_dirty();
                 self.request_redraw();
             }
@@ -3541,6 +3567,15 @@ impl OpenPaint {
                     // Ctrl+Shift+I, the binding every art app uses for invert-selection.
                     "i" | "I" if self.nav.modifiers.shift_key() => {
                         self.apply_select_action(ui::SelectAction::Invert);
+                        return true;
+                    }
+                    // Ctrl+T, the binding every art app uses for "lift what is selected". It was
+                    // a button in the Transform panel and nowhere else, so a transform could only
+                    // be started from a panel that had to be permanently on show for a task that
+                    // lasts seconds -- see `docs/CONTEXTUAL_PANELS.md`. `begin_transform` says why
+                    // when there is nothing to lift, so this needs no guard of its own.
+                    "t" | "T" => {
+                        self.begin_transform();
                         return true;
                     }
                     "e" | "E" => {

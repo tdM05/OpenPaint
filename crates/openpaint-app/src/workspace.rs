@@ -1,3 +1,4 @@
+
 //! Drawing the panel workspace, and driving it with a pointer.
 //!
 //! The one part of the panel system that is not testable without a screen, kept as thin as it can
@@ -161,6 +162,29 @@ pub const PANELS: &[PanelKind] = &[
         direction: Direction::Column,
         settings: &[Setting::Floating],
     },
+    // **The two contextual panels.** Ordinary rows in an ordinary table, which is the point:
+    // Photoshop's Options bar is special-cased chrome that cannot be docked, closed or moved, and
+    // that is precisely the exception DECISIONS 1c says this UI does not get to have. These float,
+    // dock, tab and close like everything above them; the only thing that makes them contextual is
+    // that they choose their contents from `Status`.
+    //
+    // "Tool options" rather than "Tool", because the rail one row is called "Tools" and a pair of
+    // names one letter apart is a pair somebody will mistype -- in a scenario, where the harness
+    // would then press a confident nowhere. It is also what Krita calls the same panel.
+    PanelKind {
+        id: PanelId(12),
+        name: "Tool options",
+        header: HeaderStyle::Named,
+        direction: Direction::Column,
+        settings: &[Setting::Floating],
+    },
+    PanelKind {
+        id: PanelId(13),
+        name: "Properties",
+        header: HeaderStyle::Named,
+        direction: Direction::Column,
+        settings: &[Setting::Floating],
+    },
 ];
 
 pub const MENU: PanelId = PanelId(0);
@@ -175,6 +199,8 @@ pub const PAGES: PanelId = PanelId(8);
 pub const PAGE: PanelId = PanelId(9);
 pub const TEXT: PanelId = PanelId(10);
 pub const SELECT: PanelId = PanelId(11);
+pub const TOOL: PanelId = PanelId(12);
+pub const PROPERTIES: PanelId = PanelId(13);
 
 /// Whether a panel may live in a floating window.
 ///
@@ -269,7 +295,7 @@ fn load_layout() -> Option<Loaded> {
     }
 }
 
-/// Put back any panel this build has that the saved workspace does not.
+/// Put back any panel the built-in arrangement has that the saved workspace does not.
 ///
 /// **A workspace saved before a panel existed has no idea it exists.** Nothing notices and nothing
 /// says so: the panel is simply not there, in a UI whose whole premise is that the arrangement is
@@ -277,6 +303,14 @@ fn load_layout() -> Option<Loaded> {
 /// without a *brush* panel, reported as "most things do not work, brush doesn't even work now",
 /// and the only way to find out was to go looking in the panel list for something nobody had any
 /// reason to think was missing.
+///
+/// **The built-in arrangement, not every panel this build has**, and the difference now matters:
+/// Brush, Select, Transform and Text are deliberately not in it -- their contents are the sections
+/// the two contextual panels show, and they exist as panels for anyone who wants one docked
+/// permanently. Against `PANELS` this function would put all four back into the default
+/// arrangement the first time it was saved and read again, which is the opposite of what it is for.
+/// A panel that is in neither place is reachable from the panel list, which is also how it came to
+/// be closed.
 ///
 /// A panel is put where the built-in arrangement puts it: beside the panels it belongs with,
 /// because that is an answer somebody already thought about. Failing that -- none of its
@@ -291,22 +325,26 @@ fn add_missing_panels(layout: &mut Layout, floating: &[Floating]) {
     let built_in = default_layout();
     let belongs_with = built_in.resolve(unit);
 
-    for k in PANELS {
+    let expected: Vec<PanelId> = belongs_with
+        .iter()
+        .flat_map(|slot| slot.tabs.iter().copied())
+        .collect();
+    for id in expected {
         let anywhere = |p: PanelId, l: &Layout| {
             l.find(p).is_some() || floating.iter().any(|f| f.layout.find(p).is_some())
         };
-        if anywhere(k.id, layout) {
+        if anywhere(id, layout) {
             continue;
         }
         // Somebody it sits with in the built-in arrangement, who is in this workspace.
         let neighbour = belongs_with
             .iter()
-            .find(|slot| slot.tabs.contains(&k.id))
+            .find(|slot| slot.tabs.contains(&id))
             .and_then(|slot| {
                 slot.tabs
                     .iter()
                     .copied()
-                    .find(|p| *p != k.id && layout.find(*p).is_some())
+                    .find(|p| *p != id && layout.find(*p).is_some())
             });
         let path = neighbour
             .and_then(|n| layout.find(n))
@@ -318,7 +356,7 @@ fn add_missing_panels(layout: &mut Layout, floating: &[Floating]) {
             .into_iter()
             .find(|s| s.path == path)
             .map(|s| s.active);
-        layout.insert(&path, Zone::Center, k.id);
+        layout.insert(&path, Zone::Center, id);
         if let Some(active) = showing {
             layout.set_active(&path, active);
         }
@@ -830,28 +868,40 @@ pub fn default_layout() -> Layout {
     l.set_weight(&[1, 1], 0.80);
     l.set_weight(&[1, 2], 0.20);
 
-    // The right column: layers over brush over colour, with history sharing the layers' slot
-    // because the two are rarely wanted at once.
-    l.insert(&[1, 2], Zone::Bottom, BRUSH);
+    // The right column: the layer's band over the tool's band over colour.
+    //
+    // **Two contextual panels and no strip of near-peers.** Brush, Select, Transform and Text used
+    // to be four tabs here, as though they were four of a kind; they are tool options, tool
+    // options, a task in flight and a layer property. Now the tool's settings are always in the
+    // middle band and the active layer's are always a tab beside Layers, and neither ever moves.
+    // The four are still panels -- opened from the panel list and docked wherever the artist likes,
+    // which is what makes sections rather than tabs the answer on this -- they are simply not what
+    // a fresh workspace opens with. `docs/CONTEXTUAL_PANELS.md` has the reasoning.
+    //
+    // **Not a horizontal strip under the menu**, which the spec floated as an option. The brush
+    // section is four times taller than the window on its own, and a bar the height of a menu is
+    // where a setting goes to be scrolled past rather than read.
+    l.insert(&[1, 2], Zone::Bottom, TOOL);
     l.insert(&[1, 2, 1], Zone::Bottom, COLOUR);
-    l.insert(&[1, 2, 0], Zone::Center, HISTORY);
+
     // **Tabs, not more splits.** The task panels -- what you reach for while doing one thing and
     // put away after -- go beside the panel they belong with rather than each taking a band of the
-    // window. Twelve panels laid out at once is a workspace nobody could read, and the arrangement
+    // window. A dozen panels laid out at once is a workspace nobody could read, and the arrangement
     // is the artist's to change anyway; what matters is that every panel is *somewhere* on opening,
     // because a panel nobody can find is a panel nobody has.
+    //
+    // Properties goes beside Layers because they are about the same thing: one is which layer, the
+    // other is what that layer is made of.
+    l.insert(&[1, 2, 0], Zone::Center, PROPERTIES);
+    l.insert(&[1, 2, 0], Zone::Center, HISTORY);
     l.insert(&[1, 2, 0], Zone::Center, PAGES);
     l.insert(&[1, 2, 0], Zone::Center, PAGE);
-    l.insert(&[1, 2, 1], Zone::Center, TRANSFORM);
-    l.insert(&[1, 2, 1], Zone::Center, SELECT);
-    l.insert(&[1, 2, 1], Zone::Center, TEXT);
     // **And the panel on show is the one you came for.** `insert` shows what it just added, which
-    // is right when the artist puts a panel somewhere and wrong here: adding four task panels as
-    // tabs left the workspace opening on Page and Text, with Layers and Brush behind them. The
-    // arrangement is the artist's to change; which tab is in front on a fresh workspace is not
-    // something they asked for.
+    // is right when the artist puts a panel somewhere and wrong here: adding the task panels as
+    // tabs left the workspace opening on Page, with Layers behind it. The arrangement is the
+    // artist's to change; which tab is in front on a fresh workspace is not something they asked
+    // for.
     l.set_active(&[1, 2, 0], 0);
-    l.set_active(&[1, 2, 1], 0);
     l.set_weight(&[1, 2, 0], 0.42);
     l.set_weight(&[1, 2, 1], 0.30);
     l.set_weight(&[1, 2, 2], 0.28);
@@ -3926,7 +3976,7 @@ mod tests {
         );
         // A panel left at its defaults is not written at all, or the file would freeze today's
         // defaults into every saved workspace.
-        options.insert(BRUSH.0, PanelOptions::default());
+        options.insert(TOOL.0, PanelOptions::default());
 
         let saved = options_to_saved(&options);
         assert_eq!(saved.keys().collect::<Vec<_>>(), vec!["Layers"]);
@@ -4156,7 +4206,7 @@ mod tests {
     fn a_window_is_carried_by_the_place_it_was_held() {
         let mut ws = bare();
         ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let id = ws.floating[0].id;
         let before = ws.floating[0].rect;
 
@@ -4579,7 +4629,10 @@ mod tests {
         type Step<'a> = (&'static str, Box<dyn Fn(&mut Workspace) + 'a>);
         let steps: Vec<Step<'_>> = vec![
             ("float Page", Box::new(|w: &mut Workspace| w.float(PAGE))),
-            ("float Text", Box::new(|w: &mut Workspace| w.float(TEXT))),
+            (
+                "float Properties",
+                Box::new(|w: &mut Workspace| w.float(PROPERTIES)),
+            ),
             (
                 "drag the Colour tab onto the canvas",
                 Box::new(move |w: &mut Workspace| {
@@ -4714,7 +4767,7 @@ mod tests {
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.set_screen(screen);
         ws.float(PAGE);
-        ws.float(TEXT);
+        ws.float(PROPERTIES);
         let windows_before: Vec<(FloatId, Rect)> =
             ws.floating.iter().map(|f| (f.id, f.rect)).collect();
         assert_eq!(windows_before.len(), 2, "two windows were floated");
@@ -4873,13 +4926,13 @@ mod tests {
     fn holding_a_windows_frame_asks_about_what_it_shows() {
         let mut ws = bare();
         ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let id = ws.floating[0].id;
 
         ws.frame_asked(Surface::Floating(id), &[]);
         assert_eq!(
             ws.popup_wanted,
-            Some(PopupKind::Settings(BRUSH)),
+            Some(PopupKind::Settings(TOOL)),
             "a window's frame should ask about the panel it is showing"
         );
     }
@@ -5051,7 +5104,7 @@ mod tests {
             let mut ws = bare();
             let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
             ws.screen = screen;
-            ws.float(BRUSH);
+            ws.float(TOOL);
             ws.float(COLOUR);
             let (a, b) = (ws.floating[0].id, ws.floating[1].id);
             let (from, onto) = if drag_first { (a, b) } else { (b, a) };
@@ -5072,7 +5125,7 @@ mod tests {
             );
             let mut left = ws.floating[0].layout.panels();
             left.sort_by_key(|p| p.0);
-            assert_eq!(left, vec![BRUSH, COLOUR]);
+            assert_eq!(left, vec![COLOUR, TOOL]);
         }
     }
 
@@ -5085,7 +5138,7 @@ mod tests {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.screen = screen;
-        ws.float(BRUSH);
+        ws.float(TOOL);
         ws.float(COLOUR);
         let (under, over) = (ws.floating[0].id, ws.floating[1].id);
 
@@ -5562,7 +5615,7 @@ mod tests {
         ] {
             let mut ws = bare();
             ws.screen = screen;
-            ws.float(BRUSH);
+            ws.float(TOOL);
             ws.floating[0].rect = start;
 
             // Exactly on the boundary the pull names, and mid-way along the other axis when that
@@ -5622,7 +5675,7 @@ mod tests {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.screen = screen;
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let start = Rect::new(400.0, 300.0, 320.0, 260.0);
         ws.floating[0].rect = start;
 
@@ -5653,7 +5706,7 @@ mod tests {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.screen = screen;
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let least = least_window(&ws.theme.metrics);
         let start = Rect::new(400.0, 300.0, least, least);
         ws.floating[0].rect = start;
@@ -5688,7 +5741,7 @@ mod tests {
         for escape in [false, true] {
             let mut ws = bare();
             ws.screen = screen;
-            ws.float(BRUSH);
+            ws.float(TOOL);
             ws.floating[0].rect = start;
             ws.history = crate::layout::History::default();
 
@@ -5729,7 +5782,7 @@ mod tests {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.screen = screen;
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let start = Rect::new(400.0, 300.0, 320.0, 260.0);
         ws.floating[0].rect = start;
         ws.history = crate::layout::History::default();
@@ -5754,7 +5807,7 @@ mod tests {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.screen = screen;
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let start = Rect::new(400.0, 300.0, 320.0, 260.0);
         ws.floating[0].rect = start;
 
@@ -5834,8 +5887,8 @@ mod tests {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.screen = screen;
-        ws.float(BRUSH);
-        ws.start_placing(BRUSH);
+        ws.float(TOOL);
+        ws.start_placing(TOOL);
 
         let slot = ws
             .layout
@@ -5854,8 +5907,8 @@ mod tests {
             None,
             "the press should have answered the pick"
         );
-        assert!(ws.is_docked(BRUSH), "and put the panel in the arrangement");
-        let (brush, _) = ws.layout.find(BRUSH).expect("brush");
+        assert!(ws.is_docked(TOOL), "and put the panel in the arrangement");
+        let (brush, _) = ws.layout.find(TOOL).expect("brush");
         let (layers, _) = ws.layout.find(LAYERS).expect("layers");
         assert_ne!(
             brush, layers,
@@ -5875,8 +5928,8 @@ mod tests {
         ws.screen = screen;
         let seams = ws.layout.splitters(screen, ws.theme.metrics.splitter_grab);
         let seam = seams.first().cloned().expect("a divider");
-        ws.float(BRUSH);
-        ws.start_placing(BRUSH);
+        ws.float(TOOL);
+        ws.start_placing(TOOL);
         let was = ws.layout.clone();
 
         // Straight onto a divider, and then moved: an ordinary press there resizes live.
@@ -5890,11 +5943,11 @@ mod tests {
         hand.release((at.0 + 90.0, at.1 + 90.0));
 
         assert_eq!(ws.placing(), None);
-        assert!(ws.is_docked(BRUSH), "the panel landed");
+        assert!(ws.is_docked(TOOL), "the panel landed");
         // The panel is new, so the tree cannot be identical -- but nothing else moved: taking the
         // panel out again must give back exactly what was there.
         let mut back = ws.layout.clone();
-        back.remove(BRUSH);
+        back.remove(TOOL);
         assert_eq!(
             back, was,
             "answering the pick also dragged the divider it was answered on"
@@ -5923,7 +5976,7 @@ mod tests {
     fn a_pick_holds_the_pointer() {
         let mut ws = bare();
         assert!(!ws.busy());
-        ws.start_placing(BRUSH);
+        ws.start_placing(TOOL);
         assert!(ws.busy(), "a waiting pick must own the next press");
         ws.cancel_placing();
         assert!(!ws.busy());
@@ -5974,7 +6027,15 @@ mod tests {
         for k in PANELS {
             let mut ws = bare();
             ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
-            assert!(ws.is_open(k.id), "{} is not in the default layout", k.name);
+            // **Every panel, not only the ones a fresh workspace shows.** The four sections are
+            // outside the built-in arrangement (DECISIONS 1e) and are opened from the panel list,
+            // so they are put in here the way that list would -- the claim is about a panel's own
+            // settings, and a panel reached the long way round still has to offer the way back out.
+            if !ws.is_open(k.id) {
+                let (path, _) = ws.layout.find(CANVAS).expect("the canvas is somewhere");
+                ws.layout.insert(&path, Zone::Center, k.id);
+            }
+            assert!(ws.is_open(k.id), "{} could not be opened at all", k.name);
             let controls = ws.popup_controls(PopupKind::Settings(k.id));
             assert!(
                 controls.iter().any(|c| c.id() == Some(REMOVE_ID)),
@@ -6080,7 +6141,7 @@ mod tests {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.screen = screen;
-        ws.float(BRUSH);
+        ws.float(TOOL);
         ws.float(COLOUR);
         // Overlapping, upper offset down and right, as the defaults are.
         ws.floating[0].rect = Rect::new(100.0, 100.0, 300.0, 300.0);
@@ -6119,9 +6180,9 @@ mod tests {
         for what in ["undo", "reset", "float", "remove"] {
             let mut ws = bare();
             ws.screen = screen;
-            ws.hide(BRUSH);
-            ws.toggle(BRUSH);
-            assert_eq!(ws.placing(), Some(BRUSH), "{what}: it should be in the air");
+            ws.hide(TOOL);
+            ws.toggle(TOOL);
+            assert_eq!(ws.placing(), Some(TOOL), "{what}: it should be in the air");
 
             match what {
                 "undo" => {
@@ -6137,21 +6198,21 @@ mod tests {
             // workspace at most once -- and one `hide` is enough to take it out again. Two copies
             // made the switch in the panel list read as on after being switched off, because
             // `Layout::remove` takes out one copy and stops.
-            assert!(count_of(&ws, BRUSH) <= 1, "{what}: it is in twice already");
+            assert!(count_of(&ws, TOOL) <= 1, "{what}: it is in twice already");
             let mid = (screen.w / 2.0, screen.h / 2.0);
             let mut hand = Hand::new(&mut ws, screen);
             hand.press(mid);
             assert!(
-                count_of(&ws, BRUSH) <= 1,
+                count_of(&ws, TOOL) <= 1,
                 "{what}: the press put a second copy in"
             );
-            ws.hide(BRUSH);
+            ws.hide(TOOL);
             assert_eq!(
-                count_of(&ws, BRUSH),
+                count_of(&ws, TOOL),
                 0,
                 "{what}: removing left a copy behind"
             );
-            assert!(!ws.is_open(BRUSH), "{what}: it still reads as open");
+            assert!(!ws.is_open(TOOL), "{what}: it still reads as open");
         }
     }
 
@@ -6166,7 +6227,7 @@ mod tests {
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let mut ws = bare();
         ws.screen = screen;
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let keep = least_window(&ws.theme.metrics);
         // Hanging off the right, as a move is allowed to leave it.
         let start = Rect::new(screen.w - keep, 300.0, 400.0, 260.0);
@@ -6195,7 +6256,7 @@ mod tests {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.screen = screen;
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let start = Rect::new(300.0, 200.0, 320.0, 260.0);
         ws.floating[0].rect = start;
         ws.history = crate::layout::History::default();
@@ -6220,7 +6281,7 @@ mod tests {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.screen = screen;
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let start = Rect::new(300.0, 200.0, 320.0, 260.0);
         ws.floating[0].rect = start;
 
@@ -6385,7 +6446,7 @@ mod tests {
         for divider in [false, true] {
             let mut ws = bare();
             ws.set_screen(screen);
-            ws.float(BRUSH);
+            ws.float(TOOL);
             ws.float(COLOUR);
             ws.floating[0].rect = Rect::new(700.0, 200.0, 400.0, 400.0);
             ws.floating[1].rect = Rect::new(60.0, 200.0, 400.0, 400.0);
@@ -6471,7 +6532,7 @@ mod tests {
 
         ws.hide(LAYERS);
         let without = ws.snapshot();
-        ws.start_placing(BRUSH);
+        ws.start_placing(TOOL);
 
         assert!(ws.undo(), "there is a change to take back");
         assert_eq!(ws.placing(), None, "the pick should have given way");
@@ -6483,7 +6544,7 @@ mod tests {
             without,
             "redo landed in a state that was never committed"
         );
-        assert!(ws.is_open(BRUSH), "the panel was left in neither tree");
+        assert!(ws.is_open(TOOL), "the panel was left in neither tree");
     }
 
     /// **A panel that cannot float is refused, rather than floated into uselessness.**
@@ -6542,7 +6603,7 @@ mod tests {
         let at = (tab.x + tab.w / 2.0, tab.y + tab.h / 2.0);
 
         // A window whose top edge sits just below that tab, so its border reaches up over it.
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let window = Rect::new(tab.x - 40.0, at.1 + 8.0, 300.0, 300.0);
         ws.floating[0].rect = window;
         assert!(
@@ -6581,7 +6642,7 @@ mod tests {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.screen = screen;
-        ws.float(BRUSH);
+        ws.float(TOOL);
         ws.floating[0].rect = Rect::new(200.0, 200.0, 300.0, 300.0);
         let id = ws.floating[0].id;
 
@@ -6607,7 +6668,7 @@ mod tests {
         let mut ws = bare();
         let wide = Rect::new(0.0, 0.0, 2560.0, 1440.0);
         ws.screen = wide;
-        ws.float(BRUSH);
+        ws.float(TOOL);
         ws.floating[0].rect = Rect::new(2300.0, 1200.0, 300.0, 200.0);
 
         let narrow = Rect::new(0.0, 0.0, 1280.0, 800.0);
@@ -6728,7 +6789,7 @@ mod tests {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.set_screen(screen);
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let window = Rect::new(400.0, 300.0, 320.0, 260.0);
         ws.floating[0].rect = window;
         let at = (window.x + window.w, window.y + window.h / 2.0);
@@ -6828,11 +6889,26 @@ mod tests {
         add_missing_panels(&mut old, &[]);
 
         let unit = Rect::new(0.0, 0.0, 1.0, 1.0);
-        for k in PANELS {
+        // **What the built-in arrangement has, and only that.** Brush, Select, Transform and Text
+        // are deliberately outside it -- their contents are the sections the two contextual panels
+        // show (DECISIONS 1e) -- and against the whole table this function would put all four back
+        // the first time a default workspace was saved and read again, which is the opposite of
+        // what it is for. Both directions are asserted, so a panel added later and left out of the
+        // built-in arrangement still fails here rather than passing quietly.
+        for slot in default_layout().resolve(unit) {
+            for id in slot.tabs {
+                assert!(
+                    old.find(id).is_some(),
+                    "{} was not put back into an old workspace",
+                    name_of(id)
+                );
+            }
+        }
+        for id in [BRUSH, SELECT, TRANSFORM, TEXT] {
             assert!(
-                old.find(k.id).is_some(),
-                "{} was not put back into an old workspace",
-                k.name
+                old.find(id).is_none(),
+                "{} was forced into a workspace that had closed it",
+                name_of(id)
             );
         }
         // What was already there has not been rearranged: same leaves, same order, same shape.
@@ -6861,15 +6937,15 @@ mod tests {
     fn a_floating_panel_is_not_restored_a_second_time() {
         let mut ws = bare();
         ws.set_screen(Rect::new(0.0, 0.0, 1400.0, 900.0));
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let floating = ws.floating.clone();
         let mut layout = ws.layout.clone();
-        assert!(layout.find(BRUSH).is_none(), "it is floating, not docked");
+        assert!(layout.find(TOOL).is_none(), "it is floating, not docked");
 
         add_missing_panels(&mut layout, &floating);
 
         assert!(
-            layout.find(BRUSH).is_none(),
+            layout.find(TOOL).is_none(),
             "a floating panel was restored into the arrangement as a second copy"
         );
     }
@@ -6886,20 +6962,29 @@ mod tests {
         let ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let showing: Vec<PanelId> = ws.layout.resolve(screen).iter().map(showing_of).collect();
-        for want in [MENU, TOOLS, CANVAS, LAYERS, BRUSH, COLOUR] {
+        for want in [MENU, TOOLS, CANVAS, LAYERS, TOOL, COLOUR] {
             assert!(
                 showing.contains(&want),
                 "{} is not on show in a fresh workspace: {showing:?}",
                 name_of(want)
             );
         }
-        // And every panel is still *somewhere*, behind a tab if not in front of one.
-        for k in PANELS {
-            assert!(
-                ws.is_open(k.id),
-                "{} is not in the workspace at all",
-                k.name
-            );
+        // And every panel the built-in arrangement has is still *somewhere*, behind a tab if not
+        // in front of one.
+        //
+        // **The built-in arrangement, not every panel this build has.** Brush, Select, Transform
+        // and Text are deliberately outside it: their contents are the sections the two contextual
+        // panels show, and they exist as panels for anyone who wants one docked permanently
+        // (DECISIONS 1e). A fresh workspace showing all fourteen would be showing the same controls
+        // twice.
+        for slot in default_layout().resolve(screen) {
+            for id in slot.tabs {
+                assert!(
+                    ws.is_open(id),
+                    "{} is not in the workspace at all",
+                    name_of(id)
+                );
+            }
         }
     }
 
@@ -6913,7 +6998,7 @@ mod tests {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.screen = screen;
-        ws.float(BRUSH);
+        ws.float(TOOL);
         ws.float(COLOUR);
         let (a, b) = (ws.floating[0].id, ws.floating[1].id);
 
@@ -6949,7 +7034,7 @@ mod tests {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.screen = screen;
-        ws.float(BRUSH);
+        ws.float(TOOL);
         ws.float(COLOUR);
         // Put them together first, by dropping one on the other.
         {
@@ -7020,7 +7105,7 @@ mod tests {
         let mut ws = bare();
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         ws.screen = screen;
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let id = ws.floating[0].id;
 
         let mut hand = Hand::new(&mut ws, screen);
@@ -7036,7 +7121,7 @@ mod tests {
         let mut hand = Hand::new(&mut ws, screen);
         let at = hand.strip_of(id);
         hand.hold(at);
-        assert_eq!(ws.popup_wanted, Some(PopupKind::Settings(BRUSH)));
+        assert_eq!(ws.popup_wanted, Some(PopupKind::Settings(TOOL)));
     }
 
     /// **A floating window has a tab you can see, in the place you press it.**
@@ -7049,7 +7134,7 @@ mod tests {
     fn a_floating_window_has_a_tab_like_any_other() {
         let mut ws = bare();
         ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let held = ws.floating.first().expect("a window").clone();
 
         let m = ws.theme.metrics;
@@ -7064,7 +7149,7 @@ mod tests {
             &slot,
             &m,
             style_of(&slot),
-            along_of(&slot, ws.direction_of(BRUSH)),
+            along_of(&slot, ws.direction_of(TOOL)),
             |_| 40.0,
         );
         assert_eq!(c.tabs.len(), 1, "a floating panel should have a tab");
@@ -7090,7 +7175,7 @@ mod tests {
         use crate::panel_drag::{pulse, Target, HOLD_MS};
         let mut ws = bare();
         ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let id = ws.floating[0].id;
         let area = ws.area_of(Surface::Floating(id)).expect("the window");
         let slot = ws
@@ -7130,7 +7215,7 @@ mod tests {
         );
         assert_eq!(
             ws.popup_wanted,
-            Some(PopupKind::Settings(BRUSH)),
+            Some(PopupKind::Settings(TOOL)),
             "holding a floating panel's tab should ask it what it offers"
         );
     }
@@ -7144,7 +7229,7 @@ mod tests {
         use crate::panel_drag::{pulse, Target};
         let mut ws = bare();
         ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
-        ws.float(BRUSH);
+        ws.float(TOOL);
         ws.float(COLOUR);
         let (from, to) = (ws.floating[0].id, ws.floating[1].id);
         let source = ws.area_of(Surface::Floating(from)).expect("source");
@@ -7188,7 +7273,7 @@ mod tests {
         in_it.sort_by_key(|p| p.0);
         assert_eq!(
             in_it,
-            vec![BRUSH, COLOUR],
+            vec![COLOUR, TOOL],
             "both should be in the one window"
         );
     }
@@ -7229,7 +7314,7 @@ mod tests {
     #[test]
     fn carrying_in_a_window_moves_the_window() {
         let carrying = Preview::Carrying {
-            panel: BRUSH,
+            panel: TOOL,
             over: None,
         };
         assert!(carry_moves_window(
@@ -7260,7 +7345,7 @@ mod tests {
         use crate::panel_drag::{pulse, Target};
         let mut ws = bare();
         ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let id = ws.floating[0].id;
         let source = ws.area_of(Surface::Floating(id)).expect("the window");
         let target = Target::Tab {
@@ -7306,10 +7391,10 @@ mod tests {
         );
 
         assert!(
-            ws.is_floating(BRUSH),
+            ws.is_floating(TOOL),
             "a floating window dropped on the arrangement should stay floating"
         );
-        assert!(!ws.is_docked(BRUSH), "and must not have docked itself");
+        assert!(!ws.is_docked(TOOL), "and must not have docked itself");
         // It went where it was dropped, which is what dragging one is *for*.
         let moved = ws.floating[0].rect;
         assert!(
@@ -7326,7 +7411,7 @@ mod tests {
     fn a_dragged_window_follows_the_pointer_by_its_grip() {
         let mut ws = bare();
         ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let id = ws.floating[0].id;
         let at = ws.floating[0].rect;
 
@@ -7355,7 +7440,7 @@ mod tests {
         use crate::panel_drag::{pulse, Target};
         let mut ws = bare();
         ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
-        ws.float(BRUSH);
+        ws.float(TOOL);
         ws.float(COLOUR);
         let (a, b) = (ws.floating[0].id, ws.floating[1].id);
         let source = ws.area_of(Surface::Floating(a)).expect("a");
@@ -7423,10 +7508,10 @@ mod tests {
     fn a_window_goes_when_the_last_panel_leaves_it() {
         let mut ws = bare();
         ws.screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
-        ws.float(BRUSH);
+        ws.float(TOOL);
         assert_eq!(ws.floating.len(), 1);
         let screen = ws.screen;
-        assert!(put_back(&mut ws, BRUSH, LAYERS, screen));
+        assert!(put_back(&mut ws, TOOL, LAYERS, screen));
         assert!(ws.floating.is_empty(), "the emptied window should be gone");
     }
 
@@ -7438,22 +7523,22 @@ mod tests {
     #[test]
     fn a_panel_is_either_docked_or_floating_and_never_both_or_neither() {
         let mut ws = bare();
-        assert!(ws.is_docked(BRUSH) && !ws.is_floating(BRUSH));
+        assert!(ws.is_docked(TOOL) && !ws.is_floating(TOOL));
 
-        ws.float(BRUSH);
-        assert!(ws.is_floating(BRUSH), "it should be floating now");
-        assert!(!ws.is_docked(BRUSH), "and gone from the arrangement");
+        ws.float(TOOL);
+        assert!(ws.is_floating(TOOL), "it should be floating now");
+        assert!(!ws.is_docked(TOOL), "and gone from the arrangement");
 
         assert!(put_back(
             &mut ws,
-            BRUSH,
+            TOOL,
             LAYERS,
             Rect::new(0.0, 0.0, 1400.0, 900.0)
         ));
-        assert!(ws.is_docked(BRUSH), "it should be back");
-        assert!(!ws.is_floating(BRUSH), "and no longer floating");
+        assert!(ws.is_docked(TOOL), "it should be back");
+        assert!(!ws.is_floating(TOOL), "and no longer floating");
         // Beside the panel it was docked into, which is what "put back into Layers" means.
-        let (brush, _) = ws.layout.find(BRUSH).expect("brush");
+        let (brush, _) = ws.layout.find(TOOL).expect("brush");
         let (layers, _) = ws.layout.find(LAYERS).expect("layers");
         assert_eq!(
             brush, layers,
@@ -7466,7 +7551,7 @@ mod tests {
     fn floating_a_panel_can_be_taken_back() {
         let mut ws = bare();
         let before = ws.layout.clone();
-        ws.float(BRUSH);
+        ws.float(TOOL);
         assert!(ws.undo(), "there should be a change to take back");
         assert_eq!(ws.layout, before, "the panel should be where it was");
     }
@@ -7482,13 +7567,13 @@ mod tests {
         for give_up in [false, true] {
             let mut ws = bare();
             ws.screen = screen;
-            ws.float(BRUSH);
+            ws.float(TOOL);
             let before = ws.snapshot();
 
-            ws.start_placing(BRUSH);
-            assert_eq!(ws.placing(), Some(BRUSH), "it should be in the air");
+            ws.start_placing(TOOL);
+            assert_eq!(ws.placing(), Some(TOOL), "it should be in the air");
             assert!(
-                !ws.is_open(BRUSH),
+                !ws.is_open(TOOL),
                 "and out of the workspace while it is there"
             );
 
@@ -7502,7 +7587,7 @@ mod tests {
                 );
             }
             assert_eq!(ws.placing(), None, "the pick should be over");
-            assert!(ws.is_open(BRUSH), "the panel came back");
+            assert!(ws.is_open(TOOL), "the panel came back");
             assert_eq!(
                 ws.snapshot(),
                 before,
@@ -7543,20 +7628,20 @@ mod tests {
             "the window should be covering the point"
         );
 
-        ws.hide(BRUSH);
-        ws.start_placing(BRUSH);
+        ws.hide(TOOL);
+        ws.start_placing(TOOL);
         let mut hand = Hand::new(&mut ws, screen);
         hand.press(at);
 
         assert!(
-            ws.is_docked(BRUSH),
+            ws.is_docked(TOOL),
             "the pick landed somewhere other than the arrangement behind the window"
         );
         assert!(
-            !ws.is_floating(BRUSH),
+            !ws.is_floating(TOOL),
             "it should not have gone into the window"
         );
-        let (brush, _) = ws.layout.find(BRUSH).expect("brush");
+        let (brush, _) = ws.layout.find(TOOL).expect("brush");
         let (layers, _) = ws.layout.find(LAYERS).expect("layers");
         assert_eq!(
             brush, layers,
@@ -7570,14 +7655,14 @@ mod tests {
     #[test]
     fn the_settings_offer_the_direction_a_panel_can_actually_travel() {
         let mut ws = bare();
-        let docked = ws.popup_controls(PopupKind::Settings(BRUSH));
+        let docked = ws.popup_controls(PopupKind::Settings(TOOL));
         assert!(
             docked.iter().any(|c| c.id() == Some(FLOAT_ID)),
             "a docked panel should be offered a way out"
         );
 
-        ws.float(BRUSH);
-        let afloat = ws.popup_controls(PopupKind::Settings(BRUSH));
+        ws.float(TOOL);
+        let afloat = ws.popup_controls(PopupKind::Settings(TOOL));
         assert!(
             !afloat.iter().any(|c| c.id() == Some(FLOAT_ID)),
             "a floating panel should not be offered floating again"
@@ -7652,7 +7737,7 @@ mod tests {
     #[test]
     fn a_floating_panel_survives_the_saved_form() {
         let mut ws = bare();
-        ws.float(BRUSH);
+        ws.float(TOOL);
         let where_it_was = ws.floating[0].rect;
 
         let saved = SavedWorkspace {
@@ -7665,18 +7750,18 @@ mod tests {
         };
         let text = serde_json::to_string(&saved).expect("serialise");
         assert!(
-            text.contains("Brush"),
+            text.contains("Tool options"),
             "written by name, not by number: {text}"
         );
 
         let back: SavedWorkspace = serde_json::from_str(&text).expect("parse");
         let restored = floating_from_saved(&back.floating);
         assert_eq!(restored.len(), 1);
-        assert_eq!(restored[0].layout.panels(), vec![BRUSH]);
+        assert_eq!(restored[0].layout.panels(), vec![TOOL]);
         assert_eq!(restored[0].rect, where_it_was);
 
         // A name this build does not know is dropped, not turned into some other panel.
-        let text = text.replace("Brush", "Sparkles");
+        let text = text.replace("Tool options", "Sparkles");
         let back: SavedWorkspace = serde_json::from_str(&text).expect("parse");
         assert!(
             floating_from_saved(&back.floating).is_empty(),
@@ -7718,7 +7803,7 @@ mod tests {
         use crate::panel_drag::{pulse, Target, HOLD_MS};
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let mut ws = bare();
-        let (path, _) = ws.layout.find(BRUSH).expect("brush");
+        let (path, _) = ws.layout.find(TOOL).expect("brush");
         let target = Target::Tab { path, tab: 0 };
 
         ws.gesture(
@@ -7750,7 +7835,7 @@ mod tests {
         );
         assert_eq!(
             ws.popup_wanted,
-            Some(PopupKind::Settings(BRUSH)),
+            Some(PopupKind::Settings(TOOL)),
             "holding a header should ask the panel what it offers"
         );
         // And the gesture is over: a finger now reading a menu must not still be dragging.
@@ -8140,11 +8225,11 @@ mod tests {
         use crate::panel_drag::{pulse, Pulse, Target};
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let mut ws = bare();
-        let brush_before = ws.layout.find(BRUSH).expect("brush").0;
+        let brush_before = ws.layout.find(TOOL).expect("brush").0;
         let placed = ws.layout.resolve(screen);
         let brush = placed
             .iter()
-            .find(|p| p.tabs.contains(&BRUSH))
+            .find(|p| p.tabs.contains(&TOOL))
             .expect("brush leaf");
         let chrome = crate::chrome::panel(
             brush,
@@ -8160,7 +8245,7 @@ mod tests {
         let index = brush
             .tabs
             .iter()
-            .position(|p| *p == BRUSH)
+            .position(|p| *p == TOOL)
             .expect("brush is in this leaf");
         let tab = chrome.tabs[index].rect;
         let (px, py) = (tab.x + tab.w / 2.0, tab.y + tab.h / 2.0);
@@ -8219,7 +8304,7 @@ mod tests {
             |_, _| unreachable!(),
         );
 
-        let brush_after = ws.layout.find(BRUSH).expect("brush must still exist").0;
+        let brush_after = ws.layout.find(TOOL).expect("brush must still exist").0;
         assert_ne!(
             brush_before, brush_after,
             "the drop did nothing: the panel is exactly where it started"
@@ -8236,7 +8321,7 @@ mod tests {
         let placed = ws.layout.resolve(screen);
         let brush = placed
             .iter()
-            .find(|p| p.tabs.contains(&BRUSH))
+            .find(|p| p.tabs.contains(&TOOL))
             .expect("brush");
         let target = Target::Tab {
             path: brush.path.clone(),
@@ -8480,7 +8565,7 @@ mod tests {
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let mut ws = bare();
         ws.hide(HISTORY);
-        let (path, _) = ws.layout.find(BRUSH).expect("brush");
+        let (path, _) = ws.layout.find(TOOL).expect("brush");
         let target = Target::Tab { path, tab: 0 };
 
         ws.gesture(
@@ -8493,7 +8578,7 @@ mod tests {
         );
         // Something else changes the arrangement while the press is still waiting.
         let screen_now = ws.screen;
-        assert!(put_back(&mut ws, HISTORY, BRUSH, screen_now));
+        assert!(put_back(&mut ws, HISTORY, TOOL, screen_now));
         let after = ws.layout.clone();
         assert!(ws.is_open(HISTORY));
 
@@ -8514,7 +8599,7 @@ mod tests {
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let mut ws = bare();
         let before = ws.layout.clone();
-        let (path, _) = ws.layout.find(BRUSH).expect("brush");
+        let (path, _) = ws.layout.find(TOOL).expect("brush");
         let target = Target::Tab { path, tab: 0 };
 
         ws.gesture(
@@ -8558,7 +8643,7 @@ mod tests {
         use crate::panel_drag::{pulse, Target};
         let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let mut ws = bare();
-        let (path, _) = ws.layout.find(BRUSH).expect("brush");
+        let (path, _) = ws.layout.find(TOOL).expect("brush");
         let target = Target::Tab { path, tab: 0 };
 
         ws.gesture(
@@ -8596,7 +8681,7 @@ mod tests {
             |_, _| unreachable!(),
         );
         assert!(
-            ws.layout.find(BRUSH).is_some(),
+            ws.layout.find(TOOL).is_some(),
             "the panel was dropped on the floor"
         );
     }
@@ -8606,7 +8691,7 @@ mod tests {
     fn only_a_changed_arrangement_is_saved() {
         assert!(saves(&Outcome::Moved));
         assert!(saves(&Outcome::Resized));
-        assert!(saves(&Outcome::Floated(BRUSH)));
+        assert!(saves(&Outcome::Floated(TOOL)));
         assert!(!saves(&Outcome::Nothing));
         // Which tab you are looking at is not part of the arrangement, the same reason it is not
         // recorded for undo.
@@ -8631,7 +8716,7 @@ mod tests {
         let placed = layout.resolve(screen);
         let brush = placed
             .iter()
-            .find(|p| p.tabs.contains(&BRUSH))
+            .find(|p| p.tabs.contains(&TOOL))
             .expect("the default layout has a Brush panel");
         let chrome = crate::chrome::panel(brush, &m, style_of(brush), Along::Down, |i| {
             measure(brush, i)
@@ -8677,7 +8762,7 @@ mod tests {
 
         assert_eq!(outcome, Outcome::Moved, "the drop did nothing");
         assert!(
-            layout.find(BRUSH).is_some(),
+            layout.find(TOOL).is_some(),
             "and the panel must still exist"
         );
     }
@@ -8693,7 +8778,20 @@ mod tests {
         let screen = Rect::new(0.0, 0.0, 1600.0, 1000.0);
         let placed = l.resolve(screen);
 
+        // **And the four sections are deliberately not in it** (DECISIONS 1e): their contents
+        // are what Tool options and Properties show, so a fresh workspace holding both would put
+        // the same controls on screen twice. Named rather than skipped by a rule, so a panel added
+        // later and forgotten is still caught by the first half of this.
         for kind in PANELS {
+            if [BRUSH, SELECT, TRANSFORM, TEXT].contains(&kind.id) {
+                assert!(
+                    l.find(kind.id).is_none(),
+                    "{} is a section, and a default workspace showing it as well as the \
+                     contextual panel would show the same controls twice",
+                    kind.name
+                );
+                continue;
+            }
             assert!(
                 l.find(kind.id).is_some(),
                 "{} is not in the default layout, so nobody will find it",

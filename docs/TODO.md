@@ -8,7 +8,7 @@
 > An item leaves this file when it ships, and the reasoning behind it moves to
 > `DECISIONS.md`.
 
-Last updated: 2026-09-02
+Last updated: 2026-09-03
 
 > UI work has its own document: **`UI_PLAN.md`**. This file keeps what is not part of
 > that sequence.
@@ -34,6 +34,9 @@ question, and only for the few refusals that risk work.
 | Situation | Today | Wanted |
 | --- | --- | --- |
 | Paint on a text layer | status line, and only on the *first* refused stroke | in-canvas notice; offer "convert to raster" |
+| Begin a transform with nothing selected | **says so, and says what to do instead** | done 2026-09-03 |
+| Begin a transform with one already in the air | **says so, and names the two keys that end it** | done 2026-09-03 |
+| A tool key pressed while a selection tool is up | status line names the tool, and nothing on screen changes | should put the selection tool away, as the rail does |
 | Paint on a hidden layer | **refused, and says so** — a stroke that lands and shows nothing is indistinguishable from a broken brush | done 2026-09-02 |
 | Paint on a locked layer | **refused, and names the layer** | done 2026-09-02 |
 | Copy or cut with nothing selected | says so | done 2026-09-02 |
@@ -66,6 +69,15 @@ status line already handles.
 ---
 
 ## 2. Known defects
+
+- **`colour_wheel::tests::the_hue_strip_runs_from_red_round_to_red` fails on a MinGW build.** The
+  far end of the hue strip comes back as 359.99997 rather than 0, so the test's "and 360 arrives as
+  0" assertion fails. It fails identically at `380ae19`, so it is nothing to do with the work that
+  found it; the difference is the target, `x86_64-pc-windows-gnu` against a MinGW libm rather than
+  the msvc one CI uses, and `strip.w.mul_add(t, strip.x)` is the obvious suspect — an FMA rounds
+  once where a multiply and an add round twice. Nothing an artist can see: the last subpixel of the
+  strip is red either way. Worth deciding whether the strip should wrap its own hue rather than
+  leaving it to a float landing exactly on the end.
 
 - **`lifted::tests::a_rotation_is_not_slow` cannot do its job.** It asserts a wall clock, and a
   wall clock on hardware we do not control cannot tell a fast machine running the wrong loop from
@@ -115,16 +127,29 @@ what every comparable application does. The reasoning is in `DECISIONS.md` §5h.
 
 ---
 
-## 4. Contextual panels — designed, agreed, not built
+## 4. Contextual panels — **built 2026-09-03**
 
-Brush, Select, Transform and Text are four tabs in one strip as though they were four of a kind,
-and they are three different kinds of context: tool options, a layer property, and a task in
-flight. The spec, the prior art, what not to copy from Photoshop, the four things that will go
-wrong and the order to build it in are in **`docs/CONTEXTUAL_PANELS.md`**, which also carries the
-handoff for whoever picks it up.
+Was: Brush, Select, Transform and Text as four tabs in one strip, as though they were four of a
+kind, when they are three different kinds of context. There are now two contextual panels and no
+third — Tool options follows the tool, Properties follows the active layer — and a transform
+borrows the first while it is in the air. The reasoning is in `DECISIONS.md` §1e and the spec it
+was built from is `docs/CONTEXTUAL_PANELS.md`.
 
-Start with Properties-for-text: one module, clearest case, and it answers whether contextual
-behaviour feels right before anything is restructured.
+Three things it left, none of them blocking:
+
+- **Crop is still not transient.** A crop in flight is the same kind of thing as a transform and
+  should borrow Tool options the same way, but its controls live inside `panels/page.rs` mixed with
+  the page's own size and extend, and splitting that module is a separate piece of work. It is
+  reachable meanwhile: the Page panel is a tab of the default arrangement.
+- **The resampling filter is only reachable while a transform is in the air**, or from the
+  standalone Transform panel. That is the moment it matters — it is what the commit will use, and
+  the preview filters bilinear in hardware regardless — but it is also a setting for the *next*
+  transform, and a setting you can only reach during the thing it applies to is half a setting.
+  A Settings panel would be its natural home.
+- **The tool keys do not put a selection tool away.** `b` and `e` set which paint tool is underneath
+  while the wand stays up, so the rail does not change and the status line is the only sign
+  anything happened. The rail's own buttons do put it away (`SelectAction::Stop`). One of the two
+  is wrong and it is probably the keyboard; it belongs in the §1 audit above.
 
 ---
 

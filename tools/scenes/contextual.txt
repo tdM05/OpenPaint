@@ -1,0 +1,209 @@
+# The two contextual panels: what each one follows, and what it says when it has nothing to show.
+#
+# Tool options follows the tool in hand; Properties follows the active layer. Neither is a tab you
+# pick, so the only way to see the right settings is for the panel to have changed under you --
+# which makes this scene's assertions negative as often as positive. `docs/CONTEXTUAL_PANELS.md`
+# is the design; this is the part of it a unit test cannot reach, because what is being asserted is
+# that a *drawn* panel changed.
+#
+# **Why `absent` is the assertion.** A name that is not on screen stops the run, so a `press` is
+# already a claim that the control exists; `absent` is the other half. Both read the control atlas,
+# which is written from what was actually laid out -- so between them they say the panel followed,
+# without any state key having to be trusted about it. The atlas warning in `docs/DRIVING.md`
+# applies -- `absent` passes trivially when the panel is not showing at all -- and it is answered
+# here by every block pressing something in the *same* panel immediately either side of it.
+#
+# **Sliders are named by id, not by label.** Six of the brush section's labels -- Size, Flow,
+# Hardness, Spacing, Roundness, Angle -- belong to two controls each, the slider and the picker
+# that says what drives it, and the harness refuses a name that fits two.
+#
+# **Where the canvas points come from.** The same 2200x1450 window every other scene assumes: the
+# canvas viewport is about x 330..1450 by y 130..1250, and a 2048-square page rests at about 0.59,
+# covering x 364..1416 by y 164..1216. Nothing here touches the canvas outside 660..1120 by
+# 460..920.
+expect tool Brush
+expect select-tool -
+expect layers 1
+expect active.kind raster
+expect undo 0
+expect dirty false
+
+# --- Tool options is the brush's while the brush is in hand ---
+#
+# Tolerance belongs to the wand and Scale X to a transform, and neither is merely disabled here.
+# There is no disabled state in this UI on purpose (DECISIONS 6b): a greyed control is a control
+# that will not say why.
+slide Tool options:1048577 0.6
+about brush.size 25 12
+absent Tool options:Tolerance
+absent Tool options:Scale X
+absent Tool options:Caption
+shot contextual-brush
+
+# The eraser is a paint tool too, so the section does not change -- which is the right answer and
+# worth stating, because "the panel changed" is not the claim. The claim is that it shows the
+# settings of what is in hand, and the eraser's settings are the brush's.
+press Tools:Eraser
+expect tool Eraser
+slide Tool options:1048578 0.9
+about brush.hardness 0.9
+absent Tool options:Tolerance
+shot contextual-eraser
+press Tools:Brush
+expect tool Brush
+
+# --- ...and the selection's the moment a selection tool is up ---
+#
+# The rail is what chooses. The panel follows, and the two blocks either side of this one could not
+# both run if it did not: the size slider belongs to the brush section and Tolerance to the wand's,
+# and they are never on screen together.
+press Tools:Wand
+expect select-tool wand
+absent Tool options:Size
+slide Tool options:Tolerance 0.5
+about wand.tolerance 64 20
+shot contextual-wand
+
+# Lasso and Rect have nothing of their own to set, and the panel says so rather than going quiet.
+# An empty contextual panel that names what would fill it is better than a tab, not worse -- it is
+# the whole answer to the standing complaint that a panel which goes blank advertises nothing.
+press Tool options:Lasso
+expect select-tool lasso
+absent Tool options:Tolerance
+absent Tool options:Size
+shot contextual-lasso
+press Tool options:Rect
+expect select-tool rect
+absent Tool options:Tolerance
+shot contextual-rect
+
+# Putting the tool away gives the panel back to the brush, with no tab pressed anywhere.
+press Tool options:Rect
+expect select-tool -
+slide Tool options:1048577 0.4
+absent Tool options:Tolerance
+
+# --- A transform borrows the panel, and gives it back ---
+#
+# A transform is a task in flight rather than a tool: it exists only between Begin and Apply, and
+# it has a Cancel. It was a peer tab, empty for all but a few seconds of a session. Now it takes
+# Tool options while it is in the air, and the brush has it back the instant the transform ends --
+# which the two `absent`s either side of this block are what prove.
+drag 700 500 1080 880
+expect undo 1
+press Tools:Rect
+drag 660 460 1120 920
+expect selection true
+press Tools:Brush
+expect select-tool -
+absent Tool options:Scale X
+key ctrl+t
+expect dragging true
+absent Tool options:Spacing
+slide Tool options:Scale X -0.40
+expect transform.scale 0.1000	1.0000
+shot contextual-transform
+key escape
+expect dragging false
+# Given back, and to the tool that was in hand rather than to whatever was there before.
+absent Tool options:Scale X
+slide Tool options:1048577 0.6
+about brush.size 25 12
+shot contextual-given-back
+key ctrl+d
+expect selection false
+
+# --- Properties is the active layer's, and says what would fill it when the layer is pixels ---
+#
+# The rule for this panel is written down because Photoshop's equivalent has none: it shows what
+# the active layer is made of, and nothing else. A raster layer is pixels, so there is nothing to
+# set -- and the blank state carries the advertisement a tab used to carry.
+tab Properties
+expect active.kind raster
+absent Properties:Caption
+absent Properties:Convert to raster layer
+absent Properties:Font
+shot contextual-properties-empty
+
+# The command that makes a text layer is in the Layer menu, beside Add and Duplicate, because it
+# makes a layer rather than describing one -- and because the one place somebody who has never made
+# a text layer would not look is inside the panel that has nothing to show until they have.
+press Menu:Layer
+press Menu:Add text layer
+expect layers 2
+expect active.kind text
+press Properties:Caption
+type Contextual
+key enter
+wait 900
+expect text Contextual
+expect active.name Contextual
+shot contextual-properties-text
+
+# **And it follows the layer, not the tool.** Changing tool leaves Properties exactly where it was:
+# these are two different contexts, which is the whole reason there are two panels and not one.
+press Tools:Wand
+expect select-tool wand
+press Properties:Font
+absent Tool options:Font
+press Properties:(default)
+expect text Contextual
+press Tools:Brush
+expect select-tool -
+
+# Changing *layer* is what empties it. Properties and Layers are tabs of the same slot, so the tab
+# has to come back to Properties before the absence means anything -- which is the trap
+# `docs/DRIVING.md` warns about, answered rather than assumed.
+tab Layers
+press layers:0
+expect active.kind raster
+tab Properties
+absent Properties:Caption
+absent Properties:Font
+shot contextual-properties-empty-again
+tab Layers
+press layers:1
+expect active.kind text
+tab Properties
+expect text Contextual
+press Properties:Caption
+key enter
+wait 900
+expect text Contextual
+
+# --- A field that is not on screen does not have the keyboard ---
+#
+# `editing` is dropped by the panel that draws the field, on the way out of it, so a panel that
+# stops being drawn keeps what was half-typed into it. That is right. What was not right is that it
+# went on claiming the keyboard: `Ui::typing` asked every panel it had ever drawn, so clicking into
+# a field and then changing tool left every unmodified shortcut in the application dead until that
+# panel came back, with nothing on screen to say why.
+#
+# Driven as an artist would meet it: start naming a brush, change tool with the rail, and then use
+# a one-letter shortcut. `e` selects the eraser, and it could not while a field nobody can see held
+# the caret. `tool` is the witness rather than the rail's lit button, because the keyboard's tool
+# keys set which paint tool is underneath and do not put a selection tool away.
+expect tool Brush
+expect presets
+press Tool options:1048585
+type halftyped
+expect tool Brush
+press Tools:Wand
+expect select-tool wand
+key e
+expect tool Eraser
+shot contextual-keyboard-freed
+
+# And the half-typed name is still there when the section comes back, which is the other half of
+# the same rule: the field remembers, the keyboard does not. Enter is what finishes a field, and it
+# reaches this one only because the section is on screen again.
+press Tools:Brush
+expect tool Brush
+expect select-tool -
+key enter
+wait 300
+press Save brush
+expect presets halftyped
+shot contextual-name-kept
+press Forget halftyped
+expect presets

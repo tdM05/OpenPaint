@@ -21,7 +21,6 @@ const FLIP_H: u32 = 5;
 const FLIP_V: u32 = 6;
 const APPLY: u32 = 7;
 const CANCEL: u32 = 8;
-const BEGIN: u32 = 9;
 const KERNEL: u32 = 10;
 
 /// The ends of the scale sliders, as percentages.
@@ -148,18 +147,25 @@ fn controls(live: Option<TransformState>, has_selection: bool, kernel: Kernel) -
             });
         }
     } else if has_selection {
-        controls.push(Control::Button {
-            id: BEGIN,
-            text: "Transform selection".to_owned(),
+        // **Starting one is a command, and it lives with the commands.** It was a button here, and
+        // this was the only way to reach it -- which is why the panel had to be one of four tabs
+        // permanently on show for a task that lasts a few seconds. A transform is a task in flight
+        // (`docs/CONTEXTUAL_PANELS.md`), so it borrows the Tool options panel once it is in the air
+        // and is begun from Edit, beside the other things done to a selection.
+        controls.push(Control::Label {
+            text: "Nothing is in the air. Edit \u{25b8} Transform selection, or Ctrl+T, lifts \
+                   what is selected."
+                .to_owned(),
         });
     } else {
-        // **Absent rather than dead.** The old panel greyed this out, and there is no disabled
+        // **Absent rather than dead.** The old panel greyed a button out, and there is no disabled
         // state to describe -- deliberately, since a greyed control is a control that will not say
-        // why. A button that answers nothing is worse than no button: it reads as broken. So the
-        // button goes and the reason takes its place, which is the same information without the
-        // dead target (§6b).
+        // why. A control that answers nothing is worse than none: it reads as broken. So the words
+        // say what is missing and what would fix it, which greying never did (§6b).
         controls.push(Control::Label {
-            text: "Select something first to transform it.".to_owned(),
+            text: "Select something first to transform it. Edit \u{25b8} Transform selection, \
+                   or Ctrl+T, lifts it once there is."
+                .to_owned(),
         });
     }
     controls.push(Control::Separator);
@@ -215,14 +221,13 @@ fn resize(axis: f32, percent: f32) -> f32 {
 ///
 /// The whole of the panel's other half, and pure for the same reason [`controls`] is.
 fn decide(change: &Change, live: Option<TransformState>, kernel: Kernel) -> Option<Picked> {
+    // **Nothing at all answers with nothing in the air.** The one control the panel still shows is
+    // the filter, and that is handled by its caller, which needs the pressed rectangle to open a
+    // list with. Anything else arriving here is a press against a panel that has since changed
+    // shape, and conjuring a transform nobody started would be worse than saying so.
     if live.is_none() {
-        return match change {
-            Change::Pressed(BEGIN) => Some(Picked::Transform(TransformAction::Begin)),
-            other => {
-                eprintln!("transform panel: unexpected {other:?} with nothing in flight");
-                None
-            }
-        };
+        eprintln!("transform panel: unexpected {change:?} with nothing in flight");
+        return None;
     }
     let mut state = base(live, kernel);
     let t = &mut state.transform;
@@ -291,6 +296,19 @@ mod tests {
         controls.iter().filter_map(Control::id).collect()
     }
 
+    /// Everything the panel says in words, joined, so a test can ask whether it said a thing at
+    /// all without knowing which label it landed in.
+    fn said(controls: &[Control]) -> String {
+        controls
+            .iter()
+            .filter_map(|c| match c {
+                Control::Label { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// The transform a change asked for, or a failed test saying what came back instead.
     fn set(change: &Change, state: TransformState) -> TransformState {
         match decide(change, Some(state), state.kernel) {
@@ -305,13 +323,13 @@ mod tests {
         let in_flight = ids(&controls(Some(flight()), false, Kernel::Mitchell));
         assert!(in_flight.contains(&SCALE_X), "no scale while transforming");
         assert!(in_flight.contains(&APPLY) && in_flight.contains(&CANCEL));
-        assert!(
-            !in_flight.contains(&BEGIN),
-            "a transform already in the air cannot be begun again"
-        );
 
+        // **Nothing to press with nothing in the air**, in either of the two states that can be
+        // in: the filter, which belongs to the next transform as much as to this one, and words
+        // saying where a transform is started from.
         let ready = ids(&controls(None, true, Kernel::Mitchell));
-        assert_eq!(ready, vec![BEGIN, KERNEL]);
+        assert_eq!(ready, vec![KERNEL]);
+        assert!(said(&controls(None, true, Kernel::Mitchell)).contains("Ctrl+T"));
     }
 
     /// **Nothing selected means no button, not a dead one.**
@@ -321,16 +339,19 @@ mod tests {
     #[test]
     fn with_nothing_selected_the_button_is_gone_and_the_reason_is_there() {
         let controls = controls(None, false, Kernel::Mitchell);
+        assert_eq!(
+            ids(&controls),
+            vec![KERNEL],
+            "a control nobody can use is still a control people will press"
+        );
+        let said = said(&controls);
         assert!(
-            !ids(&controls).contains(&BEGIN),
-            "a button nobody can use is still a button people will press"
+            said.contains("Select something first"),
+            "the panel went quiet instead of saying why: {said}"
         );
         assert!(
-            controls.iter().any(|c| matches!(
-                c,
-                Control::Label { text } if text.contains("Select something first")
-            )),
-            "the panel went quiet instead of saying why"
+            said.contains("Transform selection"),
+            "it says what is missing but not what would fix it: {said}"
         );
     }
 
@@ -467,15 +488,12 @@ mod tests {
         );
     }
 
-    /// With nothing in flight the only thing the panel answers is "begin".
+    /// With nothing in flight the panel answers nothing at all.
+    ///
+    /// A stale press against a panel that has since changed shape sets nothing rather than
+    /// conjuring a transform nobody started.
     #[test]
-    fn with_nothing_in_flight_only_begin_answers() {
-        assert_eq!(
-            decide(&Change::Pressed(BEGIN), None, Kernel::Mitchell),
-            Some(Picked::Transform(TransformAction::Begin))
-        );
-        // A stale press against a panel that has since changed shape sets nothing rather than
-        // conjuring a transform nobody started.
+    fn with_nothing_in_flight_nothing_answers() {
         for change in [
             Change::Set(SCALE_X, 200.0),
             Change::Pressed(APPLY),

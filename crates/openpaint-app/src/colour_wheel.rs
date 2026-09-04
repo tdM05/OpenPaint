@@ -1379,7 +1379,11 @@ mod tests {
             hue_at(2.0 / 3.0)
         );
         // 360 is red again, and must arrive as 0 rather than as a hue off the end of the circle.
-        assert!(hue_at(1.0) < 0.5, "the right end wraps back to red");
+        assert!(
+            hue_at(1.0) < 0.5,
+            "the right end wraps back to red, got {}",
+            hue_at(1.0)
+        );
 
         let square = wheel.sv_square().expect("a square");
         assert!(

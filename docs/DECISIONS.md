@@ -2171,6 +2171,93 @@ Three more that used to happen in silence now speak: painting on a hidden layer 
 outright — a stroke that lands and shows nothing is indistinguishable from a broken brush),
 undo and redo with nothing left in the stack, and copy or cut with no selection.
 
+### 1e. A panel follows a context, and there are exactly two — landed 2026-09-03
+
+Brush, Select, Transform and Text were four tabs in one strip, as though they were four of a kind.
+They are **three different kinds of context wearing one costume**: Brush and Select are tool
+options, Text is a layer property (which follows from §6a — text is a layer *kind*, so its settings
+belong to the layer), and Transform is a task in flight that exists only between Begin and Apply.
+The cost was never the click. It was that the artist had to know which of three unrelated
+categories a setting lived in before they could go looking, and the categories were written
+nowhere.
+
+So there are now two contextual panels and no third:
+
+- **Tool options** follows the tool in hand — the brush sections for Brush and Eraser, the
+  selection sections for Lasso, Rect, Wand and Move.
+- **Properties** follows the active layer, and shows what that layer is *made of*: the caption
+  editor for a text layer, and for a raster layer a sentence saying what would put something there.
+
+**One rule for Properties, and it is written down because Photoshop's equivalent has none:** it
+shows what the active layer is made of, and nothing else. Their Properties panel is a grab-bag —
+layer properties, shape properties, adjustment properties — because no rule ever said what may
+appear, and the next contextual thing always looks like it belongs. Adding a text layer is
+therefore *not* in it: that command is in the Layer menu beside Add, Duplicate and Merge down,
+because it makes a layer rather than describing one. Converting one back to pixels stays, because
+that is the act of giving up the contents the panel is showing, and the sentence about what is lost
+has to be next to the button that loses it.
+
+**A transform borrows Tool options while it is in the air** and gives it back on Apply or Cancel.
+Beginning one moved to Edit ▸ Transform selection and Ctrl+T, which is where every other command
+lives and what every other application binds. It was a button in the Transform panel and nowhere
+else, which is the whole reason that panel had to be permanently on show for a task lasting
+seconds.
+
+**The mechanism is taken from the others; the chrome is not.** Photoshop's Options bar is
+special-cased: pinned under the menu, not dockable, not closable, not movable — precisely the
+exception §1c says this UI does not get to have. These two are ordinary rows in `PANELS`; they
+float, dock, tab and close like anything else, and the only thing that makes them contextual is a
+`show` that matches on `Status` and delegates. The layout tree, the descriptor layer and the
+workspace learned nothing.
+
+**The unit is the section, not the panel.** `panels/` is one module per section now, composed into
+a contextual panel or opened as a standalone one — which is also the answer to "some people want a
+tab strip and some want the setting always in one place". The default arrangement gets the
+contextual pair; Brush, Select, Transform and Text are still panels in the list, for anyone who
+wants one docked permanently. `add_missing_panels` was narrowed to the built-in arrangement for
+exactly this: against the whole table it would have put all four back the first time the default
+workspace was saved and read again.
+
+Four things were known in advance to be the risks, and each has an answer:
+
+1. **Contents moving under you** — the standing complaint, and CSP's main irritation. The panel
+   keeps the size the layout gave it and the section scrolls inside it, which the brush section
+   already required.
+2. **Discoverability.** A tab advertises that text layers exist; a panel that goes blank does not.
+   So every context with nothing to show says what would fill it (§6b), which makes the blank state
+   *better* than the tab it replaced rather than worse.
+3. **Half-finished state.** `PanelInput` holds the scroll offset and the field with the caret, and
+   it was filed under the panel. It is filed under the *section* now (`panels::section_of`), so
+   changing tool cannot drop the artist halfway down a list they never scrolled, nor carry a
+   half-typed preset name into the wand's tolerance.
+4. **The control atlas names controls by panel**, so folding sections into a contextual panel
+   renames them — `Select:Lasso` became `Tool options:Lasso`. Done as one deliberate pass over
+   `tools/scenes/`, which is what `DRIVE_LOG.md` says to do, and the pass added `dragtabto` so a
+   drop into a *slot* names the slot rather than an offset from wherever a tab happened to land.
+
+**Named "Tool options", not "Tool"**, because the rail is called "Tools" and a pair of names one
+letter apart is a pair somebody will mistype — in a scenario, where the harness would then press a
+confident nowhere. It is also what Krita calls the same panel.
+
+**Not a horizontal strip under the menu**, which the spec floated. The brush section is four times
+taller than the window on its own, and a bar the height of a menu is where a setting goes to be
+scrolled past rather than read.
+
+Two things surfaced while doing it and are fixed here rather than reported:
+
+- **A field nobody can see was holding the keyboard.** `editing` is dropped by the panel that draws
+  the field, on the way out of it — so a panel that stops being drawn keeps what was half-typed,
+  which is right, and used to keep `Ui::typing` answering *true*, which was not. Every unmodified
+  shortcut in the application stayed dead until that panel came back. Clicking into the brush's
+  name box and then changing tab was enough; with a contextual panel it is a press on the rail.
+  `typing` now asks only the sections that were actually drawn last frame: the field remembers, and
+  the keyboard is claimed only by a field on screen.
+- **Adding a text layer was outside history** while adding a raster one was inside it, so Ctrl+Z
+  after the one did nothing and after the other worked — the same shape as `DRIVE_LOG` #4, and
+  glaring now that the two commands sit side by side in the Layer menu.
+
+The spec, the prior art and the reasoning are in `docs/CONTEXTUAL_PANELS.md`.
+
 ---
 
 ## 8. Roadmap — rewritten 2026-08-29

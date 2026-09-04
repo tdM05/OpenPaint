@@ -56,8 +56,16 @@ pub(crate) fn show(
     paint: &mut Painting<'_>,
     place: Place,
 ) -> Option<Picked> {
-    // Nothing here opens a list, so there is no popup half to draw.
-    let _ = (&mut *brush, &mut *color_srgb, place);
+    let _ = (&mut *brush, &mut *color_srgb);
+    // **Nothing here opens a list, so there is no popup half to draw** -- and this returns rather
+    // than ignoring `place`, which is the difference between dead code and a defect now that a
+    // contextual panel shows this section. The Tool options panel can own an open popup that the
+    // *brush* section asked for, and then change hands the instant a selection tool goes up: the
+    // workspace goes on asking that panel to draw its popup, and a section that ignored `place`
+    // would draw its whole self into the dropdown box. Every other section already returns here.
+    if place == Place::Popup {
+        return None;
+    }
     let controls = controls(state.select_tool, state.has_selection, state.wand);
     let mut picked: Option<Picked> = None;
     for change in paint.show(ui, &controls) {

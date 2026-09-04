@@ -35,6 +35,12 @@ this suite drew before the step existed was a test of the code that copes with a
 what space-to-pan and alt-click-to-pick both are, and what `key` cannot say, since it sends a whole
 keystroke and is over before the drag begins.
 
+`dragtabto NAME X Y` takes a tab by name and carries it *to a point*, where `dragtab NAME DX DY`
+carries it by an offset. The offset form is right for moving a window, where what a drag means is
+"this far"; it is wrong for dropping a tab into a slot, where what it means is "into there" and the
+starting point is wherever that tab happened to be laid out. That is the same hazard `dragtab`
+exists to fix, on the other end of the same drag.
+
 For rearranging the workspace: `drag` moves a panel, and `hold X1 Y1 X2 Y2` does not. A tab is
 grabbed the instant it is pressed; the hold is what turns a *stationary* press into a question —
 after `panel_drag::HOLD_MS` a still tab opens that panel's settings and the grab is dropped. So
@@ -53,6 +59,12 @@ By name, resolved from the atlas the app writes each frame:
 Assertions, against the state the app writes each frame:
 `expect KEY VALUE`, `about KEY VALUE [TOLERANCE]` (for a number that came off a drag),
 `state NAME` (print the lot).
+
+**A contextual panel is asserted through the atlas, not through a state key.** Tool options follows
+the tool and Properties follows the active layer, so the evidence that one of them *followed* is
+that a name resolves in one context and does not in the other — which `press` and `absent` read off
+the controls that were actually drawn. A state key saying which section is up would be the same
+function that chose it, answering about itself.
 
 `absent NAME` asserts that a control is **not** on screen. There was no negative assertion at all
 for a long time, so every rule about hiding a command that would be refused was enforced by unit
@@ -123,7 +135,9 @@ the list was already scrolled", and the log only says what input arrived, never 
   lives, so while the folder is swapped its autosaves land in the run's folder and are thrown away
   with it. For those minutes the work on their screen has no recovery copy at all.
 
-  Their copy runs from `targetelease` and this launches `target\drive-buildelease`, so the two
+  Their copy runs from `target
+elease` and this launches `target\drive-build
+elease`, so the two
   are told apart by path rather than by name. It also explains two things that look like harness
   faults and are not: a recovery file that cannot be deleted because their application has it open,
   and one that keeps reappearing under the same name because it is theirs and still being written.
@@ -138,7 +152,7 @@ Four things have caused an assertion to pass or fail for a reason that had nothi
 application. Each cost an hour, and each is fixed in the harness rather than worked around in a
 scenario — but they are the shapes to suspect first when a run disagrees with itself.
 
-- **A name that fits two controls.** The brush panel has a Size slider and a Size picker, and six
+- **A name that fits two controls.** The brush section has a Size slider and a Size picker, and six
   more pairs besides. First-wins resolved them silently, so a run meaning to drag a slider opened a
   dropdown and went on pressing at coordinates underneath it. A name that fits more than one
   control is refused now; say which by id.

@@ -4,9 +4,18 @@
 //!
 //! # What is drawn
 //!
-//! The three commands -- add a text layer, convert one to raster, load a font file -- along with
-//! the substitution warning, and the caption editor itself: the words, the family, the size, the
-//! weight and slant, wrapping and its width, alignment, colour, spacing and position.
+//! The caption editor: the words, the family, the size, the weight and slant, wrapping and its
+//! width, alignment, colour, spacing and position -- along with the substitution warning, and two
+//! commands, converting the layer to raster and loading a font file.
+//!
+//! **This is a section, not only a panel.** It is what the Properties panel shows when the active
+//! layer keeps words rather than pixels (see [`super::properties`]), and it is still a panel of its
+//! own for anyone who wants it docked somewhere permanently.
+//!
+//! *Adding* a text layer is not here. It is in the Layer menu, beside Add, Duplicate and Merge
+//! down, because it makes a layer rather than describing one -- and because the one place a person
+//! who has never made a text layer will not look for the command is inside the panel that only has
+//! anything to show once they have.
 //!
 //! The caption editor is written and proved in [`editor`]. A panel may not edit the document in
 //! place (see [`super`]), so it edits a copy of the block and hands it back as `Picked::TextSet`;
@@ -39,9 +48,10 @@ const POS_Y: u32 = 11;
 /// Alignments are numbered by their index in `Align::ALL`, so the base sits clear of every id
 /// above it -- and clear of a fourth alignment, if one is ever added, reaching the ids below.
 const FIRST_ALIGN: u32 = 1 << 8;
-const ADD_LAYER: u32 = 1 << 9;
-const CONVERT: u32 = ADD_LAYER + 1;
-const LOAD_FONT: u32 = ADD_LAYER + 2;
+/// The commands under the editor, numbered clear of the fields above them.
+const FIRST_COMMAND: u32 = 1 << 9;
+const CONVERT: u32 = FIRST_COMMAND;
+const LOAD_FONT: u32 = FIRST_COMMAND + 1;
 
 /// Draw the panel and report what the artist asked for.
 pub(crate) fn show(
@@ -90,13 +100,15 @@ pub(crate) fn show(
                    than the pixels, so a caption stays retypeable -- and cannot be painted on."
                 .to_owned(),
         });
+        // **And where to get one.** A panel with nothing to show has to say what would give it
+        // something (DECISIONS 6b); this one used to carry the command itself, and now that the
+        // command lives with the other layer-making commands it carries the direction instead.
+        controls.push(Control::Label {
+            text: "Layer \u{25b8} Add text layer makes one.".to_owned(),
+        });
     }
 
     controls.push(Control::Separator);
-    controls.push(Control::Button {
-        id: ADD_LAYER,
-        text: "Add text layer".to_owned(),
-    });
 
     // Offered only when there is text to convert, matching the old panel: a command that cannot
     // apply should not be on screen at all, rather than on screen and refusing.
@@ -128,7 +140,6 @@ pub(crate) fn show(
     let mut edited = block.cloned();
     for change in paint.show(ui, &controls) {
         let answer = match change {
-            Change::Pressed(ADD_LAYER) => Some(Picked::Text(TextAction::AddLayer)),
             Change::Pressed(CONVERT) => Some(Picked::Text(TextAction::ConvertToRaster)),
             Change::Pressed(LOAD_FONT) => Some(Picked::Text(TextAction::LoadFontFile)),
             other => match edited.as_mut() {

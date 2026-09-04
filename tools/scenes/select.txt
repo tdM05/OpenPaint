@@ -19,38 +19,46 @@ expect page-size 2048	2048
 # Measured, not derived: the application reports 0.5916 for a 2048 page in this window.
 about zoom 0.5916 0.02
 
-tab Select
+tab Tool options
 
-# The four tools. The panel and the rail read one field, so `select-tool` is the evidence for both.
-# Named `Select:...` throughout because the rail offers the same four words and the harness refuses
-# a name that fits two controls -- which is the whole point of it.
+# **The rail chooses, and the panel follows it.** Tool options shows the settings of whatever tool
+# is in hand, so with the brush up it is the brush section and none of these four words is on
+# screen -- the rail (`Tools:...`) is what can reach them. The moment a selection tool is up the
+# panel is the selection section, which offers the same four, so the second press of each pair goes
+# to the panel (`Tool options:...`).
+#
+# That alternation is the assertion. A name that is not on screen stops the run, so if the panel
+# had not followed the rail this scene could not get past its first `Tool options:` press -- which
+# is a stronger witness than any state key, because it reads the controls that were actually drawn.
 #
 # **Pressing the tool that is already up puts it away, whichever tool it is.** Two of the four were
 # named in the check and two were not, so a lit Lasso or Rect toggled off while a lit Wand or Move
 # was silently rebuilt -- the same press on the same-looking button doing two different things
 # depending on which button it was, with nothing in the panel to say which.
-press Select:Lasso
+absent Tool options:Lasso
+press Tools:Lasso
 expect select-tool lasso
 expect tool Brush
-press Select:Lasso
+press Tool options:Lasso
 expect select-tool -
-press Select:Rect
+absent Tool options:Lasso
+press Tools:Rect
 expect select-tool rect
-press Select:Rect
+press Tool options:Rect
 expect select-tool -
-press Select:Wand
+press Tools:Wand
 expect select-tool wand
-press Select:Wand
+press Tool options:Wand
 expect select-tool -
-press Select:Move
+press Tools:Move
 expect select-tool move
-press Select:Move
+press Tool options:Move
 expect select-tool -
 shot select-tools
 
 # A real selection, made the way an artist makes one: a rectangle dragged across the canvas.
 # A straight drag is a shape for the Rect and not for the Lasso -- see the lasso block below.
-press Select:Rect
+press Tools:Rect
 expect select-tool rect
 drag 660 460 1120 920
 expect selection true
@@ -64,14 +72,14 @@ shot select-rect
 # The status is written by the same function that would write it after filling zero pixels, so
 # the page is the proof. The selection is the rectangle dragged above.
 ink 700 500 1080 880 0
-press Select:Fill with brush colour
+press Tool options:Fill with brush colour
 expect selection true
 expect status Filled the selection
 expect undo 1
 expect dirty true
 ink 700 500 1080 880 5000
 shot select-filled
-press Select:Clear
+press Tool options:Clear
 expect selection true
 expect status Cleared the selection
 expect undo 2
@@ -120,7 +128,7 @@ expect select-tool rect
 drag 700 500 1080 880
 expect selection true
 expect status Selected
-press Select:Wand
+press Tools:Wand
 expect select-tool wand
 
 # Dragging a slider inside a panel must not reach the canvas. It once did: a release that began on
@@ -130,11 +138,11 @@ expect select-tool wand
 # The two numbers themselves have no key in `report_state`, so what is proved here is that they are
 # reachable, that they belong to the wand, and that the wand still works after them -- not that the
 # knob landed on 32. That gap is worth closing in `report_state`, not here.
-slide Select:Tolerance 0.8
+slide Tool options:Tolerance 0.8
 expect selection true
 expect select-tool wand
 about wand.tolerance 102 15
-slide Select:Expand 0.8
+slide Tool options:Expand 0.8
 expect selection true
 expect select-tool wand
 about wand.expand 6 2
@@ -152,13 +160,13 @@ expect dirty true
 shot select-wand-bucket
 
 # Turned off, the same click leaves a selection instead of paint.
-press Select:Fill on click (bucket)
+press Tool options:Fill on click (bucket)
 expect wand.fill false
 click 890 690
 expect status Selected
 expect selection true
 shot select-wand-picked
-press Select:Fill on click (bucket)
+press Tool options:Fill on click (bucket)
 expect selection true
 
 # The lasso, and the one thing the harness cannot do to it. `drag` walks a straight line, and a
@@ -170,7 +178,7 @@ expect selection true
 # lasso this suite drew was a straight line -- which is a polygon with no area, and therefore a
 # test of the code that copes with a tap rather than of the lasso. The square below is drawn as
 # four sides and the marching ants trace exactly it.
-press Select:Lasso
+press Tool options:Lasso
 expect select-tool lasso
 path 700 500 1050 500 1050 850 700 850
 expect selection true
@@ -199,10 +207,10 @@ shot select-lasso-line
 
 # The move tool. It needs a selection with pixels under it, so the rectangle is made again over the
 # filled area; the drag lifts them, floats them and puts them down on release as one undo step.
-press Select:Rect
+press Tools:Rect
 drag 700 500 1080 880
 expect selection true
-press Select:Move
+press Tool options:Move
 expect select-tool move
 expect selection true
 drag 850 650 950 750

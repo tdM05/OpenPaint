@@ -1,4 +1,13 @@
-//! One module per panel: what it shows, and what a press on it means.
+//! One module per *section*: what it shows, and what a press on it means.
+//!
+//! **A section, not a panel, because the two stopped being the same thing.** Most of these are
+//! still one panel each. Four of them -- brush, select, transform, text -- are also what the two
+//! contextual panels show: [`tool`] follows the tool in the artist's hand and [`properties`]
+//! follows the active layer, and each is a `show` that matches on [`Status`] and delegates to one
+//! of the four. That is also the answer to "some people want a tab strip and some want the setting
+//! always in one place": the same module serves the contextual panel and a standalone one opened
+//! from the panel list. `docs/CONTEXTUAL_PANELS.md` has the reasoning; DECISIONS 1e has the
+//! decision.
 //!
 //! **This is the descriptor design showing up in the file layout.** It was already in the types --
 //! a panel says what its controls *are* and applies what comes back, and nothing in it knows what a
@@ -35,8 +44,10 @@ pub(crate) mod layers;
 pub(crate) mod menu;
 pub(crate) mod page;
 pub(crate) mod pages;
+pub(crate) mod properties;
 pub(crate) mod select;
 pub(crate) mod text;
+pub(crate) mod tool;
 pub(crate) mod tools;
 pub(crate) mod transform;
 
@@ -68,9 +79,41 @@ pub(crate) fn show(
         ws::PAGE => page::show(ui, brush, color_srgb, state, paint, place),
         ws::TEXT => text::show(ui, brush, color_srgb, state, paint, place),
         ws::SELECT => select::show(ui, brush, color_srgb, state, paint, place),
+        ws::TOOL => tool::show(ui, brush, color_srgb, state, paint, place),
+        ws::PROPERTIES => properties::show(ui, brush, color_srgb, state, paint, place),
         // A panel the build knows about but nothing has been written for yet. Silent on purpose:
         // this is the one case that is not a bug, and it goes away as the last module lands.
         _ => None,
+    }
+}
+
+/// Which section a panel is currently showing.
+///
+/// **The unit of half-finished state is the section, not the panel.** [`crate::panel_draw::PanelInput`]
+/// holds the scroll offset and the text field with the caret, and it used to be filed under the
+/// panel. A contextual panel filed that way would drop the artist halfway down a list they never
+/// scrolled the moment they changed tool, and would carry a half-typed preset name out of the
+/// brush and into the wand's tolerance -- which is the third of the four things
+/// `docs/CONTEXTUAL_PANELS.md` says will go wrong. So the shell keys that state by *this*, and an
+/// ordinary panel is simply its own section.
+///
+/// It answers the same question [`tool::in_hand`] and [`properties::made_of`] answer, in the same
+/// place they answer it, so the panel that is drawn and the state it is drawn with cannot disagree.
+#[must_use]
+pub(crate) fn section_of(panel: PanelId, state: &Status<'_>) -> PanelId {
+    match panel {
+        ws::TOOL => match tool::in_hand(state) {
+            tool::InHand::Transform => ws::TRANSFORM,
+            tool::InHand::Selection => ws::SELECT,
+            tool::InHand::Paint => ws::BRUSH,
+        },
+        ws::PROPERTIES => match properties::made_of(state) {
+            properties::MadeOf::Words => ws::TEXT,
+            // Its own: the empty state is this panel's own words, not a section borrowed from
+            // somewhere else.
+            properties::MadeOf::Pixels => ws::PROPERTIES,
+        },
+        other => other,
     }
 }
 
@@ -180,6 +223,81 @@ mod tests {
     use super::{Painting, Place};
     use crate::workspace as ws;
 
+    /// **A contextual panel's half-finished state is filed under the section, not the panel.**
+    ///
+    /// The third of the four things `docs/CONTEXTUAL_PANELS.md` says will go wrong: `PanelInput`
+    /// holds the scroll offset and the field with the caret, so one entry shared across contexts
+    /// would drop the artist halfway down a list they never scrolled the moment they changed tool,
+    /// and would carry a half-typed preset name out of the brush and into the wand's tolerance.
+    ///
+    /// The sabotage for this is `section_of` answering `panel` for everything -- the `other` arm
+    /// swallowing the two contextual ids -- which is exactly the shape it would have had if nobody
+    /// had thought about it, and this test names it.
+    #[test]
+    fn a_contextual_panel_files_its_half_finished_state_under_the_section() {
+        let (layers, palette, presets, fonts) = crate::screenshot::sample_document();
+        let text_at = layers
+            .iter()
+            .position(|l| l.text().is_some())
+            .expect("the sample document has a text layer");
+        let raster_at = layers
+            .iter()
+            .position(|l| l.text().is_none())
+            .expect("the sample document has a raster layer");
+        let status = || crate::ui::Status::sample(&layers, &palette, &presets, &fonts);
+
+        let mut painting = status();
+        painting.select_tool = None;
+        painting.transform = None;
+        assert_eq!(super::section_of(ws::TOOL, &painting), ws::BRUSH);
+
+        let mut selecting = status();
+        selecting.select_tool = Some(crate::ui::SelectTool::Wand);
+        selecting.transform = None;
+        assert_eq!(super::section_of(ws::TOOL, &selecting), ws::SELECT);
+
+        let mut transforming = status();
+        transforming.transform = Some(crate::ui::TransformState {
+            transform: openpaint_core::Transform::IDENTITY,
+            lock_aspect: false,
+            kernel: openpaint_core::Kernel::Mitchell,
+        });
+        assert_eq!(super::section_of(ws::TOOL, &transforming), ws::TRANSFORM);
+
+        let mut words = status();
+        words.active_layer = text_at;
+        assert_eq!(super::section_of(ws::PROPERTIES, &words), ws::TEXT);
+
+        let mut pixels = status();
+        pixels.active_layer = raster_at;
+        assert_eq!(
+            super::section_of(ws::PROPERTIES, &pixels),
+            ws::PROPERTIES,
+            "the empty state is the panel's own words, not a section borrowed from elsewhere"
+        );
+
+        // **And an ordinary panel is its own section, whatever the document is doing.** A panel
+        // that answered something else here would share a scroll offset and a caret with a panel
+        // it has nothing to do with.
+        for panel in [
+            ws::MENU,
+            ws::TOOLS,
+            ws::BRUSH,
+            ws::LAYERS,
+            ws::COLOUR,
+            ws::HISTORY,
+            ws::TRANSFORM,
+            ws::PAGES,
+            ws::PAGE,
+            ws::TEXT,
+            ws::SELECT,
+        ] {
+            for state in [&painting, &selecting, &transforming, &words, &pixels] {
+                assert_eq!(super::section_of(panel, state), panel);
+            }
+        }
+    }
+
     /// Every panel, laid out, so the assertions in `panel_ui::place` are actually asked.
     ///
     /// **A test that cannot express the bug proves nothing.** A dozen labels shipped carrying runs
@@ -221,6 +339,8 @@ mod tests {
                     ws::PAGE,
                     ws::TEXT,
                     ws::SELECT,
+                    ws::TOOL,
+                    ws::PROPERTIES,
                 ] {
                     for place in [Place::Panel, Place::Popup] {
                         // A popup only draws when its own pick is the one open, so ask for each in

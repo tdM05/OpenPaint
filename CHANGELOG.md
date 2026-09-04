@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+### Panels follow a context now
+
+Brush, Select, Transform and Text were four tabs in one strip as though they were four of a kind.
+They are not: two are tool options, one is a layer property and one is a task in flight. There are
+now two panels instead of four tabs, and each one follows something:
+
+- **Tool options** shows the settings of whatever tool is in hand — the brush's while you paint or
+  erase, the selection's while a lasso, rectangle, wand or move is up.
+- **Properties** shows what the active layer is made of: the caption of a text layer, and for a
+  raster layer a line saying what would put something there.
+
+A **transform borrows Tool options** while it is in the air and gives it back on Apply or Cancel,
+which is what it always was. Beginning one is now **Edit ▸ Transform selection**, or **Ctrl+T**;
+**Add text layer** moved to the **Layer** menu beside Add and Duplicate, and is undoable like the
+rest of them.
+
+Nothing was taken away. Brush, Select, Transform and Text are still panels in the panel list, for
+anyone who wants one docked permanently — the same module serves the contextual panel and the
+standalone one. `docs/CONTEXTUAL_PANELS.md` and `DECISIONS.md` §1e have the reasoning.
+
+### Fixed
+
+- **A text field you could not see was holding the keyboard.** Clicking into the brush's name box
+  and then changing panel left every one-letter shortcut in the application dead — `b`, `e`, the
+  bracket keys, Delete — until that panel came back, with nothing on screen to say why. The field
+  still remembers what was half-typed; it just no longer claims the keyboard while off screen.
+- **Adding a text layer was outside undo** where adding an ordinary one was inside it, so Ctrl+Z
+  after the one did nothing.
+- Beginning a transform with nothing selected, or with one already in the air, now says so.
+
 ## 0.1.0 — 2026-09-03
 
 The first release. OpenPaint is a painting application you can do a whole job in: open a scan,

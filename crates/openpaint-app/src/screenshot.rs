@@ -779,7 +779,7 @@ mod tests {
     #[ignore = "writes a PNG to look at rather than asserting anything"]
     fn shot_floating() {
         let mut ws = plain_workspace();
-        ws.float(crate::workspace::BRUSH);
+        ws.float(crate::workspace::TOOL);
         ws.float(crate::workspace::COLOUR);
         shoot("floating", Rect::new(0.0, 0.0, 1400.0, 900.0), &[], &mut ws);
     }
@@ -826,14 +826,14 @@ mod tests {
             let screen = Rect::new(0.0, 0.0, 1400.0, 900.0);
             let mut ws = plain_workspace();
             ws.set_screen(screen);
-            ws.float(crate::workspace::BRUSH);
+            ws.float(crate::workspace::TOOL);
             if waiting {
                 // The canvas may not float, so the window below is no destination for it: the
                 // press will put the pick back and change nothing.
                 ws.start_placing(crate::workspace::CANVAS);
             }
 
-            let at = control_point(&ws, crate::workspace::BRUSH, screen);
+            let at = control_point(&ws, crate::workspace::TOOL, screen);
             let mut changed = Vec::new();
             let ctx = egui::Context::default();
             let _ = run_frames(
@@ -851,7 +851,7 @@ mod tests {
                         screen,
                         crate::workspace::Attention::Workspace,
                         |panel, ui, direction, place| {
-                            if panel == crate::workspace::BRUSH {
+                            if panel == crate::workspace::TOOL {
                                 let theme = Theme::default();
                                 let mut input = crate::panel_draw::PanelInput::default();
                                 changed = crate::panel_draw::show(
@@ -1374,7 +1374,7 @@ mod tests {
         let screen = Rect::new(0.0, 0.0, 1400.0, 1000.0);
         let mut ws = plain_workspace();
         ws.set_screen(screen);
-        ws.float(crate::workspace::BRUSH);
+        ws.float(crate::workspace::TOOL);
         ws.put_window_for_test(0, Rect::new(60.0, 40.0, 360.0, 920.0));
         shoot_panels("brush-panel", screen, &mut ws);
     }

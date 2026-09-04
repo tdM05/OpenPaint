@@ -61,9 +61,10 @@ Every panel, every menu, every keyboard chord and every core-loop action is driv
 | `history.txt` | the panel, and its buttons appearing only when there is something to undo |
 | `pages.txt`, `page.txt`, `crop.txt` | pages, page size, extend, trim, and all eight crop handles |
 | `select.txt` | every selection tool and command, the wand's settings, fill and clear in pixels |
-| `transform.txt` | every transform control, each pinned to the field it moves |
-| `text.txt` | the caption editor, each of its fourteen controls pinned to its own field |
+| `transform.txt` | every transform control, each pinned to the field it moves, in the Tool options panel a transform borrows -- and the standalone Transform panel, for the two shapes nothing else can reach |
+| `text.txt` | the caption editor in Properties, each of its fourteen controls pinned to its own field |
 | `menu.txt`, `absences.txt` | every menu item, and what the menus refuse to offer |
+| `contextual.txt` | that Tool options follows the tool and Properties follows the layer, that a transform borrows the panel and gives it back, that an empty context says what would fill it, and that a field off screen does not hold the keyboard |
 | `gestures.txt` | float, dock, move a tab, settings, remove, the panel list, window resize, layout undo |
 | `window-body.txt` | that a floating panel's own controls work and do not drag its window, for two different panels |
 | `file.txt`, `saving.txt` | a document written and read back; Ctrl+S over a path; all three answers to the unsaved-changes question |
@@ -175,3 +176,67 @@ And one thing that looked like a bug and was not: copying a rectangle over the a
 *caption*, because the caption's layer was active and copy takes the active layer, never the
 composite (DECISIONS §7c) — which is what every comparable application does. The scenario was the
 thing that was unrealistic; it now selects the inking layer first, as a person would.
+
+## Contextual panels — 2026-09-03
+
+Brush, Select, Transform and Text stopped being four tabs and became two panels that follow
+something: Tool options follows the tool in hand, Properties follows the active layer, and a
+transform borrows the first while it is in the air. `DECISIONS.md` §1e has the decision and
+`docs/CONTEXTUAL_PANELS.md` the reasoning it was built from.
+
+**This is a rename pass as much as a feature.** The control atlas names controls by panel, so
+`Select:Lasso` became `Tool options:Lasso`, `text:Caption` became `Properties:Caption`, and
+`brush:1048577` became `Tool options:1048577`; every `expect layout` in `gestures.txt`,
+`menu.txt`, `window-body.txt` and `windows-apart.txt` changed with the default arrangement. Done as
+one pass, because that is what this file says to do.
+
+`contextual.txt` is new: it switches tool and asserts the panel followed, that an empty context says
+what would fill it, that a transform borrows the panel and gives it back, and that a text field off
+screen no longer holds the keyboard.
+
+**All thirty scenarios pass, 1266 assertions.** Every one was run, not only the ones this work
+touched: the arrangement changed under all of them, and a scene that merely *opens* the workspace
+is a scene this could break.
+
+### What the driving caught that the unit tests did not
+
+- **The panel-list switch puts a panel in the air, not anywhere in particular**, and the click after
+  it is what says where. `transform.txt` was written without that click, so the three `absent`s
+  after it passed for the wrong reason — the panel was in neither tree — and the run only stopped a
+  step later, on the `press` that meant something. That is the trap `DRIVING.md` warns about, met in
+  the wild rather than in theory, and the scene now clicks a destination.
+- **Floating windows are listed back to front**, so taking one by its tab brings it forward and
+  moves it to the *end* of the line — and F3 does not put the order back, because which window is in
+  front follows the pointer and is not an arrangement. Two assertions in `gestures.txt` were written
+  the other way round.
+- **A release binary built while a sabotage sweep was running has the sabotage in it.** The first
+  driven run of `contextual.txt` opened on a workspace with both Tool options *and* Brush as tabs,
+  which is exactly what one of the nine sabotages does to `default_layout` — and the binary had been
+  compiled in the ninety seconds that file was broken on purpose. Nothing in the harness can catch
+  that; the lesson is that the two must not overlap.
+- **`Add text layer` renumbered the text section's commands.** `text.txt` presses the Load-font
+  button by id because its label ends in an ellipsis, and the id moved from 514 to 513 when the
+  command above it left for the Layer menu. Naming a control by id has that cost, and it is still
+  cheaper than an ellipsis in a scene file.
+
+### Two defects it found in the application, both pre-existing
+
+- **A text field you could not see was holding the keyboard.** `Ui::typing` asked every panel it had
+  ever drawn, and `editing` is dropped only by the panel that draws the field — so clicking into the
+  brush's name box and then changing tab left every unmodified shortcut dead until that panel came
+  back, with nothing on screen to say why. It needed a tab switch to reach before; a contextual panel
+  makes it a press on the tool rail, which is how it turned up. `typing` now asks only the sections
+  drawn last frame: the field remembers what was half-typed, and the keyboard is claimed only by a
+  field on screen. Driven in `contextual.txt`.
+- **Adding a text layer was outside history** while adding a raster one was inside it, so Ctrl+Z
+  after the one did nothing — the same shape as finding #4, and glaring once the two sat side by
+  side in the Layer menu.
+
+### And one that is not ours
+
+`colour_wheel::tests::the_hue_strip_runs_from_red_round_to_red` fails on the toolchain this session
+had to build with — the far end of the hue strip comes back as 359.99997 rather than 0. It fails
+identically at `380ae19` with the same toolchain, so it is not from this work; the machine had no
+Rust and no MSVC C++ tools, so the build is `x86_64-pc-windows-gnu` against a MinGW libm rather than
+the msvc target CI uses, and `mul_add` is the obvious suspect. The assertion now prints the value it
+got, which is how that was found at all.

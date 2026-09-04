@@ -152,6 +152,17 @@ expect status Filled the selection
 expect dirty true
 shot menu-filled
 
+# Edit > Transform selection lifts what is selected and holds it in the air. It is in a menu
+# because beginning a transform is a command; the sliders that steer one live in Tool options
+# while it is up, which is `transform.txt`'s subject. Cancel here, so the rest of this scene meets
+# the document it expects.
+press Menu:Edit
+press Menu:Transform selection
+expect dragging true
+shot menu-transforming
+key escape
+expect dragging false
+
 # Select > Clear is the other half of fill: the pixels inside the mask come off the active
 # layer, and that is recorded the same way.
 press Menu:Select
@@ -163,13 +174,27 @@ press Menu:Select
 press Menu:Deselect
 expect selection false
 
-# The Layer menu, whose four items are word for word the Layers panel's four buttons.
+# The Layer menu. Four of its items are word for word the Layers panel's four buttons; the fifth
+# makes a text layer, and it is here rather than in the panel that edits captions because it makes
+# a layer rather than describing one -- and because the one place somebody who has never made a
+# text layer will not look is inside the panel that has nothing to show until they have.
 press Menu:Layer
 press Menu:Add
 expect layers 2
 expect active.name Layer 2
 expect status Added layer 2
 shot menu-layer-added
+
+# Add text layer, offered whatever is active, and the only way to make one.
+press Menu:Layer
+press Menu:Add text layer
+expect layers 3
+expect active.kind text
+expect active.name Text
+shot menu-text-layer
+key ctrl+z
+expect layers 2
+expect active.kind raster
 
 press Menu:Layer
 press Menu:Duplicate
@@ -262,15 +287,16 @@ press Menu:Select
 press Menu:Deselect
 press Menu:Edit
 absent Menu:Fill selection
+absent Menu:Transform selection
 press Menu:Undo
 shot menu-absences
 
 # The Panels button in the bar is the other way to the workspace's list of panels -- the one that
 # is discoverable, as against the secondary press that is not. It had never been pressed.
 press Menu:Panels
-expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / *Brush,Transform,Select,Text / *Colour
+expect layout *Menu / *Tools / *Canvas / *Layers,Properties,History,Pages,Page / *Tool options / *Colour
 press popup-panels:History
-expect layout *Menu / *Tools / *Canvas / *Layers,Pages,Page / *Brush,Transform,Select,Text / *Colour
+expect layout *Menu / *Tools / *Canvas / *Layers,Properties,Pages,Page / *Tool options / *Colour
 shot menu-panel-list
 key f3
-expect layout *Menu / *Tools / *Canvas / *Layers,History,Pages,Page / *Brush,Transform,Select,Text / *Colour
+expect layout *Menu / *Tools / *Canvas / *Layers,Properties,History,Pages,Page / *Tool options / *Colour

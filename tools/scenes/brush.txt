@@ -5,7 +5,7 @@
 # Flow, Hardness, Spacing, Roundness, Angle -- belong to two controls each, the slider and the
 # picker that says what drives it. A person tells them apart by where they are; a script cannot,
 # and must say which it means.
-tab Brush
+tab Tool options
 expect brush.size 8.000
 expect brush.hardness 0.500
 expect brush.spacing 0.250
@@ -13,30 +13,30 @@ expect brush.roundness 1.000
 expect brush-tip round
 
 # The five shape sliders.
-slide brush:1048577 0.75
+slide Tool options:1048577 0.75
 about brush.size 75 30
-slide brush:1048578 0.9
+slide Tool options:1048578 0.9
 about brush.hardness 0.9
-slide brush:1048579 0.5
+slide Tool options:1048579 0.5
 about brush.spacing 0.5
-slide brush:1048580 0.4
+slide Tool options:1048580 0.4
 about brush.roundness 0.4
-slide brush:1048581 0.25
+slide Tool options:1048581 0.25
 about brush.angle 0.25
 shot brush-shape
 
 # Stabilization, flow and opacity.
-slide brush:1048582 0.5
+slide Tool options:1048582 0.5
 about brush.stabilization 100 25
-slide brush:1048583 0.5
+slide Tool options:1048583 0.5
 about brush.flow 0.5
-slide brush:1048584 0.6
+slide Tool options:1048584 0.6
 about brush.opacity 0.6
 shot brush-flow
 
 # What drives each parameter: a Pick whose list is the five modulation sources.
 expect response.size Pressure	2
-press brush:1048832
+press Tool options:1048832
 shot brush-source-open
 press Velocity
 expect response.size Velocity	2
@@ -56,33 +56,33 @@ shot brush-reset
 # The curve editor under each picker: a press on empty track adds a point, a right-click on a
 # point takes it away. 1049088 is Size's curve (FIRST_CURVE + 0).
 expect response.size Pressure	2
-press brush:1049088
+press Tool options:1049088
 expect response.size Pressure	3
 shot brush-curve
-rpress brush:1049088
+rpress Tool options:1049088
 expect response.size Pressure	2
 
 # Naming and saving a brush. The letters of a name are letters, not shortcuts: typing "beeper"
 # here used to select the eraser, step the size twice and refit the view, because every
 # unmodified key was read as a tool key as well.
-tab Brush
+tab Tool options
 expect presets 
 expect tool Brush
-press brush:1048585
+press Tool options:1048585
 type beeper
 expect tool Brush
 expect brush.size 8.000
 key enter
-slide brush:1048577 0.6
+slide Tool options:1048577 0.6
 press Save brush
 expect presets beeper
 shot brush-saved
 
 # A saved brush comes back when its row is pressed, whatever the sliders have been moved to since.
-slide brush:1048577 0.2
+slide Tool options:1048577 0.2
 press Reset to defaults
 expect brush.size 8.000
-press brush:0
+press Tool options:0
 about brush.size 30 25
 shot brush-applied
 
@@ -95,25 +95,25 @@ shot brush-forgotten
 # a picker wired to the wrong response, or a curve editor pointed at its neighbour, would have gone
 # unnoticed five times over. Each one is given a different source, and then all six are read back
 # at once -- so two of them crossed would show as two wrong answers rather than none.
-tab Brush
+tab Tool options
 press Reset to defaults
 
-press brush:1048832
+press Tool options:1048832
 press Tilt
 expect response.size Tilt	2
-press brush:1048833
+press Tool options:1048833
 press Velocity
 expect response.flow Velocity	2
-press brush:1048834
+press Tool options:1048834
 press Direction
 expect response.hardness Direction	2
-press brush:1048835
+press Tool options:1048835
 press Random
 expect response.spacing Random	2
-press brush:1048836
+press Tool options:1048836
 press Pressure
 expect response.roundness Pressure	2
-press brush:1048837
+press Tool options:1048837
 press Tilt
 expect response.angle Tilt	2
 shot brush-sources
@@ -121,40 +121,40 @@ shot brush-sources
 # And the curve under each picker: a press on empty track adds a point to that response and to no
 # other. Adding one to each in turn and reading all six back is the check that they are six
 # editors and not one drawn six times.
-press brush:1049088
+press Tool options:1049088
 expect response.size Tilt	3
-press brush:1049089
+press Tool options:1049089
 expect response.flow Velocity	3
-press brush:1049090
+press Tool options:1049090
 expect response.hardness Direction	3
-press brush:1049091
+press Tool options:1049091
 expect response.spacing Random	3
-press brush:1049092
+press Tool options:1049092
 expect response.roundness Pressure	3
-press brush:1049093
+press Tool options:1049093
 expect response.angle Tilt	3
 shot brush-curves
 
 # Right-clicking a point takes it away again, from the same curve it was added to.
-rpress brush:1049088
+rpress Tool options:1049088
 expect response.size Tilt	2
-rpress brush:1049089
+rpress Tool options:1049089
 expect response.flow Velocity	2
-rpress brush:1049090
+rpress Tool options:1049090
 expect response.hardness Direction	2
-rpress brush:1049091
+rpress Tool options:1049091
 expect response.spacing Random	2
-rpress brush:1049092
+rpress Tool options:1049092
 expect response.roundness Pressure	2
-rpress brush:1049093
+rpress Tool options:1049093
 expect response.angle Tilt	2
 
 # The edge profile is a seventh curve, and not a response: its axis is distance within the dab
 # rather than an input, which is why nothing drives it. It is only reachable while the tip is a
 # procedural one, which it is until a bitmap is loaded.
-press brush:1048590
+press Tool options:1048590
 shot brush-edge
-rpress brush:1048590
+rpress Tool options:1048590
 press Reset to defaults
 expect brush-tip round
 
@@ -162,7 +162,7 @@ expect brush-tip round
 # field that arrives selected, so the first keystroke replaces the lot and the caret is never
 # actually moved. Here the caret is walked about and the text mended in place, which is the only
 # way to find out whether the field is a text field or a box that accepts one word.
-press brush:1048585
+press Tool options:1048585
 type inkr
 key left
 type e
@@ -184,7 +184,7 @@ expect brush.size 8.000
 drag 700 450 700 850
 ink 660 600 690 700 0
 key ctrl+z
-slide brush:1048577 0.85
+slide Tool options:1048577 0.85
 about brush.size 126 20
 drag 700 450 700 850
 ink 660 600 690 700 20
@@ -199,7 +199,7 @@ press Forget finkers
 expect presets
 # The field still holds the last name that was typed into it, so it has to be emptied first --
 # otherwise this saves that name again and proves nothing.
-press brush:1048585
+press Tool options:1048585
 key ctrl+a
 key delete
 key enter

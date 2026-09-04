@@ -1,17 +1,27 @@
 # The six tools, and what each one sets.
+#
+# **Every press says `Tools:` first.** The rail offers all six, and Tool options offers the four
+# selection tools again whenever one of them is up -- deliberately, so changing between them does
+# not mean crossing the window and coming back. That puts Lasso, Rect, Wand and Move on screen twice
+# the moment the first one is pressed, and the harness refuses a name that fits two controls. Which
+# is the point of it: the two are numbered differently, and an unqualified `press Rect` resolved to
+# whichever came first.
+#
+# The rail is the subject here. `contextual.txt` is where the panel's copies are driven, and
+# `select.txt` alternates between the two on purpose.
 expect tool Brush
 expect select-tool -
-press Eraser
+press Tools:Eraser
 expect tool Eraser
-press Lasso
+press Tools:Lasso
 expect select-tool lasso
-press Rect
+press Tools:Rect
 expect select-tool rect
-press Wand
+press Tools:Wand
 expect select-tool wand
-press Move
+press Tools:Move
 expect select-tool move
-press Brush
+press Tools:Brush
 expect tool Brush
 expect select-tool -
 shot tools-brush

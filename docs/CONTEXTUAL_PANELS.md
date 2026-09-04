@@ -1,7 +1,9 @@
 # Contextual panels: where a tool's settings belong
 
-> **Status: designed, agreed with the author, not built.** Written 2026-09-03. This is the spec to
-> build from, and the second half is the handoff for whoever picks it up.
+> **Status: built, 2026-09-03.** Written and agreed the same day, and built from as written. The
+> spec is kept as it was, because it is the reasoning; what actually shipped, and the four places
+> the build had to decide something the spec left open, are in **[What was built](#what-was-built)**
+> at the end. The decision and its consequences are `DECISIONS.md` §1e.
 
 ## The problem
 
@@ -118,7 +120,7 @@ These are the known costs. None is a reason not to do it; all four need an answe
    Folding those into a Tool panel renames them. Do it as one deliberate pass, not scene by scene —
    `DRIVE_LOG.md` records what happens when scene names and reality drift apart.
 
-## How to build it
+## How it was built
 
 **Start with Properties for text.** It is the clearest case, it touches one module, and it answers
 the only question that matters — does contextual behaviour feel right — before anything is
@@ -169,10 +171,10 @@ what Transform does with the space.
 ## Running things
 
 ```
-cargo test --workspace            # 971 tests; also run with --release, CI does
+cargo test --workspace            # 975 tests; also run with --release, CI does
 cargo clippy --workspace --all-targets
 cargo fmt --all -- --check
-./tools/sweep.ps1                 # 29 scenarios, 1180 assertions, drives the real UI
+./tools/sweep.ps1                 # 30 scenarios, 1266 assertions, drives the real UI
 ```
 
 **The sweep takes the mouse and keyboard for about fifteen minutes.** Nothing else can use the
@@ -199,3 +201,65 @@ machine while it runs.
 - `crates/openpaint-app/src/panel_draw.rs` — the only thing that knows what a slider looks like.
 - `crates/openpaint-app/src/workspace.rs` — the layout tree, floating windows, popups, gestures.
 - `crates/openpaint-app/src/ui.rs` — `Status` (everything a panel may read) and the modal prompts.
+
+---
+
+# What was built
+
+Two panels, `panels/tool.rs` and `panels/properties.rs`, each of which is a `show` that matches on
+`Status` and delegates to a section. That is the whole of the new code in the panel layer; the
+workspace, the layout tree and the descriptor layer learned nothing, as the design said they would
+not. Everything else in this round was consequence.
+
+**The order was the one above.** Properties for text first — one module, and it answered whether
+contextual behaviour reads right before anything was restructured — then the Tool panel, then the
+transform.
+
+## The four things that would go wrong, and what each got
+
+1. **Contents moving under you.** Nothing resizes: a panel's size comes from the layout tree, and
+   the section scrolls inside whatever it is given. The brush section already had to.
+2. **Discoverability.** Every context with nothing to show says what would fill it, and
+   `properties::nothing_to_set` has a test asserting that it names both the thing that is missing
+   and where the command that makes one lives. `contextual.txt` drives it.
+3. **Half-finished state.** `panels::section_of` is the key `PanelInput` is filed under, and it is
+   the same function the panel is drawn from, so what is drawn and what it is drawn with cannot
+   disagree. Unit-tested, with the sabotage named in the test's own doc comment.
+4. **The atlas names controls by panel.** Done as one pass: `Select:Lasso` → `Tool options:Lasso`,
+   `text:Caption` → `Properties:Caption`, `brush:1048577` → `Tool options:1048577`, and every
+   `expect layout` in `gestures.txt`, `menu.txt`, `window-body.txt` and `windows-apart.txt`.
+
+## The four things the spec left open, and what was decided
+
+- **The name is "Tool options", not "Tool"**, because the rail is "Tools" and two names one letter
+  apart is a pair somebody mistypes — in a scenario, where the harness then presses a confident
+  nowhere. It is also Krita's name for the same panel.
+- **Not horizontal under the menu**, which the spec floated. The brush section is four times taller
+  than the window; a bar the height of a menu is where a setting goes to be scrolled past.
+- **Where the commands went.** "Add text layer" is in the Layer menu beside Add, Duplicate and
+  Merge down: it makes a layer rather than describing one, and the one place somebody who has never
+  made a text layer would not look is inside the panel that has nothing to show until they have.
+  "Convert to raster layer" stayed in the section, with the sentence about what is lost, because it
+  is the act of giving up the contents the panel is showing. Beginning a transform moved to
+  Edit ▸ Transform selection and Ctrl+T.
+- **`add_missing_panels` was narrowed to the built-in arrangement.** It existed so a panel added by
+  a later build cannot be invisible, and it walked the whole panel table — which would have put
+  Brush, Select, Transform and Text back into the default workspace the first time it was saved and
+  read again, undoing the entire change. A panel in neither place is reachable from the panel list,
+  which is also how it came to be closed.
+
+## What it left
+
+In `TODO.md` §4: crop is still not transient (its controls are inside `panels/page.rs`, mixed with
+the page's own), the resampling filter is only reachable while a transform is in the air or from
+the standalone Transform panel, and the keyboard's tool keys do not put a selection tool away where
+the rail's buttons do.
+
+## Two defects it surfaced
+
+Both pre-existing, both fixed here rather than reported, and both in `DRIVE_LOG.md`:
+
+- **A field nobody can see was holding the keyboard.** `Ui::typing` asked every panel it had ever
+  drawn, so clicking into the brush's name box and then changing tab left every unmodified shortcut
+  dead until that panel came back. It asks only the sections drawn last frame now.
+- **Adding a text layer was outside history** while adding a raster one was inside it.
