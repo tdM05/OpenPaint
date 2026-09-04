@@ -87,6 +87,13 @@ status line already handles.
   pixel: constant for the grid the transform uses now, per-filter-tap for the `HashMap` it used
   to. Until then it is a smoke test that the rotation finishes, and the doc comment on it says so.
 
+- **And `selection::tests::a_lasso_on_a_full_page_is_not_slow` is the same test in a second place.**
+  It failed once in a `--workspace` run that shared the machine with a release build, and passed
+  three times out of three on its own immediately after. That is not a flake to retry until it is
+  quiet: it is the row above, in another file, and whatever replaces the wall clock there has to
+  replace it here too. Written down so the next person who meets it red does not go looking for a
+  defect in the lasso.
+
 ### The crash that was here is fixed — 2026-09-03
 
 Was: the app test binary occasionally died with `STATUS_ACCESS_VIOLATION`, roughly one run in ten,

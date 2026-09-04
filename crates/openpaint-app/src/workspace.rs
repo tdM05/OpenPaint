@@ -1,4 +1,3 @@
-
 //! Drawing the panel workspace, and driving it with a pointer.
 //!
 //! The one part of the panel system that is not testable without a screen, kept as thin as it can
